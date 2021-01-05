@@ -17,7 +17,7 @@ BinPackParameters: true
 ColumnLimit:     115   # needed for the modelines
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
 DerivePointerBinding: false
-#ExperimentalAutoDetectBinPacking: false
+#ExperimentalAutoDetectBinPacking: true
 IndentCaseLabels: true
 Language: Cpp
 MaxEmptyLinesToKeep: 3
@@ -43,7 +43,9 @@ SpaceInEmptyParentheses: false
 SpacesInCStyleCastParentheses: false
 SpaceAfterControlStatementKeyword: false
 SpaceBeforeAssignmentOperators: true
-SpaceBeforeParens: Never
+SpaceBeforeParens: ControlStatements
 SpacesInSquareBrackets: false
-...
-
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: false
+ReflowComments: true
+SortIncludes: true

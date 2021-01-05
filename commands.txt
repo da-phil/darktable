@@ -1,0 +1,10 @@
+# Clang-format online tool to quickly check results
+https://zed0.co.uk/clang-format-configurator/
+
+# clang-tidy (before clang-format):
+clang-tidy -checks='-*,readability-braces-around-statements' -fix-errors src/**/*.c src/**/*.h
+
+# clang-format call:
+time find src/ -iname *.h -o -iname *.c -exec clang-format-12 -i {} \;
+# or (more convenient and 40% faster)
+clang-format-12 -i src/**/*.h src/**/*.c
