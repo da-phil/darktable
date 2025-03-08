@@ -38,6 +38,8 @@
 #include <glib/gstdio.h>
 #include <sqlite3.h>
 
+#include <string.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -95,6 +97,45 @@ int32_t dt_database_last_insert_rowid(const dt_database_t *db)
 {
   return (int32_t)sqlite3_last_insert_rowid(db->handle);
 }
+
+
+/* Write change logs to a file */
+void log_change(const char *message) {
+  FILE *log = g_fopen("/tmp/cdc_log.txt", "a");
+  if (log) {
+      fprintf(log, "%s\n", message);
+      fclose(log);
+  }
+}
+
+/* Callback for UPDATE HOOK */
+void update_callback(void *arg, int operation, const char *database, const char *table, sqlite3_int64 rowid) {
+  const char *op = (operation == SQLITE_INSERT) ? "INSERT" :
+                   (operation == SQLITE_UPDATE) ? "UPDATE" : "DELETE";
+  
+  char log_msg[256];
+  snprintf(log_msg, sizeof(log_msg), "[%s] on table '%s', rowid: %lld", op, table, rowid);
+  log_change(log_msg);
+}
+
+/* Rollback Hook Callback */
+void rollback_callback(void *arg) {
+  const char *message = "Transaction ROLLED BACK";
+  log_change(message);
+}
+
+/* Callback for COMMIT HOOK */
+int commit_callback(void *arg) {
+  log_change("Transaction COMMITTED\n");
+  return 0; // Return non-zero to abort the commit
+}
+
+/* Custom wrapper for custom_sqlite3_prepare to log all SQL statements */
+int custom_sqlite3_prepare(  sqlite3 *db,  const char *zSql,  int nByte,  sqlite3_stmt **ppStmt, const char **pzTail) {
+  log_change(zSql);
+  return sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+}
+
 
 /* migrate from the legacy db format (with the 'settings' blob) to the
    first version this system knows */
@@ -283,7 +324,7 @@ static gboolean _migrate_schema(dt_database_t *db, int version)
   sqlite3_exec(db->handle, "ALTER TABLE main.presets ADD COLUMN multi_name VARCHAR(256)", NULL, NULL, NULL);
   // the unique index only works if the db doesn't have any (name, operation, op_version) more than once.
   // apparently there are dbs out there which do have that. :(
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "SELECT p.rowid, p.name, p.operation, p.op_version FROM main.presets p INNER JOIN "
                      "(SELECT * FROM (SELECT rowid, name, operation, op_version, COUNT(*) AS count "
                      "FROM main.presets GROUP BY name, operation, op_version) WHERE count > 1) s "
@@ -314,7 +355,7 @@ static gboolean _migrate_schema(dt_database_t *db, int version)
 
     // find the next free amended version of name
     // clang-format off
-    sqlite3_prepare_v2(db->handle, "SELECT name FROM main.presets  WHERE name = ?1 || ' (' || ?2 || ')' AND "
+    custom_sqlite3_prepare(db->handle, "SELECT name FROM main.presets  WHERE name = ?1 || ' (' || ?2 || ')' AND "
                                    "operation = ?3 AND op_version = ?4",
                        -1, &innerstmt, NULL);
     // clang-format on
@@ -335,7 +376,7 @@ static gboolean _migrate_schema(dt_database_t *db, int version)
     // clang-format off
     const char *query = "UPDATE main.presets SET name = name || ' (' || ?1 || ')' WHERE rowid = ?2";
     // clang-format on
-    sqlite3_prepare_v2(db->handle, query, -1, &innerstmt, NULL);
+    custom_sqlite3_prepare(db->handle, query, -1, &innerstmt, NULL);
     sqlite3_bind_int(innerstmt, 1, i);
     sqlite3_bind_int(innerstmt, 2, rowid);
     if(sqlite3_step(innerstmt) != SQLITE_DONE)
@@ -366,8 +407,8 @@ static gboolean _migrate_schema(dt_database_t *db, int version)
   // Since the bug which introduced absolute paths to the db was fixed before a
   // Windows build was available this shouldn't matter though.
   // clang-format off
-  sqlite3_prepare_v2(db->handle, "SELECT id, filename FROM main.images WHERE filename LIKE '/%'", -1, &stmt, NULL);
-  sqlite3_prepare_v2(db->handle, "UPDATE main.images SET filename = ?1 WHERE id = ?2", -1, &innerstmt, NULL);
+  custom_sqlite3_prepare(db->handle, "SELECT id, filename FROM main.images WHERE filename LIKE '/%'", -1, &stmt, NULL);
+  custom_sqlite3_prepare(db->handle, "UPDATE main.images SET filename = ?1 WHERE id = ?2", -1, &innerstmt, NULL);
   // clang-format on
   while(sqlite3_step(stmt) == SQLITE_ROW)
   {
@@ -435,7 +476,7 @@ end:
 #define TRY_PREPARE(_stmt, _query, _message)                                     \
   do                                                                             \
   {                                                                              \
-    if(sqlite3_prepare_v2(db->handle, _query, -1, &_stmt, NULL) != SQLITE_OK)    \
+    if(custom_sqlite3_prepare(db->handle, _query, -1, &_stmt, NULL) != SQLITE_OK)    \
     {                                                                            \
       dt_print(DT_DEBUG_ALWAYS, "TRY_PREPARE '%s' sql: '%s'", _message, sqlite3_errmsg(db->handle)); \
       FINALIZE;                                                                  \
@@ -1115,7 +1156,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
     {
       dt_iop_order_entry_t *prior = priorities->data;
 
-      sqlite3_prepare_v2(
+      custom_sqlite3_prepare(
           db->handle,
           "INSERT INTO iop_order_tmp (iop_order, operation) VALUES (?1, ?2)",
           -1, &stmt, NULL);
@@ -1344,7 +1385,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
           {
             char *iop_list_txt = dt_ioppr_serialize_text_iop_order_list(iop_order_list);
 
-            sqlite3_prepare_v2(db->handle,
+            custom_sqlite3_prepare(db->handle,
                                "INSERT INTO module_order VALUES (?1, ?2, ?3)", -1,
                                &ins_stmt, NULL);
             sqlite3_bind_int(ins_stmt, 1, current_imgid);
@@ -1357,7 +1398,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
           }
           else
           {
-            sqlite3_prepare_v2(db->handle,
+            custom_sqlite3_prepare(db->handle,
                                "INSERT INTO module_order VALUES (?1, ?2, NULL)", -1,
                                &ins_stmt, NULL);
             sqlite3_bind_int(ins_stmt, 1, current_imgid);
@@ -1495,7 +1536,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
       // get history
       sqlite3_stmt *h2_stmt;
       // clang-format off
-      sqlite3_prepare_v2(db->handle,
+      custom_sqlite3_prepare(db->handle,
                          "SELECT operation, op_params, blendop_params"
                          " FROM main.history"
                          " WHERE imgid = ?1 AND enabled = 1"
@@ -1522,7 +1563,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
       // get module order
       h2_stmt = NULL;
       // clang-format off
-      sqlite3_prepare_v2(db->handle,
+      custom_sqlite3_prepare(db->handle,
                          "SELECT version, iop_list"
                          " FROM main.module_order"
                          " WHERE imgid = ?1",
@@ -1551,7 +1592,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
       // insert the hash for that image
       h2_stmt = NULL;
       // clang-format off
-      sqlite3_prepare_v2(db->handle,
+      custom_sqlite3_prepare(db->handle,
                          "INSERT INTO main.history_hash"
                          " VALUES (?1, ?2, NULL, ?3)",
                          -1, &h2_stmt, NULL);
@@ -2066,7 +2107,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
     while(sqlite3_step(stmt) == SQLITE_ROW)
     {
       sqlite3_stmt *stmt2;
-      sqlite3_prepare_v2(db->handle,
+      custom_sqlite3_prepare(db->handle,
                          "UPDATE `images_new` SET"
                          " (datetime_taken, import_timestamp,"
                          "  change_timestamp, export_timestamp, print_timestamp) = "
@@ -2139,7 +2180,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
     while(sqlite3_step(stmt) == SQLITE_ROW)
     {
       sqlite3_stmt *stmt2;
-      sqlite3_prepare_v2(db->handle,
+      custom_sqlite3_prepare(db->handle,
                          "UPDATE `images` SET"
                          " (flags) = "
                          " (?2) WHERE id = ?1",
@@ -2958,7 +2999,7 @@ static int _upgrade_library_schema_step(dt_database_t *db, int version)
     new_version = version; // should be the fallback so that calling code sees that we are in an infinite loop
 
   // write the new version to db
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "INSERT OR REPLACE"
                      " INTO main.db_info (key, value)"
                      " VALUES ('version', ?1)", -1, &stmt,
@@ -3006,7 +3047,7 @@ static int _upgrade_data_schema_step(dt_database_t *db, int version)
     {
       dt_iop_order_entry_t *prior = priorities->data;
 
-      sqlite3_prepare_v2(
+      custom_sqlite3_prepare(
           db->handle,
           "INSERT INTO iop_order_tmp (iop_order, operation) VALUES (?1, ?2)",
           -1, &stmt, NULL);
@@ -3249,7 +3290,7 @@ static int _upgrade_data_schema_step(dt_database_t *db, int version)
 
   // write the new version to db
   // clang-format off¨
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "INSERT OR REPLACE"
                      " INTO data.db_info (key, value)"
                      " VALUES ('version', ?1)", -1, &stmt,
@@ -3309,7 +3350,7 @@ static void _create_library_schema(dt_database_t *db)
   sqlite3_exec
     (db->handle, "CREATE TABLE main.db_info (key VARCHAR PRIMARY KEY, value VARCHAR)",
      NULL, NULL, NULL);
-  sqlite3_prepare_v2
+  custom_sqlite3_prepare
     (db->handle, "INSERT OR REPLACE INTO main.db_info (key, value) VALUES ('version', ?1)",
      -1, &stmt, NULL);
   // clang-format on
@@ -3619,7 +3660,7 @@ static void _create_data_schema(dt_database_t *db)
   sqlite3_exec
     (db->handle, "CREATE TABLE data.db_info (key VARCHAR PRIMARY KEY, value VARCHAR)",
      NULL, NULL, NULL);
-  sqlite3_prepare_v2
+  custom_sqlite3_prepare
     (db->handle, "INSERT OR REPLACE INTO data.db_info (key, value) VALUES ('version', ?1)",
      -1, &stmt, NULL);
   sqlite3_bind_int(stmt, 1, LAST_FULL_DATABASE_VERSION_DATA);
@@ -3724,8 +3765,8 @@ static void _sanitize_db(dt_database_t *db)
   sqlite3_stmt *stmt, *innerstmt;
   // clang-format off
   /* first let's get rid of non-utf8 tags. */
-  sqlite3_prepare_v2(db->handle, "SELECT id, name FROM data.tags", -1, &stmt, NULL);
-  sqlite3_prepare_v2(db->handle, "UPDATE data.tags SET name = ?1 WHERE id = ?2", -1, &innerstmt, NULL);
+  custom_sqlite3_prepare(db->handle, "SELECT id, name FROM data.tags", -1, &stmt, NULL);
+  custom_sqlite3_prepare(db->handle, "UPDATE data.tags SET name = ?1 WHERE id = ?2", -1, &innerstmt, NULL);
   // clang-format on
   while(sqlite3_step(stmt) == SQLITE_ROW)
   {
@@ -3784,7 +3825,7 @@ static void _sanitize_db(dt_database_t *db)
 #define TRY_PREPARE(_stmt, _query, _message)                                       \
   do                                                                               \
   {                                                                                \
-    if(sqlite3_prepare_v2(db->handle, _query, -1, &_stmt, NULL) != SQLITE_OK)      \
+    if(custom_sqlite3_prepare(db->handle, _query, -1, &_stmt, NULL) != SQLITE_OK)      \
     {                                                                              \
       dt_print(DT_DEBUG_ALWAYS, "TRY_PREPARE: %s, sql: %s", _message, sqlite3_errmsg(db->handle)); \
       FINALIZE;                                                                    \
@@ -4039,14 +4080,14 @@ static gboolean _upgrade_camera_table(const dt_database_t *db)
   sqlite3_stmt *stmt;
   sqlite3_stmt *innerstmt;
 
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "SELECT mi.id, mk.name, md.name"
                      " FROM main.images AS mi, main.makers AS mk, main.models AS md"
                      " WHERE mi.maker_id = mk.id"
                      "   AND mi.model_id = md.id",
                      -1, &stmt, NULL);
 
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "UPDATE main.images SET camera_id = ?1 WHERE id = ?2",
                      -1, &innerstmt, NULL);
 
@@ -4170,7 +4211,7 @@ int _get_pragma_int_val(sqlite3 *db, const char* pragma)
   gchar* query= g_strdup_printf("PRAGMA %s", pragma);
   int val = -1;
   sqlite3_stmt *stmt;
-  const int rc = sqlite3_prepare_v2(db, query,-1, &stmt, NULL);
+  const int rc = custom_sqlite3_prepare(db, query,-1, &stmt, NULL);
   if(rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
   {
     val = sqlite3_column_int(stmt, 0);
@@ -4186,7 +4227,7 @@ gchar* _get_pragma_string_val(sqlite3 *db, const char* pragma)
   gchar* query= g_strdup_printf("PRAGMA %s", pragma);
   sqlite3_stmt *stmt;
   gchar* val = NULL;
-  const int rc = sqlite3_prepare_v2(db, query,-1, &stmt, NULL);
+  const int rc = custom_sqlite3_prepare(db, query,-1, &stmt, NULL);
   if(rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
   {
     val = g_strdup((const char *)sqlite3_column_text(stmt, 0));
@@ -4348,6 +4389,11 @@ start:
     return NULL;
   }
 
+  // Set hooks
+  sqlite3_update_hook(db->handle, update_callback, NULL);
+  sqlite3_commit_hook(db->handle, commit_callback, NULL);
+
+
   /* attach a memory database to db connection for use with temporary tables
      used during instance life time, which is discarded on exit.
   */
@@ -4356,7 +4402,7 @@ start:
   // attach the data database which contains presets, styles, tags and similar things not tied to single images
   sqlite3_stmt *stmt;
   gboolean have_data_db = load_data && g_file_test(dbfilename_data, G_FILE_TEST_EXISTS);
-  int rc = sqlite3_prepare_v2(db->handle, "ATTACH DATABASE ?1 AS data", -1, &stmt, NULL);
+  int rc = custom_sqlite3_prepare(db->handle, "ATTACH DATABASE ?1 AS data", -1, &stmt, NULL);
   sqlite3_bind_text(stmt, 1, dbfilename_data, -1, SQLITE_TRANSIENT);
   if(rc != SQLITE_OK || sqlite3_step(stmt) != SQLITE_DONE)
   {
@@ -4389,7 +4435,7 @@ start:
   else
   {
     gchar* data_status = _get_pragma_string_val(db->handle, "data.quick_check");
-    rc = sqlite3_prepare_v2(db->handle,
+    rc = custom_sqlite3_prepare(db->handle,
                             "SELECT value FROM data.db_info WHERE key = 'version'",
                             -1, &stmt, NULL);
     if(!g_strcmp0(data_status, "ok") && rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
@@ -4563,7 +4609,7 @@ start:
   gchar* libdb_status = _get_pragma_string_val(db->handle, "main.quick_check");
   // next we are looking at the library database
   // does the db contain the new 'db_info' table?
-  rc = sqlite3_prepare_v2(db->handle,
+  rc = custom_sqlite3_prepare(db->handle,
                           "SELECT value FROM main.db_info WHERE key = 'version'",
                           -1, &stmt, NULL);
   if(!g_strcmp0(libdb_status, "ok") && rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
@@ -4734,7 +4780,7 @@ start:
   {
     // does it contain the legacy 'settings' table?
     sqlite3_finalize(stmt);
-    rc = sqlite3_prepare_v2(db->handle, "SELECT settings FROM main.settings", -1, &stmt, NULL);
+    rc = custom_sqlite3_prepare(db->handle, "SELECT settings FROM main.settings", -1, &stmt, NULL);
     if(rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
     {
       // the old blob had the version as an int in the first place
@@ -4782,7 +4828,7 @@ start:
 #ifdef HAVE_ICU
   // check if sqlite is already icu enabled
   // if not enabled expected error: no such function:icu_load_collation
-  rc = sqlite3_prepare_v2(db->handle,
+  rc = custom_sqlite3_prepare(db->handle,
                           "SELECT icu_load_collation('en_US', 'english')",
                           -1, &stmt, NULL);
   sqlite3_finalize(stmt);
@@ -4807,7 +4853,7 @@ void dt_upgrade_maker_model(const dt_database_t *db)
 
   // check if updating the camera table is needed (done for each new darktable version)
 
-  sqlite3_prepare_v2(db->handle,
+  custom_sqlite3_prepare(db->handle,
                      "SELECT value"
                      " FROM main.db_info"
                      " WHERE key = 'dt_version'",
@@ -4824,7 +4870,7 @@ void dt_upgrade_maker_model(const dt_database_t *db)
 
     sqlite3_finalize(stmt);
 
-    sqlite3_prepare_v2(db->handle,
+    custom_sqlite3_prepare(db->handle,
                        "INSERT OR REPLACE"
                        " INTO main.db_info (key, value)"
                        " VALUES ('dt_version', ?1)",

@@ -19,16 +19,21 @@
 #pragma once
 
 #include <glib.h>
+#include <sqlite3.h>
 #include <stdint.h>
 
 G_BEGIN_DECLS
 
 struct dt_database_t;
 
+int custom_sqlite3_prepare(sqlite3 *db,           /* Database handle */
+                           const char *zSql,      /* SQL statement, UTF-8 encoded */
+                           int nByte,             /* Maximum length of zSql in bytes. */
+                           sqlite3_stmt **ppStmt, /* OUT: Statement handle */
+                           const char **pzTail    /* OUT: Pointer to unused portion of zSql */
+);
 /** allocates and initializes database */
-struct dt_database_t *dt_database_init(const char *alternative,
-                                       const gboolean load_data,
-                                       const gboolean has_gui);
+struct dt_database_t *dt_database_init(const char *alternative, const gboolean load_data, const gboolean has_gui);
 /** closes down database and frees memory */
 void dt_database_destroy(const struct dt_database_t *);
 /** get handle */
@@ -54,7 +59,7 @@ gboolean dt_database_maybe_snapshot(const struct dt_database_t *db);
 /** get list of snapshot files to remove after successful snapshot */
 char **dt_database_snaps_to_remove(const struct dt_database_t *db);
 /** get possibly the freshest snapshot to restore */
-gchar *dt_database_get_most_recent_snap(const char* db_filename);
+gchar *dt_database_get_most_recent_snap(const char *db_filename);
 
 int32_t dt_database_last_insert_rowid(const struct dt_database_t *);
 // nested transactions support

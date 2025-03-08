@@ -19,10 +19,11 @@
 #pragma once
 
 #include <sqlite3.h>
+#include "common/database.h"
 
 // define this to see all sql queries passed to prepare and exec at compile time, or a variable name
 // warning:
-// there are some direct calls to sqlite3_exec and sqlite3_prepare_v2 which are missing here. grep manually.
+// there are some direct calls to sqlite3_exec and custom_sqlite3_prepare which are missing here. grep manually.
 // #define DEBUG_SQL_QUERIES
 
 #ifdef DEBUG_SQL_QUERIES
@@ -94,7 +95,7 @@
   do                                                                                                              \
   {                                                                                                               \
     dt_print(DT_DEBUG_SQL, "[sql] %s:%d, function %s(): prepare \"%s\"", __FILE__, __LINE__, __FUNCTION__, (b));  \
-    __DT_DEBUG_ASSERT_WITH_QUERY__(sqlite3_prepare_v2(a, b, c, d, e), (b));                                       \
+    __DT_DEBUG_ASSERT_WITH_QUERY__(custom_sqlite3_prepare(a, b, c, d, e), (b));                                       \
     __DT_DEBUG_SQL_QUERY__(b)                                                                                     \
   } while(0)
 
@@ -111,4 +112,3 @@
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
 // clang-format on
-
