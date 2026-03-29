@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/exif.h"
+#include "common/hdr_alignment.h"
 #include "common/film.h"
 #include "common/gpx.h"
 #include "common/history.h"
@@ -49,6 +50,7 @@
 #include <gio/gio.h>
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <math.h>
 #ifndef _WIN32
 #include <glob.h>
 #endif
@@ -410,6 +412,9 @@ typedef struct dt_control_merge_hdr_t
 
   float *pixels, *weight;
 
+  // copy of the first image's mosaic data used as alignment reference
+  float *ref_mosaic;
+
   int wd;
   int ht;
   dt_image_orientation_t orientation;
@@ -504,6 +509,7 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
 
     d->pixels = calloc((size_t)datai->width * datai->height, sizeof(float));
     d->weight = calloc((size_t)datai->width * datai->height, sizeof(float));
+    d->ref_mosaic = NULL;
     d->wd = datai->width;
     d->ht = datai->height;
     d->orientation = image.orientation;
@@ -562,13 +568,66 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
   const float photoncnt = 100.0f * aperture * exp / iso;
   float saturation = 1.0f;
   d->whitelevel = fmaxf(d->whitelevel, saturation * cal);
+
+  // --- auto-alignment of subsequent images to the first ---
+  const float *merge_src = (const float *)ivoid;
+  float *aligned_buf = NULL;
+
+  if(!d->ref_mosaic)
+  {
+    // first image: store a copy as alignment reference
+    d->ref_mosaic = malloc(sizeof(float) * (size_t)d->wd * d->ht);
+    if(d->ref_mosaic)
+      memcpy(d->ref_mosaic, ivoid, sizeof(float) * (size_t)d->wd * d->ht);
+  }
+  else if(d->first_filter != 9u) // alignment supported for Bayer only
+  {
+    dt_hdr_alignment_t align = { 0 };
+    align.H[0] = 1.0f;
+    align.H[4] = 1.0f;
+    if(dt_hdr_align_compute(d->ref_mosaic, (const float *)ivoid,
+                            d->wd, d->ht, &align))
+    {
+      float mesh_max = 0.0f;
+      for(int i = 0; i < DT_HDR_ALIGN_MESH_NODES; i++)
+      {
+        mesh_max = MAX(mesh_max, fabsf(align.mesh_dx[i]));
+        mesh_max = MAX(mesh_max, fabsf(align.mesh_dy[i]));
+      }
+
+      // only apply warp if homography differs meaningfully from identity
+      if(fabsf(align.H[2]) > 0.25f || fabsf(align.H[5]) > 0.25f
+         || fabsf(align.H[0] - 1.0f) > 1e-4f || fabsf(align.H[4] - 1.0f) > 1e-4f
+         || fabsf(align.H[1]) > 1e-4f || fabsf(align.H[3]) > 1e-4f
+         || fabsf(align.H[6]) > 1e-8f || fabsf(align.H[7]) > 1e-8f
+         || mesh_max > 0.25f)
+      {
+        aligned_buf = malloc(sizeof(float) * (size_t)d->wd * d->ht);
+        if(aligned_buf)
+        {
+          dt_hdr_align_apply((const float *)ivoid, aligned_buf,
+                             d->wd, d->ht, d->first_filter, &align);
+          merge_src = aligned_buf;
+        }
+      }
+    }
+    else
+    {
+      dt_print(DT_DEBUG_ALWAYS, "[hdr_merge] alignment failed, merging unaligned");
+    }
+  }
+  else
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[hdr_merge] X-Trans sensor: alignment not yet supported, merging unaligned");
+  }
+
   DT_OMP_FOR(collapse(2))
   for(int y = 0; y < d->ht; y++)
     for(int x = 0; x < d->wd; x++)
     {
       // read unclamped raw value with subtracted black and rescaled
       // to 1.0 saturation.  this is the output of the rawprepare iop.
-      const float in = ((float *)ivoid)[x + d->wd * y];
+      const float in = merge_src[x + d->wd * y];
       // weights based on siggraph 12 poster zijian zhu, zhengguo li,
       // susanto rahardja, pasi fraenti 2d denoising factor for high
       // dynamic range imaging
@@ -581,6 +640,10 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
       // to get maximum value of all color channels. to find that, go
       // through the pattern block (we conservatively do a 3x3 for
       // bayer or xtrans):
+      // skip out-of-bounds pixels produced by alignment warping
+      // (sentinel value -1.0f from _warp_plane)
+      if(in < -0.5f) continue;
+
       int xx = x & ~1, yy = y & ~1;
       float M = 0.0f, m = FLT_MAX;
       if(xx < d->wd - 2 && yy < d->ht - 2)
@@ -588,8 +651,10 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
         for(int i = 0; i < 3; i++)
           for(int j = 0; j < 3; j++)
           {
-            M = MAX(M, ((float *)ivoid)[xx + i + d->wd * (yy + j)]);
-            m = MIN(m, ((float *)ivoid)[xx + i + d->wd * (yy + j)]);
+            const float val = merge_src[xx + i + d->wd * (yy + j)];
+            if(val < -0.5f) continue; // skip warped-out-of-bounds sentinels
+            M = MAX(M, val);
+            m = MIN(m, val);
           }
         // move envelope a little to allow non-zero weight even for
         // clipped regions.  this is because even if the 2x2 block is
@@ -628,6 +693,7 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
       }
     }
 
+  free(aligned_buf);
   return 0;
 }
 
@@ -728,6 +794,7 @@ static int32_t _control_merge_hdr_job_run(dt_job_t *job)
 end:
   free(d.pixels);
   free(d.weight);
+  free(d.ref_mosaic);
 
   return 0;
 }

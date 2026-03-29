@@ -26,6 +26,7 @@
 #include "common/file_location.h"
 #include "common/gaussian.h"
 #include "common/guided_filter.h"
+#include "common/hdr_alignment.h"
 #include "common/heal.h"
 #include "common/interpolation.h"
 #include "common/locallaplaciancl.h"
@@ -1488,6 +1489,7 @@ finally:
     cl->heal = dt_heal_init_cl_global();
     cl->colorspaces = dt_colorspaces_init_cl_global();
     cl->guided_filter = dt_guided_filter_init_cl_global();
+    cl->hdr_alignment = dt_hdr_alignment_init_cl_global();
 
     char checksum[64];
     snprintf(checksum, sizeof(checksum), "%u", cl->crc);
@@ -1586,6 +1588,7 @@ void dt_opencl_cleanup(dt_opencl_t *cl)
     dt_heal_free_cl_global(cl->heal);
     dt_colorspaces_free_cl_global(cl->colorspaces);
     dt_guided_filter_free_cl_global(cl->guided_filter);
+    dt_hdr_alignment_free_cl_global(cl->hdr_alignment);
 
     for(int i = 0; i < cl->num_devs; i++)
     {

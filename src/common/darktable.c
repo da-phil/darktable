@@ -263,7 +263,7 @@ static int usage(const char *argv0)
          "-d SIGNAL\n"
          "    Enable debug output to the terminal. Valid signals are:\n\n"
          "    act_on, cache, camctl, camsupport, control, dev, expose,\n"
-         "    imageio, input, ioporder, lighttable, lua, masks, memory,\n"
+         "    hdrmerge, imageio, input, ioporder, lighttable, lua, masks, memory,\n"
          "    nan, opencl, params, perf, pipe, print, pwstorage, signal,\n"
          "    sql, tiling, picker, undo\n"
          "\n"
@@ -1154,6 +1154,7 @@ int dt_init(int argc,
           !strcmp(darg, "expose") ? DT_DEBUG_EXPOSE :
           !strcmp(darg, "picker") ? DT_DEBUG_PICKER :
           !strcmp(darg, "ai") ? DT_DEBUG_AI : // AI related stuff.
+          !strcmp(darg, "hdrmerge") ? DT_DEBUG_HDRMERGE : // HDR merge alignment messages.
           0;
         if(dadd)
           darktable.unmuted |= dadd;
