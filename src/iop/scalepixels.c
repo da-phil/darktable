@@ -138,9 +138,29 @@ int distort_backtransform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, 
 void distort_mask(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece, const float *const in,
                   float *const out, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  // TODO
-  memset(out, 0, sizeof(float) * roi_out->width * roi_out->height);
-  fprintf(stderr, "TODO: implement %s() in %s\n", __FUNCTION__, __FILE__);
+  const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+
+  const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
+  const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
+
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(x_scale, y_scale, in, out, roi_in, roi_out) \
+  shared(interpolation) \
+  schedule(static)
+#endif
+  for(int j = 0; j < roi_out->height; j++)
+  {
+    float *outptr = out + (size_t)j * roi_out->width;
+    for(int i = 0; i < roi_out->width; i++)
+    {
+      float x = i * x_scale;
+      float y = j * y_scale;
+
+      dt_interpolation_compute_pixel1c(interpolation, in, &outptr[i], x, y, roi_in->width,
+                                       roi_in->height, roi_in->width);
+    }
+  }
 }
 
 void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop_roi_t *roi_out,
@@ -199,11 +219,16 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const int ch = piece->colors;
   const int ch_width = ch * roi_in->width;
   const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
-  const dt_iop_scalepixels_data_t * const d = piece->data;
+
+  // Compute scale factors directly from the actual roi_in/roi_out to ensure consistency,
+  // rather than relying on d->x_scale/d->y_scale which may have been overwritten by
+  // distort_transform/distort_backtransform via precalculate_scale().
+  const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
+  const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
 
 #ifdef _OPENMP
 #pragma omp parallel for default(none) \
-  dt_omp_firstprivate(ch_width, d, ivoid, ovoid, roi_in, roi_out) \
+  dt_omp_firstprivate(ch_width, x_scale, y_scale, ivoid, ovoid, roi_in, roi_out) \
   shared(interpolation) \
   schedule(static)
 #endif
@@ -214,8 +239,8 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
     float *out = ((float *)ovoid) + (size_t)4 * j * roi_out->width;
     for(int i = 0; i < roi_out->width; i++, out += 4)
     {
-      float x = i*d->x_scale;
-      float y = j*d->y_scale;
+      float x = i * x_scale;
+      float y = j * y_scale;
 
       dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out, x, y, roi_in->width,
                                        roi_in->height, ch_width);
