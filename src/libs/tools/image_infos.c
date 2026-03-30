@@ -40,19 +40,15 @@ const char *name(dt_lib_module_t *self)
   return _("image infos");
 }
 
-const char **views(dt_lib_module_t *self)
+dt_view_type_flags_t views(dt_lib_module_t *self)
 {
   /* we handle the hidden case here */
   const gboolean is_hidden =
     dt_conf_is_equal("plugins/darkroom/image_infos_position", "hidden");
   if(is_hidden)
-  {
-    static const char *vv[] = { NULL };
-    return vv;
-  }
-
-  static const char *v[] = { "darkroom", NULL };
-  return v;
+    return DT_VIEW_NONE;
+  else
+    return DT_VIEW_DARKROOM;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -75,18 +71,18 @@ int expandable(dt_lib_module_t *self)
   return 0;
 }
 
-int position()
+int position(const dt_lib_module_t *self)
 {
   return 1500;
 }
 
 void _lib_imageinfo_update_message(gpointer instance, dt_lib_module_t *self)
 {
-  dt_lib_imageinfo_t *d = (dt_lib_imageinfo_t *)self->data;
+  dt_lib_imageinfo_t *d = self->data;
 
   // we grab the image
-  const int imgid = darktable.develop->image_storage.id;
-  if(imgid < 0) return;
+  const dt_imgid_t imgid = darktable.develop->image_storage.id;
+  if(!dt_is_valid_imgid(imgid)) return;
 
   // we compute the info line (we reuse the function used in export to disk)
   char input_dir[512] = { 0 };
@@ -128,7 +124,7 @@ void _lib_imageinfo_update_message3(gpointer instance, int query_change, int cha
 void gui_init(dt_lib_module_t *self)
 {
   /* initialize ui widgets */
-  dt_lib_imageinfo_t *d = (dt_lib_imageinfo_t *)g_malloc0(sizeof(dt_lib_imageinfo_t));
+  dt_lib_imageinfo_t *d = g_malloc0(sizeof(dt_lib_imageinfo_t));
   self->data = (void *)d;
 
   self->widget = gtk_event_box_new();
@@ -141,32 +137,26 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_show_all(self->widget);
 
   /* lets signup for develop image changed signals */
-  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_DEVELOP_IMAGE_CHANGED,
-                            G_CALLBACK(_lib_imageinfo_update_message), self);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _lib_imageinfo_update_message);
 
   /* signup for develop initialize to update info of current
      image in darkroom when enter */
-  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_DEVELOP_INITIALIZE,
-                            G_CALLBACK(_lib_imageinfo_update_message), self);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_INITIALIZE, _lib_imageinfo_update_message);
 
-  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_IMAGE_INFO_CHANGED,
-                                  G_CALLBACK(_lib_imageinfo_update_message2), self);
-  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_COLLECTION_CHANGED,
-                                  G_CALLBACK(_lib_imageinfo_update_message3), self);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_IMAGE_INFO_CHANGED, _lib_imageinfo_update_message2);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_COLLECTION_CHANGED, _lib_imageinfo_update_message3);
 }
 
 void gui_cleanup(dt_lib_module_t *self)
 {
-  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_lib_imageinfo_update_message), self);
-  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_lib_imageinfo_update_message2), self);
-  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_lib_imageinfo_update_message3), self);
-
   g_free(self->data);
   self->data = NULL;
 }
 
 
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2020 darktable developers.
+    Copyright (C) 2010-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,9 +15,6 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
 #include "common/colorspaces.h"
 #include "common/imagebuf.h"
 #include "common/points.h"
@@ -118,27 +115,12 @@ const char *deprecated_msg()
   return _("this module is deprecated. better use color mapping module instead.");
 }
 
-int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
+                                            dt_dev_pixelpipe_t *pipe,
+                                            dt_dev_pixelpipe_iop_t *piece)
 {
-  return iop_cs_Lab;
+  return IOP_CS_LAB;
 }
-
-#if 0
-void init_key_accels(dt_iop_module_so_t *self)
-{
-  dt_accel_register_iop(self, FALSE, NC_("accel", "acquire"), 0, 0);
-  dt_accel_register_iop(self, FALSE, NC_("accel", "apply"), 0, 0);
-}
-
-void connect_key_accels(dt_iop_module_t *self)
-{
-  dt_iop_colortransfer_gui_data_t *g =
-    (dt_iop_colortransfer_gui_data_t*)self->gui_data;
-
-  dt_accel_connect_button_iop(self, "acquire", g->acquire_button);
-  dt_accel_connect_button_iop(self, "apply", g->apply_button);
-}
-#endif
 
 static void capture_histogram(const float *col, const dt_iop_roi_t *roi, int *hist)
 {
@@ -161,16 +143,6 @@ static void capture_histogram(const float *col, const dt_iop_roi_t *roi, int *hi
 static void invert_histogram(const int *hist, float *inv_hist)
 {
 // invert non-normalised accumulated hist
-#if 0
-  int last = 0;
-  for(int i=0; i<HISTN; i++) for(int k=last; k<HISTN; k++)
-      if(hist[k] >= i)
-      {
-        last = k;
-        inv_hist[i] = 100.0*k/(float)HISTN;
-        break;
-      }
-#else
   int last = 31;
   for(int i = 0; i <= last; i++) inv_hist[i] = 100.0 * i / (float)HISTN;
   for(int i = last + 1; i < HISTN; i++)
@@ -181,7 +153,6 @@ static void invert_histogram(const int *hist, float *inv_hist)
         inv_hist[i] = 100.0 * k / (float)HISTN;
         break;
       }
-#endif
 
   // printf("inv histogram debug:\n");
   // for(int i=0;i<100;i++) printf("%d => %f\n", i, inv_hist[hist[(int)CLAMP(HISTN*i/100.0, 0, HISTN-1)]]);
@@ -268,12 +239,7 @@ static void kmeans(const float *col, const dt_iop_roi_t *const roi, const int n,
   {
     for(int k = 0; k < n; k++) cnt[k] = 0;
 // randomly sample col positions inside roi
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-    dt_omp_firstprivate(cnt, mean, n, roi, samples, var) \
-    shared(col, mean_out) \
-    schedule(static)
-#endif
+    DT_OMP_FOR()
     for(int s = 0; s < samples; s++)
     {
       const int j = dt_points_get() * roi->height;
@@ -285,26 +251,16 @@ static void kmeans(const float *col, const dt_iop_roi_t *const roi, const int n,
         const dt_aligned_pixel_t Lab = { L, col[3 * (roi->width * j + i) + 1], col[3 * (roi->width * j + i) + 2] };
         // determine dist to mean_out
         const int c = get_cluster(Lab, n, mean_out);
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+        DT_OMP_PRAGMA(atomic)
         cnt[c]++;
 // update mean, var
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+        DT_OMP_PRAGMA(atomic)
         var[c][0] += Lab[1] * Lab[1];
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+        DT_OMP_PRAGMA(atomic)
         var[c][1] += Lab[2] * Lab[2];
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+        DT_OMP_PRAGMA(atomic)
         mean[c][0] += Lab[1];
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+        DT_OMP_PRAGMA(atomic)
         mean[c][1] += Lab[2];
       }
     }
@@ -333,18 +289,18 @@ static void kmeans(const float *col, const dt_iop_roi_t *const roi, const int n,
   }
 }
 
-void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
   // FIXME: this returns nan!!
-  dt_iop_colortransfer_data_t *data = (dt_iop_colortransfer_data_t *)piece->data;
+  dt_iop_colortransfer_data_t *data = piece->data;
   float *in = (float *)ivoid;
   float *out = (float *)ovoid;
   const int ch = piece->colors;
 
   if(data->flag == ACQUIRE)
   {
-    if((piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW) == DT_DEV_PIXELPIPE_PREVIEW)
+    if(piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW)
     {
       // only get stuff from the preview pipe, rest stays untouched.
       int hist[HISTN];
@@ -358,7 +314,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 
       // notify gui that commit_params should let stuff flow back!
       data->flag = ACQUIRED;
-      dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
+      dt_iop_colortransfer_params_t *p = self->params;
       p->flag = ACQUIRE2;
     }
     dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, ch);
@@ -368,12 +324,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
     // apply histogram of L and clustering of (a,b)
     int hist[HISTN];
     capture_histogram(in, roi_in, hist);
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-    dt_omp_firstprivate(ch, roi_out) \
-    shared(data, in, out, hist) \
-    schedule(static)
-#endif
+    DT_OMP_FOR()
     for(int k = 0; k < roi_out->height; k++)
     {
       size_t j = (size_t)ch * roi_out->width * k;
@@ -398,12 +349,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
     get_cluster_mapping(data->n, mean, data->mean, mapio);
 
 // for all pixels: find input cluster, transfer to mapped target cluster
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-    dt_omp_firstprivate(ch, mapio, mean, roi_out, var) \
-    shared(data, in, out) \
-    schedule(static)
-#endif
+    DT_OMP_FOR()
     for(int k = 0; k < roi_out->height; k++)
     {
       float weight[MAXN];
@@ -443,244 +389,34 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
   }
 }
 
-#if 0
-static void
-spinbutton_changed (GtkSpinButton *button, dt_iop_module_t *self)
-{
-  if(darktable.gui->reset) return;
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-//  dt_iop_colortransfer_gui_data_t *g = (dt_iop_colortransfer_gui_data_t *)self->gui_data;
-  p->n = gtk_spin_button_get_value(button);
-  memset(p->hist,0, sizeof(float)*HISTN);
-  memset(p->mean,0, sizeof(float)*MAXN*2);
-  memset(p->var,0,  sizeof(float)*MAXN*2);
-  dt_control_queue_redraw_widget(self->widget);
-}
-
-static void
-acquire_button_pressed (GtkButton *button, dt_iop_module_t *self)
-{
-  if(darktable.gui->reset) return;
-  // request color pick
-  // needed to trigger expose events:
-  self->request_color_pick = DT_REQUEST_COLORPICK_MODULE;
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-  p->flag = ACQUIRE;
-  if(self->off) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), 1);
-  dt_dev_add_history_item(darktable.develop, self, TRUE); // FIXME: Why do we need to add this to the history?
-}
-
-static void
-apply_button_pressed (GtkButton *button, dt_iop_module_t *self)
-{
-  if(darktable.gui->reset) return;
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-  dt_iop_colortransfer_gui_data_t *g = (dt_iop_colortransfer_gui_data_t *)self->gui_data;
-  memcpy(p, &(g->flowback), self->params_size);
-  p->flag = APPLY;
-  if(self->off) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), 1);
-  dt_dev_add_history_item(darktable.develop, self, TRUE);
-}
-
-static gboolean
-expose (GtkWidget *widget, GdkEventExpose *event, dt_iop_module_t *self)
-{
-  // this is called whenever the pipeline finishes processing (i.e. after a color pick)
-  if(darktable.gui->reset) return FALSE;
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-  if(p->flag == ACQUIRED)
-  {
-    // clear the color picking request if we got the cluster data
-    self->request_color_pick = DT_REQUEST_COLORPICK_OFF;
-    p->flag = NEUTRAL;
-    dt_dev_add_history_item(darktable.develop, self, TRUE);
-  }
-  else if(p->flag == ACQUIRE2)
-  {
-    // color pick is still on, so the data has to be still in the pipe,
-    // toggle a commit_params
-    p->flag = ACQUIRE3;
-    dt_dev_add_history_item(darktable.develop, self, TRUE);
-    self->request_color_pick = DT_REQUEST_COLORPICK_OFF;
-  }
-  return FALSE;
-}
-
-void commit_params (struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
-{
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)p1;
-  dt_iop_colortransfer_data_t *d = (dt_iop_colortransfer_data_t *)piece->data;
-  if(p->flag == ACQUIRE3 && d->flag == ACQUIRED)
-  {
-    // if data is flagged ACQUIRED, actually copy data back from pipe!
-    d->flag = NEUTRAL;
-    p->flag = ACQUIRED; // let gui know the data is there.
-    if(self->dev == darktable.develop && self->gui_data)
-    {
-      dt_iop_colortransfer_gui_data_t *g = (dt_iop_colortransfer_gui_data_t *)self->gui_data;
-      memcpy (&g->flowback, d, self->params_size);
-      g->flowback_set = 1;
-      FILE *f = g_fopen("/tmp/dt_colortransfer_loaded", "wb");
-      if(f)
-      {
-        if(fwrite(&g->flowback, self->params_size, 1, f) > 0) g->flowback.flag = APPLY;
-        fclose(f);
-      }
-      dt_control_queue_redraw_widget(self->widget);
-    }
-  }
-  else
-  {
-    // dt_iop_colortransfer_flag_t flag = d->flag;
-    memcpy(d, p, self->params_size);
-    // only allow apply and acquire commands from gui.
-    // if(p->flag != APPLY && p->flag != ACQUIRE && p->flag != NEUTRAL) d->flag = flag;
-    if(p->flag == ACQUIRE2) d->flag = ACQUIRE;
-    if(p->flag == ACQUIRE3) d->flag = NEUTRAL;
-    if(p->flag == ACQUIRED) d->flag = NEUTRAL;
-    // if(p->flag == ACQUIRE) p->flag = ACQUIRE2;
-  }
-}
-#endif
-
-void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = malloc(sizeof(dt_iop_colortransfer_data_t));
-  dt_iop_colortransfer_data_t *d = (dt_iop_colortransfer_data_t *)piece->data;
+  dt_iop_colortransfer_data_t *d = piece->data;
   d->flag = NEUTRAL;
 }
 
-void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
 }
 
-void gui_update(struct dt_iop_module_t *self)
+void gui_update(dt_iop_module_t *self)
 {
-#if 0
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-  dt_iop_colortransfer_gui_data_t *g = (dt_iop_colortransfer_gui_data_t *)self->gui_data;
-  gtk_spin_button_set_value(g->spinbutton, p->n);
-  //gtk_widget_set_size_request(GTK_WIDGET(g->area), 300, MIN(100, 300/p->n));
-  // redraw color cluster preview
-  dt_control_queue_redraw_widget(self->widget);
-#endif
 }
 
-#if 0
-static gboolean
-cluster_preview_draw (GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
-{
-  // dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-  dt_iop_colortransfer_gui_data_t *g = (dt_iop_colortransfer_gui_data_t *)self->gui_data;
-  dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)&g->flowback;
-  if(!g->flowback_set) p = (dt_iop_colortransfer_params_t *)self->params;
-  const int inset = 5;
-  int width = allocation.width, height = allocation.height;
-  cairo_surface_t *cst = dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
-  cairo_t *cr = cairo_create(cst);
-  cairo_set_source_rgb (cr, .2, .2, .2);
-  cairo_paint(cr);
-
-  cairo_translate(cr, inset, inset);
-  width -= 2*inset;
-  height -= 2*inset;
-
-  if(g->flowback_set) gtk_widget_set_sensitive(g->apply_button, TRUE);
-#if 0
-  if(g->flowback_set)
-  {
-    memcpy(self->params, &g->flowback, self->params_size);
-    g->flowback_set = 0;
-    p->flag = APPLY;
-    dt_dev_add_history_item(darktable.develop, self, TRUE);
-  }
-#endif
-
-  const float sep = 2.0;
-  const float qwd = (width-(p->n-1)*sep)/(float)p->n;
-  for(int cl=0; cl<p->n; cl++)
-  {
-    // draw cluster
-    for(int j=-1; j<=1; j++) for(int i=-1; i<=1; i++)
-      {
-        // draw 9x9 grid showing mean and variance of this cluster.
-        double rgb[3] = {0.5, 0.5, 0.5};
-        cmsCIELab Lab;
-        Lab.L = 5.0;//53.390011;
-        Lab.a = (p->mean[cl][0] + i*p->var[cl][0]);// / Lab.L;
-        Lab.b = (p->mean[cl][1] + j*p->var[cl][1]);// / Lab.L;
-        Lab.L = 53.390011;
-        cmsDoTransform(g->xform, &Lab, rgb, 1);
-        cairo_set_source_rgb (cr, rgb[0], rgb[1], rgb[2]);
-        cairo_rectangle(cr, qwd*(i+1)/3.0, height*(j+1)/3.0, qwd/3.0-.5, height/3.0-.5);
-        cairo_fill(cr);
-      }
-    cairo_translate (cr, qwd + sep, 0);
-  }
-
-  cairo_destroy(cr);
-  cairo_set_source_surface (crf, cst, 0, 0);
-  cairo_paint(crf);
-  cairo_surface_destroy(cst);
-  return TRUE;
-}
-#endif
-
-void gui_init(struct dt_iop_module_t *self)
+void gui_init(dt_iop_module_t *self)
 {
   IOP_GUI_ALLOC(colortransfer);
 
   self->widget = dt_ui_label_new(_("this module will be removed in the future\nand is only here so you can "
                                    "switch it off\nand move to the new color mapping module."));
-
-#if 0
-  dt_iop_colortransfer_gui_data_t *g = IOP_GUI_ALLOC(colortransfer);
-  // dt_iop_colortransfer_params_t *p = (dt_iop_colortransfer_params_t *)self->params;
-
-  g->flowback_set = 0;
-  cmsHPROFILE hsRGB = dt_colorspaces_get_profile(DT_COLORSPACE_SRGB, "", DT_PROFILE_DIRECTION_IN)->profile;
-  cmsHPROFILE hLab  = dt_colorspaces_get_profile(DT_COLORSPACE_LAB, "", DT_PROFILE_DIRECTION_ANY)->profile;
-  g->xform = cmsCreateTransform(hLab, TYPE_Lab_DBL, hsRGB, TYPE_RGB_DBL, INTENT_PERCEPTUAL, 0);
-
-  self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_IOP_MODULE_CONTROL_SPACING));
-  g_signal_connect (G_OBJECT(self->widget), "draw",
-                    G_CALLBACK(draw), self);
-
-  g->area = gtk_drawing_area_new();
-  gtk_widget_set_size_request(GTK_WIDGET(g->area), 300, 100);
-  gtk_box_pack_start(GTK_BOX(self->widget), g->area, TRUE, TRUE, 0);
-  g_signal_connect (G_OBJECT (g->area), "draw", G_CALLBACK (cluster_preview_draw), self);
-
-  GtkBox *box = GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
-  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(box), TRUE, TRUE, 0);
-  GtkWidget *button;
-  g->spinbutton = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(1, MAXN, 1));
-  gtk_widget_set_tooltip_text(GTK_WIDGET(g->spinbutton), _("number of clusters to find in image"));
-  gtk_box_pack_start(box, GTK_WIDGET(g->spinbutton), FALSE, FALSE, 0);
-  g_signal_connect(G_OBJECT(g->spinbutton), "value-changed", G_CALLBACK(spinbutton_changed), (gpointer)self);
-
-  button = gtk_button_new_with_label(_("acquire"));
-  g->acquire_button = button;
-  gtk_widget_set_tooltip_text(button, _("analyze this image"));
-  gtk_box_pack_start(box, button, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(acquire_button_pressed), (gpointer)self);
-
-  g->apply_button = gtk_button_new_with_label(_("apply"));
-  gtk_widget_set_tooltip_text(g->apply_button, _("apply previously analyzed image look to this image"));
-  gtk_box_pack_start(box, g->apply_button, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(g->apply_button), "clicked", G_CALLBACK(apply_button_pressed), (gpointer)self);
-  FILE *f = g_fopen("/tmp/dt_colortransfer_loaded", "rb");
-  if(f)
-  {
-    if(fread(&g->flowback, self->params_size, 1, f) > 0) g->flowback_set = 1;
-    fclose(f);
-  }
-  else gtk_widget_set_sensitive(GTK_WIDGET(g->apply_button), FALSE);
-#endif
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

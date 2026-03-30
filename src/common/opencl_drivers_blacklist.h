@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2020 darktable developers.
+    Copyright (C) 2016-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 #pragma once
 
 #include <string.h>
+#include <strings.h>
 
 // FIXME: in the future, we may want to also take DRIVER_VERSION into account
 static const gchar *bad_opencl_drivers[] =
@@ -26,25 +27,22 @@ static const gchar *bad_opencl_drivers[] =
   // clang-format off
 
   "beignet",
-  "pocl",
+  "clover",
+  "amd-app",
 /*
   Neo was originally blacklisted due to improper cache invalidation, but this has been fixed.
-  During the discussion of that issue in pull request 2033, it was hinted that Neo may be still be
-  problematic on Windows, so keep it blacklisted there for now
-
-  TODO:  Determine if Windows failures were due to the same cache invalidation issue.
+  Per Issue 20104, enabling neo for Windows.
 */
 #if defined _WIN32
-  "neo",
+  "d3d12",
 #endif
   NULL
 
   // clang-format on
 };
 
-// 0 - ok
-// else it is blacklisted
-int dt_opencl_check_driver_blacklist(const char *device_version)
+// returns TRUE if blacklisted
+static gboolean _opencl_check_driver_blacklist(const char *device_version)
 {
   gchar *device = g_ascii_strdown(device_version, -1);
 
@@ -54,14 +52,17 @@ int dt_opencl_check_driver_blacklist(const char *device_version)
 
     // oops, found in black list
     g_free(device);
-    return 1;
+    return TRUE;
   }
 
   // did not find in the black list, guess it's ok.
   g_free(device);
-  return 0;
+  return FALSE;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

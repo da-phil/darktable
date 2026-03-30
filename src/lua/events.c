@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2013-2021 darktable developers.
+   Copyright (C) 2013-2023 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,10 +18,10 @@
 #include "lua/events.h"
 #include "common/darktable.h"
 #include "common/file_location.h"
-#include "common/imageio_module.h"
 #include "control/control.h"
 #include "control/jobs/control_jobs.h"
 #include "gui/accelerators.h"
+#include "imageio/imageio_module.h"
 #include "lua/call.h"
 #include "lua/image.h"
 
@@ -110,7 +110,7 @@ void dt_lua_event_add(lua_State *L, const char *evt_name)
   if(args != 3)
   {
     lua_pop(L, args);
-    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: wrong number of args for %s, expected 3, got %d\n", __FUNCTION__, evt_name, args);
+    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: wrong number of args for %s, expected 3, got %d", __FUNCTION__, evt_name, args);
     return;
   }
 
@@ -128,7 +128,7 @@ void dt_lua_event_add(lua_State *L, const char *evt_name)
     lua_setfield(L, -2, "on_event");
   }
   else{
-    dt_print(DT_DEBUG_LUA, "LUA ERROR :%s: function argument not found for on_event for event %s\n", __FUNCTION__, evt_name);
+    dt_print(DT_DEBUG_LUA, "LUA ERROR :%s: function argument not found for on_event for event %s", __FUNCTION__, evt_name);
     return;
   }
 
@@ -140,7 +140,7 @@ void dt_lua_event_add(lua_State *L, const char *evt_name)
   }
   else
   {
-    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: function argument not found for on_destroy for event %s\n", __FUNCTION__, evt_name);
+    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: function argument not found for on_destroy for event %s", __FUNCTION__, evt_name);
     return;
   }
 
@@ -153,7 +153,7 @@ void dt_lua_event_add(lua_State *L, const char *evt_name)
   }
   else
   {
-    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: function argument not found for on_register for event %s\n", __FUNCTION__, evt_name);
+    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s: function argument not found for on_register for event %s", __FUNCTION__, evt_name);
     return;
   }
 
@@ -541,18 +541,88 @@ static int lua_destroy_event(lua_State *L)
   return 0;
 }
 
+static int lua_query_event(lua_State *L)
+{
+  // 1 is the index name
+  // 2 is event name
+  const char *evt_name = luaL_checkstring(L, 2);
 
+  // get the event list
+  lua_getfield(L, LUA_REGISTRYINDEX, "dt_lua_event_list");
+
+  // get the table for this event and check to make sure it exists
+  lua_getfield(L, -1, evt_name);
+  if(lua_isnil(L, -1))
+  {
+    // event table not found, so it's a nonexistent event
+    lua_pop(L, 2);
+    lua_pushboolean(L, false);
+  }
+  else
+  {
+    // add the index table to the stack
+    lua_getfield(L, 4, "index");
+
+    if(strcmp(luaL_checkstring(L, 2), "shortcut") == 0) // shortcut event
+    {
+      // lookup the value (tooltip) for the key (index name)
+      lua_getfield(L, 5, luaL_checkstring(L, 1));
+
+      // check to make sure the key was found
+      if(lua_isnoneornil(L, -1))
+      {
+        // not found, return false
+        lua_pop(L, 6);
+        lua_pushboolean(L, false);
+      }
+      else
+      {
+        // found, return true
+        lua_pop(L, 6);
+        lua_pushboolean(L, true);
+      }
+    }
+    else  // multi instance event
+    { 
+      // loop through the index table trying for a match on index name
+      for(int i = 1; i <= luaL_len(L, 5); i++)
+      {
+        lua_rawgeti(L, 5, i);
+        if(strcmp(luaL_checkstring(L, -1), luaL_checkstring(L, 1)) == 0)
+        {
+          // found the index name
+          lua_pop(L, lua_gettop(L));
+          lua_pushboolean(L, true);
+          break;
+        }
+      }
+    }
+    if(lua_gettop(L) > 1)
+    {
+      // didn't find the event
+      lua_pop(L, 5);
+      lua_pushboolean(L, false);
+    }
+  }
+
+  return 1;
+}
 
 int dt_lua_init_early_events(lua_State *L)
 {
   lua_newtable(L);
   lua_setfield(L, LUA_REGISTRYINDEX, "dt_lua_event_list");
+  lua_newtable(L);
+  lua_setfield(L, LUA_REGISTRYINDEX, "dt_lua_mimic_list");
   dt_lua_push_darktable_lib(L);
   lua_pushstring(L, "register_event");
   lua_pushcfunction(L, &lua_register_event);
   lua_settable(L, -3);
   lua_pushstring(L, "destroy_event");
   lua_pushcfunction(L, &lua_destroy_event);
+  lua_settable(L, -3);
+  lua_pushstring(L, "query_event");
+  lua_pushcfunction(L, &lua_query_event);
   lua_settable(L, -3);
   lua_pop(L, 1);
   return 0;
@@ -567,22 +637,15 @@ int dt_lua_init_early_events(lua_State *L)
  * shortcut events
  * keyed event with a tuned registration to handle shortcuts
  */
-static gboolean shortcut_callback(GtkAccelGroup *accel_group, GObject *acceleratable, guint keyval,
-                                  GdkModifierType modifier, gpointer p)
+static void shortcut_callback(dt_action_t *action)
 {
   dt_lua_async_call_alien(dt_lua_event_trigger_wrapper,
       0, NULL, NULL,
       LUA_ASYNC_TYPENAME,"const char*","shortcut",
-      LUA_ASYNC_TYPENAME_WITH_FREE,"char*",strdup(p),g_cclosure_new(G_CALLBACK(&free),NULL,NULL),
+      LUA_ASYNC_TYPENAME_WITH_FREE,"char*",strdup(action->label),g_cclosure_new(G_CALLBACK(&free),NULL,NULL),
       LUA_ASYNC_DONE);
-  return TRUE;
 }
 
-
-static void closure_destroy(gpointer data, GClosure *closure)
-{
-  free(data);
-}
 
 static int register_shortcut_event(lua_State *L)
 {
@@ -599,11 +662,8 @@ static int register_shortcut_event(lua_State *L)
   // register the event
   int result = dt_lua_event_keyed_register(L); // will raise an error in case of duplicate key
 
-  // register the accelerator in the lua shortcuts
-  dt_accel_register_lua(tmp, 0, 0);
-
   // set up the accelerator path
-  dt_accel_connect_lua(tmp, g_cclosure_new(G_CALLBACK(shortcut_callback), tmp, closure_destroy));
+  dt_action_register(&darktable.control->actions_lua, tmp, shortcut_callback,  0, 0);
 
   return result;
 }
@@ -628,7 +688,8 @@ static int destroy_shortcut_event(lua_State *L)
   int result = dt_lua_event_keyed_destroy(L); // will raise an error in case of duplicate key
 
   // remove the accelerator from the lua shortcuts
-  dt_accel_rename_lua(tmp, NULL);
+  dt_action_t *ac = dt_action_section(&darktable.control->actions_lua, tmp);
+  dt_action_rename(ac, NULL);
 
   // free temporary buffer
   free(tmp);
@@ -663,10 +724,33 @@ int dt_lua_init_events(lua_State *L)
   lua_pushcfunction(L, dt_lua_event_multiinstance_register);
   lua_pushcfunction(L, dt_lua_event_multiinstance_destroy);
   lua_pushcfunction(L, dt_lua_event_multiinstance_trigger);
+  dt_lua_event_add(L, "darkroom-image-loaded");
+  
+  lua_pushcfunction(L, dt_lua_event_multiinstance_register);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_destroy);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_trigger);
   dt_lua_event_add(L, "darkroom-image-history-changed");
+
+  lua_pushcfunction(L, dt_lua_event_multiinstance_register);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_destroy);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_trigger);
+  dt_lua_event_add(L, "pixelpipe-processing-complete");
+
+  lua_pushcfunction(L, dt_lua_event_multiinstance_register);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_destroy);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_trigger);
+  dt_lua_event_add(L, "image-group-information-changed");
+
+  lua_pushcfunction(L, dt_lua_event_multiinstance_register);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_destroy);
+  lua_pushcfunction(L, dt_lua_event_multiinstance_trigger);
+  dt_lua_event_add(L, "collection-changed");
 
   return 0;
 }
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

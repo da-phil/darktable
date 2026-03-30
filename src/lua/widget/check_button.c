@@ -42,6 +42,7 @@ static int label_member(lua_State *L)
   if(lua_gettop(L) > 2) {
     const char * label = luaL_checkstring(L,3);
     gtk_button_set_label(GTK_BUTTON(check_button->widget),label);
+    gtk_label_set_ellipsize(GTK_LABEL(gtk_bin_get_child(GTK_BIN(check_button->widget))), PANGO_ELLIPSIZE_END);
     return 0;
   }
   lua_pushstring(L,gtk_button_get_label(GTK_BUTTON(check_button->widget)));
@@ -90,6 +91,9 @@ int dt_lua_init_widget_check_button(lua_State* L)
 
   return 0;
 }
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

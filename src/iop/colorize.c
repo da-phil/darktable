@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2021 darktable developers.
+    Copyright (C) 2011-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,9 +15,6 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/opencl.h"
@@ -41,15 +38,6 @@
 #include <string.h>
 
 DT_MODULE_INTROSPECTION(2, dt_iop_colorize_params_t)
-
-// legacy parameters of version 1 of module
-typedef struct dt_iop_colorize_params1_t
-{
-  float hue;
-  float saturation;
-  float source_lightness_mix;
-  float lightness;
-} dt_iop_colorize_params1_t;
 
 typedef struct dt_iop_colorize_params_t
 {
@@ -94,12 +82,14 @@ int default_group()
   return IOP_GROUP_EFFECT | IOP_GROUP_GRADING;
 }
 
-int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
+                                            dt_dev_pixelpipe_t *pipe,
+                                            dt_dev_pixelpipe_iop_t *piece)
 {
-  return iop_cs_Lab;
+  return IOP_CS_LAB;
 }
 
-const char *description(struct dt_iop_module_t *self)
+const char **description(dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("overlay a solid color on the image"),
                                       _("creative"),
@@ -108,69 +98,92 @@ const char *description(struct dt_iop_module_t *self)
                                       _("non-linear, Lab, display-referred"));
 }
 
-int legacy_params(dt_iop_module_t *self, const void *const old_params, const int old_version,
-                  void *new_params, const int new_version)
+int legacy_params(dt_iop_module_t *self,
+                  const void *const old_params,
+                  const int old_version,
+                  void **new_params,
+                  int32_t *new_params_size,
+                  int *new_version)
 {
-  if(old_version == 1 && new_version == 2)
+  typedef struct dt_iop_colorize_params_v2_t
   {
-    const dt_iop_colorize_params1_t *old = old_params;
-    dt_iop_colorize_params_t *new = new_params;
+    float hue;
+    float saturation;
+    float source_lightness_mix;
+    float lightness;
+    int version;
+  } dt_iop_colorize_params_v2_t;
 
-    new->hue = old->hue;
-    new->saturation = old->saturation;
-    new->source_lightness_mix = old->source_lightness_mix;
-    new->lightness = old->lightness;
-    new->version = 1;
+  if(old_version == 1)
+  {
+    typedef struct dt_iop_colorize_params_v1_t
+    {
+      float hue;
+      float saturation;
+      float source_lightness_mix;
+      float lightness;
+    } dt_iop_colorize_params_v1_t;
+
+    const dt_iop_colorize_params_v1_t *o = old_params;
+    dt_iop_colorize_params_v2_t *n = malloc(sizeof(dt_iop_colorize_params_v2_t));
+
+    n->hue = o->hue;
+    n->saturation = o->saturation;
+    n->source_lightness_mix = o->source_lightness_mix;
+    n->lightness = o->lightness;
+    n->version = 1;
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_colorize_params_v2_t);
+    *new_version = 2;
     return 0;
   }
   return 1;
 }
 
-void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
-             void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+void process(dt_iop_module_t *self,
+             dt_dev_pixelpipe_iop_t *piece,
+             const void *const ivoid,
+             void *const ovoid,
+             const dt_iop_roi_t *const roi_in,
+             const dt_iop_roi_t *const roi_out)
 {
-  float *in, *out;
-  dt_iop_colorize_data_t *d = (dt_iop_colorize_data_t *)piece->data;
-  const int ch = piece->colors;
+  if(!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, self, piece->colors,
+                                         ivoid, ovoid, roi_in, roi_out))
+    return;
+
+  const float *const in = (float*)ivoid;
+  float *const out = (float*)ovoid;
+  dt_iop_colorize_data_t *d = piece->data;
 
   const float L = d->L;
   const float a = d->a;
   const float b = d->b;
   const float mix = d->mix;
   const float Lmlmix = L - (mix * 100.0f) / 2.0f;
+  const size_t npixels = (size_t)roi_out->height * roi_out->width;
+  const dt_aligned_pixel_t color = { 0.0f, a, b, 0.0f };
 
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(a, b, ch, ivoid, Lmlmix, mix, ovoid, roi_out) \
-  private(in, out) \
-  schedule(static)
-#endif
-  for(int k = 0; k < roi_out->height; k++)
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npixels; k++)
   {
-
-    const int stride = ch * roi_out->width;
-
-    in = (float *)ivoid + (size_t)k * stride;
-    out = (float *)ovoid + (size_t)k * stride;
-
-    for(int l = 0; l < stride; l += ch)
-    {
-      out[l + 0] = Lmlmix + in[l + 0] * mix;
-      out[l + 1] = a;
-      out[l + 2] = b;
-      out[l + 3] = in[l + 3];
-    }
+    const float mixed_L = Lmlmix + in[4*k + 0] * mix;
+    copy_pixel(out + 4*k, color);
+    out[4*k] = mixed_L;
   }
 }
 
 #ifdef HAVE_OPENCL
-int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
-               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+int process_cl(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               cl_mem dev_in,
+               cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_colorize_data_t *data = (dt_iop_colorize_data_t *)piece->data;
-  dt_iop_colorize_global_data_t *gd = (dt_iop_colorize_global_data_t *)self->global_data;
+  dt_iop_colorize_data_t *data = piece->data;
+  dt_iop_colorize_global_data_t *gd = self->global_data;
 
-  cl_int err = -999;
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
   const int height = roi_in->height;
@@ -180,41 +193,25 @@ int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_m
   const float b = data->b;
   const float mix = data->mix;
 
-  size_t sizes[] = { ROUNDUPWD(width), ROUNDUPHT(height), 1 };
-
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 0, sizeof(cl_mem), (void *)&dev_in);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 1, sizeof(cl_mem), (void *)&dev_out);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 2, sizeof(int), (void *)&width);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 3, sizeof(int), (void *)&height);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 4, sizeof(float), (void *)&mix);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 5, sizeof(float), (void *)&L);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 6, sizeof(float), (void *)&a);
-  dt_opencl_set_kernel_arg(devid, gd->kernel_colorize, 7, sizeof(float), (void *)&b);
-  err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_colorize, sizes);
-  if(err != CL_SUCCESS) goto error;
-  return TRUE;
-
-error:
-  dt_print(DT_DEBUG_OPENCL, "[opencl_colorize] couldn't enqueue kernel! %d\n", err);
-  return FALSE;
+  return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_colorize, width, height,
+    CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(mix), CLARG(L), CLARG(a), CLARG(b));
 }
 #endif
 
-void init_global(dt_iop_module_so_t *module)
+void init_global(dt_iop_module_so_t *self)
 {
   const int program = 8; // extended.cl, from programs.conf
-  dt_iop_colorize_global_data_t *gd
-      = (dt_iop_colorize_global_data_t *)malloc(sizeof(dt_iop_colorize_global_data_t));
-  module->data = gd;
+  dt_iop_colorize_global_data_t *gd = malloc(sizeof(dt_iop_colorize_global_data_t));
+  self->data = gd;
   gd->kernel_colorize = dt_opencl_create_kernel(program, "colorize");
 }
 
-void cleanup_global(dt_iop_module_so_t *module)
+void cleanup_global(dt_iop_module_so_t *self)
 {
-  dt_iop_colorize_global_data_t *gd = (dt_iop_colorize_global_data_t *)module->data;
+  dt_iop_colorize_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colorize);
-  free(module->data);
-  module->data = NULL;
+  free(self->data);
+  self->data = NULL;
 }
 
 static inline void update_saturation_slider_end_color(GtkWidget *slider, float hue)
@@ -226,8 +223,8 @@ static inline void update_saturation_slider_end_color(GtkWidget *slider, float h
 
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
-  dt_iop_colorize_params_t *p = (dt_iop_colorize_params_t *)self->params;
-  dt_iop_colorize_gui_data_t *g = (dt_iop_colorize_gui_data_t *)self->gui_data;
+  dt_iop_colorize_params_t *p = self->params;
+  dt_iop_colorize_gui_data_t *g = self->gui_data;
 
   if(w == g->hue)
   {
@@ -236,10 +233,12 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   }
 }
 
-void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_iop_t *piece)
+void color_picker_apply(dt_iop_module_t *self,
+                        GtkWidget *picker,
+                        dt_dev_pixelpipe_t *pipe)
 {
-  dt_iop_colorize_gui_data_t *g = (dt_iop_colorize_gui_data_t *)self->gui_data;
-  dt_iop_colorize_params_t *p = (dt_iop_colorize_params_t *)self->params;
+  dt_iop_colorize_gui_data_t *g = self->gui_data;
+  dt_iop_colorize_params_t *p = self->params;
 
   // convert picker RGB 2 HSL
   float H = .0f, S = .0f, L = .0f;
@@ -267,16 +266,18 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
-void gui_reset(struct dt_iop_module_t *self)
+void gui_reset(dt_iop_module_t *self)
 {
   dt_iop_color_picker_reset(self, TRUE);
 }
 
-void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
+void commit_params(dt_iop_module_t *self,
+                   dt_iop_params_t *p1,
+                   dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_colorize_params_t *p = (dt_iop_colorize_params_t *)p1;
-  dt_iop_colorize_data_t *d = (dt_iop_colorize_data_t *)piece->data;
+  dt_iop_colorize_data_t *d = piece->data;
 
   /* create Lab */
   dt_aligned_pixel_t rgb = { 0 };
@@ -293,11 +294,7 @@ void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pix
   }
   else
   {
-    // this fits better. conversion matrix from sRGB to XYZ@D50 - which is what dt_XYZ_to_Lab() expects as
-    // input
-    XYZ[0] = (rgb[0] * 0.4360747f) + (rgb[1] * 0.3850649f) + (rgb[2] * 0.1430804f);
-    XYZ[1] = (rgb[0] * 0.2225045f) + (rgb[1] * 0.7168786f) + (rgb[2] * 0.0606169f);
-    XYZ[2] = (rgb[0] * 0.0139322f) + (rgb[1] * 0.0971045f) + (rgb[2] * 0.7141733f);
+    dt_Rec709_to_XYZ_D50(rgb, XYZ);
   }
 
   dt_XYZ_to_Lab(XYZ, Lab);
@@ -309,47 +306,46 @@ void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pix
   d->mix = p->source_lightness_mix / 100.0f;
 }
 
-void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(dt_iop_module_t *self,
+               dt_dev_pixelpipe_t *pipe,
+               dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = calloc(1, sizeof(dt_iop_colorize_data_t));
 }
 
-void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(dt_iop_module_t *self,
+                  dt_dev_pixelpipe_t *pipe,
+                  dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
 }
 
-void gui_update(struct dt_iop_module_t *self)
+void gui_update(dt_iop_module_t *self)
 {
-  dt_iop_colorize_gui_data_t *g = (dt_iop_colorize_gui_data_t *)self->gui_data;
-  dt_iop_colorize_params_t *p = (dt_iop_colorize_params_t *)self->params;
+  dt_iop_colorize_gui_data_t *g = self->gui_data;
+  dt_iop_colorize_params_t *p = self->params;
 
   dt_iop_color_picker_reset(self, TRUE);
-
-  dt_bauhaus_slider_set(g->hue, p->hue);
-  dt_bauhaus_slider_set(g->saturation, p->saturation);
-  dt_bauhaus_slider_set(g->lightness, p->lightness);
-  dt_bauhaus_slider_set(g->source_mix, p->source_lightness_mix);
 
   update_saturation_slider_end_color(g->saturation, p->hue);
 }
 
-void init(dt_iop_module_t *module)
+void init(dt_iop_module_t *self)
 {
-  dt_iop_default_init(module);
+  dt_iop_default_init(self);
 
-  ((dt_iop_colorize_params_t *)module->default_params)->version = module->version();
+  ((dt_iop_colorize_params_t *)self->default_params)->version = self->version();
 }
 
-void gui_init(struct dt_iop_module_t *self)
+void gui_init(dt_iop_module_t *self)
 {
   dt_iop_colorize_gui_data_t *g = IOP_GUI_ALLOC(colorize);
 
   g->hue = dt_color_picker_new(self, DT_COLOR_PICKER_POINT, dt_bauhaus_slider_from_params(self, N_("hue")));
   dt_bauhaus_slider_set_feedback(g->hue, 0);
   dt_bauhaus_slider_set_factor(g->hue, 360.0f);
-  dt_bauhaus_slider_set_format(g->hue, "%.2f°");
+  dt_bauhaus_slider_set_format(g->hue, "°");
   dt_bauhaus_slider_set_stop(g->hue, 0.0f  , 1.0f, 0.0f, 0.0f);
   dt_bauhaus_slider_set_stop(g->hue, 0.166f, 1.0f, 1.0f, 0.0f);
   dt_bauhaus_slider_set_stop(g->hue, 0.322f, 0.0f, 1.0f, 0.0f);
@@ -360,23 +356,22 @@ void gui_init(struct dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->hue, _("select the hue tone"));
 
   g->saturation = dt_bauhaus_slider_from_params(self, N_("saturation"));
-  dt_bauhaus_slider_set_factor(g->saturation, 100.0f);
-  dt_bauhaus_slider_set_format(g->saturation, "%.0f%%");
+  dt_bauhaus_slider_set_format(g->saturation, "%");
   dt_bauhaus_slider_set_stop(g->saturation, 0.0f, 0.2f, 0.2f, 0.2f);
   dt_bauhaus_slider_set_stop(g->saturation, 1.0f, 1.0f, 1.0f, 1.0f);
   gtk_widget_set_tooltip_text(g->saturation, _("select the saturation shadow tone"));
 
   g->lightness = dt_bauhaus_slider_from_params(self, N_("lightness"));
-  dt_bauhaus_slider_set_format(g->lightness, "%.2f%%");
-  dt_bauhaus_slider_set_step(g->lightness, 0.1);
+  dt_bauhaus_slider_set_format(g->lightness, "%");
   gtk_widget_set_tooltip_text(g->lightness, _("lightness of color"));
 
   g->source_mix = dt_bauhaus_slider_from_params(self, "source_lightness_mix");
-  dt_bauhaus_slider_set_format(g->source_mix, "%.2f%%");
-  dt_bauhaus_slider_set_step(g->source_mix, 0.1);
+  dt_bauhaus_slider_set_format(g->source_mix, "%");
   gtk_widget_set_tooltip_text(g->source_mix, _("mix value of source lightness"));
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

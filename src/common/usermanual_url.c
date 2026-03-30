@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2018-2021 darktable developers.
+    Copyright (C) 2018-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -26,40 +26,43 @@ typedef struct _help_url
 
 dt_help_url urls_db[] =
 {
+  {"document_root",              "/"},
   {"ratings",                    "lighttable/digital-asset-management/star-color/#star-ratings"},
   {"layout_filemanager",         "lighttable/lighttable-modes/filemanager/"},
   {"layout_zoomable",            "lighttable/lighttable-modes/zoomable-lighttable/"},
   {"layout_culling",             "lighttable/lighttable-modes/culling/"},
   {"layout_preview",             "lighttable/lighttable-modes/full-preview/"},
-  {"filter",                     NULL},
   {"colorlabels",                "lighttable/digital-asset-management/star-color/#color-labels"},
   {"import",                     "module-reference/utility-modules/lighttable/import/"},
+  {"import_dialog",              "module-reference/utility-modules/lighttable/import/#import-dialog"},
   {"select",                     "module-reference/utility-modules/lighttable/select/"},
   {"image",                      "module-reference/utility-modules/lighttable/selected-image/"},
   {"copy_history",               "module-reference/utility-modules/lighttable/history-stack/"},
-  {"styles",                     "module-reference/utility-modules/lighttable/styles/"},
+  {"styles",                     "module-reference/utility-modules/lighttable/styles/#module-controls"},
   {"timeline",                   "module-reference/utility-modules/lighttable/timeline/"},
-  {"styles_usage",               "module-reference/utility-modules/lighttable/styles/#module-controls"},
   {"metadata",                   "module-reference/utility-modules/shared/metadata-editor/"},
+  {"metadata_preferences",       "module-reference/utility-modules/shared/metadata-editor/#preferences"},
   {"tagging",                    "module-reference/utility-modules/shared/tagging/"},
   {"geotagging",                 "module-reference/utility-modules/shared/geotagging/"},
   {"collect",                    "module-reference/utility-modules/shared/collections/"},
   {"recentcollect",              "module-reference/utility-modules/shared/recent-collections/"},
   {"metadata_view",              "module-reference/utility-modules/shared/image-information/"},
   {"export",                     "module-reference/utility-modules/shared/export/"},
-  {"histogram",                  "module-reference/utility-modules/shared/histogram/"},
+  {"export_dialog",              "module-reference/utility-modules/shared/export/#metadata-preferences"},
+  {"histogram",                  "module-reference/utility-modules/shared/scopes/"},
   {"navigation",                 "module-reference/utility-modules/darkroom/navigation/"},
   {"snapshots",                  "module-reference/utility-modules/darkroom/snapshots/"},
-  {"modulegroups",               "module-reference/utility-modules/darkroom/manage-module-layouts/"},
   {"history",                    "module-reference/utility-modules/darkroom/history-stack/"},
   {"colorpicker",                "module-reference/utility-modules/darkroom/global-color-picker/"},
   {"masks",                      "module-reference/utility-modules/darkroom/mask-manager/"},
+  {"modulegroups",               "darkroom/organization/manage-module-layouts/"},
   {"masks_drawn",                "darkroom/masking-and-blending/masks/drawn/"},
   {"masks_parametric",           "darkroom/masking-and-blending/masks/parametric/"},
   {"masks_raster",               "darkroom/masking-and-blending/masks/raster/"},
   {"masks_blending_op",          "darkroom/masking-and-blending/masks/drawn-and-parametric/"},
   {"masks_blending",             "darkroom/masking-and-blending/overview/"},
   {"masks_combined",             "darkroom/masking-and-blending/masks/drawn-and-parametric/"},
+  {"masks_refinement",           "darkroom/masking-and-blending/masks/refinement-controls/"},
   {"duplicate",                  "module-reference/utility-modules/darkroom/duplicate-manager/"},
   {"location",                   "module-reference/utility-modules/map/find-location/"},
   {"map_settings",               "module-reference/utility-modules/map/map-settings/"},
@@ -68,19 +71,17 @@ dt_help_url urls_db[] =
   {"print_settings_page"         "module-reference/utility-modules/print/print-settings/#page"},
   {"print_settings_button"       "module-reference/utility-modules/print/print-settings/#print-button"},
   {"print_overview",             "print/overview/"},
-  {"camera_settings",            "module-reference/utility-modules/tethering/camera-settings/"},
+  {"camera",                     "module-reference/utility-modules/tethering/camera-settings/"},
   {"import_camera",              "overview/workflow/import-rate-tag/"},
   {"import_fr",                  "overview/workflow/import-rate-tag/"},
-  {"global_toolbox",             NULL},
-  {"global_toolbox_preferences", "overview/user-interface/top-panel/#on-the-right-hand-side/"},
-  {"global_toolbox_help",        "overview/user-interface/top-panel/#on-the-right-hand-side"},
+  {"global_toolbox",             "overview/user-interface/top-panel/#on-the-right-hand-side"},
   {"lighttable_mode",            "lighttable/overview/"},
   {"lighttable_filemanager",     "lighttable/lighttable-modes/filemanager/"},
   {"lighttable_zoomable",        "lighttable/lighttable-modes/zoomable-lighttable/"},
   {"darkroom_bottom_panel",      "darkroom/darkroom-view-layout/#bottom-panel"},
   {"module_header",              "darkroom/processing-modules/module-header/"},
-  {"tethering_session",          "module-reference/utility-modules/tethering/session/"},
-  {"tethering_live_view",        "module-reference/utility-modules/tethering/live-view/"},
+  {"session",                    "module-reference/utility-modules/tethering/session/"},
+  {"live_view",                  "module-reference/utility-modules/tethering/live-view/"},
   {"module_toolbox",             NULL},
   {"view_toolbox",               NULL},
   {"backgroundjobs",             NULL},
@@ -94,8 +95,13 @@ dt_help_url urls_db[] =
   {"overexposed",                "module-reference/utility-modules/darkroom/clipping/"},
   {"softproof",                  "module-reference/utility-modules/darkroom/soft-proof/"},
   {"gamut",                      "module-reference/utility-modules/darkroom/gamut/"},
+  {"shortcuts",                  "preferences-settings/shortcuts/"},
+  {"presets",                    "preferences-settings/presets/"},
+  {"css_tweaks",                 "preferences-settings/general/#css-theme-modifications"},
+  {"preset_dialog",              "darkroom/processing-modules/presets/#creating-and-editing-presets"},
 
   // iop links
+  {"agx",                        "module-reference/processing-modules/agx/"},
   {"ashift",                     "module-reference/processing-modules/rotate-perspective/"},
   {"atrous",                     "module-reference/processing-modules/contrast-equalizer/"},
   {"basecurve",                  "module-reference/processing-modules/base-curve/"},
@@ -116,6 +122,7 @@ dt_help_url urls_db[] =
   {"colorchecker",               "module-reference/processing-modules/color-look-up-table/"},
   {"colorcontrast",              "module-reference/processing-modules/color-contrast/"},
   {"colorcorrection",            "module-reference/processing-modules/color-correction/"},
+  {"colorequal",                 "module-reference/processing-modules/color-equalizer/"},
   {"colorin",                    "module-reference/processing-modules/input-color-profile/"},
   {"colorize",                   "module-reference/processing-modules/colorize/"},
   {"colormapping",               "module-reference/processing-modules/color-mapping/"},
@@ -127,11 +134,14 @@ dt_help_url urls_db[] =
   {"defringe",                   "module-reference/processing-modules/defringe/"},
   {"demosaic",                   "module-reference/processing-modules/demosaic/"},
   {"denoiseprofile",             "module-reference/processing-modules/denoise-profiled/"},
+  {"diffuse",                    "module-reference/processing-modules/diffuse/"},
   {"dither",                     "module-reference/processing-modules/dithering/"},
+  {"enlargecanvas",              "module-reference/processing-modules/enlarge-canvas/"},
   {"equalizer",                  NULL}, // deprecated, replaced by atrous
   {"exposure",                   "module-reference/processing-modules/exposure/"},
   {"filmic",                     "module-reference/processing-modules/filmic-rgb/"},
   {"filmicrgb",                  "module-reference/processing-modules/filmic-rgb/"},
+  {"sigmoid",                    "module-reference/processing-modules/sigmoid/"},
   {"flip",                       "module-reference/processing-modules/orientation/"},
   {"globaltonemap",              "module-reference/processing-modules/global-tonemap/"},
   {"graduatednd",                "module-reference/processing-modules/graduated-density/"},
@@ -150,6 +160,8 @@ dt_help_url urls_db[] =
   {"monochrome",                 "module-reference/processing-modules/monochrome/"},
   {"negadoctor",                 "module-reference/processing-modules/negadoctor/"},
   {"nlmeans",                    "module-reference/processing-modules/astrophoto-denoise/"},
+  {"overlay",                    "module-reference/processing-modules/composite/"},
+  {"primaries",                  "module-reference/processing-modules/rgb-primaries/"},
   {"profile_gamma",              "module-reference/processing-modules/unbreak-input-profile/"},
   {"rawdenoise",                 "module-reference/processing-modules/raw-denoise/"},
   {"rawprepare",                 "module-reference/processing-modules/raw-black-white-point/"},
@@ -175,12 +187,20 @@ dt_help_url urls_db[] =
   {"zonesystem",                 "module-reference/processing-modules/zone-system/"},
 };
 
-char *dt_get_help_url(char *name)
+char *dt_get_help_url(const char *name)
 {
-  if(name==NULL) return NULL;
+  if(name == NULL)
+    return NULL;
 
-  for(int k=0; k< sizeof(urls_db)/2/sizeof(char *); k++)
-    if(!strcmp(urls_db[k].name, name)) return urls_db[k].url;
+  for(int k = 0; k < sizeof(urls_db)/2/sizeof(char *); k++)
+    if(!strcmp(urls_db[k].name, name))
+      return urls_db[k].url;
 
   return NULL;
 }
+
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// vim: shiftwidth=2 expandtab tabstop=2 cindent
+// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

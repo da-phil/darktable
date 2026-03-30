@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    copyright (c) 2011--2013 ulrich pegelow.
+    Copyright (C) 2011-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -279,13 +279,13 @@ blendif_factor_rgb_hsl(const float4 input, const float4 output,
     float4 HSL_input = RGB_2_HSL(input);
     float4 HSL_output = RGB_2_HSL(output);
 
-    scaled[DEVELOP_BLENDIF_H_in] = clamp(HSL_input.x, 0.0f, 1.0f);			        // H scaled to 0..1
-    scaled[DEVELOP_BLENDIF_S_in] = clamp(HSL_input.y, 0.0f, 1.0f);		                // S scaled to 0..1
-    scaled[DEVELOP_BLENDIF_l_in] = clamp(HSL_input.z, 0.0f, 1.0f);		                // L scaled to 0..1
+    scaled[DEVELOP_BLENDIF_H_in] = clipf(HSL_input.x);			        // H scaled to 0..1
+    scaled[DEVELOP_BLENDIF_S_in] = clipf(HSL_input.y);		          // S scaled to 0..1
+    scaled[DEVELOP_BLENDIF_l_in] = clipf(HSL_input.z);		          // L scaled to 0..1
 
-    scaled[DEVELOP_BLENDIF_H_out] = clamp(HSL_output.x, 0.0f, 1.0f);			        // H scaled to 0..1
-    scaled[DEVELOP_BLENDIF_S_out] = clamp(HSL_output.y, 0.0f, 1.0f);		                // S scaled to 0..1
-    scaled[DEVELOP_BLENDIF_l_out] = clamp(HSL_output.z, 0.0f, 1.0f);		                // L scaled to 0..1
+    scaled[DEVELOP_BLENDIF_H_out] = clipf(HSL_output.x);			      // H scaled to 0..1
+    scaled[DEVELOP_BLENDIF_S_out] = clipf(HSL_output.y);		        // S scaled to 0..1
+    scaled[DEVELOP_BLENDIF_l_out] = clipf(HSL_output.z);		        // L scaled to 0..1
   }
 
   const unsigned int invert_mask = (blendif >> 16) ^ ((mask_combine & DEVELOP_COMBINE_INCL) ? DEVELOP_BLENDIF_RGB_MASK : 0);
@@ -942,7 +942,154 @@ blendop_RAW(__read_only image2d_t in_a, __read_only image2d_t in_b, __read_only 
 
   }
 
-  write_imagef(out, (int2)(x, y), (float4)(o, 0.0f, 0.0f, 0.0f));
+  write_imagef(out, (int2)(x, y), o);
+}
+
+__kernel void
+blendop_RAW4(__read_only image2d_t in_a, __read_only image2d_t in_b, __read_only image2d_t mask, __write_only image2d_t out, const int width, const int height,
+            const int blend_mode, const float blend_parameter, const int2 offs, const int mask_display)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+
+  if(x >= width || y >= height) return;
+
+  float4 a, b, o;
+
+  if((blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE)
+  {
+    b = read_imagef(in_a, sampleri, (int2)(x, y) + offs);
+    a = read_imagef(in_b, sampleri, (int2)(x, y));
+  }
+  else
+  {
+    a = read_imagef(in_a, sampleri, (int2)(x, y) + offs);
+    b = read_imagef(in_b, sampleri, (int2)(x, y));
+  }
+
+  float4 opacity = read_imagef(mask, sampleri, (int2)(x, y)).x;
+
+  const float4 min = 0.0f;
+  const float4 max = 1.0f;
+  const float4 lmin = 0.0f;
+  const float4 lmax = 1.0f;        /* max + fabs(min) */
+  const float4 halfmax = 0.5f;     /* lmax / 2.0f */
+  const float4 doublemax = 2.0f;   /* lmax * 2.0f */
+  const float4 opacity2 = opacity*opacity;
+
+  float4 la = clamp(a + fabs(min), lmin, lmax);
+  float4 lb = clamp(b + fabs(min), lmin, lmax);
+
+
+  /* select the blend operator */
+  switch(blend_mode & DEVELOP_BLEND_MODE_MASK)
+  {
+    case DEVELOP_BLEND_LIGHTEN:
+      o = clamp(a * (1.0f - opacity) + fmax(a, b) * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_DARKEN:
+      o = clamp(a * (1.0f - opacity) + fmin(a, b) * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_MULTIPLY:
+      o = clamp(a * (1.0f - opacity) + a * b * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_AVERAGE:
+      o = clamp(a * (1.0f - opacity) + (a + b)/2.0f * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_ADD:
+      o =  clamp(a * (1.0f - opacity) +  (a + b) * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_SUBTRACT:
+      o =  clamp(a * (1.0f - opacity) +  (b + a - fabs(min + max)) * opacity, min, max);
+      break;
+
+    case DEVELOP_BLEND_DIFFERENCE:
+    case DEVELOP_BLEND_DIFFERENCE2:
+      o = clamp(la * (1.0f - opacity) + fabs(la - lb) * opacity, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_SCREEN:
+      o = clamp(la * (1.0f - opacity) + (lmax - (lmax - la) * (lmax - lb)) * opacity, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_OVERLAY:
+      o = clamp(la * (1.0f - opacity2) + (la > halfmax ? lmax - (lmax - doublemax * (la - halfmax)) * (lmax-lb) : doublemax * la * lb) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_SOFTLIGHT:
+      o = clamp(la * (1.0f - opacity2) + (lb > halfmax ? lmax - (lmax - la)  * (lmax - (lb - halfmax)) : la * (lb + halfmax)) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_HARDLIGHT:
+      o = clamp(la * (1.0f - opacity2) + (lb > halfmax ? lmax - (lmax - doublemax * (la - halfmax)) * (lmax-lb) : doublemax * la * lb) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_VIVIDLIGHT:
+      o = clamp(la * (1.0f - opacity2) + (lb > halfmax ? la / (lb >= lmax ? lmax : (doublemax * (lmax - lb))) : (lb <= lmin ? lmin : lmax - (lmax - la)/(doublemax * lb))) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_LINEARLIGHT:
+      o = clamp(la * (1.0f - opacity2) + (la + doublemax * lb - lmax) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_PINLIGHT:
+      o = clamp(la * (1.0f - opacity2) + (lb > halfmax ? fmax(la, doublemax * (lb - halfmax)) : fmin(la, doublemax * lb)) * opacity2, lmin, lmax) - fabs(min);
+      break;
+
+    case DEVELOP_BLEND_LIGHTNESS:
+      o = clamp(a, min, max);   // Noop for Raw
+      break;
+
+    case DEVELOP_BLEND_CHROMA:
+      o = clamp(a, min, max);   // Noop for Raw
+      break;
+
+    case DEVELOP_BLEND_HUE:
+      o = clamp(a, min, max);   // Noop for Raw
+      break;
+
+    case DEVELOP_BLEND_COLOR:
+      o = clamp(a, min, max);   // Noop for Raw
+      break;
+
+    case DEVELOP_BLEND_COLORADJUST:
+      o = clamp(a, min, max);   // Noop for Raw
+      break;
+
+    case DEVELOP_BLEND_BOUNDED:
+      o =  clamp((a * (1.0f - opacity)) + (b * opacity), min, max);
+      break;
+
+    case DEVELOP_BLEND_LAB_LIGHTNESS:
+    case DEVELOP_BLEND_LAB_COLOR:
+    case DEVELOP_BLEND_LAB_L:
+    case DEVELOP_BLEND_LAB_A:
+    case DEVELOP_BLEND_LAB_B:
+      o = a;                            // Noop for Raw (without clamping)
+      break;
+
+    case DEVELOP_BLEND_HSV_LIGHTNESS:
+    case DEVELOP_BLEND_HSV_COLOR:
+    case DEVELOP_BLEND_RGB_R:
+    case DEVELOP_BLEND_RGB_G:
+    case DEVELOP_BLEND_RGB_B:
+      o = a;                            // Noop for Raw (without clamping)
+      break;
+
+    /* fallback to normal blend */
+    case DEVELOP_BLEND_NORMAL2:
+    default:
+      o =  (a * (1.0f - opacity)) + (b * opacity);
+      break;
+
+  }
+
+  write_imagef(out, (int2)(x, y), o);
 }
 
 
@@ -1302,8 +1449,7 @@ blendop_mask_tone_curve(__read_only image2d_t mask_in, __write_only image2d_t ma
     scaled_opacity = (scaled_opacity + brightness) / (1.f + brightness);
     scaled_opacity = fmax(scaled_opacity, -1.f);
   }
-  opacity = clamp(
-      ((scaled_opacity * e / (1.f + (e - 1.f) * fabs(scaled_opacity))) / 2.f + 0.5f) * gopacity, 0.f, 1.f);
+  opacity = clipf(((scaled_opacity * e / (1.f + (e - 1.f) * fabs(scaled_opacity))) / 2.f + 0.5f) * gopacity);
   write_imagef(mask_out, (int2)(x, y), opacity);
 }
 
@@ -1349,51 +1495,51 @@ blendop_display_channel(__read_only image2d_t in_a, __read_only image2d_t in_b, 
   switch(channel & DT_DEV_PIXELPIPE_DISPLAY_ANY)
   {
     case DT_DEV_PIXELPIPE_DISPLAY_L:
-      c = clamp(a.x / 100.0f / exp2(boost_factors[DEVELOP_BLENDIF_L_in]), 0.0f, 1.0f);
+      c = clipf(a.x / 100.0f / exp2(boost_factors[DEVELOP_BLENDIF_L_in]));
       is_lab = 1;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_L | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.x / 100.0f / exp2(boost_factors[DEVELOP_BLENDIF_L_out]), 0.0f, 1.0f);
+      c = clipf(b.x / 100.0f / exp2(boost_factors[DEVELOP_BLENDIF_L_out]));
       is_lab = 1;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_a:
-      c = clamp(a.y / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f, 0.0f, 1.0f);
+      c = clipf(a.y / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f);
       is_lab = 1;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_a | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.y / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_out]) + 0.5f, 0.0f, 1.0f);
+      c = clipf(b.y / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_out]) + 0.5f);
       is_lab = 1;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_b:
-      c = clamp(a.z / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_B_in]) + 0.5f, 0.0f, 1.0f);
+      c = clipf(a.z / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_B_in]) + 0.5f);
       is_lab = 1;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_b | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.z / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f, 0.0f, 1.0f);
+      c = clipf(b.z / 256.0f / exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f);
       is_lab = 1;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_R:
-      c = clamp(a.x / exp2(boost_factors[DEVELOP_BLENDIF_RED_in]), 0.0f, 1.0f);
+      c = clipf(a.x / exp2(boost_factors[DEVELOP_BLENDIF_RED_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_R | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.x / exp2(boost_factors[DEVELOP_BLENDIF_RED_out]), 0.0f, 1.0f);
+      c = clipf(b.x / exp2(boost_factors[DEVELOP_BLENDIF_RED_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_G:
-      c = clamp(a.y / exp2(boost_factors[DEVELOP_BLENDIF_GREEN_in]), 0.0f, 1.0f);
+      c = clipf(a.y / exp2(boost_factors[DEVELOP_BLENDIF_GREEN_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_G | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.y / exp2(boost_factors[DEVELOP_BLENDIF_GREEN_out]), 0.0f, 1.0f);
+      c = clipf(b.y / exp2(boost_factors[DEVELOP_BLENDIF_GREEN_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_B:
-      c = clamp(a.z / exp2(boost_factors[DEVELOP_BLENDIF_BLUE_in]), 0.0f, 1.0f);
+      c = clipf(a.z / exp2(boost_factors[DEVELOP_BLENDIF_BLUE_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_B | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
-      c = clamp(b.z / exp2(boost_factors[DEVELOP_BLENDIF_BLUE_out]), 0.0f, 1.0f);
+      c = clipf(b.z / exp2(boost_factors[DEVELOP_BLENDIF_BLUE_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_GRAY:
@@ -1401,7 +1547,7 @@ blendop_display_channel(__read_only image2d_t in_a, __read_only image2d_t in_b, 
         c = 0.3f * a.x + 0.59f * a.y + 0.11f * a.z;
       else
         c = get_rgb_matrix_luminance(a, profile_info, profile_info->matrix_in, profile_lut);
-      c = clamp(c / exp2(boost_factors[DEVELOP_BLENDIF_GRAY_in]), 0.0f, 1.0f);
+      c = clipf(c / exp2(boost_factors[DEVELOP_BLENDIF_GRAY_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_GRAY | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
@@ -1409,87 +1555,87 @@ blendop_display_channel(__read_only image2d_t in_a, __read_only image2d_t in_b, 
         c = 0.3f * b.x + 0.59f * b.y + 0.11f * b.z;
       else
         c = get_rgb_matrix_luminance(b, profile_info, profile_info->matrix_in, profile_lut);
-      c = clamp(c / exp2(boost_factors[DEVELOP_BLENDIF_GRAY_out]), 0.0f, 1.0f);
+      c = clipf(c / exp2(boost_factors[DEVELOP_BLENDIF_GRAY_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_LCH_C:
       LCH = Lab_2_LCH(a);
-      c = clamp(LCH.y / (128.0f * sqrt(2.0f) / exp2(boost_factors[DEVELOP_BLENDIF_C_in])), 0.0f, 1.0f);
+      c = clipf(LCH.y / (128.0f * sqrt(2.0f) / exp2(boost_factors[DEVELOP_BLENDIF_C_in])));
       is_lab = 1;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_LCH_C | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       LCH = Lab_2_LCH(b);
-      c = clamp(LCH.y / (128.0f * sqrt(2.0f)) / exp2(boost_factors[DEVELOP_BLENDIF_C_out]), 0.0f, 1.0f);
+      c = clipf(LCH.y / (128.0f * sqrt(2.0f)) / exp2(boost_factors[DEVELOP_BLENDIF_C_out]));
       is_lab = 1;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_LCH_h:
       LCH = Lab_2_LCH(a);
-      c = clamp(LCH.z, 0.0f, 1.0f); // no boost for hues
+      c = clipf(LCH.z); // no boost for hues
       is_lab = 1;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_LCH_h | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       LCH = Lab_2_LCH(b);
-      c = clamp(LCH.z, 0.0f, 1.0f); // no boost for hues
+      c = clipf(LCH.z); // no boost for hues
       is_lab = 1;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_HSL_H:
       HSL = RGB_2_HSL(a);
-      c = clamp(HSL.x, 0.0f, 1.0f); // no boost for hues
+      c = clipf(HSL.x); // no boost for hues
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_HSL_H | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       HSL = RGB_2_HSL(b);
-      c = clamp(HSL.x, 0.0f, 1.0f); // no boost for hues
+      c = clipf(HSL.x); // no boost for hues
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_HSL_S:
       HSL = RGB_2_HSL(a);
-      c = clamp(HSL.y, 0.0f, 1.0f); // no boost for HSL
+      c = clipf(HSL.y); // no boost for HSL
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_HSL_S | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       HSL = RGB_2_HSL(b);
-      c = clamp(HSL.y, 0.0f, 1.0f); // no boost for HSL
+      c = clipf(HSL.y); // no boost for HSL
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_HSL_l:
       HSL = RGB_2_HSL(a);
-      c = clamp(HSL.z, 0.0f, 1.0f); // no boost for HSL
+      c = clipf(HSL.z); // no boost for HSL
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_HSL_l | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       HSL = RGB_2_HSL(b);
-      c = clamp(HSL.z, 0.0f, 1.0f); // no boost for HSL
+      c = clipf(HSL.z); // no boost for HSL
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Jz:
       JzCzhz = rgb_to_JzCzhz(a, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.x / exp2(boost_factors[DEVELOP_BLENDIF_Jz_in]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.x / exp2(boost_factors[DEVELOP_BLENDIF_Jz_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Jz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       JzCzhz = rgb_to_JzCzhz(b, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.x / exp2(boost_factors[DEVELOP_BLENDIF_Jz_out]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.x / exp2(boost_factors[DEVELOP_BLENDIF_Jz_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz:
       JzCzhz = rgb_to_JzCzhz(a, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.y / exp2(boost_factors[DEVELOP_BLENDIF_Cz_in]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.y / exp2(boost_factors[DEVELOP_BLENDIF_Cz_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       JzCzhz = rgb_to_JzCzhz(b, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.y / exp2(boost_factors[DEVELOP_BLENDIF_Cz_out]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.y / exp2(boost_factors[DEVELOP_BLENDIF_Cz_out]));
       is_lab = 0;
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz:
       JzCzhz = rgb_to_JzCzhz(a, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.z / exp2(boost_factors[DEVELOP_BLENDIF_hz_in]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.z / exp2(boost_factors[DEVELOP_BLENDIF_hz_in]));
       is_lab = 0;
       break;
     case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
       JzCzhz = rgb_to_JzCzhz(b, profile_info, profile_lut, use_profile);
-      c = clamp(JzCzhz.z / exp2(boost_factors[DEVELOP_BLENDIF_hz_out]), 0.0f, 1.0f);
+      c = clipf(JzCzhz.z / exp2(boost_factors[DEVELOP_BLENDIF_hz_out]));
       is_lab = 0;
       break;
     default:

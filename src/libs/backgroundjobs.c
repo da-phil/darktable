@@ -52,10 +52,9 @@ const char *name(dt_lib_module_t *self)
   return _("background jobs");
 }
 
-const char **views(dt_lib_module_t *self)
+dt_view_type_flags_t views(dt_lib_module_t *self)
 {
-  static const char *v[] = {"*", NULL};
-  return v;
+  return DT_VIEW_ALL;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -63,7 +62,7 @@ uint32_t container(dt_lib_module_t *self)
   return DT_UI_CONTAINER_PANEL_LEFT_BOTTOM;
 }
 
-int position()
+int position(const dt_lib_module_t *self)
 {
   return 1;
 }
@@ -93,7 +92,7 @@ void gui_init(dt_lib_module_t *self)
   // its gui_data!
   for(const GList *iter = darktable.control->progress_system.list; iter; iter = g_list_next(iter))
   {
-    dt_progress_t *progress = (dt_progress_t *)iter->data;
+    dt_progress_t *progress = iter->data;
     void *gui_data = dt_control_progress_get_gui_data(progress);
     free(gui_data);
     gui_data = _lib_backgroundjobs_added(self, dt_control_progress_has_progress_bar(progress),
@@ -135,17 +134,26 @@ static gboolean _added_gui_thread(gpointer user_data)
   gtk_widget_show_all(params->instance_widget);
   gtk_widget_show(params->self_widget);
 
+  // instance cursor to tell user that, if this is a blocking job with
+  // a global busy cursor, the cancel box in this widget can stop it
+  GdkWindow *window = gtk_widget_get_window(params->instance_widget);
+  if(window)
+  {
+    GdkCursor *cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "default");
+    gdk_window_set_cursor(window, cursor);
+    g_object_unref(cursor);
+  }
+
   free(params);
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 static void *_lib_backgroundjobs_added(dt_lib_module_t *self, gboolean has_progress_bar, const gchar *message)
 {
   // add a new gui thingy
-  dt_lib_backgroundjob_element_t *instance
-      = (dt_lib_backgroundjob_element_t *)calloc(1, sizeof(dt_lib_backgroundjob_element_t));
+  dt_lib_backgroundjob_element_t *instance = calloc(1, sizeof(dt_lib_backgroundjob_element_t));
   if(!instance) return NULL;
-  _added_gui_thread_t *params = (_added_gui_thread_t *)malloc(sizeof(_added_gui_thread_t));
+  _added_gui_thread_t *params = malloc(sizeof(_added_gui_thread_t));
   if(!params)
   {
     free(instance);
@@ -155,7 +163,8 @@ static void *_lib_backgroundjobs_added(dt_lib_module_t *self, gboolean has_progr
   instance->widget = gtk_event_box_new();
 
   /* initialize the ui elements for job */
-  gtk_widget_set_name(GTK_WIDGET(instance->widget), "background_job_eventbox");
+  gtk_widget_set_name(GTK_WIDGET(instance->widget), "background-job-eventbox");
+  dt_gui_add_class(GTK_WIDGET(instance->widget), "dt_big_btn_canvas");
   GtkBox *vbox = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
   instance->hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_container_add(GTK_CONTAINER(instance->widget), GTK_WIDGET(vbox));
@@ -205,13 +214,13 @@ static gboolean _destroyed_gui_thread(gpointer user_data)
   // free data
   free(params->instance);
   free(params);
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 // remove the gui that is pointed to in instance
 static void _lib_backgroundjobs_destroyed(dt_lib_module_t *self, dt_lib_backgroundjob_element_t *instance)
 {
-  _destroyed_gui_thread_t *params = (_destroyed_gui_thread_t *)malloc(sizeof(_destroyed_gui_thread_t));
+  _destroyed_gui_thread_t *params = malloc(sizeof(_destroyed_gui_thread_t));
   if(!params) return;
   params->self = self;
   params->instance = instance;
@@ -221,7 +230,7 @@ static void _lib_backgroundjobs_destroyed(dt_lib_module_t *self, dt_lib_backgrou
 static void _lib_backgroundjobs_cancel_callback_new(GtkWidget *w, gpointer user_data)
 {
   dt_progress_t *progress = (dt_progress_t *)user_data;
-  dt_control_progress_cancel(darktable.control, progress);
+  dt_control_progress_cancel(progress);
 }
 
 typedef struct _cancellable_gui_thread_t
@@ -235,13 +244,13 @@ static gboolean _cancellable_gui_thread(gpointer user_data)
   _cancellable_gui_thread_t *params = (_cancellable_gui_thread_t *)user_data;
 
   GtkBox *hbox = GTK_BOX(params->instance->hbox);
-  GtkWidget *button = dtgtk_button_new(dtgtk_cairo_paint_cancel, CPF_STYLE_FLAT, NULL);
+  GtkWidget *button = dtgtk_button_new(dtgtk_cairo_paint_cancel, 0, NULL);
   g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(_lib_backgroundjobs_cancel_callback_new), params->progress);
   gtk_box_pack_start(hbox, GTK_WIDGET(button), FALSE, FALSE, 0);
   gtk_widget_show_all(button);
 
   free(params);
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 static void _lib_backgroundjobs_cancellable(dt_lib_module_t *self, dt_lib_backgroundjob_element_t *instance,
@@ -249,9 +258,9 @@ static void _lib_backgroundjobs_cancellable(dt_lib_module_t *self, dt_lib_backgr
 {
   // add a cancel button to the gui. when clicked we want dt_control_progress_cancel(darktable.control,
   // progress); to be called
-  if(!darktable.control->running) return;
+  if(!dt_control_running()) return;
 
-  _cancellable_gui_thread_t *params = (_cancellable_gui_thread_t *)malloc(sizeof(_cancellable_gui_thread_t));
+  _cancellable_gui_thread_t *params = malloc(sizeof(_cancellable_gui_thread_t));
   if(!params) return;
   params->instance = instance;
   params->progress = progress;
@@ -271,16 +280,16 @@ static gboolean _update_gui_thread(gpointer user_data)
   gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(params->instance->progressbar), CLAMP(params->value, 0, 1.0));
 
   free(params);
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 static void _lib_backgroundjobs_updated(dt_lib_module_t *self, dt_lib_backgroundjob_element_t *instance,
                                         double value)
 {
   // update the progress bar
-  if(!darktable.control->running) return;
+  if(!dt_control_running()) return;
 
-  _update_gui_thread_t *params = (_update_gui_thread_t *)malloc(sizeof(_update_gui_thread_t));
+  _update_gui_thread_t *params = malloc(sizeof(_update_gui_thread_t));
   if(!params) return;
   params->instance = instance;
   params->value = value;
@@ -301,22 +310,24 @@ static gboolean _update_message_gui_thread(gpointer user_data)
 
   g_free(params->message);
   free(params);
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 static void _lib_backgroundjobs_message_updated(dt_lib_module_t *self, dt_lib_backgroundjob_element_t *instance,
                                                 const char *message)
 {
   // update the progress bar
-  if(!darktable.control->running) return;
+  if(!dt_control_running()) return;
 
-  _update_label_gui_thread_t *params = (_update_label_gui_thread_t *)malloc(sizeof(_update_label_gui_thread_t));
+  _update_label_gui_thread_t *params = malloc(sizeof(_update_label_gui_thread_t));
   if(!params) return;
   params->instance = instance;
   params->message = g_strdup(message);
   g_main_context_invoke(NULL, _update_message_gui_thread, params);
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

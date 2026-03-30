@@ -23,18 +23,18 @@
 #include "common/pdf.h"
 #include "common/cups_print.h"
 #include "common/image.h"
-
+#include "common/math.h"
 
 #define MAX_IMAGE_PER_PAGE 20
 
-typedef struct _imgage_pos
+typedef struct _image_pos
 {
   float x, y, width, height;
 } dt_image_pos;
 
 typedef struct _image_box
 {
-  int32_t imgid;
+  dt_imgid_t imgid;
   int32_t max_width, max_height; // max size for the export (in pixels)
   int32_t exp_width, exp_height; // final exported size (in pixels)
   int32_t dis_width, dis_height; // image size on screen (in pixels)
@@ -61,7 +61,7 @@ typedef struct dt_screen_pos
 
 typedef struct dt_images_box
 {
-  int32_t imgid_to_load;
+  dt_imgid_t imgid_to_load;
   int32_t motion_over;
   int count;
   dt_image_box box[MAX_IMAGE_PER_PAGE];
@@ -71,37 +71,63 @@ typedef struct dt_images_box
 } dt_images_box;
 
 // return the box index or -1 if (x, y) coordinate is not over an image
-int32_t dt_printing_get_image_box(const dt_images_box *imgs, const int x, const int y);
+int32_t dt_printing_get_image_box(const dt_images_box *imgs,
+                                  const int x,
+                                  const int y);
 
 void dt_printing_clear_box(dt_image_box *img);
 void dt_printing_clear_boxes(dt_images_box *imgs);
 
 /* (x, y) -> (width, height) are in pixels (on screen position) */
 void dt_printing_setup_display(dt_images_box *imgs,
-                               const float px, const float py, const float pwidth, const float pheight,
-                               const float ax, const float ay, const float awidth, const float aheight, gboolean borderless);
+                               const float px,
+                               const float py,
+                               const float pwidth,
+                               const float pheight,
+                               const float ax,
+                               const float ay,
+                               const float awidth,
+                               const float aheight,
+                               const gboolean borderless);
 
-void dt_printing_setup_box(dt_images_box *imgs, const int idx,
-                           const float x, const float y,
-                           const float width, const float height);
+void dt_printing_setup_box(dt_images_box *imgs,
+                           const int idx,
+                           const float x,
+                           const float y,
+                           const float width,
+                           const float height);
 
 /* page_width page_height in mm, compute the max_width and max_height in
    pixels for the image */
 void dt_printing_setup_page(dt_images_box *imgs,
-                            const float page_width, const float page_height,
+                            const float page_width,
+                            const float page_height,
                             const int resolution);
 
 /* setup the image id and exported width x height */
-void dt_printing_setup_image(dt_images_box *imgs, const int idx,
-                             const int32_t imgid, const int32_t width, const int32_t height,
+void dt_printing_setup_image(dt_images_box *imgs,
+                             const int idx,
+                             const dt_imgid_t imgid,
+                             const int32_t width,
+                             const int32_t height,
                              const dt_alignment_t alignment);
 
 /* return the on screen pos with alignement */
-void dt_printing_get_screen_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos);
-void dt_printing_get_screen_rel_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos);
-void dt_printing_get_image_pos_mm(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos);
-void dt_printing_get_image_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos);
+void dt_printing_get_screen_pos(const dt_images_box *imgs,
+                                const dt_image_box *img,
+                                dt_image_pos *pos);
+void dt_printing_get_screen_rel_pos(const dt_images_box *imgs,
+                                    const dt_image_box *img,
+                                    dt_image_pos *pos);
+void dt_printing_get_image_pos_mm(const dt_images_box *imgs,
+                                  const dt_image_box *img,
+                                  dt_image_pos *pos);
+void dt_printing_get_image_pos(const dt_images_box *imgs,
+                               const dt_image_box *img,
+                               dt_image_pos *pos);
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

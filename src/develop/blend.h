@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2021 darktable developers.
+    Copyright (C) 2011-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -21,11 +21,16 @@
 #include "common/iop_profile.h"
 #include "common/opencl.h"
 #include "develop/pixelpipe.h"
+#include "develop/masks.h"
 #include "dtgtk/button.h"
 #include "dtgtk/gradientslider.h"
 #include "gui/color_picker_proxy.h"
+#include "common/imagebuf.h"
+#include "common/gaussian.h"
 
-#define DEVELOP_BLEND_VERSION (11)
+#define DEVELOP_BLEND_VERSION (14)
+
+G_BEGIN_DECLS
 
 typedef enum dt_develop_blend_colorspace_t
 {
@@ -174,8 +179,8 @@ typedef enum dt_develop_blendif_channels_t
 /** blend parameters current version */
 typedef struct dt_develop_blend_params_t
 {
-  /** what kind of masking to use: off, non-mask (uniformly), hand-drawn mask and/or conditional mask
-   *  or raster mask */
+  /** what kind of masking to use: off, non-mask (uniformly),
+   *  hand-drawn mask and/or conditional mask or raster mask */
   uint32_t mask_mode;
   /** blending color space type */
   int32_t blend_cst;
@@ -188,7 +193,7 @@ typedef struct dt_develop_blend_params_t
   /** how masks are combined */
   uint32_t mask_combine;
   /** id of mask in current pipeline */
-  uint32_t mask_id;
+  dt_mask_id_t mask_id;
   /** blendif mask */
   uint32_t blendif;
   /** feathering radius */
@@ -203,14 +208,16 @@ typedef struct dt_develop_blend_params_t
   float brightness;
   /** details threshold */
   float details;
+  /** feathering parameters version */
+  uint32_t feather_version;
   /** some reserved fields for future use */
-  uint32_t reserved[3];
+  uint32_t reserved[2];
   /** blendif parameters */
   float blendif_parameters[4 * DEVELOP_BLENDIF_SIZE];
   float blendif_boost_factors[DEVELOP_BLENDIF_SIZE];
   dt_dev_operation_t raster_mask_source;
   int raster_mask_instance;
-  int raster_mask_id;
+  dt_mask_id_t raster_mask_id;
   gboolean raster_mask_invert;
 } dt_develop_blend_params_t;
 
@@ -223,6 +230,7 @@ typedef struct dt_blendop_cl_global_t
   int kernel_blendop_mask_rgb_jzczhz;
   int kernel_blendop_Lab;
   int kernel_blendop_RAW;
+  int kernel_blendop_RAW4;
   int kernel_blendop_rgb_hsl;
   int kernel_blendop_rgb_jzczhz;
   int kernel_blendop_mask_tone_curve;
@@ -230,11 +238,7 @@ typedef struct dt_blendop_cl_global_t
   int kernel_blendop_display_channel;
   int kernel_calc_Y0_mask;
   int kernel_calc_scharr_mask;
-  int kernel_write_scharr_mask;
-  int kernel_write_mask;
-  int kernel_read_mask;
   int kernel_calc_blend;
-  int kernel_mask_blur;
 } dt_blendop_cl_global_t;
 
 
@@ -270,31 +274,29 @@ typedef struct dt_iop_gui_blendif_filter_t
   GtkBox *box;
 } dt_iop_gui_blendif_filter_t;
 
-typedef struct dt_iop_blend_name_value_t
-{
-  char name[32];
-  int value;
-} dt_develop_name_value_t;
+extern const dt_introspection_type_enum_tuple_t dt_develop_blend_colorspace_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_blend_mode_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_blend_mode_flag_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_mask_mode_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_combine_masks_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_feathering_guide_names[];
+extern const dt_introspection_type_enum_tuple_t dt_develop_invert_mask_names[];
 
-extern const dt_develop_name_value_t dt_develop_blend_colorspace_names[];
-extern const dt_develop_name_value_t dt_develop_blend_mode_names[];
-extern const dt_develop_name_value_t dt_develop_blend_mode_flag_names[];
-extern const dt_develop_name_value_t dt_develop_mask_mode_names[];
-extern const dt_develop_name_value_t dt_develop_combine_masks_names[];
-extern const dt_develop_name_value_t dt_develop_feathering_guide_names[];
-extern const dt_develop_name_value_t dt_develop_invert_mask_names[];
-
+#ifdef HAVE_AI
+#define DEVELOP_MASKS_NB_SHAPES 6
+#else
 #define DEVELOP_MASKS_NB_SHAPES 5
+#endif
 
 /** blend gui data */
 typedef struct dt_iop_gui_blend_data_t
 {
-  int blendif_support;
-  int blend_inited;
-  int blendif_inited;
-  int masks_support;
-  int masks_inited;
-  int raster_inited;
+  gboolean blendif_support;
+  gboolean blend_inited;
+  gboolean blendif_inited;
+  gboolean masks_support;
+  gboolean masks_inited;
+  gboolean raster_inited;
 
   dt_develop_blend_colorspace_t csp;
   dt_iop_module_t *module;
@@ -303,8 +305,8 @@ typedef struct dt_iop_gui_blend_data_t
   GList *masks_modes_toggles;
 
   GtkWidget *iopw;
-  GtkBox *top_box;
-  GtkBox *bottom_box;
+  GtkBox *blend_box;
+  GtkBox *refine_box;
   GtkBox *masks_modes_box;
   GtkBox *blendif_box;
   GtkBox *masks_box;
@@ -320,7 +322,6 @@ typedef struct dt_iop_gui_blend_data_t
   GtkWidget *blend_modes_combo;
   GtkWidget *blend_modes_blend_order;
   GtkWidget *blend_mode_parameter_slider;
-  GtkWidget *masks_invert_combo;
   GtkWidget *opacity_slider;
   GtkWidget *masks_feathering_guide_combo;
   GtkWidget *feathering_radius_slider;
@@ -335,7 +336,7 @@ typedef struct dt_iop_gui_blend_data_t
   int tab;
   int altmode[8][2];
   dt_dev_pixelpipe_display_mask_t save_for_leave;
-  int timeout_handle;
+  guint timeout_handle;
   GtkNotebook *channel_tabs;
   gboolean output_channels_shown;
 
@@ -348,7 +349,7 @@ typedef struct dt_iop_gui_blend_data_t
   GtkWidget *masks_edit;
   GtkWidget *masks_polarity;
   int *masks_combo_ids;
-  int masks_shown;
+  dt_masks_edit_mode_t masks_shown;
 
   GtkWidget *raster_combo;
   GtkWidget *raster_polarity;
@@ -364,99 +365,140 @@ dt_blendop_cl_global_t *dt_develop_blend_init_cl_global(void);
 void dt_develop_blend_free_cl_global(dt_blendop_cl_global_t *b);
 
 /** apply blend */
-void dt_develop_blend_process(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
-                              const void *const i, void *const o, const struct dt_iop_roi_t *const roi_in,
-                              const struct dt_iop_roi_t *const roi_out);
+void dt_develop_blend_process(dt_iop_module_t *self,
+                              dt_dev_pixelpipe_iop_t *piece,
+                              const void *const i,
+                              void *const o,
+                              const dt_iop_roi_t *const roi_in,
+                              const dt_iop_roi_t *const roi_out);
 
 /** get blend version */
 int dt_develop_blend_version(void);
 
 /** returns the default blend color space for the given module */
-dt_develop_blend_colorspace_t dt_develop_blend_default_module_blend_colorspace(dt_iop_module_t *module);
+dt_develop_blend_colorspace_t
+dt_develop_blend_default_module_blend_colorspace(dt_iop_module_t *module);
 
 /** initializes the default blend parameters for the given color space in blend_params */
 void dt_develop_blend_init_blend_parameters(dt_develop_blend_params_t *blend_params,
-                                            dt_develop_blend_colorspace_t cst);
+                                            const dt_develop_blend_colorspace_t cst);
 
 /** initializes the default blendif parameters for the given color space in blend_params */
 void dt_develop_blend_init_blendif_parameters(dt_develop_blend_params_t *blend_params,
-                                              dt_develop_blend_colorspace_t cst);
+                                              const dt_develop_blend_colorspace_t cst);
 
 /** returns the color space for the given module */
-dt_iop_colorspace_type_t dt_develop_blend_colorspace(const dt_dev_pixelpipe_iop_t *const piece,
-                                                     dt_iop_colorspace_type_t cst);
+dt_iop_colorspace_type_t
+dt_develop_blend_colorspace(const dt_dev_pixelpipe_iop_t *const piece,
+                            const dt_iop_colorspace_type_t cst);
 
-/** check if content of params is all zero, indicating a non-initialized set of blend parameters which needs
- * special care. */
-gboolean dt_develop_blend_params_is_all_zero(const void *params, size_t length);
-
-/** update blendop params from older versions */
-int dt_develop_blend_legacy_params(dt_iop_module_t *module, const void *const old_params,
-                                   const int old_version, void *new_params, const int new_version,
-                                   const int length);
-int dt_develop_blend_legacy_params_from_so(dt_iop_module_so_t *module_so, const void *const old_params,
-                                           const int old_version, void *new_params, const int new_version,
-                                           const int length);
+/** update blendop params to current version */
+gboolean dt_develop_blend_legacy_params(dt_iop_module_t *module,
+                                        const void *const old_params,
+                                        const int old_version,
+                                        void *new_params,
+                                        const int new_version,
+                                        const int length);
+gboolean dt_develop_blend_legacy_params_from_so(dt_iop_module_so_t *module_so,
+                                                const void *const old_params,
+                                                const int old_version,
+                                                void *new_params,
+                                                const int new_version,
+                                                const int length);
 
 /** color blending utility functions */
 
 #define DEVELOP_BLENDIF_PARAMETER_ITEMS 6
 
-/** initializes the parameter array (of size DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE) */
-void dt_develop_blendif_process_parameters(float *const parameters, const dt_develop_blend_params_t *const params);
+/** initializes the parameter array (of size
+ * DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE) */
+void dt_develop_blendif_process_parameters(float *const parameters,
+                                           const dt_develop_blend_params_t *const params);
 
 /**
  * Set up a profile adapted to the blending.
  *
- * darktable built-in color profiles are chroma-adjusted such that they define a [D65 RGB -> D50 XYZ] transform,
- * which is expected by CIE Lab and the ICC pipeline. Since JzAzBz expects an XYZ vector adjusted for D65, we
- * apply a Bradford transform on the profile primaries to output D65 XYZ. The updated primaries are stored in
- * matrix_out. This is valid only in the context of blending with JzAzBz color space. The resulting XYZ is used
- * only to define masks and not re-injected into the pipeline.
+ * darktable built-in color profiles are chroma-adjusted such that
+ * they define a [D65 RGB -> D50 XYZ] transform, which is expected by
+ * CIE Lab and the ICC pipeline. Since JzAzBz expects an XYZ vector
+ * adjusted for D65, we apply a Bradford transform on the profile
+ * primaries to output D65 XYZ. The updated primaries are stored in
+ * matrix_out. This is valid only in the context of blending with
+ * JzAzBz color space. The resulting XYZ is used only to define masks
+ * and not re-injected into the pipeline.
  *
  * The initialized profile may only be used to convert from RGB to XYZ.
  */
-int dt_develop_blendif_init_masking_profile(struct dt_dev_pixelpipe_iop_t *piece,
-                                            dt_iop_order_iccprofile_info_t *blending_profile,
-                                            dt_develop_blend_colorspace_t cst);
+gboolean dt_develop_blendif_init_masking_profile(dt_dev_pixelpipe_iop_t *piece,
+                                                 dt_iop_order_iccprofile_info_t *blending_profile,
+                                                 const dt_develop_blend_colorspace_t cst);
 
 /** color blending mask generation functions */
 
-void dt_develop_blendif_raw_make_mask(struct dt_dev_pixelpipe_iop_t *piece, const float *const a,
-                                      const float *const b, const struct dt_iop_roi_t *const roi_in,
-                                      const struct dt_iop_roi_t *const roi_out, float *const mask);
-void dt_develop_blendif_lab_make_mask(struct dt_dev_pixelpipe_iop_t *piece, const float *const a,
-                                      const float *const b, const struct dt_iop_roi_t *const roi_in,
-                                      const struct dt_iop_roi_t *const roi_out, float *const mask);
-void dt_develop_blendif_rgb_hsl_make_mask(struct dt_dev_pixelpipe_iop_t *piece, const float *const a,
-                                          const float *const b, const struct dt_iop_roi_t *const roi_in,
-                                          const struct dt_iop_roi_t *const roi_out, float *const mask);
-void dt_develop_blendif_rgb_jzczhz_make_mask(struct dt_dev_pixelpipe_iop_t *piece, const float *const a,
-                                             const float *const b, const struct dt_iop_roi_t *const roi_in,
-                                             const struct dt_iop_roi_t *const roi_out, float *const mask);
+void dt_develop_blendif_raw_make_mask(dt_dev_pixelpipe_iop_t *piece,
+                                      const float *const a,
+                                      const float *const b,
+                                      const dt_iop_roi_t *const roi_in,
+                                      const dt_iop_roi_t *const roi_out,
+                                      float *const mask);
+
+void dt_develop_blendif_lab_make_mask(dt_dev_pixelpipe_iop_t *piece,
+                                      const float *const a,
+                                      const float *const b,
+                                      const dt_iop_roi_t *const roi_in,
+                                      const dt_iop_roi_t *const roi_out,
+                                      float *const mask);
+
+void dt_develop_blendif_rgb_hsl_make_mask(dt_dev_pixelpipe_iop_t *piece,
+                                          const float *const a,
+                                          const float *const b,
+                                          const dt_iop_roi_t *const roi_in,
+                                          const dt_iop_roi_t *const roi_out,
+                                          float *const mask);
+
+void dt_develop_blendif_rgb_jzczhz_make_mask(dt_dev_pixelpipe_iop_t *piece,
+                                             const float *const a,
+                                             const float *const b,
+                                             const dt_iop_roi_t *const roi_in,
+                                             const dt_iop_roi_t *const roi_out,
+                                             float *const mask);
 
 /** color blending operators */
 
-void dt_develop_blendif_raw_blend(struct dt_dev_pixelpipe_iop_t *piece, const float *const a, float *const b,
-                                  const struct dt_iop_roi_t *const roi_in,
-                                  const struct dt_iop_roi_t *const roi_out, const float *const mask,
+void dt_develop_blendif_raw_blend(dt_dev_pixelpipe_iop_t *piece,
+                                  const float *const a,
+                                  float *const b,
+                                  const dt_iop_roi_t *const roi_in,
+                                  const dt_iop_roi_t *const roi_out,
+                                  const float *const mask,
                                   const dt_dev_pixelpipe_display_mask_t request_mask_display);
-void dt_develop_blendif_lab_blend(struct dt_dev_pixelpipe_iop_t *piece, const float *const a, float *const b,
-                                  const struct dt_iop_roi_t *const roi_in,
-                                  const struct dt_iop_roi_t *const roi_out, const float *const mask,
+
+void dt_develop_blendif_lab_blend(dt_dev_pixelpipe_iop_t *piece,
+                                  const float *const a,
+                                  float *const b,
+                                  const dt_iop_roi_t *const roi_in,
+                                  const dt_iop_roi_t *const roi_out,
+                                  const float *const mask,
                                   const dt_dev_pixelpipe_display_mask_t request_mask_display);
-void dt_develop_blendif_rgb_hsl_blend(struct dt_dev_pixelpipe_iop_t *piece, const float *const a, float *const b,
-                                      const struct dt_iop_roi_t *const roi_in,
-                                      const struct dt_iop_roi_t *const roi_out, const float *const mask,
+
+void dt_develop_blendif_rgb_hsl_blend(dt_dev_pixelpipe_iop_t *piece,
+                                      const float *const a,
+                                      float *const b,
+                                      const dt_iop_roi_t *const roi_in,
+                                      const dt_iop_roi_t *const roi_out,
+                                      const float *const mask,
                                       const dt_dev_pixelpipe_display_mask_t request_mask_display);
-void dt_develop_blendif_rgb_jzczhz_blend(struct dt_dev_pixelpipe_iop_t *piece, const float *const a, float *const b,
-                                         const struct dt_iop_roi_t *const roi_in,
-                                         const struct dt_iop_roi_t *const roi_out, const float *const mask,
+
+void dt_develop_blendif_rgb_jzczhz_blend(dt_dev_pixelpipe_iop_t *piece,
+                                         const float *const a,
+                                         float *const b,
+                                         const dt_iop_roi_t *const roi_in,
+                                         const dt_iop_roi_t *const roi_out,
+                                         const float *const mask,
                                          const dt_dev_pixelpipe_display_mask_t request_mask_display);
 
 
 /** gui related stuff */
-void dt_iop_gui_init_blendif(GtkBox *blendw, dt_iop_module_t *module);
 void dt_iop_gui_init_blending(GtkWidget *iopw, dt_iop_module_t *module);
 void dt_iop_gui_update_blending(dt_iop_module_t *module);
 void dt_iop_gui_update_blendif(dt_iop_module_t *module);
@@ -465,19 +507,26 @@ void dt_iop_gui_cleanup_blending(dt_iop_module_t *module);
 void dt_iop_gui_blending_lose_focus(dt_iop_module_t *module);
 void dt_iop_gui_blending_reload_defaults(dt_iop_module_t *module);
 
-gboolean blend_color_picker_apply(dt_iop_module_t *module, GtkWidget *picker, dt_dev_pixelpipe_iop_t *piece);
-
-/** routine to translate from mode id to sequence in option list */
-int dt_iop_gui_blending_mode_seq(dt_iop_gui_blend_data_t *bd, int mode);
-
+gboolean blend_color_picker_apply(dt_iop_module_t *module,
+                                  GtkWidget *picker,
+                                  dt_dev_pixelpipe_t *pipe);
 
 #ifdef HAVE_OPENCL
 /** apply blend for opencl modules*/
-int dt_develop_blend_process_cl(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
-                                cl_mem dev_in, cl_mem dev_out, const struct dt_iop_roi_t *roi_in,
-                                const struct dt_iop_roi_t *roi_out);
+gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     cl_mem dev_in,
+                                     cl_mem dev_out,
+                                     const dt_iop_roi_t *roi_in,
+                                     const dt_iop_roi_t *roi_out);
 #endif
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+#define _BLEND_FUNC_PROTO(align, uni) DT_OMP_DECLARE_SIMD(aligned align uniform uni) static void
+
+G_END_DECLS
+
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

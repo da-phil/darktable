@@ -22,7 +22,9 @@ typedef enum pw_storage_backend_t
 {
   PW_STORAGE_BACKEND_NONE = 0,
   PW_STORAGE_BACKEND_KWALLET,
-  PW_STORAGE_BACKEND_LIBSECRET
+  PW_STORAGE_BACKEND_LIBSECRET,
+  PW_STORAGE_BACKEND_APPLE_KEYCHAIN,
+  PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS
 } pw_storage_backend_t;
 
 /** pwstorage context */
@@ -41,6 +43,9 @@ gboolean dt_pwstorage_set(const gchar *slot, GHashTable *table);
 /** Load (key,value) pairs. */
 GHashTable *dt_pwstorage_get(const gchar *slot);
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

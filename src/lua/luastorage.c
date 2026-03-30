@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2014-2021 darktable developers.
+   Copyright (C) 2014-2025 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -14,18 +14,19 @@
 
    You should have received a copy of the GNU General Public License
    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
- */
+*/
+
 #include "lua/luastorage.h"
+#include "common/darktable.h"
 #include "common/file_location.h"
 #include "common/image.h"
-#include "common/imageio.h"
-#include "common/imageio_module.h"
 #include "control/jobs.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_module.h"
 #include "lua/call.h"
 #include "lua/glist.h"
 #include "lua/image.h"
 #include "lua/widget/widget.h"
-#include <common/darktable.h>
 #include <stdio.h>
 
 typedef struct
@@ -52,11 +53,14 @@ static void push_lua_data(lua_State*L, lua_storage_t *d)
   lua_pushlightuserdata(L, d);
   lua_gettable(L, LUA_REGISTRYINDEX);
 }
+
 static const char *name_wrapper(const struct dt_imageio_module_storage_t *self)
 {
   return ((lua_storage_gui_t *)self->gui_data)->name;
 }
+
 static void empty_wrapper(struct dt_imageio_module_storage_t *self){};
+
 static int default_supported_wrapper(struct dt_imageio_module_storage_t *self,
                                      struct dt_imageio_module_format_t *format)
 {
@@ -69,26 +73,39 @@ static int default_supported_wrapper(struct dt_imageio_module_storage_t *self,
     return FALSE;
   }
 }
-static int default_dimension_wrapper(struct dt_imageio_module_storage_t *self, dt_imageio_module_data_t *data,
-                                     uint32_t *width, uint32_t *height)
+
+static int default_dimension_wrapper(struct dt_imageio_module_storage_t *self,
+                                     dt_imageio_module_data_t *data,
+                                     uint32_t *width,
+                                     uint32_t *height)
 {
   return 0;
 };
 
-static int store_wrapper(struct dt_imageio_module_storage_t *self, struct dt_imageio_module_data_t *self_data,
-                         const int imgid, dt_imageio_module_format_t *format, dt_imageio_module_data_t *fdata,
-                         const int num, const int total, const gboolean high_quality, const gboolean upscale,
-                         const gboolean export_masks, dt_colorspaces_color_profile_type_t icc_type,
-                         const gchar *icc_filename, dt_iop_color_intent_t icc_intent, dt_export_metadata_t *metadata)
+static int store_wrapper(struct dt_imageio_module_storage_t *self,
+                         struct dt_imageio_module_data_t *self_data,
+                         const dt_imgid_t imgid,
+                         dt_imageio_module_format_t *format,
+                         dt_imageio_module_data_t *fdata,
+                         const int num,
+                         const int total,
+                         const gboolean high_quality,
+                         const gboolean upscale,
+                         const gboolean is_scaling,
+                         const double scale_factor,
+                         const gboolean export_masks,
+                         dt_colorspaces_color_profile_type_t icc_type,
+                         const gchar *icc_filename,
+                         dt_iop_color_intent_t icc_intent,
+                         dt_export_metadata_t *metadata)
 {
 
   /* construct a temporary file name */
   char tmpdir[PATH_MAX] = { 0 };
-  gboolean from_cache = FALSE;
   dt_loc_get_tmp_dir(tmpdir, sizeof(tmpdir));
 
   char dirname[PATH_MAX] = { 0 };
-  dt_image_full_path(imgid, dirname, sizeof(dirname), &from_cache);
+  dt_image_full_path(imgid, dirname, sizeof(dirname), NULL);
   dt_image_path_append_version(imgid, dirname, sizeof(dirname));
   gchar *filename = g_path_get_basename(dirname);
   gchar *end = g_strrstr(filename, ".") + 1;
@@ -96,10 +113,11 @@ static int store_wrapper(struct dt_imageio_module_storage_t *self, struct dt_ima
 
   gchar *complete_name = g_build_filename(tmpdir, filename, (char *)NULL);
 
-  if(dt_imageio_export(imgid, complete_name, format, fdata, high_quality, upscale, TRUE, export_masks, icc_type,
-                       icc_filename, icc_intent, self, self_data, num, total, metadata) != 0)
+  if(dt_imageio_export(imgid, complete_name, format, fdata, high_quality, upscale, is_scaling, scale_factor,
+                       TRUE, export_masks, icc_type, icc_filename, icc_intent, self, self_data, num, total, metadata) != 0)
   {
-    fprintf(stderr, "[%s] could not export to file: `%s'!\n", self->name(self), complete_name);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[lua] %s: could not export to file `%s'!", self->name(self), complete_name);
     g_free(complete_name);
     g_free(filename);
     return 1;
@@ -146,9 +164,13 @@ static int store_wrapper(struct dt_imageio_module_storage_t *self, struct dt_ima
 }
 
 // FIXME: return 0 on success and 1 on error!
-static int initialize_store_wrapper(struct dt_imageio_module_storage_t *self, dt_imageio_module_data_t *data,
-                                    dt_imageio_module_format_t **format, dt_imageio_module_data_t **fdata,
-                                    GList **images, const gboolean high_quality, const gboolean upscale)
+static int initialize_store_wrapper(struct dt_imageio_module_storage_t *self,
+                                    dt_imageio_module_data_t *data,
+                                    dt_imageio_module_format_t **format,
+                                    dt_imageio_module_data_t **fdata,
+                                    GList **images,
+                                    const gboolean high_quality,
+                                    const gboolean upscale)
 {
   dt_lua_lock();
   lua_State *L = darktable.lua_state.state;
@@ -187,7 +209,8 @@ static int initialize_store_wrapper(struct dt_imageio_module_storage_t *self, dt
     g_list_free(*images);
     if(lua_type(L, -1) != LUA_TTABLE)
     {
-      dt_print(DT_DEBUG_LUA, "LUA ERROR initialization function of storage did not return nil or table\n");
+      dt_print(DT_DEBUG_LUA,
+               "LUA ERROR initialization function of storage did not return nil or table");
       dt_lua_unlock();
       return 1;
     }
@@ -207,7 +230,9 @@ static int initialize_store_wrapper(struct dt_imageio_module_storage_t *self, dt
   dt_lua_unlock();
   return 0;
 }
-static void finalize_store_wrapper(struct dt_imageio_module_storage_t *self, dt_imageio_module_data_t *data)
+
+static void finalize_store_wrapper(struct dt_imageio_module_storage_t *self,
+                                   dt_imageio_module_data_t *data)
 {
   dt_lua_lock();
   lua_State *L = darktable.lua_state.state;
@@ -236,10 +261,12 @@ static void finalize_store_wrapper(struct dt_imageio_module_storage_t *self, dt_
   lua_pop(L, 2);
   dt_lua_unlock();
 }
+
 static size_t params_size_wrapper(struct dt_imageio_module_storage_t *self)
 {
   return 0;
 }
+
 static void *get_params_wrapper(struct dt_imageio_module_storage_t *self)
 {
   lua_storage_t *d = malloc(sizeof(lua_storage_t));
@@ -271,6 +298,7 @@ static void free_param_wrapper_destroy(void * data)
   free(d);
   free(params);
 }
+
 static int32_t free_param_wrapper_job(dt_job_t *job)
 {
   free_param_wrapper_data *params = dt_control_job_get_params(job);
@@ -288,11 +316,12 @@ static int32_t free_param_wrapper_job(dt_job_t *job)
 }
 
 
-static void free_params_wrapper(struct dt_imageio_module_storage_t *self, dt_imageio_module_data_t *data)
+static void free_params_wrapper(struct dt_imageio_module_storage_t *self,
+                                dt_imageio_module_data_t *data)
 {
   dt_job_t *job = dt_control_job_create(&free_param_wrapper_job, "lua: destroy storage param");
   if(!job) return;
-  free_param_wrapper_data *t = (free_param_wrapper_data *)calloc(1, sizeof(free_param_wrapper_data));
+  free_param_wrapper_data *t = calloc(1, sizeof(free_param_wrapper_data));
   if(!t)
   {
     dt_control_job_dispose(job);
@@ -300,10 +329,12 @@ static void free_params_wrapper(struct dt_imageio_module_storage_t *self, dt_ima
   }
   dt_control_job_set_params(job, t, free_param_wrapper_destroy);
   t->data = (lua_storage_t *)data;
-  dt_control_add_job(darktable.control, DT_JOB_QUEUE_SYSTEM_BG, job);
+  dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, job);
 }
 
-static int set_params_wrapper(struct dt_imageio_module_storage_t *self, const void *params, const int size)
+static int set_params_wrapper(struct dt_imageio_module_storage_t *self,
+                              const void *params,
+                              const int size)
 {
   return 0;
 }
@@ -457,7 +488,7 @@ static int register_storage(lua_State *L)
     for(GList *it = darktable.imageio->plugins_format; it; it = g_list_next(it))
     {
       lua_pushvalue(L, 5);
-      dt_imageio_module_format_t *format = (dt_imageio_module_format_t *)it->data;
+      dt_imageio_module_format_t *format = it->data;
       dt_imageio_module_data_t *sdata = storage->get_params(storage);
       dt_imageio_module_data_t *fdata = format->get_params(format);
       luaA_push_type(L, storage->parameter_lua_type, sdata);
@@ -478,7 +509,7 @@ static int register_storage(lua_State *L)
     // all formats are supported
     for(GList *it = darktable.imageio->plugins_format; it; it = g_list_next(it))
     {
-      dt_imageio_module_format_t *format = (dt_imageio_module_format_t *)it->data;
+      dt_imageio_module_format_t *format = it->data;
       data->supported_formats = g_list_prepend(data->supported_formats, format);
     }
   }
@@ -522,6 +553,8 @@ int dt_lua_init_luastorages(lua_State *L)
   return 0;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

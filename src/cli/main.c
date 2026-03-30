@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2012-2021 darktable developers.
+    Copyright (C) 2012-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -34,12 +34,12 @@
 #include "common/history.h"
 #include "common/image.h"
 #include "common/image_cache.h"
-#include "common/imageio.h"
-#include "common/imageio_jpeg.h"
-#include "common/imageio_module.h"
 #include "common/points.h"
 #include "control/conf.h"
 #include "develop/imageop.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_jpeg.h"
+#include "imageio/imageio_module.h"
 
 #include <inttypes.h>
 #include <libintl.h>
@@ -61,31 +61,50 @@
 
 static void usage(const char *progname)
 {
-  fprintf(stderr, "usage: %s [<input file or dir>] [<xmp file>] <output destination> [options] [--core <darktable options>]\n", progname);
-  fprintf(stderr, "\n");
-  fprintf(stderr, "options:\n");
-  fprintf(stderr, "   --width <max width> default: 0 = full resolution\n");
-  fprintf(stderr, "   --height <max height> default: 0 = full resolution\n");
-  fprintf(stderr, "   --bpp <bpp>, unsupported\n");
-  fprintf(stderr, "   --hq <0|1|false|true> default: true\n");
-  fprintf(stderr, "   --upscale <0|1|false|true>, default: false\n");
-  fprintf(stderr, "   --export_masks <0|1|false|true>, default: false\n");
-  fprintf(stderr, "   --style <style name>\n");
-  fprintf(stderr, "   --style-overwrite\n");
-  fprintf(stderr, "   --apply-custom-presets <0|1|false|true>, default: true\n");
-  fprintf(stderr, "                          disable for multiple instances\n");
-  fprintf(stderr, "   --out-ext <extension>, default from output destination or '.jpg'\n");
-  fprintf(stderr, "                          if specified, takes preference over output\n");
-  fprintf(stderr, "   --import <file or dir> specify input file or dir, can be used'\n");
-  fprintf(stderr, "                          multiple times instead of input file\n");
-  fprintf(stderr, "   --icc-type <type> specify icc type, default to NONE\n");
-  fprintf(stderr, "                     use --help icc-type for list of supported types\n");
-  fprintf(stderr, "   --icc-file <file> specify icc filename, default to NONE\n");
-  fprintf(stderr, "   --icc-intent <intent> specify icc intent, default to LAST\n");
-  fprintf(stderr, "                     use --help icc-intent for list of supported intents\n");
-  fprintf(stderr, "   --verbose\n");
-  fprintf(stderr, "   --help,-h [option]\n");
-  fprintf(stderr, "   --version\n");
+fprintf(stderr, "darktable %s\n"
+                "Copyright (C) 2012-%s Johannes Hanika and other contributors.\n"
+                "\n"
+                "<https://www.darktable.org>\n"
+                "darktable is an open source photography workflow application and\n"
+                "non-destructive raw developer for photographers.\n"
+                "GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>\n"
+                "This is free software: you are free to change and redistribute it.\n"
+                "There is NO WARRANTY, to the extent permitted by law.\n\n"
+                "Usage:\n"
+                "\n"
+                "  darktable-cli [IMAGE_FILE | IMAGE_FOLDER]\n"
+                "                [XMP_FILE] DIR [OPTIONS]\n"
+                "                [--core DARKTABLE_OPTIONS]\n"
+                "\n"
+                "Options:\n"
+                "   --apply-custom-presets <0|1|false|true>, default: true\n"
+                "                          disable for multiple instances\n"
+                "   --bpp <bpp>, unsupported\n"
+                "   --export_masks <0|1|false|true>, default: false\n"
+
+                "   --height <max height> default: 0 = full resolution\n"
+                "   --width <max width> default: 0 = full resolution\n"
+
+                "   --hq <0|1|false|true> default: true\n"
+                "   --upscale <0|1|false|true>, default: false\n"
+                "   --style <style name>\n"
+                "   --style-overwrite\n"
+                "   --out-ext <extension>, default from output destination or '.jpg'\n"
+                "                          if specified, takes preference over output\n"
+                "   --import <file or dir> specify input file or dir, can be used'\n"
+                "                          multiple times instead of input file\n"
+                "   --icc-type <type> specify icc type, default to NONE\n"
+                "                     use --help icc-type for list of supported types\n"
+                "   --icc-file <file> specify icc filename, default to NONE\n"
+                "   --icc-intent <intent> specify icc intent, default to LAST\n"
+                "                     use --help icc-intent for list of supported intents\n"
+                "   --verbose\n"
+                "   -h, --help [option]\n"
+                "   -v, --version\n",
+                darktable_package_version,
+                darktable_last_commit_year);
+
+  // FS TODO: to add instructions for DARKTABLE_OPTIONS
 }
 
 static void icc_types()
@@ -119,6 +138,7 @@ static void icc_types()
   fprintf(stderr, " HLG_REC2020\n");
   fprintf(stderr, " PQ_P3\n");
   fprintf(stderr, " HLG_P3\n");
+  fprintf(stderr, " DISPLAY_P3\n");
 }
 
 #define ICC_FROM_STR(name) if(!strcmp(option, #name)) return DT_COLORSPACE_ ## name;
@@ -151,6 +171,7 @@ static dt_colorspaces_color_profile_type_t get_icc_type(const char* option)
   ICC_FROM_STR(HLG_REC2020);
   ICC_FROM_STR(PQ_P3);
   ICC_FROM_STR(HLG_P3);
+  ICC_FROM_STR(DISPLAY_P3);
   return DT_COLORSPACE_LAST;
 }
 #undef ICC_FROM_STR
@@ -223,11 +244,12 @@ int main(int argc, char *arg[])
         }
         exit(1);
       }
-      else if(!strcmp(arg[k], "--version"))
+      else if(!strcmp(arg[k], "--version") || !strcmp(arg[k], "-v"))
       {
-        printf("this is darktable-cli %s\ncopyright (c) 2012-%s johannes hanika, tobias ellinghaus\n",
-               darktable_package_version, darktable_last_commit_year);
-        exit(0);
+          printf("darktable %s\nCopyright (C) 2012-%s Johannes Hanika and other contributors.\n\n",darktable_package_version, darktable_last_commit_year);
+          printf("See %s for detailed documentation.\n", PACKAGE_DOCS);
+          printf("See %s to report bugs.\n",PACKAGE_BUGREPORT);
+          exit(0);
       }
       else if(!strcmp(arg[k], "--width") && argc > k + 1)
       {
@@ -328,7 +350,7 @@ int main(int argc, char *arg[])
           usage(arg[0]);
           exit(1);
         }
-        if (*arg[k] == '.')
+        if(*arg[k] == '.')
         {
           //remove dot ;)
           arg[k]++;
@@ -440,7 +462,7 @@ int main(int argc, char *arg[])
     output_filename = g_strdup(input_filename);
     input_filename = xmp_filename = NULL;
   }
-  else if (inputs && file_counter == 2)
+  else if(inputs && file_counter == 2)
   {
     // inputs as options, xmp & output specified
     if(output_filename)
@@ -449,7 +471,7 @@ int main(int argc, char *arg[])
     xmp_filename = input_filename;
     input_filename = NULL;
   }
-  else if (inputs && file_counter == 3)
+  else if(inputs && file_counter == 3)
   {
     fprintf(stderr, _("error: input file and import opts specified! that's not supported!\n"));
     usage(arg[0]);
@@ -458,8 +480,7 @@ int main(int argc, char *arg[])
       g_free(output_filename);
     if(output_ext)
       g_free(output_ext);
-    if(inputs)
-      g_list_free_full(inputs, g_free);
+    g_list_free_full(inputs, g_free);
     exit(1);
   }
   else if(file_counter == 2)
@@ -526,26 +547,60 @@ int main(int argc, char *arg[])
 
     if(g_file_test(input, G_FILE_TEST_IS_DIR))
     {
-      const int filmid = dt_film_import(input);
-      if(!filmid)
+      //const dt_filmid_t filmid = dt_film_import(input);
+      dt_film_t film;
+      dt_filmid_t filmid = dt_film_new(&film, input);
+      //if(!filmid)
+      if(!dt_is_valid_filmid(filmid))
       {
-        // one of inputs was a failure, no prob
         fprintf(stderr, _("error: can't open folder %s"), input);
         fprintf(stderr, "\n");
         continue;
       }
-      id_list = g_list_concat(id_list, dt_film_get_image_ids(filmid));
+      // Based on dt_pathlist_import_create in control/jobs/film_jobs.c
+      GDir *cdir = g_dir_open(input, 0, NULL);
+      if(cdir)
+      {
+        const gchar *fname;
+        while((fname = g_dir_read_name(cdir)) != NULL)
+        {
+          if(fname[0] == '.') continue;  // skip hidden files
+          gchar *fullname = g_build_filename(input, fname, NULL);
+          if(!g_file_test(fullname, G_FILE_TEST_IS_DIR) && dt_supported_image(fname))
+          {
+            // Import each supported image file directly
+            const dt_imgid_t imgid = dt_image_import(filmid, fullname, TRUE, FALSE);
+            if(dt_is_valid_imgid(imgid))
+            {
+              id_list = g_list_append(id_list, GINT_TO_POINTER(imgid));
+            }
+            else
+            {
+              fprintf(stderr, _("error: can't import file %s"), fullname);
+              fprintf(stderr, "\n");
+            }
+          }
+          g_free(fullname);
+        }
+        g_dir_close(cdir);
+      }
+      else
+      {
+        fprintf(stderr, _("error: can't read directory %s"), input);
+        fprintf(stderr, "\n");
+        continue;
+      }
     }
     else
     {
       dt_film_t film;
-      int filmid = 0;
+      dt_filmid_t filmid = NO_FILMID;
 
       gchar *directory = g_path_get_dirname(input);
       filmid = dt_film_new(&film, directory);
-      const int32_t id = dt_image_import(filmid, input, TRUE, TRUE);
+      const dt_imgid_t id = dt_image_import(filmid, input, TRUE, FALSE);
       g_free(directory);
-      if(!id)
+      if(!dt_is_valid_imgid(id))
       {
         fprintf(stderr, _("error: can't open file %s"), input);
         fprintf(stderr, "\n");
@@ -578,10 +633,10 @@ int main(int argc, char *arg[])
     for(GList *iter = id_list; iter; iter = g_list_next(iter))
     {
       int id = GPOINTER_TO_INT(iter->data);
-      dt_image_t *image = dt_image_cache_get(darktable.image_cache, id, 'w');
-      if(dt_exif_xmp_read(image, xmp_filename, 1) != 0)
+      dt_image_t *image = dt_image_cache_get(id, 'w');
+      if(dt_exif_xmp_read(image, xmp_filename, FALSE))
       {
-        fprintf(stderr, _("error: can't open xmp file %s"), xmp_filename);
+        fprintf(stderr, _("error: can't open XMP file %s"), xmp_filename);
         fprintf(stderr, "\n");
         free(m_arg);
         g_free(output_filename);
@@ -590,7 +645,7 @@ int main(int argc, char *arg[])
         exit(1);
       }
       // don't write new xmp:
-      dt_image_cache_write_release(darktable.image_cache, image, DT_IMAGE_CACHE_RELAXED);
+      dt_image_cache_write_release(image, DT_IMAGE_CACHE_RELAXED);
     }
   }
 
@@ -649,6 +704,12 @@ int main(int argc, char *arg[])
   {
     g_free(output_ext);
     output_ext = g_strdup("tiff");
+  }
+
+  if(!strcmp(output_ext, "jxl"))
+  {
+    g_free(output_ext);
+    output_ext = g_strdup("jpegxl");
   }
 
   // init the export data structures
@@ -747,11 +808,22 @@ int main(int argc, char *arg[])
   for(GList *iter = id_list; iter; iter = g_list_next(iter), num++)
   {
     const int id = GPOINTER_TO_INT(iter->data);
-    // TODO: have a parameter in command line to get the export presets
     dt_export_metadata_t metadata;
-    metadata.flags = dt_lib_export_metadata_default_flags();
-    metadata.list = NULL;
-    if(storage->store(storage, sdata, id, format, fdata, num, total, high_quality, upscale, export_masks,
+    // TODO: have a parameter in command line to get the export presets
+    if(custom_presets)
+    {
+      metadata.flags = dt_lib_export_metadata_get_conf_flags();
+      metadata.list = dt_util_str_to_glist("\1", dt_lib_export_metadata_get_conf());
+      if(metadata.list)
+        metadata.list = g_list_remove(metadata.list, metadata.list->data);
+    }
+    else
+    {
+      metadata.flags = dt_lib_export_metadata_default_flags();
+      metadata.list = NULL;
+    }
+    if(storage->store(storage, sdata, id, format, fdata, num, total, high_quality,
+                      upscale, FALSE, 1.0, export_masks,
                       icc_type, icc_filename, icc_intent, &metadata) != 0)
       res = 1;
   }
@@ -771,6 +843,8 @@ int main(int argc, char *arg[])
   exit(res);
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2021 darktable developers.
+    Copyright (C) 2010-2023 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,23 +15,15 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "button.h"
 #include "bauhaus/bauhaus.h"
 #include "gui/gtk.h"
 #include <string.h>
 
-static void _button_class_init(GtkDarktableButtonClass *klass);
-static void _button_init(GtkDarktableButton *button);
-static gboolean _button_draw(GtkWidget *widget, cairo_t *cr);
+G_DEFINE_TYPE(GtkDarktableButton, dtgtk_button, GTK_TYPE_BUTTON)
 
-static void _button_class_init(GtkDarktableButtonClass *klass)
-{
-  GtkWidgetClass *widget_class = (GtkWidgetClass *)klass;
-
-  widget_class->draw = _button_draw;
-}
-
-static void _button_init(GtkDarktableButton *button)
+static void dtgtk_button_init(GtkDarktableButton *button)
 {
 }
 
@@ -74,17 +66,8 @@ static gboolean _button_draw(GtkWidget *widget, cairo_t *cr)
   int cwidth = width - margin.left - margin.right;
   int cheight = height - margin.top - margin.bottom;
 
-  /* draw standard button background if not transparent */
-  if(flags & CPF_STYLE_FLAT)
-  {
-    if(flags & CPF_PRELIGHT)
-      gtk_render_background(context, cr, startx, starty, cwidth, cheight);
-    else if (!(flags & CPF_ACTIVE))
-      fg_color.alpha = CLAMP(fg_color.alpha / 2.0, 0.3, 1.0);
-  }
-  else if(!(flags & CPF_BG_TRANSPARENT))
-    gtk_render_background(context, cr, startx, starty, cwidth, cheight);
-
+  /* draw standard button background and borders */
+  gtk_render_background(context, cr, startx, starty, cwidth, cheight);
   gtk_render_frame(context, cr, startx, starty, cwidth, cheight);
   gdk_cairo_set_source_rgba(cr, &fg_color);
 
@@ -97,12 +80,12 @@ static gboolean _button_draw(GtkWidget *widget, cairo_t *cr)
     cwidth -= border.left + border.right + padding.left + padding.right;
     cheight -= border.top + border.bottom + padding.top + padding.bottom;
 
-    /* we have to leave some breathing room to the cairo icon paint function to possibly    */
-    /* draw slightly outside the bounding box, for optical alignment and balancing of icons */
-    /* we do this by putting a drawing area widget inside the button and using the CSS      */
-    /* margin property in px of the drawing area as extra room in percent (DPI safe)        */
-    /* we do this because Gtk+ does not support CSS size in percent                         */
-    /* this extra margin can be also (slightly) negative                                    */
+    /* We have to leave some breathing room to the cairo icon paint function to possibly
+       draw slightly outside the bounding box, for alignment and balancing of icons.
+       We do this by putting a drawing area widget inside the button and using the CSS
+       margin property in px of the drawing area as extra room in percent (DPI safe).
+       We do this because GTK does not support CSS size in percent.
+       This extra margin can be also (slightly) negative. */
     GtkStyleContext *ccontext = gtk_widget_get_style_context(DTGTK_BUTTON(widget)->canvas);
     GtkBorder cmargin;
     gtk_style_context_get_margin(ccontext, state, &cmargin);
@@ -120,8 +103,17 @@ static gboolean _button_draw(GtkWidget *widget, cairo_t *cr)
   return FALSE;
 }
 
+static void dtgtk_button_class_init(GtkDarktableButtonClass *klass)
+{
+  GtkWidgetClass *widget_class = (GtkWidgetClass *)klass;
+
+  widget_class->draw = _button_draw;
+}
+
 // Public functions
-GtkWidget *dtgtk_button_new(DTGTKCairoPaintIconFunc paint, gint paintflags, void *paintdata)
+GtkWidget *dtgtk_button_new(DTGTKCairoPaintIconFunc paint,
+                            gint paintflags,
+                            void *paintdata)
 {
   GtkDarktableButton *button;
   button = g_object_new(dtgtk_button_get_type(), NULL);
@@ -130,29 +122,15 @@ GtkWidget *dtgtk_button_new(DTGTKCairoPaintIconFunc paint, gint paintflags, void
   button->icon_data = paintdata;
   button->canvas = gtk_drawing_area_new();
   gtk_container_add(GTK_CONTAINER(button), button->canvas);
-  gtk_widget_set_name(GTK_WIDGET(button), "dt-button");
+  dt_gui_add_class(GTK_WIDGET(button), "dt_module_btn");
   gtk_widget_set_name(GTK_WIDGET(button->canvas), "button-canvas");
   return (GtkWidget *)button;
 }
 
-GType dtgtk_button_get_type()
-{
-  static GType dtgtk_button_type = 0;
-  if(!dtgtk_button_type)
-  {
-    static const GTypeInfo dtgtk_button_info = {
-      sizeof(GtkDarktableButtonClass), (GBaseInitFunc)NULL, (GBaseFinalizeFunc)NULL,
-      (GClassInitFunc)_button_class_init, NULL, /* class_finalize */
-      NULL,                                     /* class_data */
-      sizeof(GtkDarktableButton), 0,            /* n_preallocs */
-      (GInstanceInitFunc)_button_init,
-    };
-    dtgtk_button_type = g_type_register_static(GTK_TYPE_BUTTON, "GtkDarktableButton", &dtgtk_button_info, 0);
-  }
-  return dtgtk_button_type;
-}
-
-void dtgtk_button_set_paint(GtkDarktableButton *button, DTGTKCairoPaintIconFunc paint, gint paintflags, void *paintdata)
+void dtgtk_button_set_paint(GtkDarktableButton *button,
+                            DTGTKCairoPaintIconFunc paint,
+                            gint paintflags,
+                            void *paintdata)
 {
   g_return_if_fail(button != NULL);
   button->icon = paint;
@@ -169,30 +147,8 @@ void dtgtk_button_set_active(GtkDarktableButton *button, gboolean active)
     button->icon_flags &= ~CPF_ACTIVE;
 }
 
-void dtgtk_button_override_color(GtkDarktableButton *button, GdkRGBA *color)
-{
-  g_return_if_fail(button != NULL);
-  if(color)
-  {
-    button->fg = *color;
-    button->icon_flags |= CPF_CUSTOM_FG;
-  }
-  else
-    button->icon_flags &= ~CPF_CUSTOM_FG;
-}
-
-void dtgtk_button_override_background_color(GtkDarktableButton *button, GdkRGBA *color)
-{
-  g_return_if_fail(button != NULL);
-  if(color)
-  {
-    button->bg = *color;
-    button->icon_flags |= CPF_CUSTOM_BG;
-  }
-  else
-    button->icon_flags &= ~CPF_CUSTOM_BG;
-}
-
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

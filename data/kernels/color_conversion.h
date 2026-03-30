@@ -19,16 +19,16 @@
 #include "common.h"
 #include "colorspace.h"
 
-// must be in synch with dt_iop_colorspace_type_t in imageop.h
+// must be in synch with dt_iop_colorspace_type_t in colorspaces.h
 typedef enum dt_iop_colorspace_type_t
 {
-  iop_cs_NONE = -1,
-  iop_cs_RAW = 0,
-  iop_cs_Lab = 1,
-  iop_cs_rgb = 2,
-  iop_cs_LCh = 3,
-  iop_cs_HSL = 4,
-  iop_cs_JzCzhz = 5,
+  IOP_CS_NONE = -1,
+  IOP_CS_RAW = 0,
+  IOP_CS_LAB = 1,
+  IOP_CS_RGB = 2,
+  IOP_CS_LCH = 3,
+  IOP_CS_HSL = 4,
+  IOP_CS_JZCZHZ = 5,
 } dt_iop_colorspace_type_t;
 
 // must be in synch with dt_colorspaces_iccprofile_info_cl_t
@@ -62,7 +62,7 @@ static inline float lerp_lookup_unbounded(const float x, read_only image2d_t lut
       const float l2 = read_imagef(lut, sampleri, p2).x;
       return l1 * (1.0f - f) + l2 * f;
     }
-    else return unbounded_coeffs[1] * native_powr(x*unbounded_coeffs[0], unbounded_coeffs[2]);
+    else return unbounded_coeffs[1] * dtcl_pow(x*unbounded_coeffs[0], unbounded_coeffs[2]);
   }
   else return x;
 }
@@ -86,7 +86,7 @@ static inline float lookup_unbounded(read_only image2d_t lut, const float x, con
       const int2 p = (int2)((xi & 0xff), (xi >> 8));
       return read_imagef(lut, sampleri, p).x;
     }
-    else return a[1] * native_powr(x*a[0], a[2]);
+    else return a[1] * dtcl_pow(x*a[0], a[2]);
   }
   else return x;
 }

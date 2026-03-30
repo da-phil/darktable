@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2017-2021 darktable developers.
+    Copyright (C) 2017-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 #include "common/collection.h"
 #include "common/darktable.h"
 #include "common/image.h"
+#include "common/image_cache.h"
 #include "control/control.h"
 #include <glib.h>   // for GList, gpointer, g_list_prepend
 #include <stdlib.h> // for NULL, malloc, free
@@ -34,7 +35,11 @@ typedef struct dt_undo_item_t
   dt_undo_data_t data;
   double ts;
   gboolean is_group;
-  void (*undo)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t data, dt_undo_action_t action, GList **imgs);
+  void (*undo)(gpointer user_data,
+               dt_undo_type_t type,
+               dt_undo_data_t data,
+               dt_undo_action_t action,
+               GList **imgs);
   void (*free_data)(gpointer data);
 } dt_undo_item_t;
 
@@ -44,24 +49,25 @@ dt_undo_t *dt_undo_init(void)
   udata->undo_list = NULL;
   udata->redo_list = NULL;
   udata->disable_next = FALSE;
-  udata->locked = FALSE;
-  dt_pthread_mutex_init(&udata->mutex, NULL);
+
+  pthread_mutexattr_t recursive_locking;
+  pthread_mutexattr_init(&recursive_locking);
+  pthread_mutexattr_settype(&recursive_locking, PTHREAD_MUTEX_RECURSIVE);
+  dt_pthread_mutex_init(&udata->mutex, &recursive_locking);
+
   udata->group = DT_UNDO_NONE;
   udata->group_indent = 0;
-  dt_print(DT_DEBUG_UNDO, "[undo] init\n");
+  dt_print(DT_DEBUG_UNDO, "[undo] init");
   return udata;
 }
 
-#define LOCK \
-  dt_pthread_mutex_lock(&self->mutex); self->locked = TRUE
-
-#define UNLOCK \
-  self->locked = FALSE; dt_pthread_mutex_unlock(&self->mutex)
+#define LOCK    dt_pthread_mutex_lock(&self->mutex);
+#define UNLOCK  dt_pthread_mutex_unlock(&self->mutex)
 
 void dt_undo_disable_next(dt_undo_t *self)
 {
   self->disable_next = TRUE;
-  dt_print(DT_DEBUG_UNDO, "[undo] disable next\n");
+  dt_print(DT_DEBUG_UNDO, "[undo] disable next");
 }
 
 void dt_undo_cleanup(dt_undo_t *self)
@@ -73,86 +79,100 @@ void dt_undo_cleanup(dt_undo_t *self)
 static void _free_undo_data(void *p)
 {
   dt_undo_item_t *item = (dt_undo_item_t *)p;
-  if (item->free_data) item->free_data(item->data);
+  if(item->free_data) item->free_data(item->data);
   free(item);
 }
 
-static void _undo_record(dt_undo_t *self, gpointer user_data, dt_undo_type_t type, dt_undo_data_t data,
-                         gboolean is_group,
-                         void (*undo)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t item, dt_undo_action_t action, GList **imgs),
+static void _undo_record(dt_undo_t *self,
+                         gpointer user_data,
+                         const dt_undo_type_t type,
+                         const dt_undo_data_t data,
+                         const gboolean is_group,
+                         void (*undo)(gpointer user_data,
+                                      const dt_undo_type_t type,
+                                      const dt_undo_data_t item,
+                                      const dt_undo_action_t action,
+                                      GList **imgs),
                          void (*free_data)(gpointer data))
 {
   if(!self) return;
 
-  if(self->disable_next)
+  LOCK;
+
+  const gboolean disable_next = self->disable_next;
+  if(disable_next)
   {
     if(free_data) free_data(data);
     self->disable_next = FALSE;
   }
   else
   {
-    // do not block, if an undo record is asked and there is a lock it means that this call has been done in un
-    // undo/redo callback. We just skip this event.
+    dt_undo_item_t *item = malloc(sizeof(dt_undo_item_t));
 
-    if(!self->locked)
-    {
-      LOCK;
+    item->user_data = user_data;
+    item->type      = type;
+    item->data      = data;
+    item->undo      = undo;
+    item->free_data = free_data;
+    item->ts        = dt_get_wtime();
+    item->is_group  = is_group;
 
-      dt_undo_item_t *item = malloc(sizeof(dt_undo_item_t));
+    self->undo_list = g_list_prepend(self->undo_list, (gpointer)item);
 
-      item->user_data = user_data;
-      item->type      = type;
-      item->data      = data;
-      item->undo      = undo;
-      item->free_data = free_data;
-      item->ts        = dt_get_wtime();
-      item->is_group  = is_group;
+    // recording an undo data, invalidate all the redo
+    g_list_free_full(self->redo_list, _free_undo_data);
+    self->redo_list = NULL;
 
-      self->undo_list = g_list_prepend(self->undo_list, (gpointer)item);
-
-      // recording an undo data invalidate all the redo
-      g_list_free_full(self->redo_list, _free_undo_data);
-      self->redo_list = NULL;
-
-      dt_print(DT_DEBUG_UNDO, "[undo] record for type %d (length %d)\n",
-               type, g_list_length(self->undo_list));
-
-      UNLOCK;
-    }
+    dt_print(DT_DEBUG_UNDO, "[undo] record for type %d (length %d)%s",
+             type, g_list_length(self->undo_list),
+             disable_next ? ", disable next": "");
   }
+
+  UNLOCK;
 }
 
-void dt_undo_start_group(dt_undo_t *self, dt_undo_type_t type)
+void dt_undo_start_group(dt_undo_t *self,
+                         const dt_undo_type_t type)
 {
   if(!self) return;
 
+  LOCK;
   if(self->group == DT_UNDO_NONE)
   {
-    dt_print(DT_DEBUG_UNDO, "[undo] start group for type %d\n", type);
+    dt_print(DT_DEBUG_UNDO, "[undo] start group for type %d", type);
     self->group = type;
     self->group_indent = 1;
     _undo_record(self, NULL, type, NULL, TRUE, NULL, NULL);
   }
   else
     self->group_indent++;
+  UNLOCK;
 }
 
 void dt_undo_end_group(dt_undo_t *self)
 {
   if(!self) return;
-
+  LOCK;
   assert(self->group_indent>0);
   self->group_indent--;
   if(self->group_indent == 0)
   {
     _undo_record(self, NULL, self->group, NULL, TRUE, NULL, NULL);
-    dt_print(DT_DEBUG_UNDO, "[undo] end group for type %d\n", self->group);
+    dt_print(DT_DEBUG_UNDO, "[undo] end group for type %d", self->group);
     self->group = DT_UNDO_NONE;
   }
+  UNLOCK;
 }
 
-void dt_undo_record(dt_undo_t *self, gpointer user_data, dt_undo_type_t type, dt_undo_data_t data,
-                    void (*undo)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t item, dt_undo_action_t action, GList **imgs),
+void dt_undo_record(dt_undo_t *self,
+                    gpointer user_data,
+                    dt_undo_type_t type,
+                    dt_undo_data_t data,
+                    void (*undo)(gpointer user_data,
+                                 const dt_undo_type_t type,
+                                 const dt_undo_data_t item,
+                                 const dt_undo_action_t action,
+                                 GList **imgs),
                     void (*free_data)(gpointer data))
 {
   _undo_record(self, user_data, type, data, FALSE, undo, free_data);
@@ -163,7 +183,9 @@ gint _images_list_cmp(gconstpointer a, gconstpointer b)
   return GPOINTER_TO_INT(a) - GPOINTER_TO_INT(b);
 }
 
-static void _undo_do_undo_redo(dt_undo_t *self, uint32_t filter, dt_undo_action_t action)
+static void _undo_do_undo_redo(dt_undo_t *self,
+                               const uint32_t filter,
+                               const dt_undo_action_t action)
 {
   if(!self) return;
 
@@ -177,12 +199,16 @@ static void _undo_do_undo_redo(dt_undo_t *self, uint32_t filter, dt_undo_action_
 
   // check for first item that is matching the given pattern
 
-  dt_print(DT_DEBUG_UNDO, "[undo] action %s for %d (from length %d -> to length %d)\n",
-           action == DT_ACTION_UNDO?"UNDO":"DO", filter, g_list_length(*from), g_list_length(*to));
+  dt_print(DT_DEBUG_UNDO,
+           "[undo] action %s for %d (from length %d -> to length %d)",
+           action == DT_ACTION_UNDO ? "UNDO" : "DO",
+           filter,
+           g_list_length(*from),
+           g_list_length(*to));
 
   for(GList *l = *from; l; l = g_list_next(l))
   {
-    dt_undo_item_t *item = (dt_undo_item_t *)l->data;
+    dt_undo_item_t *item = l->data;
 
     if(item->type & filter)
     {
@@ -238,8 +264,10 @@ static void _undo_do_undo_redo(dt_undo_t *self, uint32_t filter, dt_undo_action_
           *to = g_list_prepend(*to, item);
 
           l = next;
-          if (l) item = (dt_undo_item_t *)l->data;
-        } while (l && (item->type & filter) && (in_group || (fabs(item->ts - first_item_ts) < MAX_TIME_PERIOD)));
+          if(l) item = (dt_undo_item_t *)l->data;
+        } while(l
+                && (item->type & filter)
+                && (in_group || (fabs(item->ts - first_item_ts) < MAX_TIME_PERIOD)));
       }
 
       break;
@@ -252,34 +280,40 @@ static void _undo_do_undo_redo(dt_undo_t *self, uint32_t filter, dt_undo_action_
     imgs = g_list_sort(imgs, _images_list_cmp);
     // remove duplicates
     for(const GList *img = imgs; img; img = g_list_next(img))
+    {
+      // udpate xmp is done via set_change_timestamp
+      dt_image_cache_set_change_timestamp(GPOINTER_TO_INT(img->data));
       while(img->next && img->data == img->next->data)
         imgs = g_list_delete_link(imgs, img->next);
-    // udpate xmp for updated images
-
-    dt_image_synch_xmps(imgs);
+    }
   }
 
-  dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF, imgs);
+  dt_collection_update_query(darktable.collection,
+                             DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF, imgs);
 }
 
-void dt_undo_do_redo(dt_undo_t *self, uint32_t filter)
+void dt_undo_do_redo(dt_undo_t *self, const uint32_t filter)
 {
+  dt_gui_cursor_set_busy();
   _undo_do_undo_redo(self, filter, DT_ACTION_REDO);
+  dt_gui_cursor_clear_busy();
 }
 
-void dt_undo_do_undo(dt_undo_t *self, uint32_t filter)
+void dt_undo_do_undo(dt_undo_t *self, const uint32_t filter)
 {
+  dt_gui_cursor_set_busy();
   _undo_do_undo_redo(self, filter, DT_ACTION_UNDO);
+  dt_gui_cursor_clear_busy();
 }
 
-static void _undo_clear_list(GList **list, uint32_t filter)
+static void _undo_clear_list(GList **list, const uint32_t filter)
 {
   // check for first item that is matching the given pattern
 
   GList *next;
   for(GList *l = *list; l; l = next)
   {
-    dt_undo_item_t *item = (dt_undo_item_t *)l->data;
+    dt_undo_item_t *item = l->data;
     next = g_list_next(l); // get next node now, because we may delete the current one
     if(item->type & filter)
     {
@@ -289,7 +323,7 @@ static void _undo_clear_list(GList **list, uint32_t filter)
     }
   };
 
-  dt_print(DT_DEBUG_UNDO, "[undo] clear list for %d (length %d)\n",
+  dt_print(DT_DEBUG_UNDO, "[undo] clear list for %d (length %d)",
            filter, g_list_length(*list));
 }
 
@@ -306,13 +340,17 @@ void dt_undo_clear(dt_undo_t *self, uint32_t filter)
   UNLOCK;
 }
 
-static void _undo_iterate(GList *list, uint32_t filter, gpointer user_data,
-                          void (*apply)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t item))
+static void _undo_iterate(GList *list,
+                          const uint32_t filter,
+                          gpointer user_data,
+                          void (*apply)(gpointer user_data,
+                                        const dt_undo_type_t type,
+                                        const dt_undo_data_t item))
 {
   // check for first item that is matching the given pattern
   for(GList *l = list; l; l = g_list_next(l))
   {
-    dt_undo_item_t *item = (dt_undo_item_t *)l->data;
+    dt_undo_item_t *item = l->data;
     if(!item->is_group && (item->type & filter))
     {
       apply(user_data, item->type, item->data);
@@ -320,26 +358,22 @@ static void _undo_iterate(GList *list, uint32_t filter, gpointer user_data,
   };
 }
 
-void dt_undo_iterate_internal(dt_undo_t *self, uint32_t filter, gpointer user_data,
-                              void (*apply)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t item))
+void dt_undo_iterate(dt_undo_t *self,
+                     const uint32_t filter,
+                     gpointer user_data,
+                     void (*apply)(gpointer user_data,
+                                            const dt_undo_type_t type,
+                                            const dt_undo_data_t item))
 {
   if(!self) return;
-
+  LOCK;
   _undo_iterate(self->undo_list, filter, user_data, apply);
   _undo_iterate(self->redo_list, filter, user_data, apply);
-}
-
-
-void dt_undo_iterate(dt_undo_t *self, uint32_t filter, gpointer user_data,
-                     void (*apply)(gpointer user_data, dt_undo_type_t type, dt_undo_data_t item))
-{
-  if(!self) return;
-
-  LOCK;
-  dt_undo_iterate_internal(self, filter, user_data, apply);
   UNLOCK;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2020 darktable developers.
+    Copyright (C) 2010-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,10 +15,12 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/darktable.h"
-#include "common/imageio.h"
-#include "common/imageio_module.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +30,7 @@ DT_MODULE(1)
 
 int write_image(dt_imageio_module_data_t *data, const char *filename, const void *ivoid,
                 dt_colorspaces_color_profile_type_t over_type, const char *over_filename,
-                void *exif, int exif_len, int imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
+                void *exif, int exif_len, dt_imgid_t imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
                 const gboolean export_masks)
 {
   const dt_imageio_module_data_t *const pfm = data;
@@ -47,7 +49,7 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
     while(off-- > 0) fprintf(f, "0");
     fprintf(f, "\n");
     void *buf_line = dt_alloc_align_float((size_t)3 * pfm->width);
-    for(int j = 0; j < pfm->height; j++)
+    for(int j = 0; buf_line && j < pfm->height; j++)
     {
       // NOTE: pfm has rows in reverse order
       const int row_in = pfm->height - 1 - j;
@@ -78,7 +80,7 @@ size_t params_size(dt_imageio_module_format_t *self)
 
 void *get_params(dt_imageio_module_format_t *self)
 {
-  dt_imageio_module_data_t *d = (dt_imageio_module_data_t *)calloc(1, sizeof(dt_imageio_module_data_t));
+  dt_imageio_module_data_t *d = calloc(1, sizeof(dt_imageio_module_data_t));
   return d;
 }
 
@@ -115,7 +117,7 @@ const char *extension(dt_imageio_module_data_t *data)
 
 const char *name()
 {
-  return _("PFM (float)");
+  return _("PFM");
 }
 
 void init(dt_imageio_module_format_t *self)
@@ -134,6 +136,8 @@ void gui_reset(dt_imageio_module_format_t *self)
 {
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

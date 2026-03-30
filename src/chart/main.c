@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2021 darktable developers.
+    Copyright (C) 2016-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,7 +20,6 @@
 #include "chart/colorchart.h"
 #include "chart/common.h"
 #include "chart/deltaE.h"
-#include "chart/pfm.h"
 #include "chart/thinplate.h"
 #include "chart/tonecurve.h"
 #include "common/exif.h"
@@ -29,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "common/pfm.h"
 
 #ifdef __APPLE__
 #include "osx/osx.h"
@@ -351,13 +351,13 @@ static gboolean open_reference_image(dt_lut_t *self, const char *filename)
 
 static gboolean open_image(image_t *image, const char *filename)
 {
-  int width, height;
+  int width, height, error = 0;
 
   free_image(image);
 
   if(!filename) return FALSE;
 
-  float *pfm = read_pfm(filename, &width, &height);
+  float *pfm = dt_read_pfm(filename, &error, &width, &height, NULL, 3);
 
   if(!pfm)
   {
@@ -757,7 +757,8 @@ static void add_patches_to_array(dt_lut_t *self, GList *patch_names, int *N, int
     get_Lab_from_box(source_patch, source_Lab);
     get_Lab_from_box(reference_patch, reference_Lab);
 
-    for(int j = 0; j < 3; j++) colorchecker_Lab[3 * (*i) + j] = source_Lab[j];
+    for_three_channels(j)
+      colorchecker_Lab[3 * (*i) + j] = source_Lab[j];
     target_L[*i] = reference_Lab[0];
     target_a[*i] = reference_Lab[1];
     target_b[*i] = reference_Lab[2];
@@ -1057,7 +1058,7 @@ static void process_data(dt_lut_t *self, double *target_L, double *target_a, dou
   double avgerr, maxerr;
   sparsity = thinplate_match(&tonecurve, 3, N, colorchecker_Lab, target, sparsity, perm, coeff, &avgerr, &maxerr);
 
-  if (self->result_label != NULL)
+  if(self->result_label != NULL)
   {
     // TODO: is the rank interesting, too?
     char *result_string = g_strdup_printf(_("average dE: %.02f\nmax dE: %.02f"), avgerr, maxerr);
@@ -1421,12 +1422,13 @@ static void get_Lab_from_box(box_t *box, float *Lab)
     case DT_COLORSPACE_XYZ:
     {
       dt_aligned_pixel_t XYZ;
-      for(int i = 0; i < 3; i++) XYZ[i] = box->color[i] * 0.01;
+      for_each_channel(i)
+        XYZ[i] = box->color[i] * 0.01;
       dt_XYZ_to_Lab(XYZ, Lab);
       break;
     }
     case DT_COLORSPACE_LAB:
-      for(int i = 0; i < 3; i++) Lab[i] = box->color[i];
+      for_each_channel(i) Lab[i] = box->color[i];
       break;
     default:
       break;
@@ -1435,8 +1437,6 @@ static void get_Lab_from_box(box_t *box, float *Lab)
 
 static void init_table(dt_lut_t *self)
 {
-  GtkTreeIter iter;
-
   gtk_list_store_clear(GTK_LIST_STORE(self->model));
 
   if(!self->chart) return;
@@ -1445,8 +1445,8 @@ static void init_table(dt_lut_t *self)
   patch_names = g_list_sort(patch_names, (GCompareFunc)g_strcmp0);
   for(GList *name = patch_names; name; name = g_list_next(name))
   {
-    gtk_list_store_append(GTK_LIST_STORE(self->model), &iter);
-    gtk_list_store_set(GTK_LIST_STORE(self->model), &iter, COLUMN_NAME, (char *)name->data, -1);
+    gtk_list_store_insert_with_values(GTK_LIST_STORE(self->model), NULL, -1,
+                                      COLUMN_NAME, (char *)name->data, -1);
   }
   g_list_free(patch_names);
 
@@ -1528,15 +1528,7 @@ static void get_xyz_sample_from_image(const image_t *const image, float shrink, 
 
   double sample_x = 0.0, sample_y = 0.0, sample_z = 0.0;
   size_t n_samples = 0;
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(image) \
-  shared(corners, x_start, y_start, x_end, y_end) \
-  dt_omp_sharedconst(delta_x_top, delta_y_top, delta_x_bottom, delta_y_bottom, delta_x_left, \
-                     delta_y_left, delta_x_right, delta_y_right) \
-  reduction(+ : n_samples, sample_x, sample_y, sample_z) \
-  schedule(static)
-#endif
+  DT_OMP_FOR(shared(corners) reduction(+ : n_samples, sample_x, sample_y, sample_z))
   for(int y = y_start; y < y_end; y++)
     for(int x = x_start; x < x_end; x++)
     {
@@ -1649,17 +1641,19 @@ static void free_image(image_t *image)
 
 static void image_lab_to_xyz(float *image, const int width, const int height)
 {
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, width) \
-  shared(image) \
-  schedule(static)
-#endif
+  DT_OMP_FOR(shared(image))
   for(int y = 0; y < height; y++)
     for(int x = 0; x < width; x++)
     {
-      float *pixel = &image[(x + y * width) * 3];
-      dt_Lab_to_XYZ(pixel, pixel);
+      const int i0 = (x + y * width) * 3 + 0;
+      const int i1 = (x + y * width) * 3 + 1;
+      const int i2 = (x + y * width) * 3 + 2;
+      dt_aligned_pixel_t pixel_lab = { image[i0], image[i1], image[i2], 0.0f };
+      dt_aligned_pixel_t pixel_xyz = { 0.0 };
+      dt_Lab_to_XYZ(pixel_lab, pixel_xyz);
+      image[i0] = pixel_xyz[0];
+      image[i1] = pixel_xyz[1];
+      image[i2] = pixel_xyz[2];
     }
 }
 
@@ -1935,6 +1929,9 @@ int main(int argc, char *argv[])
   return res;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

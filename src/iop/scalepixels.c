@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2014-2020 darktable developers.
+    Copyright (C) 2014-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,12 +15,11 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+
 #include "bauhaus/bauhaus.h"
 #include "common/interpolation.h"
 #include "develop/imageop.h"
+#include "develop/imageop_gui.h"
 #include "develop/tiling.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
@@ -36,7 +35,7 @@ typedef struct dt_iop_scalepixels_params_t
   // Aspect ratio of the pixels, usually 1 but some cameras need scaling
   // <1 means the image needs to be stretched vertically, (0.5 means 2x)
   // >1 means the image needs to be stretched horizontally (2 mean 2x)
-  float pixel_aspect_ratio; // $DEFAULT: 1.0f
+  float pixel_aspect_ratio; // $MIN: 0.5f $MAX: 2.0f $DEFAULT: 1.0f $DESCRIPTION: "pixel aspect ratio"
 } dt_iop_scalepixels_params_t;
 
 typedef struct dt_iop_scalepixels_gui_data_t
@@ -70,18 +69,26 @@ int operation_tags()
   return IOP_TAG_DISTORT;
 }
 
-int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
+                                            dt_dev_pixelpipe_t *pipe,
+                                            dt_dev_pixelpipe_iop_t *piece)
 {
-  return iop_cs_rgb;
+  return IOP_CS_RGB;
 }
 
-const char *description(struct dt_iop_module_t *self)
+const char **description(dt_iop_module_t *self)
 {
-  return g_strdup(_("internal module to setup technical specificities of raw sensor.\n\n"
-                    "you should not touch values here !"));
+  return dt_iop_set_description(self,
+                                _("module for setting pixel aspect ratio\n\n"
+                                "useful for certain sensor types\n"
+                                "and anamorphic desqueeze"),
+                                _("corrective"),
+                                _("linear, RGB, scene-referred"),
+                                _("linear, RGB"),
+                                _("linear, RGB, scene-referred"));
 }
 
-static void transform(const dt_dev_pixelpipe_iop_t *const piece, float *p)
+static void _transform(const dt_dev_pixelpipe_iop_t *const piece, float *p)
 {
   dt_iop_scalepixels_data_t *d = piece->data;
 
@@ -95,7 +102,7 @@ static void transform(const dt_dev_pixelpipe_iop_t *const piece, float *p)
   }
 }
 
-static void precalculate_scale(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece)
+static void _precalculate_scale(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece)
 {
   // Since the scaling is calculated by modify_roi_in use that to get them
   // This doesn't seem strictly needed but since clipping.c also does it we try
@@ -106,9 +113,12 @@ static void precalculate_scale(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *pi
   self->modify_roi_in(self, piece, &roi_out, &roi_in);
 }
 
-int distort_transform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, float *points, size_t points_count)
+gboolean distort_transform(dt_iop_module_t *self,
+                           dt_dev_pixelpipe_iop_t *piece,
+                           float *points,
+                           size_t points_count)
 {
-  precalculate_scale(self, piece);
+  _precalculate_scale(self, piece);
   dt_iop_scalepixels_data_t *d = piece->data;
 
   for(size_t i = 0; i < points_count * 2; i += 2)
@@ -117,13 +127,15 @@ int distort_transform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, floa
     points[i+1] /= d->y_scale;
   }
 
-  return 1;
+  return TRUE;
 }
 
-int distort_backtransform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, float *points,
-                          size_t points_count)
+gboolean distort_backtransform(dt_iop_module_t *self,
+                               dt_dev_pixelpipe_iop_t *piece,
+                               float *points,
+                               size_t points_count)
 {
-  precalculate_scale(self, piece);
+  _precalculate_scale(self, piece);
   dt_iop_scalepixels_data_t *d = piece->data;
 
   for(size_t i = 0; i < points_count * 2; i += 2)
@@ -132,36 +144,35 @@ int distort_backtransform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, 
     points[i+1] *= d->y_scale;
   }
 
-  return 1;
+  return TRUE;
 }
 
-void distort_mask(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece, const float *const in,
-                  float *const out, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+void distort_mask(dt_iop_module_t *self,
+                  dt_dev_pixelpipe_iop_t *piece,
+                  const float *const in,
+                  float *const out,
+                  const dt_iop_roi_t *const roi_in,
+                  const dt_iop_roi_t *const roi_out)
 {
-  const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *iter = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  const int iw = roi_in->width;
+  const int ih = roi_in->height;
+  const size_t ow = roi_out->width;
 
   // Compute scale factors locally from the actual roi_in/roi_out to ensure
   // consistency, rather than relying on d->x_scale/d->y_scale which may have
-  // been overwritten by precalculate_scale() with different ROI dimensions.
+  // been overwritten by _precalculate_scale() with different ROI dimensions.
   const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
   const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
 
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(x_scale, y_scale, in, out, roi_in, roi_out) \
-  shared(interpolation) \
-  schedule(static)
-#endif
-  for(int j = 0; j < roi_out->height; j++)
+  DT_OMP_FOR(collapse(2))
+  for(int row = 0; row < roi_out->height; row++)
   {
-    float *outptr = out + (size_t)j * roi_out->width;
-    for(int i = 0; i < roi_out->width; i++)
+    for(int col = 0; col < roi_out->width; col++)
     {
-      float x = i * x_scale;
-      float y = j * y_scale;
-
-      dt_interpolation_compute_pixel1c(interpolation, in, &outptr[i], x, y, roi_in->width,
-                                       roi_in->height, roi_in->width);
+      const float x = col * x_scale;
+      const float y = row * y_scale;
+      out[ow * row + col] = CLIP(dt_interpolation_compute_sample(iter, in, x, y, iw, ih, 1, iw));
     }
   }
 }
@@ -174,8 +185,8 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
   float xy[2] = { roi_out->x, roi_out->y };
   float wh[2] = { roi_out->width, roi_out->height };
 
-  transform(piece, xy);
-  transform(piece, wh);
+  _transform(piece, xy);
+  _transform(piece, wh);
 
   roi_out->x = (int)floorf(xy[0]);
   roi_out->y = (int)floorf(xy[1]);
@@ -196,16 +207,9 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const d
 
   // If possible try to get an image that's strictly larger than what we want to output
   float hw[2] = {roi_out->height, roi_out->width};
-  transform(piece, hw); // transform() is used reversed here intentionally
+  _transform(piece, hw); // _transform() is used reversed here intentionally
   roi_in->height = hw[0];
   roi_in->width = hw[1];
-
-  float reduction_ratio = MAX(hw[0] / (piece->buf_in.height * 1.0f), hw[1] / (piece->buf_in.width * 1.0f));
-  if (reduction_ratio > 1.0f)
-  {
-    roi_in->height /= reduction_ratio;
-    roi_in->width /= reduction_ratio;
-  }
 
   dt_iop_scalepixels_data_t *d = piece->data;
   d->x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
@@ -221,20 +225,15 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 {
   const int ch = piece->colors;
   const int ch_width = ch * roi_in->width;
-  const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
 
   // Compute scale factors locally from the actual roi_in/roi_out to ensure
   // consistency, rather than relying on d->x_scale/d->y_scale which may have
-  // been overwritten by precalculate_scale() with different ROI dimensions.
+  // been overwritten by _precalculate_scale() with different ROI dimensions.
   const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
   const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
 
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(ch_width, x_scale, y_scale, ivoid, ovoid, roi_in, roi_out) \
-  shared(interpolation) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   // (slow) point-by-point transformation.
   // TODO: optimize with scanlines and linear steps between?
   for(int j = 0; j < roi_out->height; j++)
@@ -242,9 +241,8 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
     float *out = ((float *)ovoid) + (size_t)4 * j * roi_out->width;
     for(int i = 0; i < roi_out->width; i++, out += 4)
     {
-      float x = i * x_scale;
-      float y = j * y_scale;
-
+      const float x = i * x_scale;
+      const float y = j * y_scale;
       dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out, x, y, roi_in->width,
                                        roi_in->height, ch_width);
     }
@@ -261,8 +259,8 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *params, dt_dev_pixelp
   d->x_scale = 1.0f;
   d->y_scale = 1.0f;
 
-  if(isnan(p->pixel_aspect_ratio) || p->pixel_aspect_ratio <= 0.0f || p->pixel_aspect_ratio == 1.0f)
-    piece->enabled = 0;
+  if(dt_isnan(p->pixel_aspect_ratio) || p->pixel_aspect_ratio <= 0.0f || p->pixel_aspect_ratio == 1.0f)
+    piece->enabled = FALSE;
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -276,40 +274,14 @@ void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelp
   piece->data = NULL;
 }
 
-void reload_defaults(dt_iop_module_t *self)
-{
-  dt_iop_scalepixels_params_t *d = self->default_params;
-
-  const dt_image_t *const image = &(self->dev->image_storage);
-
-  d->pixel_aspect_ratio = image->pixel_aspect_ratio;
-
-  self->default_enabled = (!isnan(d->pixel_aspect_ratio) &&
-                           d->pixel_aspect_ratio > 0.0f &&
-                           d->pixel_aspect_ratio != 1.0f);
-
-  // FIXME: does not work.
-  self->hide_enable_button = !self->default_enabled;
-
-  if(self->widget)
-    gtk_label_set_text(GTK_LABEL(self->widget), self->default_enabled
-                       ? _("automatic pixel scaling")
-                       :_("automatic pixel scaling\nonly works for the sensors that need it."));
-}
-
-void gui_update(dt_iop_module_t *self)
-{
-}
-
 void gui_init(dt_iop_module_t *self)
 {
-  IOP_GUI_ALLOC(scalepixels);
-
-  self->widget = dt_ui_label_new("");
-  gtk_label_set_line_wrap(GTK_LABEL(self->widget), TRUE);
-
+  GtkWidget *w = dt_bauhaus_slider_from_params(self, "pixel_aspect_ratio");
+  gtk_widget_set_tooltip_text(w, _("adjust pixel aspect ratio"));
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

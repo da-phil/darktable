@@ -1,7 +1,6 @@
 /*
     This file is part of darktable,
-    copyright (c) 2011 johannes hanika.
-    copyright (c) 2012--2013 Ulrich Pegelow.
+    copyright (c) 2011-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -77,7 +76,7 @@ denoiseprofile_precondition_v2(read_only image2d_t in, write_only image2d_t out,
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
   const float alpha = pixel.w;
 
-  float4 t = fmax(2.0f * native_powr(fmax((float4)0.0f, pixel / wb + b), 1.0f - p / 2.0f) / ((-p + 2.0f) * sqrt(a)), 0.f);
+  float4 t = fmax(2.0f * dtcl_pow(fmax((float4)0.0f, pixel / wb + b), 1.0f - p / 2.0f) / ((-p + 2.0f) * sqrt(a)), 0.f);
 
   t.w = alpha;
 
@@ -96,7 +95,7 @@ denoiseprofile_precondition_Y0U0V0(read_only image2d_t in, write_only image2d_t 
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
   const float alpha = pixel.w;
 
-  const float4 t = fmax(2.0f * native_powr(fmax((float4)0.0f, pixel + b), 1.0f - p / 2.0f) / ((-p + 2.0f) * sqrt(a)), 0.f);
+  const float4 t = fmax(2.0f * dtcl_pow(fmax((float4)0.0f, pixel + b), 1.0f - p / 2.0f) / ((-p + 2.0f) * sqrt(a)), 0.f);
 
   float4 outpx = (float4)0.0f;
   outpx.x += toY0U0V0[0] * t.x;
@@ -357,7 +356,7 @@ denoiseprofile_finish_v2(read_only image2d_t in, global float4* U2, write_only i
   float4 delta = px * px + (float4)bias;
   float4 denominator = 4.0f / (sqrt(a) * (2.0f - p));
   float4 z1 = (px + sqrt(fmax((float4)0.0f, delta))) / denominator;
-  px = fmax(native_powr(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
+  px = fmax(dtcl_pow(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
   px = px * wb;
   px.w = alpha;
 
@@ -406,7 +405,7 @@ denoiseprofile_backtransform_v2(read_only image2d_t in, write_only image2d_t out
   const float4 delta = px * px + (float4)bias;
   const float4 denominator = 4.0f / (sqrt(a) * (2.0f - p));
   const float4 z1 = (px + sqrt(fmax((float4)0.0f, delta))) / denominator;
-  px = fmax(native_powr(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
+  px = fmax(dtcl_pow(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
   px = px * wb;
   px.w = alpha;
 
@@ -441,7 +440,7 @@ denoiseprofile_backtransform_Y0U0V0(read_only image2d_t in, write_only image2d_t
   const float4 delta = px * px + (float4)bias * wb;
   const float4 denominator = 4.0f / (sqrt(a) * (2.0f - p));
   const float4 z1 = (px + sqrt(fmax((float4)0.0f, delta))) / denominator;
-  px = fmax(native_powr(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
+  px = fmax(dtcl_pow(z1, 1.0f / (1.0f - p / 2.0f)) - b, 0.f);
   px.w = alpha;
 
   write_imagef (out, (int2)(x, y), px);
@@ -500,22 +499,19 @@ denoiseprofile_decompose(read_only image2d_t in, write_only image2d_t coarse, wr
 kernel void
 denoiseprofile_synthesize(read_only image2d_t coarse, read_only image2d_t detail, write_only image2d_t out,
      const int width, const int height,
-     const float t0, const float t1, const float t2, const float t3,
-     const float b0, const float b1, const float b2, const float b3)
+     const float4 threshold, const float4 boost)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
 
   if(x >= width || y >= height) return;
 
-  const float4 threshold = (float4)(t0, t1, t2, t3);
-  const float4 boost     = (float4)(b0, b1, b2, b3);
   float4 c = read_imagef(coarse, sampleri, (int2)(x, y));
   float4 d = read_imagef(detail, sampleri, (int2)(x, y));
-  float4 amount = copysign(max((float4)(0.0f), fabs(d) - threshold), d);
+  float4 amount = copysign(fmax((float4)(0.0f), fabs(d) - threshold), d);
   float4 sum = c + boost*amount;
   sum.w = c.w;
-  write_imagef (out, (int2)(x, y), sum);
+  write_imagef(out, (int2)(x, y), sum);
 }
 
 

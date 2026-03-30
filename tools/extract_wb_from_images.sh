@@ -1,11 +1,17 @@
 #!/bin/bash
 
 #
-# Usage: extract_wb_from_images [-p]
-#        -p  do the purge, otherwise only display unused tags
+# Usage: extract_wb_from_images
 #
 
 commandline="$0 $*"
+
+# check for exiftool
+_etpath="$(which exiftool)"
+if [ ! -f "$_etpath" -o ! -x "$_etpath" ] ; then
+    echo "error: 'exiftool' not found, please ensure it is installed and added to path."
+    exit 1
+fi
 
 # handle command line arguments
 option="$1"

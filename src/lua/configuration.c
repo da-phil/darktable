@@ -15,9 +15,6 @@
    You should have received a copy of the GNU General Public License
    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
  */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
 #include "common/darktable.h"
 #include "common/file_location.h"
 #include "lua/configuration.h"
@@ -64,7 +61,7 @@ static int check_version(lua_State *L)
   }
   else
   {
-    dt_print(DT_DEBUG_LUA, "LUA ERROR Module %s is not compatible with API %d.%d.%d-%s\n", module_name,
+    dt_print(DT_DEBUG_LUA, "LUA ERROR Module %s is not compatible with API %d.%d.%d-%s", module_name,
              LUA_API_VERSION_MAJOR, LUA_API_VERSION_MINOR, LUA_API_VERSION_PATCH, LUA_API_VERSION_SUFFIX);
   }
   return 0;
@@ -109,6 +106,16 @@ int dt_lua_init_configuration(lua_State *L)
 
   lua_pushstring(L, "cache_dir");
   dt_loc_get_user_cache_dir(tmp_path, sizeof(tmp_path));
+  lua_pushstring(L, tmp_path);
+  lua_settable(L, -3);
+
+  lua_pushstring(L, "share_dir");
+  dt_loc_get_sharedir(tmp_path, sizeof(tmp_path));
+  lua_pushstring(L, tmp_path);
+  lua_settable(L, -3);
+
+  lua_pushstring(L, "data_dir");
+  dt_loc_get_datadir(tmp_path, sizeof(tmp_path));
   lua_pushstring(L, tmp_path);
   lua_settable(L, -3);
 
@@ -171,6 +178,9 @@ int dt_lua_init_configuration(lua_State *L)
 
 
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+
