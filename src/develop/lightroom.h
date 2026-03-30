@@ -24,14 +24,11 @@
    When called from lightable : dev == NULL, in this case only the tags are imported
    When called from darkroom  : dev != NULL, in this case only develop data are imported
 */
-gboolean dt_lightroom_import(dt_imgid_t imgid, dt_develop_t *dev, gboolean iauto);
+gboolean dt_lightroom_import(int imgid, dt_develop_t *dev, gboolean iauto);
 
 /* returns NULL if not found, or g_strdup'ed pathname, the caller should g_free it. */
-char *dt_get_lightroom_xmp(dt_imgid_t imgid);
+char *dt_get_lightroom_xmp(int imgid);
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

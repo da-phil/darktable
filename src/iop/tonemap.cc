@@ -26,6 +26,11 @@
 
 #define __STDC_FORMAT_MACROS
 
+extern "C" {
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
@@ -41,11 +46,11 @@
 #include "iop/iop_api.h"
 #include <gtk/gtk.h>
 #include <inttypes.h>
+}
 
 #include "iop/Permutohedral.h"
 
-G_BEGIN_DECLS
-
+extern "C" {
 DT_MODULE_INTROSPECTION(1, dt_iop_tonemapping_params_t)
 
 typedef struct dt_iop_tonemapping_params_t
@@ -85,14 +90,12 @@ const char *deprecated_msg()
   return _("this module is deprecated. please use the local contrast or tone equalizer module instead.");
 }
 
-dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
-                                            dt_dev_pixelpipe_t *pipe,
-                                            dt_dev_pixelpipe_iop_t *piece)
+int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_RGB;
+  return iop_cs_rgb;
 }
 
-void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
   dt_iop_tonemapping_data_t *data = (dt_iop_tonemapping_data_t *)piece->data;
@@ -199,7 +202,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 
 // GUI
 //
-void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
+void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_tonemapping_params_t *p = (dt_iop_tonemapping_params_t *)p1;
@@ -208,32 +211,36 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->Fsize = p->Fsize;
 }
 
-void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = malloc(sizeof(dt_iop_tonemapping_data_t));
 }
 
-void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
 }
 
-void gui_init(dt_iop_module_t *self)
+void gui_update(struct dt_iop_module_t *self)
+{
+  dt_iop_tonemapping_gui_data_t *g = (dt_iop_tonemapping_gui_data_t *)self->gui_data;
+  dt_iop_tonemapping_params_t *p = (dt_iop_tonemapping_params_t *)self->params;
+  dt_bauhaus_slider_set(g->contrast, p->contrast);
+  dt_bauhaus_slider_set(g->Fsize, p->Fsize);
+}
+
+void gui_init(struct dt_iop_module_t *self)
 {
   dt_iop_tonemapping_gui_data_t *g = IOP_GUI_ALLOC(tonemapping);
 
   g->contrast = dt_bauhaus_slider_from_params(self, "contrast");
 
   g->Fsize = dt_bauhaus_slider_from_params(self, "Fsize");
-  dt_bauhaus_slider_set_format(g->Fsize, "%");
+  dt_bauhaus_slider_set_format(g->Fsize, "%.0f%%");
+}
 }
 
-G_END_DECLS
-
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

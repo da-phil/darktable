@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2020-2024 darktable developers.
+    Copyright (C) 2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,7 +20,8 @@
 
 #include "common/chromatic_adaptation.h"
 #include "common/image.h"
-#include "common/dttypes.h"
+#include "external/adobe_coeff.c"
+
 
 /* Standard CIE illuminants */
 typedef enum dt_illuminant_t
@@ -33,10 +34,10 @@ typedef enum dt_illuminant_t
   DT_ILLUMINANT_LED             = 5, // $DESCRIPTION: "LED (LED light)"
   DT_ILLUMINANT_BB              = 6, // $DESCRIPTION: "Planckian (black body)" general black body radiator - not CIE standard
   DT_ILLUMINANT_CUSTOM          = 7, // $DESCRIPTION: "custom" input x and y directly - bypass search
+  DT_ILLUMINANT_DETECT_SURFACES = 8, // $DESCRIPTION: "(AI) detect from image surfaces..." auto-detection in image from grey world model
+  DT_ILLUMINANT_DETECT_EDGES    = 9, // $DESCRIPTION: "(AI) detect from image edges..."auto-detection in image from grey edges model
   DT_ILLUMINANT_CAMERA          = 10,// $DESCRIPTION: "as shot in camera" read RAW EXIF for WB
-  DT_ILLUMINANT_LAST,
-  DT_ILLUMINANT_DETECT_SURFACES = 8,
-  DT_ILLUMINANT_DETECT_EDGES    = 9,
+  DT_ILLUMINANT_LAST
 } dt_illuminant_t;
 
 // CIE fluorescent standards : https://en.wikipedia.org/wiki/Standard_illuminant
@@ -115,26 +116,23 @@ static float led[DT_ILLUMINANT_LED_LAST][2] = { { 0.4560f, 0.4078f },  // DT_ILL
                                                 { 0.4560f, 0.4548f },  // DT_ILLUMINANT_LED_V1
                                                 { 0.3781f, 0.3775f }}; // DT_ILLUMINANT_LED_V2
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float xy_to_CCT(const float x, const float y)
 {
   // Try to find correlated color temperature from chromaticity
   // Valid for 3000 K to 50000 K
   // Reference : https://www.usna.edu/Users/oceano/raylee/papers/RLee_AO_CCTpaper.pdf
   // Warning : we throw a number ever if it's grossly off. You need to check the error later.
-  if(x < FLT_MAX)
-  {
-    const float n = (x - 0.3366f)/(y - 0.1735f);
-    return (-949.86315f + 6253.80338f * expf(-n / 0.92159f)
-            + 28.70599f * expf(-n / 0.20039f)
-            + 0.00004f * expf(-n / 0.07125f));
-  }
-  else // we were called with coordinates flagged as invalid
-    return 0.0f; // invalid chromaticity
+  const float n = (x - 0.3366f)/(y - 0.1735f);
+  return -949.86315f + 6253.80338f * expf(-n / 0.92159f) + 28.70599f * expf(-n / 0.20039f) + 0.00004f * expf(-n / 0.07125f);
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void CCT_to_xy_daylight(const float t, float *x, float *y)
 {
   // Take correlated color temperature in K and find the closest daylight illuminant in 4000 K - 250000 K
@@ -153,7 +151,9 @@ static inline void CCT_to_xy_daylight(const float t, float *x, float *y)
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void CCT_to_xy_blackbody(const float t, float *x, float *y)
 {
   // Take correlated color temperature in K and find the closest blackbody illuminant in 1667 K - 250000 K
@@ -177,7 +177,9 @@ static inline void CCT_to_xy_blackbody(const float t, float *x, float *y)
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void illuminant_xy_to_XYZ(const float x, const float y, dt_aligned_pixel_t XYZ)
 {
   XYZ[0] = x / y;             // X
@@ -186,7 +188,9 @@ static inline void illuminant_xy_to_XYZ(const float x, const float y, dt_aligned
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void illuminant_xy_to_RGB(const float x, const float y, dt_aligned_pixel_t RGB)
 {
   // Get an sRGB preview of current illuminant
@@ -198,12 +202,14 @@ static inline void illuminant_xy_to_RGB(const float x, const float y, dt_aligned
   dt_XYZ_to_Rec709_D50(XYZ, RGB);
 
   // Handle gamut clipping
-  const float max_RGB = max3f(RGB);
+  const float max_RGB = fmaxf(fmaxf(RGB[0], RGB[1]), RGB[2]);
   for(int c = 0; c < 3; c++) RGB[c] = fmaxf(RGB[c] / max_RGB, 0.f);
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void illuminant_CCT_to_RGB(const float t, dt_aligned_pixel_t RGB)
 {
   float x, y;
@@ -217,7 +223,7 @@ static inline void illuminant_CCT_to_RGB(const float t, dt_aligned_pixel_t RGB)
 
 
 // Fetch image from pipeline and read EXIF for camera RAW WB coeffs
-static inline gboolean find_temperature_from_raw_coeffs(const dt_image_t *img, const dt_aligned_pixel_t custom_wb,
+static inline int find_temperature_from_raw_coeffs(const dt_image_t *img, const dt_aligned_pixel_t custom_wb,
                                                    float *chroma_x, float *chroma_y);
 
 
@@ -245,8 +251,8 @@ static inline int illuminant_to_xy(const dt_illuminant_t illuminant, // primary 
     case DT_ILLUMINANT_PIPE:
     {
       // darktable default pipeline D50
-      x = D50xyY.x;
-      y = D50xyY.y;
+      x = 0.34567f;
+      y = 0.35850f;
       break;
     }
     case DT_ILLUMINANT_E:
@@ -386,18 +392,18 @@ static inline void matrice_pseudoinverse(float (*in)[3], float (*out)[3], int si
 }
 
 
-static gboolean find_temperature_from_raw_coeffs(const dt_image_t *img, const dt_aligned_pixel_t custom_wb,
+static int find_temperature_from_raw_coeffs(const dt_image_t *img, const dt_aligned_pixel_t custom_wb,
                                             float *chroma_x, float *chroma_y)
 {
   if(img == NULL) return FALSE;
   if(!dt_image_is_matrix_correction_supported(img)) return FALSE;
 
-  gboolean has_valid_coeffs = TRUE;
+  int has_valid_coeffs = TRUE;
   const int num_coeffs = (img->flags & DT_IMAGE_4BAYER) ? 4 : 3;
 
   // Check coeffs
   for(int k = 0; has_valid_coeffs && k < num_coeffs; k++)
-    if(!dt_isnormal(img->wb_coeffs[k]) || img->wb_coeffs[k] == 0.0f) has_valid_coeffs = FALSE;
+    if(!isnormal(img->wb_coeffs[k]) || img->wb_coeffs[k] == 0.0f) has_valid_coeffs = FALSE;
 
   if(!has_valid_coeffs) return FALSE;
 
@@ -411,9 +417,9 @@ static gboolean find_temperature_from_raw_coeffs(const dt_image_t *img, const dt
 
   // Get the camera input profile (matrice of primaries)
   float XYZ_to_CAM[4][3];
-  dt_mark_colormatrix_invalid(&XYZ_to_CAM[0][0]);
+  XYZ_to_CAM[0][0] = NAN;
 
-  if(dt_is_valid_colormatrix(img->d65_color_matrix[0]))
+  if(!isnan(img->d65_color_matrix[0]))
   {
     // keep in sync with reload_defaults from colorin.c
     // embedded matrix is used with higher priority than standard one
@@ -431,19 +437,17 @@ static gboolean find_temperature_from_raw_coeffs(const dt_image_t *img, const dt
   }
   else
   {
-    for(int k=0; k<4; k++)
-      for(int i=0; i<3; i++)
-        XYZ_to_CAM[k][i] = img->adobe_XYZ_to_CAM[k][i];
+    dt_dcraw_adobe_coeff(img->camera_makermodel, (float(*)[12])XYZ_to_CAM);
   }
 
-  if(!dt_is_valid_colormatrix(XYZ_to_CAM[0][0])) return FALSE;
+  if(isnan(XYZ_to_CAM[0][0])) return FALSE;
 
   // Bloody input matrices define XYZ -> CAM transform, as if we often needed camera profiles to output
   // So we need to invert them. Here go your CPU cycles again.
   float CAM_to_XYZ[4][3];
-  dt_mark_colormatrix_invalid(&CAM_to_XYZ[0][0]);
+  CAM_to_XYZ[0][0] = NAN;
   matrice_pseudoinverse(XYZ_to_CAM, CAM_to_XYZ, 3);
-  if(!dt_is_valid_colormatrix(CAM_to_XYZ[0][0])) return FALSE;
+  if(isnan(CAM_to_XYZ[0][0])) return FALSE;
 
   float x, y;
   WB_coeffs_to_illuminant_xy(CAM_to_XYZ, WB, &x, &y);
@@ -454,7 +458,9 @@ static gboolean find_temperature_from_raw_coeffs(const dt_image_t *img, const dt
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float planckian_normal(const float x, const float t)
 {
   float n = 0.f;
@@ -471,7 +477,9 @@ static inline float planckian_normal(const float x, const float t)
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void blackbody_xy_to_tinted_xy(const float x, const float y, const float t, const float tint,
                                              float *x_out, float *y_out)
 {
@@ -483,7 +491,9 @@ static inline void blackbody_xy_to_tinted_xy(const float x, const float y, const
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float get_tint_from_tinted_xy(const float x, const float y, const float t)
 {
   // Find the distance between planckian locus and arbitrary x y chromaticity in the orthogonal direction
@@ -496,10 +506,12 @@ static inline float get_tint_from_tinted_xy(const float x, const float y, const 
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void xy_to_uv(const float xy[2], float uv[2])
 {
-  // Convert to CIE1960 Yuv color space, useful to compute CCT
+  // Convert to CIE1960 Yuv color space, usefull to compute CCT
   // https://en.wikipedia.org/wiki/CIE_1960_color_space
   const float denom = 12.f * xy[1] - 1.882f * xy[0] + 2.9088f;
   uv[0] = 5.5932f * xy[0] + 1.9116 * xy[1];
@@ -534,8 +546,10 @@ struct pair pair_min(struct pair r, struct pair n)
 }
 
 // Define a new reduction operation
-DT_OMP_PRAGMA(declare reduction(pairmin:struct pair:omp_out=pair_min(omp_out,omp_in)) \
-              initializer(omp_priv = { FLT_MAX, 0.0f }))
+#ifdef _OPENMP
+#pragma omp declare reduction(pairmin:struct pair:omp_out=pair_min(omp_out,omp_in))    \
+  initializer(omp_priv = { FLT_MAX, 0.0f })
+#endif
 
 static inline float CCT_reverse_lookup(const float x, const float y)
 {
@@ -551,7 +565,11 @@ static inline float CCT_reverse_lookup(const float x, const float y)
   struct pair min_radius = { FLT_MAX, 0.0f };
 
 #if !(defined(__apple_build_version__) && __apple_build_version__ < 11030000) //makes Xcode 11.3.1 compiler crash
-  DT_OMP_FOR(reduction(pairmin:min_radius))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(x, y, T_min, T_range, LUT_samples) reduction(pairmin:min_radius)\
+  schedule(simd:static)
+#endif
 #endif
   for(size_t i = 0; i < LUT_samples; i++)
   {
@@ -578,9 +596,3 @@ static inline float CCT_reverse_lookup(const float x, const float y)
 
   return min_radius.temperature;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
-// vim: shiftwidth=2 expandtab tabstop=2 cindent
-// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

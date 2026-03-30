@@ -30,27 +30,26 @@ static dt_lua_widget_type_t label_type = {
 static int label_member(lua_State *L)
 {
   lua_label label;
-  luaA_to(L, lua_label, &label, 1);
+  luaA_to(L,lua_label,&label,1);
   if(lua_gettop(L) > 2) {
-    const char * text = luaL_checkstring(L, 3);
-    gtk_label_set_text(GTK_LABEL(label->widget), text);
-    gtk_label_set_ellipsize(GTK_LABEL(label->widget), PANGO_ELLIPSIZE_END);
+    const char * text = luaL_checkstring(L,3);
+    gtk_label_set_text(GTK_LABEL(label->widget),text);
     return 0;
   }
-  lua_pushstring(L, gtk_label_get_text(GTK_LABEL(label->widget)));
+  lua_pushstring(L,gtk_label_get_text(GTK_LABEL(label->widget)));
   return 1;
 }
 
 static int selectable_member(lua_State *L)
 {
   lua_label label;
-  luaA_to(L, lua_label, &label, 1);
+  luaA_to(L,lua_label,&label,1);
   if(lua_gettop(L) > 2) {
-    gboolean selectable = lua_toboolean(L, 3);
-    gtk_label_set_selectable(GTK_LABEL(label->widget), selectable);
+    gboolean selectable = lua_toboolean(L,3);
+    gtk_label_set_selectable(GTK_LABEL(label->widget),selectable);
     return 0;
   }
-  lua_pushboolean(L, gtk_label_get_selectable(GTK_LABEL(label->widget)));
+  lua_pushboolean(L,gtk_label_get_selectable(GTK_LABEL(label->widget)));
   return 1;
 }
 
@@ -97,28 +96,25 @@ static int tostring_member(lua_State *L)
 
 int dt_lua_init_widget_label(lua_State* L)
 {
-  dt_lua_init_widget_type(L, &label_type, lua_label, GTK_TYPE_LABEL);
+  dt_lua_init_widget_type(L,&label_type,lua_label,GTK_TYPE_LABEL);
 
   lua_pushcfunction(L, tostring_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_setmetafield(L, lua_label, "__tostring");
-  lua_pushcfunction(L, label_member);
+  lua_pushcfunction(L,label_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_register(L, lua_label, "label");
-  lua_pushcfunction(L, selectable_member);
+  lua_pushcfunction(L,selectable_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_register(L, lua_label, "selectable");
   lua_pushcfunction(L, halign_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_register(L, lua_label, "halign");
-  lua_pushcfunction(L, ellipsize_member);
+  lua_pushcfunction(L,ellipsize_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_register(L, lua_label, "ellipsize");
   return 0;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

@@ -46,7 +46,6 @@ typedef double progress_double; // a double in [0.0,1.0] any value out of bound 
 // Types added to the lua type system and usable externally
 typedef GtkOrientation dt_lua_orientation_t;
 typedef GtkAlign dt_lua_align_t;
-typedef GtkPositionType dt_lua_position_type_t;
 typedef PangoEllipsizeMode dt_lua_ellipsize_mode_t;
 
 
@@ -181,9 +180,6 @@ void dt_lua_type_setmetafield_type(lua_State*L,luaA_Type type,const char* method
 
 int dt_lua_init_early_types(lua_State *L);
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

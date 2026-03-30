@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2026 darktable developers.
+    Copyright (C) 2010-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -22,7 +22,6 @@
 #include "common/file_location.h"
 #include "common/grealpath.h"
 #include "common/utility.h"
-#include "control/conf.h"
 #include "gui/gtk.h"
 
 /* getpwnam_r availability check */
@@ -46,89 +45,41 @@
 #include <sys/stat.h>
 #include <ctype.h>
 
+#ifdef HAVE_CONFIG_H
+  #include <config.h>
+#endif
+
 #include <librsvg/rsvg.h>
 // ugh, ugly hack. why do people break stuff all the time?
 #ifndef RSVG_CAIRO_H
 #include <librsvg/rsvg-cairo.h>
 #endif
 
-const char *dt_util_localize_string(const char *s)
+gchar *dt_util_dstrcat(gchar *str, const gchar *format, ...)
 {
-  // check whether the string starts with the magic tag to request localization
-  static const char prefix[] = "_l10n_";
-  static const int prefix_len = sizeof(prefix)-1;
-
-  if(s && strncmp(s, prefix, prefix_len) == 0)
-    return Q_(s+prefix_len);
-  else
-    return s;
-}
-
-gchar *dt_util_localize_segmented_name(const char *s,
-                                       const gboolean with_space)
-{
-  const char *sep = with_space ? " | " : "|";
-
-  const gboolean is_builtin = g_str_has_prefix(s, BUILTIN_PREFIX);
-
-  const char *local_s = is_builtin
-    ? _(s+sizeof(BUILTIN_PREFIX)-1) : s;
-  const gboolean is_empty = strlen(s) == 0;
-
-  char *localized = g_strdup(is_empty ? "" : _(local_s));
-
-  //  Check if translation found, if not localize each segment
-
-  if(!is_empty && !strcmp(local_s, localized))
-  {
-    gchar **split = g_strsplit(local_s, "|", 0);
-    GList *items = NULL;
-
-    if(split)
-    {
-      for(int i = 0; split[i] != NULL; i++)
-      {
-        const char *name = g_strstrip(split[i]);
-        const char *l_name = dt_util_localize_string(name);
-        items = g_list_append(items, (void *)l_name);
-      }
-    }
-
-    g_free(localized);
-    localized = dt_util_glist_to_str(sep, items);
-
-    g_list_free(items);
-    g_strfreev(split);
-  }
-
-  return localized;
-}
-
-void dt_util_str_cat(gchar **str,
-                     const gchar *format, ...)
-{
-  if(!str) return;
-
   va_list args;
+  gchar *ns;
   va_start(args, format);
-  const size_t clen = *str ? strlen(*str) : 0;
+  const size_t clen = str ? strlen(str) : 0;
   const int alen = g_vsnprintf(NULL, 0, format, args);
-  va_end(args);
   const int nsize = alen + clen + 1;
 
   /* realloc for new string */
-  *str = g_realloc(*str, nsize);
+  ns = g_realloc(str, nsize);
+  if(str == NULL) ns[0] = '\0';
+  va_end(args);
 
   /* append string */
   va_start(args, format);
-  g_vsnprintf(*str + clen, alen + 1, format, args);
+  g_vsnprintf(ns + clen, alen + 1, format, args);
   va_end(args);
 
-  (*str)[nsize - 1] = '\0';
+  ns[nsize - 1] = '\0';
+
+  return ns;
 }
 
-guint dt_util_str_occurence(const gchar *haystack,
-                            const gchar *needle)
+guint dt_util_str_occurence(const gchar *haystack, const gchar *needle)
 {
   guint o = 0;
   if(haystack && needle)
@@ -145,39 +96,14 @@ guint dt_util_str_occurence(const gchar *haystack,
   return o;
 }
 
-gchar *dt_util_float_to_str(const gchar *format,
-                            const double value)
+gchar *dt_util_str_replace(const gchar *string, const gchar *pattern, const gchar *substitute)
 {
-#if defined(WIN32)
-  _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
-  setlocale (LC_NUMERIC, "C");
-#else
-  locale_t nlocale = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
-  locale_t locale = uselocale(nlocale);
-#endif
-
-  gchar *txt = g_strdup_printf(format, value);
-
-#if defined(WIN32)
-  _configthreadlocale(_DISABLE_PER_THREAD_LOCALE);
-#else
-  uselocale(locale);
-  freelocale(nlocale);
-#endif
-  return txt;
-}
-
-gchar *dt_util_str_replace(const gchar *string,
-                           const gchar *pattern,
-                           const gchar *substitute)
-{
-  const gint occurrences = dt_util_str_occurence(string, pattern);
+  const gint occurences = dt_util_str_occurence(string, pattern);
   gchar *nstring = NULL;
 
-  if(occurrences)
+  if(occurences)
   {
-    nstring = g_malloc_n(strlen(string) + (occurrences * strlen(substitute)) + 1,
-                         sizeof(gchar));
+    nstring = g_malloc_n(strlen(string) + (occurences * strlen(substitute)) + 1, sizeof(gchar));
     const gchar *pend = string + strlen(string);
     const gchar *s = string, *p = string;
     gchar *np = nstring;
@@ -196,13 +122,11 @@ gchar *dt_util_str_replace(const gchar *string,
     np[pend - p] = '\0';
   }
   else
-    nstring = g_strdup(string); // otherwise it's a hell to decide
-                                // whether to free this string later.
+    nstring = g_strdup(string); // otherwise it's a hell to decide whether to free this string later.
   return nstring;
 }
 
-gchar *dt_util_glist_to_str(const gchar *separator,
-                            GList *items)
+gchar *dt_util_glist_to_str(const gchar *separator, GList *items)
 {
   if(items == NULL) return NULL;
 
@@ -325,9 +249,7 @@ gchar *dt_util_fix_path(const gchar *path)
  * Return value: strlen(src)
  * Implementation by Philip Page, see https://bugzilla.gnome.org/show_bug.cgi?id=520116
  **/
-size_t dt_utf8_strlcpy(char *dest,
-                       const char *src,
-                       const size_t n)
+size_t dt_utf8_strlcpy(char *dest, const char *src, size_t n)
 {
   register const gchar *s = src;
   while(s - src < n && *s)
@@ -386,15 +308,7 @@ gboolean dt_util_test_writable_dir(const char *path)
   if(path == NULL) return FALSE;
 #ifdef _WIN32
   struct _stati64 stats;
-
-  wchar_t *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
-  const int result = _wstati64(wpath, &stats);
-  g_free(wpath);
-
-  if(result)
-  { // error while testing path:
-    return FALSE;
-  }
+  if(_stati64(path, &stats)) return FALSE;
 #else
   struct stat stats;
   if(stat(path, &stats)) return FALSE;
@@ -431,8 +345,7 @@ gchar *dt_util_foo_to_utf8(const char *string)
   else
     tag = g_convert(string, -1, "UTF-8", "LATIN1", NULL, NULL, NULL); // let's try latin1
 
-  if(!tag) // hmm, neither utf8 nor latin1, let's fall back to ascii
-           // and just remove everything that isn't
+  if(!tag) // hmm, neither utf8 nor latin1, let's fall back to ascii and just remove everything that isn't
   {
     tag = g_strdup(string);
     char *c = tag;
@@ -446,7 +359,7 @@ gchar *dt_util_foo_to_utf8(const char *string)
 }
 
 // get easter sunday (in the western world)
-static void easter(const int Y, int* month, int *day)
+static void easter(int Y, int* month, int *day)
 {
   const int a  = Y % 19;
   const int b  = Y / 100;
@@ -488,15 +401,13 @@ dt_logo_season_t dt_util_get_logo_season(void)
     easter_sunday.tm_isdst = -1;
     time_t easter_sunday_sec = mktime(&easter_sunday);
     // we start at midnight, so it's basically +- 2 days
-    if(llabs(easter_sunday_sec - now) <= 2 * 24 * 60 * 60)
-      return DT_LOGO_SEASON_EASTER;
+    if(llabs(easter_sunday_sec - now) <= 2 * 24 * 60 * 60) return DT_LOGO_SEASON_EASTER;
   }
 
   return DT_LOGO_SEASON_NONE;
 }
 
-static cairo_surface_t *_util_get_svg_img(gchar *logo,
-                                          const float size)
+static cairo_surface_t *_util_get_svg_img(gchar *logo, const float size)
 {
   GError *error = NULL;
   cairo_surface_t *surface = NULL;
@@ -518,30 +429,16 @@ static cairo_surface_t *_util_get_svg_img(gchar *logo,
                 final_height = dimension.height * factor * ppd;
     const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, final_width);
 
-    guint8 *image_buffer = calloc(stride * final_height, sizeof(guint8));
-    if(!image_buffer)
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "warning: unable to allocate rasterization buffer for SVG '%s'", dtlogo);
-      g_free(logo);
-      g_free(dtlogo);
-      g_object_unref(svg);
-      return NULL;
-    }
+    guint8 *image_buffer = (guint8 *)calloc(stride * final_height, sizeof(guint8));
     if(darktable.gui)
-      surface = dt_cairo_image_surface_create_for_data(image_buffer,
-                                                       CAIRO_FORMAT_ARGB32, final_width,
-                                                       final_height, stride);
+      surface = dt_cairo_image_surface_create_for_data(image_buffer, CAIRO_FORMAT_ARGB32, final_width,
+                                                      final_height, stride);
     else // during startup we don't know ppd yet and darktable.gui isn't initialized yet.
-      surface = cairo_image_surface_create_for_data(image_buffer,
-                                                    CAIRO_FORMAT_ARGB32,
-                                                    final_width,
-                                                    final_height, stride);
+      surface = cairo_image_surface_create_for_data(image_buffer, CAIRO_FORMAT_ARGB32, final_width,
+                                                       final_height, stride);
     if(cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS)
     {
-      dt_print(DT_DEBUG_ALWAYS,
-               "warning: can't load darktable logo from SVG file `%s'",
-               dtlogo);
+      fprintf(stderr, "warning: can't load darktable logo from SVG file `%s'\n", dtlogo);
       cairo_surface_destroy(surface);
       free(image_buffer);
       image_buffer = NULL;
@@ -551,7 +448,7 @@ static cairo_surface_t *_util_get_svg_img(gchar *logo,
     {
       cairo_t *cr = cairo_create(surface);
       cairo_scale(cr, factor, factor);
-      dt_render_svg(svg, cr, dimension.width, dimension.height, 0, 0);
+      dt_render_svg(svg, cr, final_width, final_height, 0, 0);
       cairo_destroy(cr);
       cairo_surface_flush(surface);
     }
@@ -559,9 +456,7 @@ static cairo_surface_t *_util_get_svg_img(gchar *logo,
   }
   else
   {
-    dt_print(DT_DEBUG_ALWAYS,
-             "warning: can't load darktable logo from SVG file `%s'\n%s",
-             dtlogo, error->message);
+    fprintf(stderr, "warning: can't load darktable logo from SVG file `%s'\n%s\n", dtlogo, error->message);
     g_error_free(error);
   }
 
@@ -588,8 +483,7 @@ cairo_surface_t *dt_util_get_logo_text(const float size)
   return _util_get_svg_img(g_strdup("dt_text.svg"), size);
 }
 
-// the following two functions (dt_util_latitude_str and
-// dt_util_longitude_str) were taken from libosmgpsmap
+// the following two functions (dt_util_latitude_str and dt_util_longitude_str) were taken from libosmgpsmap
 // Copyright (C) 2013 John Stowers <john.stowers@gmail.com>
 /* these can be overwritten with versions that support
  *   localization */
@@ -664,9 +558,7 @@ double dt_util_gps_string_to_number(const gchar *input)
   gchar **list = g_strsplit(input, ",", 0);
   if(list)
   {
-    if(list[1] == NULL) // Already in decimal format
-      res = g_ascii_strtod(list[0], NULL);
-    else if(list[2] == NULL) // format DDD,MM.mm{N|S}
+    if(list[2] == NULL) // format DDD,MM.mm{N|S}
       res = g_ascii_strtoll(list[0], NULL, 10) + (g_ascii_strtod(list[1], NULL) / 60.0);
     else if(list[3] == NULL) // format DDD,MM,SS{N|S}
       res = g_ascii_strtoll(list[0], NULL, 10) + (g_ascii_strtoll(list[1], NULL, 10) / 60.0)
@@ -677,12 +569,8 @@ double dt_util_gps_string_to_number(const gchar *input)
   return res;
 }
 
-gboolean dt_util_gps_rationale_to_number(const double r0_1,
-                                         const double r0_2,
-                                         const double r1_1,
-                                         const double r1_2,
-                                         const double r2_1,
-                                         const double r2_2, char sign,
+gboolean dt_util_gps_rationale_to_number(const double r0_1, const double r0_2, const double r1_1,
+                                         const double r1_2, const double r2_1, const double r2_2, char sign,
                                          double *result)
 {
   if(!result) return FALSE;
@@ -719,10 +607,7 @@ gboolean dt_util_gps_rationale_to_number(const double r0_1,
   return TRUE;
 }
 
-gboolean dt_util_gps_elevation_to_number(const double r_1,
-                                         const double r_2,
-                                         char sign,
-                                         double *result)
+gboolean dt_util_gps_elevation_to_number(const double r_1, const double r_2, char sign, double *result)
 {
   if(!result) return FALSE;
   double res = 0.0;
@@ -739,8 +624,7 @@ gboolean dt_util_gps_elevation_to_number(const double r_1,
 }
 
 
-// make paths absolute and try to normalize on Windows. also deal with
-// character encoding on Windows.
+// make paths absolute and try to normalize on Windows. also deal with character encoding on Windows.
 gchar *dt_util_normalize_path(const gchar *_input)
 {
 #ifdef _WIN32
@@ -792,15 +676,12 @@ gchar *dt_util_normalize_path(const gchar *_input)
   }
 
 #ifdef _WIN32
-  // on Windows filenames are case insensitive, so we can end up with
-  // an arbitrary number of different spellings for the same file.
-  // another problem is that path separators can either be / or \ leading
-  // to even more problems.
+  // on Windows filenames are case insensitive, so we can end up with an arbitrary number of different spellings for the same file.
+  // another problem is that path separators can either be / or \ leading to even more problems.
 
   // TODO:
-  // this handles filenames in the formats <drive
-  // letter>:\path\to\file or \\host-name\share-name\file some other
-  // formats like \Device\... are not supported
+  // this handles filenames in the formats <drive letter>:\path\to\file or \\host-name\share-name\file
+  // some other formats like \Device\... are not supported
 
   // the Windows api expects wide chars and not utf8 :(
   wchar_t *wfilename = g_utf8_to_utf16(filename, -1, NULL, NULL, NULL);
@@ -854,15 +735,12 @@ const gboolean dt_util_path_is_UNC(const gchar *filename)
 }
 #endif
 
-// gets the directory components of a file name, like
-// g_path_get_dirname(), but works also with Windows networks paths
-// (\\hostname\share\file)
+// gets the directory components of a file name, like g_path_get_dirname(), but works also with Windows networks paths (\\hostname\share\file)
 gchar *dt_util_path_get_dirname(const gchar *filename)
 {
   gchar *dirname = g_path_get_dirname(filename);
 
-  /* Remove trailing slash, as g_path_get_dirname() leaves it for
-     Windows UNC and this messes up film roll name */
+  /* Remove trailing slash, as g_path_get_dirname() leaves it for Windows UNC and this messes up film roll name */
   if(dirname[0])
   {
     int last = strlen(dirname) - 1;
@@ -872,8 +750,7 @@ gchar *dt_util_path_get_dirname(const gchar *filename)
   return dirname;
 }
 
-guint dt_util_string_count_char(const char *text,
-                                const char needle)
+guint dt_util_string_count_char(const char *text, const char needle)
 {
   guint count = 0;
   while(text[0])
@@ -892,8 +769,7 @@ void dt_util_str_to_loc_numbers_format(char *data)
   g_strdelimit(data, en_decimal_point, loc_decimal_point);
 }
 
-GList *dt_util_str_to_glist(const gchar *separator,
-                            const gchar *text)
+GList *dt_util_str_to_glist(const gchar *separator, const gchar *text)
 {
   if(text == NULL) return NULL;
   GList *list = NULL;
@@ -901,10 +777,10 @@ GList *dt_util_str_to_glist(const gchar *separator,
   gchar *entry = g_strdup(text);
   gchar *prev = entry;
   int len = strlen(prev);
-  while(len)
+  while (len)
   {
     gchar *next = g_strstr_len(prev, -1, separator);
-    if(next)
+    if (next)
     {
       const gchar c = next[0];
       next[0] = '\0';
@@ -956,10 +832,9 @@ char *dt_util_format_exposure(const float exposuretime)
   return result;
 }
 
-char *dt_read_file(const char *const filename,
-                   size_t *filesize)
+char *dt_read_file(const char *const filename, size_t *filesize)
 {
-  if(filesize) *filesize = 0;
+  if (filesize) *filesize = 0;
   FILE *fd = g_fopen(filename, "rb");
   if(!fd) return NULL;
 
@@ -967,68 +842,45 @@ char *dt_read_file(const char *const filename,
   const size_t end = ftell(fd);
   rewind(fd);
 
-  char *content = malloc(sizeof(char) * end);
+  char *content = (char *)malloc(sizeof(char) * end);
   if(!content) return NULL;
 
   const size_t count = fread(content, sizeof(char), end, fd);
   fclose(fd);
-  if(count == end)
+  if (count == end)
   {
-    if(filesize) *filesize = end;
+    if (filesize) *filesize = end;
     return content;
   }
   free(content);
   return NULL;
 }
 
-void dt_copy_file(const char *const sourcefile,
-                  const char *destination)
+void dt_copy_file(const char *const sourcefile, const char *dst)
 {
   char *content = NULL;
   FILE *fin = g_fopen(sourcefile, "rb");
-  FILE *fout = g_fopen(destination, "wb");
+  FILE *fout = g_fopen(dst, "wb");
 
   if(fin && fout)
   {
     fseek(fin, 0, SEEK_END);
-    const size_t filesize = ftell(fin);
+    const size_t end = ftell(fin);
     rewind(fin);
-
-    content = (char *)g_try_malloc_n(filesize, sizeof(char));
-    if(content == NULL)
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "[dt_copy_file] failure to allocate memory for copying file '%s'",
-               sourcefile);
-      goto END;
-    }
-    if(fread(content, sizeof(char), filesize, fin) != filesize)
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "[dt_copy_file] error reading file '%s' for copying",
-               sourcefile);
-      goto END;
-    }
-    if(fwrite(content, sizeof(char), filesize, fout) != filesize)
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "[dt_copy_file] error writing file '%s' during copying",
-               destination);
-      goto END;
-    }
+    content = (char *)g_malloc_n(end, sizeof(char));
+    if(content == NULL) goto END;
+    if(fread(content, sizeof(char), end, fin) != end) goto END;
+    if(fwrite(content, sizeof(char), end, fout) != end) goto END;
   }
 
 END:
-  if(fout != NULL)
-    fclose(fout);
-  if(fin != NULL)
-    fclose(fin);
+  if(fout != NULL) fclose(fout);
+  if(fin != NULL) fclose(fin);
 
   g_free(content);
 }
 
-void dt_copy_resource_file(const char *src,
-                           const char *dst)
+void dt_copy_resource_file(const char *src, const char *dst)
 {
   char share[PATH_MAX] = { 0 };
   dt_loc_get_datadir(share, sizeof(share));
@@ -1044,38 +896,16 @@ RsvgDimensionData dt_get_svg_dimension(RsvgHandle *svg)
   #if LIBRSVG_CHECK_VERSION(2,52,0)
     double width;
     double height;
-    if(rsvg_handle_get_intrinsic_size_in_pixels(svg, &width, &height)) //only works if SVG document has size specified
-    {
-      dimension.width = lround(width);
-      dimension.height = lround(height);
-    }
-    else
-    {
-#define VIEWPORT_SIZE 32767 //use maximum cairo surface size to have enough precision when size is converted to int
-      const RsvgRectangle viewport = {
-        .x = 0,
-        .y = 0,
-        .width = VIEWPORT_SIZE,
-        .height = VIEWPORT_SIZE,
-      };
-#undef VIEWPORT_SIZE
-      RsvgRectangle rectangle;
-      rsvg_handle_get_geometry_for_layer(svg, NULL, &viewport, NULL, &rectangle, NULL);
-      dimension.width = lround(rectangle.width);
-      dimension.height = lround(rectangle.height);
-    }
+    rsvg_handle_get_intrinsic_size_in_pixels(svg, &width, &height);
+    dimension.width = width;
+    dimension.height = height;
   #else
     rsvg_handle_get_dimensions(svg, &dimension);
   #endif
   return dimension;
 }
 
-void dt_render_svg(RsvgHandle *svg,
-                   cairo_t *cr,
-                   const double width,
-                   const double height,
-                   const double offset_x,
-                   const double offset_y)
+void dt_render_svg(RsvgHandle *svg, cairo_t *cr, double width, double height, double offset_x, double offset_y)
 {
   // rsvg_handle_render_cairo has been deprecated in librsvg 2.52
   #if LIBRSVG_CHECK_VERSION(2,52,0)
@@ -1091,10 +921,8 @@ void dt_render_svg(RsvgHandle *svg,
   #endif
 }
 
-// check if the path + basenames are the same (<=> only differ by the
-// extension)
-gboolean dt_has_same_path_basename(const char *filename1,
-                                   const char *filename2)
+// check if the path + basenames are the same (<=> only differ by the extension)
+gboolean dt_has_same_path_basename(const char *filename1, const char *filename2)
 {
   // assume both filenames have an extension
   if(!filename1 || !filename2) return FALSE;
@@ -1112,76 +940,28 @@ gboolean dt_has_same_path_basename(const char *filename1,
   return TRUE;
 }
 
-// set the filename2 extension to filename1 - return NULL if fails -
-// result should be freed
-char *dt_copy_filename_extension(const char *filename1,
-                                 const char *filename2)
+// set the filename2 extension to filename1 - return NULL if fails - result should be freed
+char *dt_copy_filename_extension(const char *filename1, const char *filename2)
 {
   // assume both filenames have an extension
-  if(!filename2) return NULL;
+  if(!filename1 || !filename2) return NULL;
+  const char *dot1 = strrchr(filename1, '.');
+  if(!dot1) return NULL;
   const char *dot2 = strrchr(filename2, '.');
   if(!dot2) return NULL;
-
-  return dt_filename_change_extension(filename1, dot2+1);
-}
-
-char *dt_filename_change_extension(const char *filename,
-                                   const char *ext)
-{
-  // assume both filenames have an extension
-  if(!filename || !ext) return NULL;
-  const char *dot = strrchr(filename, '.');
-  if(!dot) return NULL;
-  const int name_lgth = dot - filename + 1;
-  const int ext_lgth = strlen(ext);
-  char *output = g_try_malloc(name_lgth + ext_lgth + 1);
+  const int name_lgth = dot1 - filename1;
+  const int ext_lgth = strlen(dot2);
+  char *output = g_malloc(name_lgth + ext_lgth + 1);
   if(output)
   {
-    memcpy(output, filename, name_lgth);
-    memcpy(&output[name_lgth], ext, ext_lgth + 1);
+    memcpy(output, filename1, name_lgth);
+    memcpy(&output[name_lgth], &filename2[strlen(filename2) - ext_lgth], ext_lgth + 1);
   }
   return output;
 }
 
-GList *dt_read_file_pattern(const char *dir_path,
-                            const char *pattern_str)
-{
-  GList *files = NULL;
-  GError *error = NULL;
-
-  // Open the directory
-  GDir *dir = g_dir_open(dir_path, 0, &error);
-
-  if(dir == NULL)
-  {
-    g_error_free(error);
-    return NULL;
-  }
-
-  // Compile the pattern
-  GPatternSpec *pattern = g_pattern_spec_new(pattern_str);
-
-  // Iterate over directory contents
-  const gchar *filename;
-  while((filename = g_dir_read_name(dir)) != NULL)
-  {
-    if(g_pattern_match_string(pattern, filename))
-    {
-      files = g_list_append(files, g_strdup(filename));
-    }
-  }
-
-  // Cleanup
-  g_dir_close(dir);
-  g_pattern_spec_free(pattern);
-
-  return files;
-}
-
 // replaces all occurences of a substring in a string
-gchar *dt_str_replace(const char *string,
-                      const char *search,
-                      const char *replace)
+gchar *dt_str_replace(const char *string, const char *search, const char *replace)
 {
   gchar **split = g_strsplit(string, search, -1);
   gchar *res = g_strjoinv(replace, split);
@@ -1189,44 +969,6 @@ gchar *dt_str_replace(const char *string,
   return res;
 }
 
-gboolean dt_str_commasubstring(const char *list,
-                               const char *search)
-{
-  if(search == NULL)
-    return FALSE;
-
-  gchar *nlist = g_strdup(list);
-  char delimiter[] = ",";
-
-  char *ptr =strtok(nlist, delimiter);
-  while(ptr != NULL)
-  {
-    if(g_strcmp0(search, ptr) == 0)
-    {
-      g_free(nlist);
-      return TRUE;
-    }
-    ptr = strtok(NULL, delimiter);
-  }
-
-  g_free(nlist);
-  return FALSE;
-}
-
-gboolean dt_is_scene_referred(void)
-{
-  return dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (filmic)")
-    || dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (sigmoid)")
-    || dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (AgX)");
-}
-
-gboolean dt_is_display_referred(void)
-{
-  return dt_conf_is_equal("plugins/darkroom/workflow", "display-referred (legacy)");
-}
-
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

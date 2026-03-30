@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    copyright (c) 2019-2023 darktable developers.
+    copyright (c) 2019--2020 Diederik ter Rahe.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -41,9 +41,10 @@ const char *name(dt_lib_module_t *self)
   return _("midi");
 }
 
-dt_view_type_flags_t views(dt_lib_module_t *self)
+const char **views(dt_lib_module_t *self)
 {
-  return DT_VIEW_NONE;
+  static const char *v[] = {"*", NULL};
+  return v;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -51,7 +52,17 @@ uint32_t container(dt_lib_module_t *self)
   return DT_UI_CONTAINER_PANEL_TOP_CENTER;
 }
 
-typedef struct dt_midi_device_t
+int expandable(dt_lib_module_t *self)
+{
+  return 0;
+}
+
+int position()
+{
+  return 1;
+}
+
+typedef struct midi_device
 {
   dt_input_device_t   id;
   const PmDeviceInfo *info;
@@ -62,35 +73,29 @@ typedef struct dt_midi_device_t
   gboolean            syncing;
   gint                encoding;
   gint8               last_known[128];
-  gint8               rotor_lights[128];
   guint8              num_keys, num_knobs, first_key, first_knob, first_light;
 
   int                 last_controller, last_received, last_diff, num_identical;
+  gboolean            is_x_touch_mini;
+} midi_device;
 
-  gchar               behringer; // (X)-Touch (M)ini/(C)ompact/(E)tended/(O)ne/BC(F/R)2000
-} dt_midi_device_t;
+const char *note_names[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B", NULL };
 
-static const char *_note_names[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B", NULL };
-
-static gchar *_key_to_string(const guint key,
-                             const gboolean display)
+gchar *key_to_string(const guint key, const gboolean display)
 {
-  // The MIDI note range is from C−1 (note #0) to G9 (note #127).
-  return g_strdup_printf(display ? "%s%d (%d)" : "%s%d",
-                         _note_names[key % 12], (int)key / 12 - 1, key);
+  return g_strdup_printf("%s%d", note_names[key % 12], key / 12 - 1);
 }
 
-static gboolean _string_to_key(const gchar *string,
-                               guint *key)
+gboolean string_to_key(const gchar *string, guint *key)
 {
   int octave = 0;
   char name[3];
 
   if(sscanf(string, "%2[ABCDEFG#]%d", name, &octave) == 2)
   {
-    for(int note = 0; _note_names[note]; note++)
+    for(int note = 0; note_names[note]; note++)
     {
-      if(!strcmp(name, _note_names[note]))
+      if(!strcmp(name, note_names[note]))
       {
         *key = note + 12 * (octave + 1);
         return TRUE;
@@ -101,47 +106,29 @@ static gboolean _string_to_key(const gchar *string,
   return FALSE;
 }
 
-static gchar *_move_to_string(const guint move,
-                              const gboolean display)
+gchar *move_to_string(const guint move, const gboolean display)
 {
   return g_strdup_printf("CC%u", move);
 }
 
-static gboolean _string_to_move(const gchar *string,
-                                guint *move)
+gboolean string_to_move(const gchar *string, guint *move)
 {
   return sscanf(string, "CC%u", move) == 1;
 }
 
-static gboolean _key_to_move(dt_lib_module_t *self,
-                             const dt_input_device_t id,
-                             const guint key,
-                             guint *move)
+gboolean key_to_move(dt_lib_module_t *self, const dt_input_device_t id, const guint key, guint *move)
 {
   for(GSList *devices = self->data; devices; devices = devices->next)
   {
-    const dt_midi_device_t *midi = devices->data;
+    midi_device *midi = devices->data;
     if(midi->id != id) continue;
 
-    if(midi->behringer == 'M')
+    if(midi->is_x_touch_mini)
     {
       if(key < 8)
         *move = key + 1;
       else if(key >= 24 && key < 32)
         *move = key - 13;
-      else
-        return FALSE;
-    }
-    else if(midi->behringer == 'C')
-    {
-      if(key < 16)
-        *move = key + 10;
-      else if(key >= 40 && key < 49)
-        *move = key - 39;
-      else if(key >= 55 && key < 71)
-        *move = key -18;
-      else if(key >= 95 && key < 104)
-        *move = key - 67;
       else
         return FALSE;
     }
@@ -154,31 +141,23 @@ static gboolean _key_to_move(dt_lib_module_t *self,
   return TRUE;
 }
 
-static const dt_input_driver_definition_t _driver_definition
-  = { "midi", _key_to_string, _string_to_key, _move_to_string, _string_to_move, _key_to_move };
+const dt_input_driver_definition_t driver_definition
+  = { "midi", key_to_string, string_to_key, move_to_string, string_to_move, key_to_move };
 
-static void _midi_write(dt_midi_device_t *midi,
-                        const gint channel,
-                        const gint type,
-                        const gint key,
-                        const gint velocity)
+void midi_write(midi_device *midi, gint channel, gint type, gint key, gint velocity)
 {
-  if(midi->portmidi_out)
+  if (midi->portmidi_out)
   {
     PmMessage message = Pm_Message((type << 4) + channel, key, velocity);
     PmError pmerror = Pm_WriteShort(midi->portmidi_out, 0, message);
-    if(pmerror != pmNoError)
+    if (pmerror != pmNoError)
     {
       g_print("Portmidi error: %s\n", Pm_GetErrorText(pmerror));
-      Pm_Close(midi->portmidi_out);
-      midi->portmidi_out = NULL;
     }
   }
 }
 
-static gint _calculate_move(dt_midi_device_t *midi,
-                            const gint controller,
-                            const gint velocity)
+gint calculate_move(midi_device *midi, gint controller, gint velocity)
 {
   switch(midi->encoding)
   {
@@ -250,7 +229,7 @@ static gint _calculate_move(dt_midi_device_t *midi,
           if(controller == midi->last_controller &&
              diff * midi->last_diff < 0)
           {
-            const int diff_received = velocity - midi->last_received;
+            int diff_received = velocity - midi->last_received;
             if(abs(diff) > abs(diff_received))
               diff = diff_received;
           }
@@ -267,84 +246,23 @@ static gint _calculate_move(dt_midi_device_t *midi,
   }
 }
 
-static void _midi_write_bcontrol(dt_midi_device_t *midi,
-                                 const gchar seq,
-                                 gchar *str)
-{
-  // sysex string contains zeros so can't use standard string handling and Pm_WriteSysEx
-  unsigned char sysex[100];
-  const int syslen = g_snprintf((gchar *)sysex, sizeof(sysex),
-                                "\xF0%c\x20\x32\x7F\x7F\x20%c%c%s\xF7%c%c%c",
-                                0, 0, seq, str, 0, 0, 0);
-  PmEvent buffer[sizeof(sysex)/4] = {0};
-  for(int i = 0; i < syslen / 4; i++)
-    buffer[i].message = sysex[i*4] | (sysex[i*4+1] << 8) | (sysex[i*4+2] << 16) | (sysex[i*4+3] << 24);
-  PmError pmerror = Pm_Write(midi->portmidi_out, buffer, syslen / 4);
-  if(pmerror != pmNoError)
-  {
-    g_print("Portmidi error while writing light pattern to BCF/R2000: %s\n", Pm_GetErrorText(pmerror));
-    Pm_Close(midi->portmidi_out);
-    midi->portmidi_out = NULL;
-  }
-  g_free(str);
-}
-
-static void _update_with_move(dt_midi_device_t *midi,
-                              const PmTimestamp timestamp,
-                              const gint controller,
-                              const float move)
+void update_with_move(midi_device *midi, PmTimestamp timestamp, gint controller, float move)
 {
   float new_position = dt_shortcut_move(midi->id, timestamp, controller, move);
 
-  const int new_pattern =
-    DT_ACTION_IS_INVALID(new_position) ? 1
-    : fmodf(new_position, DT_VALUE_PATTERN_ACTIVE) == DT_VALUE_PATTERN_SUM ? 2
-    : new_position >= DT_VALUE_PATTERN_PERCENTAGE ? 2
-    : new_position >= DT_VALUE_PATTERN_PLUS_MINUS ? 3
-    : 1;
-
-  static const int light_codes[] = { 1, 1 /* pan */, 2 /* fan */, 4 /* trim */};
-
-  if(midi->behringer == 'M')
+  if(midi->is_x_touch_mini && controller != 9 && controller != 10)
   {
-    if(midi->first_key == 8
-       ? controller <  9 /* layer A */
-       : controller > 10 /* layer B */)
-    {
-      // Light pattern always for 1-8 range, but CC=1-8 (bank A) or 11-18 (bank B).
-      _midi_write(midi, 0, 0xB, controller % 10, light_codes[new_pattern]);
-    }
+    // Light pattern always for 1-8 range, but CC=1-8 (bank A) or 11-18 (bank B).
+    if(isnan(new_position))
+      ; // midi_write(midi, 0, 0xB, controller % 10, 0); // off
+    else if(new_position >= DT_VALUE_PATTERN_PERCENTAGE ||
+            fmodf(new_position, DT_VALUE_PATTERN_ACTIVE) == DT_VALUE_PATTERN_SUM)
+      midi_write(midi, 0, 0xB, controller % 10, 2); // fan
+    else if(new_position >= DT_VALUE_PATTERN_PLUS_MINUS)
+      midi_write(midi, 0, 0xB, controller % 10, 4); // trim
+    else
+      midi_write(midi, 0, 0xB, controller % 10, 1); // pan
   }
-  else if(midi->behringer == 'C')
-  {
-    if(midi->first_key == 16
-       ? (controller >= 10 && controller <= 25) /* layer A */
-       : (controller >= 37 && controller <= 52) /* layer B */)
-    {
-      // Light pattern always for 10-25 range, but CC=10-25 (bank A) or 37-52 (bank B).
-      _midi_write(midi, 1, 0xB, controller % 27, light_codes[new_pattern]);
-    }
-  }
-  else if(new_pattern != midi->rotor_lights[controller])
-  {
-    midi->rotor_lights[controller] = new_pattern;
-
-    if((midi->behringer == 'R' || midi->behringer == 'F')
-       && controller < 32 && midi->portmidi_out)
-    {
-      static const gchar *bcontrol_codes[] = { "1dot/off", "12dot", "bar", "pan" };
-
-      _midi_write_bcontrol(midi, 0, g_strdup_printf("$rev %c", midi->behringer));
-      _midi_write_bcontrol(midi, 1, g_strdup_printf("$encoder %d", controller + 1));
-      _midi_write_bcontrol(midi, 2, g_strdup_printf("  .easypar CC 1 %d 0 127 absolute", controller));
-      _midi_write_bcontrol(midi, 3, g_strdup_printf("  .mode %s", bcontrol_codes[new_pattern]));
-      _midi_write_bcontrol(midi, 4, g_strdup_printf("  .showvalue on"));
-      _midi_write_bcontrol(midi, 5, g_strdup_printf("$end"));
-    }
-  }
-
-  if(DT_ACTION_IS_INVALID(new_position))
-    return;
 
   int rotor_position = 0;
   if(new_position >= 0)
@@ -360,30 +278,33 @@ static void _update_with_move(dt_midi_device_t *midi,
       }
     }
   }
-  else
+  else if(!isnan(new_position))
   {
-    const int c = - new_position;
+    int c = - new_position;
     if(c > 1)
     {
-      if(midi->behringer == 'M' || midi->behringer == 'C')
+      if(midi->is_x_touch_mini)
         rotor_position = fmodf(c * 10.5f - (c > 13 ? 140.1f : 8.6f), 128);
       else
         rotor_position = fmodf(c * 9.0f - 10.f, 128);
     }
   }
+  else
+  {
+    /*if(midi->last_known[controller] == 0)*/ return;
+  }
 
   midi->last_known[controller] = rotor_position;
-  _midi_write(midi, midi->channel, 0xB, controller, rotor_position);
-
-  // dt_print(DT_DEBUG_INPUT, "Controller: Channel %d, controller %d, position: %d", midi->channel, controller, rotor_position);
+  midi_write(midi, midi->channel, 0xB, controller, rotor_position);
+//dt_print(DT_DEBUG_INPUT, "Controller: Channel %d, controller %d, position: %d\n", midi->channel, controller, rotor_position);
 }
 
-static gboolean _poll_devices(gpointer user_data)
+static gboolean poll_midi_devices(gpointer user_data)
 {
   dt_lib_module_t *self = user_data;
   for(GSList *devices = self->data; devices; devices = devices->next)
   {
-    dt_midi_device_t *midi = devices->data;
+    midi_device *midi = devices->data;
 
     PmEvent event[EVENT_BUFFER_SIZE];
     const int num_events = Pm_Read(midi->portmidi_in, event, EVENT_BUFFER_SIZE);
@@ -397,7 +318,7 @@ static gboolean _poll_devices(gpointer user_data)
 
       int event_type = event_status >> 4;
 
-      if(event_type == 0x9 && // note on
+      if (event_type == 0x9 && // note on
           event_data2 == 0) // without volume
       {
         event_type = 0x8; // note off
@@ -405,71 +326,52 @@ static gboolean _poll_devices(gpointer user_data)
 
       midi->channel = event_status & 0x0F;
 
-      gboolean layer_B = FALSE;
+      gboolean x_touch_mini_layer_B = FALSE;
 
-      switch(event_type)
+      switch (event_type)
       {
       case 0x9:  // note on
-        dt_print(DT_DEBUG_INPUT, "Note On: Channel %d, Data1 %d", midi->channel, event_data1);
+        dt_print(DT_DEBUG_INPUT, "Note On: Channel %d, Data1 %d\n", midi->channel, event_data1);
 
-        layer_B = event_data1 > (midi->behringer == 'M' ? 23 : 54);
-
-        const int key_num = event_data1 - midi->first_key + 1;
-        if(key_num > midi->num_keys && !midi->behringer)
-          midi->num_keys = key_num;
+        x_touch_mini_layer_B = event_data1 > 23;
 
         dt_shortcut_key_press(midi->id, event[i].timestamp, event_data1);
         break;
       case 0x8:  // note off
-        dt_print(DT_DEBUG_INPUT, "Note Off: Channel %d, Data1 %d", midi->channel, event_data1);
+        dt_print(DT_DEBUG_INPUT, "Note Off: Channel %d, Data1 %d\n", midi->channel, event_data1);
 
-        layer_B = event_data1 > (midi->behringer == 'M' ? 23 : 54);
+        x_touch_mini_layer_B = event_data1 > 23;
 
         dt_shortcut_key_release(midi->id, event[i].timestamp, event_data1);
         break;
       case 0xb:  // controllers, sustain
-        if(midi->behringer == 'C' && event_data1 > 100) // ignore fader touch
-        {
-          layer_B = event_data1 > 110;
-          break;
-        }
-
-        layer_B = event_data1 > (midi->behringer == 'M' ? 9 : 27);
+        x_touch_mini_layer_B = event_data1 > 9;
 
         int accum = 0;
         for(int j = i; j < num_events; j++)
-        {
           if(Pm_MessageStatus(event[j].message) == event_status &&
              Pm_MessageData1(event[j].message) == event_data1)
           {
             event_data2 = Pm_MessageData2(event[j].message);
-            dt_print(DT_DEBUG_INPUT, "Controller: Channel %d, Data1 %d, Data2 %d", midi->channel, event_data1, event_data2);
+            dt_print(DT_DEBUG_INPUT, "Controller: Channel %d, Data1 %d, Data2 %d\n", midi->channel, event_data1, event_data2);
 
-            accum += _calculate_move(midi, event_data1, event_data2);
+            accum += calculate_move(midi, event_data1, event_data2);
             event[j].message = 0; // don't process again later
           }
-        }
 
-        const int knob_num = event_data1 - midi->first_knob + 1;
-        if(knob_num > midi->num_knobs)
-          midi->num_knobs = knob_num;
-
-        _update_with_move(midi, event[i].timestamp, event_data1, accum);
+        update_with_move(midi, event[i].timestamp, event_data1, accum);
 
         break;
       default:
-        continue; // layer_B has not been set
+        continue; // x_touch_mini_layer_B has not been set
       }
 
-      if(midi->behringer == 'M' || midi->behringer == 'C')
+      if(midi->is_x_touch_mini && midi->first_knob != (x_touch_mini_layer_B ? 11 : 1))
       {
-        guint8 old_first = midi->first_key;
-        midi->first_key = midi->behringer == 'M'
-                        ? (layer_B ? 32 :  8)
-                        : (layer_B ? 71 : 16); // 'C'
+        midi->first_knob  = x_touch_mini_layer_B ? 11 : 1;
+        midi->first_key   = x_touch_mini_layer_B ? 32 : 8;
 
-        if(midi->first_key != old_first)
-          for(int j = 1; j <= midi->num_knobs ; j++) midi->last_known[j] = -1;
+        for(int j = 0; (j != midi->first_knob || (j += midi->num_knobs)) && j < 128; j++) midi->last_known[j] = -1;
       }
     }
   }
@@ -477,35 +379,33 @@ static gboolean _poll_devices(gpointer user_data)
   return G_SOURCE_CONTINUE;
 }
 
-static void _midi_open_devices(dt_lib_module_t *self)
+void midi_open_devices(dt_lib_module_t *self)
 {
-  dt_input_device_t id = dt_register_input_driver(self, &_driver_definition);
-  const char *devices_string = dt_conf_get_string_const("plugins/midi/devices");
-  if(!strcmp(devices_string, "-"))
-    return;
-
   if(Pm_Initialize())
   {
-    dt_print(DT_DEBUG_ALWAYS, "[_midi_open_devices] ERROR initialising PortMidi");
+    fprintf(stderr, "[midi_open_devices] ERROR initialising PortMidi\n");
     return;
   }
   else
-    dt_print(DT_DEBUG_INPUT, "[_midi_open_devices] PortMidi initialized");
+    dt_print(DT_DEBUG_INPUT, "[midi_open_devices] PortMidi initialized\n");
 
+  dt_input_device_t id = dt_register_input_driver(self, &driver_definition);
+
+  const char *devices_string = dt_conf_get_string_const("plugins/midi/devices");
   gchar **dev_strings = g_strsplit(devices_string, ",", 0);
+
   int last_dev = -1;
 
   for(int i = 0; i < Pm_CountDevices(); i++)
   {
     const PmDeviceInfo *info = Pm_GetDeviceInfo(i);
-    dt_print(DT_DEBUG_INPUT, "[_midi_open_devices] found midi device '%s' via '%s'", info->name, info->interf);
+    dt_print(DT_DEBUG_INPUT, "[midi_open_devices] found midi device '%s' via '%s'\n", info->name, info->interf);
 
     if(info->input && !strstr(info->name, "Midi Through Port"))
     {
-      int dev = -1, encoding = 0, num_keys = 0;
+      int dev = -1;
 
       gchar **cur_dev = dev_strings;
-      gchar **cur_dev_par = NULL;
       for(; cur_dev && *cur_dev; cur_dev++)
       {
         if(**cur_dev == '-')
@@ -522,21 +422,12 @@ static void _midi_open_devices(dt_lib_module_t *self)
 
           if(dev > last_dev) last_dev = dev;
 
-          g_strfreev(cur_dev_par);
-          cur_dev_par = g_strsplit(*cur_dev, ":", 3);
-          if(*cur_dev_par && strstr(info->name, *cur_dev_par))
+          if(strstr(info->name, *cur_dev))
           {
-            if(*(cur_dev_par+1))
-            {
-              sscanf(*(cur_dev_par+1), "%d", &encoding);
-              if(*(cur_dev_par+2))
-                sscanf(*(cur_dev_par+2), "%d", &num_keys);
-            }
             break;
           }
         }
       }
-      g_strfreev(cur_dev_par);
 
       if(!cur_dev || !*cur_dev) dev = ++last_dev;
 
@@ -547,61 +438,29 @@ static void _midi_open_devices(dt_lib_module_t *self)
 
       if(error < 0)
       {
-        dt_print(DT_DEBUG_ALWAYS, "[_midi_open_devices] ERROR opening midi device '%s' via '%s'",
-                 info->name, info->interf);
+        fprintf(stderr, "[midi_open_devices] ERROR opening midi device '%s' via '%s'\n", info->name, info->interf);
         continue;
       }
       else
       {
-        dt_print(DT_DEBUG_INPUT, "[_midi_open_devices] opened midi device '%s' via '%s' as midi%d",
-                 info->name, info->interf, dev);
-        if(!cur_dev || !*cur_dev)
-          dt_control_log(_("%s opened as midi%d"), info->name, dev);
+        fprintf(stderr, "[midi_open_devices] opened midi device '%s' via '%s' as midi%d\n", info->name, info->interf, dev);
       }
 
-      dt_midi_device_t *midi = g_malloc0(sizeof(dt_midi_device_t));
+      midi_device *midi = (midi_device *)g_malloc0(sizeof(midi_device));
 
       midi->id          = id + dev;
       midi->info        = info;
       midi->portmidi_in = stream_in;
-      midi->encoding    = encoding;
-      midi->num_keys    = num_keys;
 
-      if(strstr(info->name, "X-TOUCH MINI"))
-      {
-        midi->behringer =  'M';
-        midi->num_knobs =   18;
-        midi->first_knob =   1;
-        midi->num_keys =    16;
-        midi->first_key =    8;
-        midi->channel =     10;
-      }
-      else if(strstr(info->name, "X-TOUCH COMPACT"))
-       {
-        midi->behringer =  'C';
-        midi->num_knobs =   52;
-        midi->first_knob =   1;
-        midi->num_keys =    39;
-        midi->first_key =   16;
-      }
-      else if(strstr(info->name, "BCR2000"))
-      {
-        midi->behringer =  'R';
-        midi->num_knobs =   56;
-        midi->num_keys =    26;
-        midi->first_key =   32;
-        midi->first_light = 32;
-      }
-      else if(strstr(info->name, "BCF2000"))
-      {
-        midi->behringer =  'F';
-        midi->num_knobs =   40;
-        midi->num_keys =    26;
-        midi->first_key =   32;
-        midi->first_light = 32;
-      }
+      midi->is_x_touch_mini = strstr(info->name, "X-TOUCH MINI") != NULL;
 
-      midi->num_identical = midi->behringer || encoding ? 0 : 5; // countdown "relative down" moves received before switching to relative mode
+      midi->num_knobs   = midi->is_x_touch_mini ?  8 : 128;
+      midi->first_knob  = midi->is_x_touch_mini ?  1 :   0;
+      midi->num_keys    = midi->is_x_touch_mini ? 16 : 128;
+      midi->first_key   = midi->is_x_touch_mini ?  8 :   0;
+      midi->first_light = 0;
+
+      midi->num_identical = midi->is_x_touch_mini ? 0 : 5; // countdown "relative down" moves received before switching to relative mode
       midi->last_received = -1;
       for(int j = 0; j < 128; j++) midi->last_known[j] = -1;
 
@@ -621,17 +480,14 @@ static void _midi_open_devices(dt_lib_module_t *self)
 
   g_strfreev(dev_strings);
 
-  if(self->data)
-    g_timeout_add(10, _poll_devices, self);
-  else
-    Pm_Terminate();
+  if(self->data) g_timeout_add(10, poll_midi_devices, self);
 }
 
-static void _midi_device_free(dt_midi_device_t *midi)
+void midi_device_free(midi_device *midi)
 {
   Pm_Close(midi->portmidi_in);
 
-  if(midi->portmidi_out)
+  if (midi->portmidi_out)
   {
     Pm_Close(midi->portmidi_out);
   }
@@ -639,36 +495,29 @@ static void _midi_device_free(dt_midi_device_t *midi)
   g_free(midi);
 }
 
-static void _midi_close_devices(dt_lib_module_t *self)
+void midi_close_devices(dt_lib_module_t *self)
 {
-  if(self->data)
-  {
-    g_source_remove_by_user_data(self);
-    g_slist_free_full(self->data, (void (*)(void *))_midi_device_free);
-    self->data = NULL;
-    Pm_Terminate();
-  }
+  g_source_remove_by_user_data(self);
+
+  g_slist_free_full(self->data, (void (*)(void *))midi_device_free);
+  self->data = NULL;
+
+  Pm_Terminate();
 }
 
-static gboolean _update_devices(gpointer user_data)
+//static void callback_image_changed(gpointer instance, gpointer user_data)
+static gboolean _timeout_midi_update(gpointer user_data)
 {
   GSList *devices = (GSList *)((dt_lib_module_t *)user_data)->data;
   while(devices)
   {
-    dt_midi_device_t *midi = devices->data;
+    midi_device *midi = devices->data;
 
-    for(int i = 0; i < midi->num_knobs && midi->portmidi_out; i++)
-      _update_with_move(midi, 0, i + midi->first_knob, DT_READ_ACTION_ONLY);
+    for(int i = 0; i < midi->num_knobs; i++) update_with_move(midi, 0, i + midi->first_knob, NAN);
 
-    gint global = midi->behringer == 'M' ? 0
-                : midi->behringer == 'C' ? 1
-                : midi->channel;
-    for(int i = 0; i < midi->num_keys && midi->portmidi_out; i++)
-    {
-      _midi_write(midi, global, 0x9, i + midi->first_light,
-                  dt_shortcut_key_active(midi->id, i + midi->first_key)
-                  ? (midi->behringer == 'C' ? 2 : 1) : 0);
-    }
+    for(int i = 0; i < midi->num_keys; i++)
+      midi_write(midi, midi->is_x_touch_mini ? 0 : midi->channel, 0x9,
+                 i + midi->first_light, dt_shortcut_key_active(midi->id, i + midi->first_key));
 
     devices = devices->next;
   }
@@ -678,26 +527,39 @@ static gboolean _update_devices(gpointer user_data)
 
 void gui_init(dt_lib_module_t *self)
 {
-  dt_capabilities_add("midi");
-
+  if(!self->widget)
+  {
+    self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_no_show_all(self->widget, TRUE);
+  }
   self->data = NULL;
 
-  _midi_open_devices(self);
+  midi_open_devices(self);
 
-  g_timeout_add(250, _update_devices, self);
+  g_timeout_add(250, _timeout_midi_update, self);
+
+  // dt_control_signal_connect(darktable.signals, DT_SIGNAL_DEVELOP_IMAGE_CHANGED,
+  //                           G_CALLBACK(callback_image_changed), self);
+
+  // dt_control_signal_connect(darktable.signals, DT_SIGNAL_DEVELOP_HISTORY_CHANGE,
+  //                           G_CALLBACK(callback_image_changed), self);
 }
 
 void gui_cleanup(dt_lib_module_t *self)
 {
   g_source_remove_by_user_data(self);
 
-  _midi_close_devices(self);
+  // dt_control_signal_disconnect(darktable.signals,
+  //                              G_CALLBACK(callback_image_changed), self);
+
+  // dt_control_signal_disconnect(darktable.signals,
+  //                              G_CALLBACK(callback_image_changed), self);
+
+  midi_close_devices(self);
 }
 
 #endif // HAVE_PORTMIDI
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

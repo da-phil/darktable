@@ -23,8 +23,6 @@
 #include <glib.h>
 #include <gtk/gtk.h>
 
-#include "common/darktable.h"
-
 #define MAX_STARS 5
 #define IMG_TO_FIT 0.0f
 
@@ -52,8 +50,7 @@ typedef enum dt_thumbnail_container_t
 {
   DT_THUMBNAIL_CONTAINER_LIGHTTABLE,
   DT_THUMBNAIL_CONTAINER_CULLING,
-  DT_THUMBNAIL_CONTAINER_PREVIEW,
-  DT_THUMBNAIL_CONTAINER_DUPLICATE
+  DT_THUMBNAIL_CONTAINER_PREVIEW
 } dt_thumbnail_container_t;
 
 typedef enum dt_thumbnail_selection_mode_t
@@ -63,16 +60,9 @@ typedef enum dt_thumbnail_selection_mode_t
   DT_THUMBNAIL_SEL_MODE_MOD_ONLY    // user can only change selection with mouse AND CTRL or SHIFT
 } dt_thumbnail_selection_mode_t;
 
-typedef enum dt_thumbnail_selection_t
-{
-  DT_THUMBNAIL_SELECTION_UNSELECTED= 0, // value should stay 0 to be equivalent to FALSE
-  DT_THUMBNAIL_SELECTION_SELECTED= 1,   // user should stay 1 to be equivalent to TRUE
-  DT_THUMBNAIL_SELECTION_UNKNOWN
-} dt_thumbnail_selection_t;
-
 typedef struct
 {
-  dt_imgid_t imgid, rowid;
+  int imgid, rowid;
   int width, height;         // current thumb size (with the background and the border)
   int x, y;                  // current position at screen
   int img_width, img_height; // current image size (can be greater than the image box in case of zoom)
@@ -88,7 +78,6 @@ typedef struct
   gchar *info_line;
   gboolean is_altered;
   gboolean has_audio;
-  gboolean has_tags;
   gboolean is_grouped;
   gboolean is_bw;
   gboolean is_bw_flow;
@@ -110,7 +99,7 @@ typedef struct
 
   GtkWidget *w_cursor;    // GtkDrawingArea -- triangle to show current image(s) in filmstrip
   GtkWidget *w_bottom_eb; // GtkEventBox -- background of the bottom infos area (contains w_bottom)
-  GtkWidget *w_bottom;    // GtkLabel -- text of the bottom infos area, just with #thumb-bottom
+  GtkWidget *w_bottom;    // GtkLabel -- text of the bottom infos area, just with #thumb_bottom_ext
   GtkWidget *w_reject;    // GtkDarktableThumbnailBtn -- Reject icon
   GtkWidget *w_stars[MAX_STARS];  // GtkDarktableThumbnailBtn -- Stars icons
   GtkWidget *w_color;     // GtkDarktableThumbnailBtn -- Colorlabels "flower" icon
@@ -118,7 +107,6 @@ typedef struct
   GtkWidget *w_local_copy; // GtkDarktableThumbnailBtn -- localcopy triangle
   GtkWidget *w_altered;    // GtkDarktableThumbnailBtn -- Altered icon
   GtkWidget *w_group;      // GtkDarktableThumbnailBtn -- Grouping icon
-  GtkWidget *w_tags;       // GtkDarktableThumbnailBtn -- Tags icon
   GtkWidget *w_audio;      // GtkDarktableThumbnailBtn -- Audio sidecar icon
 
   GtkWidget *w_zoom_eb; // GtkEventBox -- container for the zoom level widget
@@ -135,10 +123,10 @@ typedef struct
 
   dt_thumbnail_overlay_t over;  // type of overlays
   int overlay_timeout_duration; // for hover_block overlay, we hide the it after a delay
-  guint overlay_timeout_id;       // id of the g_source timeout fct
+  int overlay_timeout_id;       // id of the g_source timeout fct
   gboolean tooltip;             // should we show the tooltip ?
 
-  guint expose_again_timeout_id;  // source id of the expose_again timeout
+  int expose_again_timeout_id;  // source id of the expose_again timeout
 
   // specific for culling and preview
   gboolean zoomable;   // can we zoom in/out the thumbnail (used for culling/preview)
@@ -156,49 +144,29 @@ typedef struct
   gboolean busy; // should we show the busy message ?
 } dt_thumbnail_t;
 
-dt_thumbnail_t *dt_thumbnail_new(const int width,
-                                 const int height,
-                                 const float zoom_ratio,
-                                 const dt_imgid_t imgid,
-                                 const int rowid,
-                                 const dt_thumbnail_overlay_t over,
-                                 const dt_thumbnail_container_t container,
-                                 const gboolean tooltip,
-                                 const dt_thumbnail_selection_t sel);
+dt_thumbnail_t *dt_thumbnail_new(int width, int height, float zoom_ratio, int imgid, int rowid, dt_thumbnail_overlay_t over,
+                                 dt_thumbnail_container_t container, gboolean tooltip);
 void dt_thumbnail_destroy(dt_thumbnail_t *thumb);
-GtkWidget *dt_thumbnail_create_widget(dt_thumbnail_t *thumb,
-                                      const float zoom_ratio);
-void dt_thumbnail_resize(dt_thumbnail_t *thumb,
-                         const int width,
-                         const int height,
-                         const gboolean force,
-                         const float zoom_ratio);
-void dt_thumbnail_set_group_border(dt_thumbnail_t *thumb,
-                                   const dt_thumbnail_border_t border);
-void dt_thumbnail_set_mouseover(dt_thumbnail_t *thumb,
-                                const gboolean over);
+GtkWidget *dt_thumbnail_create_widget(dt_thumbnail_t *thumb, float zoom_ratio);
+void dt_thumbnail_resize(dt_thumbnail_t *thumb, int width, int height, gboolean force, float zoom_ratio);
+void dt_thumbnail_set_group_border(dt_thumbnail_t *thumb, dt_thumbnail_border_t border);
+void dt_thumbnail_set_mouseover(dt_thumbnail_t *thumb, gboolean over);
 
 // set if the thumbnail should react (mouse_over) to drag and drop
 // note that it's just cosmetic as dropping occurs in thumbtable in any case
-void dt_thumbnail_set_drop(dt_thumbnail_t *thumb,
-                           const gboolean accept_drop);
+void dt_thumbnail_set_drop(dt_thumbnail_t *thumb, gboolean accept_drop);
 
 // update the information of the image and update icons accordingly
 void dt_thumbnail_update_infos(dt_thumbnail_t *thumb);
 
 // check if the image is selected and set its state and background
 void dt_thumbnail_update_selection(dt_thumbnail_t *thumb);
-// force the selected state of a thumb
-void dt_thumbnail_set_selection(dt_thumbnail_t *thumb,
-                                const gboolean selected);
 
 // force image recomputing
 void dt_thumbnail_image_refresh(dt_thumbnail_t *thumb);
 
 // do we need to display simple overlays or extended ?
-void dt_thumbnail_set_overlay(dt_thumbnail_t *thumb,
-                              dt_thumbnail_overlay_t over,
-                              const int timeout);
+void dt_thumbnail_set_overlay(dt_thumbnail_t *thumb, dt_thumbnail_overlay_t over, int timeout);
 
 // force reloading image infos
 void dt_thumbnail_reload_infos(dt_thumbnail_t *thumb);
@@ -210,11 +178,7 @@ float dt_thumbnail_get_zoom100(dt_thumbnail_t *thumb);
 // get the zoom ratio from 0 ("image to fit") to 1 ("max zoom value")
 float dt_thumbnail_get_zoom_ratio(dt_thumbnail_t *thumb);
 
-// reset the image surface
-void dt_thumbnail_surface_destroy(dt_thumbnail_t *thumb);
 #endif
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

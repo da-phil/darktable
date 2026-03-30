@@ -7,7 +7,6 @@ import os
 import xml.etree.ElementTree as ET
 import subprocess
 import shlex
-import json
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -19,44 +18,48 @@ IGNORED_PRESETS = {"Auto", "Kelvin", "Measured", "AsShot", "As Shot", "Preset",
                  "Natural Auto", "Multi Auto", "Color Temperature Enhancement",
                  "One Touch WB 1", "One Touch WB 2", "One Touch WB 3",
                  "One Touch WB 4", "Custom WB 1", "Auto0", "Auto1", "Auto2",
-                 "Custom", "CWB1", "CWB2", "CWB3", "CWB4", "Black",
+                 "Custom", "CWB1", "CWB2", "CWB3", "CWB4", "Black", 
                  "Illuminator1", "Illuminator2", "Uncorrected"}
 
 FL_PRESET_REPLACE = {
-    "Fluorescent": "Cool White Fluorescent",
-    "FluorescentP1": "Day White Fluorescent",
-    "FluorescentP2": "Daylight Fluorescent",
-    "FluorescentM1": "Warm White Fluorescent",
-    "FluorescentD": "Daylight Fluorescent",
-    "FluorescentN": "Neutral Fluorescent",
-    "FluorescentW": "White Fluorescent",
-    "Unknown (0x600)": "Underwater",
-    "Sunny": "Direct Sunlight",
-    "Fine Weather": "Direct Sunlight",
-    "Tungsten (Incandescent)": "Tungsten",
-    "ISO Studio Tungsten": "Tungsten",
-    "Cool WHT FL": "Cool White Fluorescent",
-    "Daylight FL": "Daylight Fluorescent",
-    "Warm WHT FL": "Warm White Fluorescent",
-    "White FL": "White Fluorescent",
-    "Mercury Lamp": "High Temp. Mercury-Vapor Fluorescent",
-    "Day White FL": "Day White Fluorescent",
-    "Sodium Lamp": "Sodium-Vapor Fluorescent",
-    "3000K (Tungsten light)": "Tungsten",
-    "4000K (Cool white fluorescent)": "Cool White Fluorescent",
-    "5300K (Fine Weather)": "Daylight",
-    "5500K (Flash)": "Flash",
-    "6000K (Cloudy)": "Cloudy",
-    "7500K (Fine Weather with Shade)": "Shade",
-}
+  "Fluorescent" : "CoolWhiteFluorescent",
+  "FluorescentP1" : "DayWhiteFluorescent",
+  "FluorescentP2" : "DaylightFluorescent",
+  "FluorescentM1" : "WarmWhiteFluorescent",
+  "FluorescentD"  : "DaylightFluorescent",
+  "FluorescentN"  : "NeutralFluorescent",
+  "FluorescentW"  : "WhiteFluorescent",
+  "Daylight Fluorescent" : "DaylightFluorescent",
+  "Day White Fluorescent" : "DayWhiteFluorescent",
+  "White Fluorescent" : "WhiteFluorescent",
+  "Unknown (0x600)" : "Underwater",
+  "Sunny" : "DirectSunlight",
+  "Fine Weather" : "DirectSunlight",
+  "Tungsten (Incandescent)" : "Tungsten",
+  "ISO Studio Tungsten" : "Tungsten",
+  "Cool WHT FL" : "CoolWhiteFluorescent",
+  "Daylight FL" : "DaylightFluorescent",
+  "Warm WHT FL" : "WarmWhiteFluorescent",
+  "Warm White Fluorescent" : "WarmWhiteFluorescent",
+  "White FL" : "WhiteFluorescent",
+  "Mercury Lamp" : "HighTempMercuryVaporFluorescent",
+  "Day White FL" : "DayWhiteFluorescent",
+  "Sodium Lamp" : "SodiumVaporFluorescent",
+  "3000K (Tungsten light)" : "Tungsten",
+  "4000K (Cool white fluorescent)" : "CoolWhiteFluorescent",
+  "5300K (Fine Weather)" : "Daylight",
+  "5500K (Flash)" : "Flash",
+  "6000K (Cloudy)" : "Cloudy",
+  "7500K (Fine Weather with Shade)" : "Shade",
+  }
 
-PRESET_ORDER = ["Direct Sunlight", "Daylight", "D55", "Shade", "Cloudy",
-                "Tungsten", "Incandescent", "Fluorescent",
-                "Warm White Fluorescent", "Cool White Fluorescent",
-                "Day White Fluorescent", "Daylight Fluorescent",
-                "Neutral Fluorescent", "White Fluorescent",
-                "High Temp. Mercury-Vapor Fluorescent", "HTMercury",
-                "Sodium-Vapor Fluorescent", "Underwater", "Flash", "Unknown"]
+PRESET_ORDER = ["DirectSunlight", "Daylight", "D55", "Shade","Cloudy",
+              "Tungsten", "Incandescent","Fluorescent", 
+              "WarmWhiteFluorescent", "CoolWhiteFluorescent",
+              "DayWhiteFluorescent","DaylightFluorescent",
+              "DaylightFluorescent", "NeutralFluorescent", "WhiteFluorescent",
+              "HighTempMercuryVaporFluorescent", "HTMercury", 
+              "SodiumVaporFluorescent", "Underwater", "Flash", "Unknown"]
 
 PRESET_SORT_MAPPING = {}
 
@@ -178,10 +181,10 @@ for filename in sys.argv[1:]:
                 g = 1
             else:
                 eprint("Found RGB tag '{0}' with {1} values instead of 2, 3 or 4".format(p, len(values)))
-
+            
             if 'Fluorescent' in p:
                 fl_count += 1
-
+            
             if not p:
                 p= 'Unknown'
             if p not in IGNORED_PRESETS:
@@ -203,20 +206,22 @@ for filename in sys.argv[1:]:
             finetune = int(float(values[0]) * 2.0)
             gm_skew = gm_skew or (float(values[1]) != 0.0)
         elif tag == "White Balance Fine Tune" and maker.startswith("NIKON"): # nikon
-            finetune = 0-(int(float(values[0]) * 2)) # older nikons lie about half-steps (eg 6->6->5 instead of 6->5.5->5, need to address this later on, so rescalling this now)
+            finetune = 0-(int(values[0]) * 2) # nikon lies about half-steps (eg 6->6->5 instead of 6->5.5->5, need to address this later on, so rescalling this now)
             gm_skew = gm_skew or (int(values[1]) != 0)
         elif tag == "White Balance Fine Tune" and maker == "FUJIFILM" and int(values[3]) != 0: # fuji
             eprint("Warning: Fuji does not seem to produce any sensible data for finetuning! If all finetuned values are identical, use one with no finetuning (0)")
             finetune = int(values[3]) / 20 # Fuji has -180..180 but steps are every 20
             gm_skew = gm_skew or (int(values[1].replace(',','')) != 0)
-        elif tag == "White Balance Fine Tune" and maker == "SONY" and preset == "Cool White Fluorescent" and int(values[0]) != 0:
+        elif tag == "White Balance Fine Tune" and maker == "SONY" and preset == "CoolWhiteFluorescent":
             # Sony's Fluorescent Fun
             if values[0] == "-1":
-                preset = "Warm White Fluorescent"
+                preset = "WarmWhiteFluorescent"
+            elif values[0] == "0":
+                preset = "CoolWhiteFluorescent"
             elif values[0] == "1":
-                preset = "Day White Fluorescent"
+                preset = "DayWhiteFluorescent"
             elif values[0] == "2":
-                preset = "Daylight Fluorescent"
+                preset = "DaylightFluorescent"
             else:
                 eprint("Warning: Unknown Sony Fluorescent WB Preset!")
         elif tag == "White Balance Bracket": # olympus
@@ -233,43 +238,39 @@ for filename in sys.argv[1:]:
     if gm_skew:
         eprint('WARNING: {0} has finetuning over GM axis! Data is skewed!'.format(filename))
 
-    # adjust the maker/model we found with the map we generated before
-    if exif_name_map.get(maker,model) is not None:
-        maker,model = exif_name_map[maker,model]
+    # Adjust the maker/model we found with the map we generated before
+    if exif_name_map[maker,model]:
+        enm = exif_name_map[maker,model]
+        maker = enm[0]
+        model = enm[1]
     else:
         eprint("WARNING: Couldn't find model in cameras.xml ('{0}', '{1}')".format(maker, model))
 
     for preset_arr in listed_presets:
-        # ugly hack. Canon's Fluorescent is listed as White Fluorescent (4000K) in usermanual
+        # ugly hack. Canon's Fluorescent is listed as WhiteFluorescent in usermanual
         preset_arrv = list(preset_arr)
         if maker and maker == "Canon" and preset_arrv[0] == "Fluorescent":
-            preset_arrv[0] = "Cool White Fluorescent"
+            preset_arrv[0] = "WhiteFluorescent"
         if preset_arrv[0] in FL_PRESET_REPLACE:
             preset_arrv[0] = FL_PRESET_REPLACE[preset_arrv[0]]
         if preset_arrv[0] not in IGNORED_PRESETS:
             found_presets.append(tuple([maker,model,preset_arrv[0], 0, preset_arrv[1], preset_arrv[2], preset_arrv[3]]))
-
-    # print out the WB value that was used in the file
+    
+    # Print out the WB value that was used in the file
     if not preset:
         preset = filename
-    if red and green and blue:
-        if preset in IGNORED_PRESETS:
-            eprint("Ignoring preset '{0}'".format(preset))
-        else:
-            preset_name = ''
-            if preset.endswith('K'):
-                preset_name = '"'+preset+'"'
-            else:
-                preset_name = preset
-            found_presets.append(tuple([maker, model, preset, int(finetune), red, green, blue]))
+    if red and green and blue and preset not in IGNORED_PRESETS:
+        found_presets.append(tuple([maker, model, preset, int(finetune), red, green, blue]))
 
 # get rid of duplicate presets
+
 found_presets = list(set(found_presets))
 
-# sort by maker, model, predefined preset name mapping, and fine tuning value
 def preset_to_sort(preset):
     sort_for_preset = 0
-    if preset[2] in PRESET_SORT_MAPPING:
+    if preset[2] in IGNORED_PRESETS:
+        sort_for_preset = 0
+    elif preset[2] in PRESET_SORT_MAPPING:
         sort_for_preset = PRESET_SORT_MAPPING[preset[2]]
     elif preset[2].endswith('K'):
         sort_for_preset = int(preset[2][:-1])
@@ -279,14 +280,19 @@ def preset_to_sort(preset):
 
 found_presets.sort(key=preset_to_sort)
 
-# deal with Nikon half-steps
+min_padding = 0
+for preset in found_presets:
+    if len(preset[2]) > min_padding:
+        min_padding = len(preset[2])
+
+#dealing with Nikon half-steps
 for index in range(len(found_presets)-1):
-    if (found_presets[index][0] == 'Nikon' and # case now translated
-        found_presets[index+1][0] == found_presets[index][0] and
+    if (found_presets[index][0] == 'Nikon' and #case now translated
+        found_presets[index+1][0] == found_presets[index][0] and 
         found_presets[index+1][1] == found_presets[index][1] and
         found_presets[index+1][2] == found_presets[index][2] and
         found_presets[index+1][3] == found_presets[index][3]) :
-
+       
         curr_finetune = int(found_presets[index][3])
 
         if curr_finetune < 0:
@@ -300,8 +306,8 @@ for index in range(len(found_presets)-1):
 
 # check for gaps in finetuning for half-steps (seems that nikon and sony can have half-steps)
 for index in range(len(found_presets)-1):
-    if ( (found_presets[index][0] == "Nikon" or found_presets[index][0] == "Sony") and # case now translated
-        found_presets[index+1][0] == found_presets[index][0] and
+    if ( (found_presets[index][0] == "Nikon" or found_presets[index][0] == "Sony") and #case now translated
+        found_presets[index+1][0] == found_presets[index][0] and ##
         found_presets[index+1][1] == found_presets[index][1] and
         found_presets[index+1][2] == found_presets[index][2]) :
 
@@ -311,8 +317,8 @@ for index in range(len(found_presets)-1):
         if (found_presets[index+1][3] % 2 == 0 and
             found_presets[index][3] % 2 == 0 and
             found_presets[index+1][3] == found_presets[index][3] + 2):
-
-            # detected gap eg -12 -> -10. slicing in half to undo multiplication done earlier
+    
+            #detected gap eg -12 -> -10. slicing in half to undo multiplication done earlier
             found_presets[index][3] = int(found_presets[index][3] / 2)
             found_presets[index+1][3] = int(found_presets[index+1][3] / 2)
         elif (found_presets[index+1][3] % 2 == 0 and
@@ -321,24 +327,24 @@ for index in range(len(found_presets)-1):
               (index + 2 == len(found_presets) or
                found_presets[index+2][2] != found_presets[index+1][2] ) ):
 
-            # deal with corner case of last-halfstep not being dealt with earlier
+            #dealing with corner case of last-halfstep not being dealth with earlier
             found_presets[index+1][3] = int(found_presets[index+1][3] / 2)
 
         found_presets[index] = tuple(found_presets[index])
         found_presets[index+1] = tuple(found_presets[index+1])
 
-# detect lazy finetuning (will not complain if there's no finetuning)
+#detect lazy finetuning (will not complain if there's no finetuning)
 lazy_finetuning = []
 for index in range(len(found_presets)-1):
-    if (found_presets[index+1][0] == found_presets[index][0] and
+    if (found_presets[index+1][0] == found_presets[index][0] and ##
         found_presets[index+1][1] == found_presets[index][1] and
         found_presets[index+1][2] == found_presets[index][2] and
         found_presets[index+1][3] != ((found_presets[index][3])+1) ):
-
+        
         # found gap. complain about needing to interpolate
         lazy_finetuning.append(tuple([found_presets[index][0], found_presets[index][1], found_presets[index][2]]))
 
-# get rid of duplicate lazy finetuning reports
+# Get rid of duplicate lazy finetuning reports
 lazy_finetuning = list(set(lazy_finetuning))
 
 # $stderr.puts lazy_finetuning.inspect.gsub("], ", "],\n") # debug content
@@ -346,21 +352,13 @@ lazy_finetuning = list(set(lazy_finetuning))
 for lazy in lazy_finetuning:
   eprint("Gaps detected in finetuning for {0} {1} preset {2}, dt will need to interpolate!".format(lazy[0], lazy[1], lazy[2]))
 
-# convert to nested dictionary
-wb_dict = []
-for maker in set([p[0] for p in found_presets]):
-    maker_dict = []
-    maker_presets = [p for p in found_presets if p[0] == maker]
-    for model in set([p[1] for p in maker_presets]):
-        model_dict = [
-            {"name": p[2], "tuning": p[3], "channels": [p[4], p[5], p[6], 0]}
-            if p[3]
-            else {"name": p[2], "channels": [p[4], p[5], p[6], 0]}
-            for p in maker_presets
-            if p[1] == model
-        ]
-        maker_dict.append({"model": model, "presets": model_dict})
-    wb_dict.append({"maker": maker, "models": maker_dict})
-
-# print json formatted code
-print(json.dumps({'version': 1, 'wb_presets': wb_dict}, indent=2))
+for preset in found_presets:
+    if preset[2] in IGNORED_PRESETS:
+        eprint("Ignoring preset '{0}'".format(preset[2]))
+    else:
+        preset_name = ''
+        if preset[2].endswith('K'):
+            preset_name = '"'+preset[2]+'"'
+        else:
+            preset_name = preset[2]
+        print('  {{ "{0}", "{1}", {2:<{min_pad}}, {3}, {{ {4}, {5}, {6}, 0 }} }},'.format(preset[0], preset[1], preset_name, preset[3], preset[4], preset[5], preset[6], min_pad=min_padding))

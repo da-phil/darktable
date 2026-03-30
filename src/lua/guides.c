@@ -97,7 +97,7 @@ static int register_guide(lua_State *L)
   luaL_checktype(L, 2, LUA_TFUNCTION);
   draw_callback_id = luaL_ref(L, LUA_REGISTRYINDEX);
 
-  callback_data_t *user_data = malloc(sizeof(callback_data_t));
+  callback_data_t *user_data = (callback_data_t *)malloc(sizeof(callback_data_t));
   user_data->draw_callback_id = draw_callback_id;
   user_data->gui_callback_id = gui_callback_id;
 
@@ -122,9 +122,6 @@ int dt_lua_init_guides(lua_State *L)
 
 
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

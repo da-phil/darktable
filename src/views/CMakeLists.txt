@@ -11,6 +11,11 @@ add_library(darkroom MODULE "darkroom.c")
 add_library(lighttable MODULE "lighttable.c")
 add_library(slideshow MODULE "slideshow.c")
 
+if(USE_GAME)
+    add_library(knight MODULE "knight.c")
+    set(MODULES ${MODULES} knight)
+endif(USE_GAME)
+
 if(USE_MAP)
     add_library(map MODULE "map.c")
     set(MODULES ${MODULES} map)
@@ -37,7 +42,7 @@ foreach(module ${MODULES})
     else()
         set_target_properties(${module}
                               PROPERTIES
-                              INSTALL_RPATH ${RPATH_ORIGIN}/..)
+                              INSTALL_RPATH ${CMAKE_INSTALL_LIBDIR_RPATH})
     endif(WIN32)
 
     install(TARGETS ${module} DESTINATION ${CMAKE_INSTALL_LIBDIR}/darktable/views COMPONENT DTApplication)

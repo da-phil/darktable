@@ -35,15 +35,15 @@
       if(!g_module_symbol(module->module, #function_name, (gpointer) & (module->function_name))) \
           module->function_name = default_ ## function_name
 
-  dt_print(DT_DEBUG_CONTROL, "[" INCLUDE_API_FROM_MODULE_LOAD "] loading `%s' from %s", module_name, libname);
+  dt_print(DT_DEBUG_CONTROL, "[" INCLUDE_API_FROM_MODULE_LOAD "] loading `%s' from %s\n", module_name, libname);
   module->module = g_module_open(libname, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
   if(!module->module) goto api_h_error;
   int (*version)();
   if(!g_module_symbol(module->module, "dt_module_dt_version", (gpointer) & (version))) goto api_h_error;
   if(version() != dt_version())
   {
-    dt_print(DT_DEBUG_ALWAYS,
-            "[" INCLUDE_API_FROM_MODULE_LOAD "] `%s' is compiled for another version of dt (module %d (%s) != dt %d (%s)) !",
+    fprintf(stderr,
+            "[" INCLUDE_API_FROM_MODULE_LOAD "] `%s' is compiled for another version of dt (module %d (%s) != dt %d (%s)) !\n",
             libname, abs(version()), version() < 0 ? "debug" : "opt", abs(dt_version()),
             dt_version() < 0 ? "debug" : "opt");
     goto api_h_error;
@@ -52,9 +52,8 @@
 
   goto skip_error;
 api_h_error:
-  dt_print(DT_DEBUG_ALWAYS, "[" INCLUDE_API_FROM_MODULE_LOAD "] failed to open `%s': %s", module_name, g_module_error());
+  fprintf(stderr, "[" INCLUDE_API_FROM_MODULE_LOAD "] failed to open `%s': %s\n", module_name, g_module_error());
   if(module->module) g_module_close(module->module);
-  module->module = NULL;
   return 1;
 skip_error:
   #undef INCLUDE_API_FROM_MODULE_LOAD
@@ -74,7 +73,9 @@ skip_error:
   #define OPTIONAL(return_type, function_name, ...) return_type function_name(__VA_ARGS__)
   #define REQUIRED(return_type, function_name, ...) return_type function_name(__VA_ARGS__)
   #define DEFAULT(return_type, function_name, ...) return_type function_name(__VA_ARGS__)
-  G_BEGIN_DECLS
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
   // these 2 functions are defined by DT_MODULE() macro.
   #pragma GCC visibility push(default)
   // returns the version of dt's module interface at the time this module was build
@@ -82,11 +83,11 @@ skip_error:
   // returns the version of this module
   int dt_module_mod_version();
   #pragma GCC visibility pop
-  G_END_DECLS
+  #ifdef __cplusplus
+  }
+  #endif
 #endif
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

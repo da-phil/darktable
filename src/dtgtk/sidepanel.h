@@ -23,21 +23,35 @@
 
 G_BEGIN_DECLS
 
-#define DTGTK_TYPE_SIDE_PANEL dtgtk_side_panel_get_type()
-G_DECLARE_FINAL_TYPE(GtkDarktableSidePanel, dtgtk_side_panel, DTGTK, SIDE_PANEL, GtkBox)
+#define DTGTK_TYPE_SIDE_PANEL (dtgtk_side_panel_get_type())
+#define DTGTK_SIDE_PANEL(obj)                                                                                \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), DTGTK_TYPE_SIDE_PANEL, GtkDarktableSidePanel))
+#define DTGTK_IS_SIDE_PANEL(obj) (G_TYPE_CHECK_INSTANCE_TYPE((obj), DTGTK_TYPE_SIDE_PANEL))
+#define DTGTK_SIDE_PANEL_CLASS(klass)                                                                        \
+  (G_TYPE_CHECK_CLASS_CAST((klass), DTGTK_TYPE_SIDE_PANEL, GtkDarktableSidePanelClass))
+#define DTGTK_IS_SIDE_PANEL_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE((klass), DTGTK_TYPE_SIDE_PANEL))
+#define DTGTK_SIDE_PANEL_GET_CLASS(obj)                                                                      \
+  (G_TYPE_INSTANCE_GET_CLASS((obj), DTGTK_TYPE_SIDE_PANEL, GtkDarktableSidePanelClass))
 
-struct _GtkDarktableSidePanel
+typedef struct _GtkDarktableSidePanel
 {
-  GtkBox panel;
-};
+  GtkPaned panel;
+} GtkDarktableSidePanel;
+
+typedef struct _GtkDarktableSidePanelClass
+{
+  GtkPanedClass parent_class;
+
+  /*< private >*/
+  gint width;
+} GtkDarktableSidePanelClass;
+
+GType dtgtk_side_panel_get_type(void);
 
 GtkWidget *dtgtk_side_panel_new();
 
 G_END_DECLS
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

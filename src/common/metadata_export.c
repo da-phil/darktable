@@ -44,7 +44,7 @@ char *dt_lib_export_metadata_get_conf(void)
     metadata_presets = dt_conf_get_string(flags_keyword);
     int i = 0;
     char *conf_keyword = g_strdup_printf("%s%d", formula_keyword, i);
-    while(dt_conf_key_exists(conf_keyword))
+    while (dt_conf_key_exists(conf_keyword))
     {
       gchar *nameformula = dt_conf_get_string(conf_keyword);
       g_free(conf_keyword);
@@ -55,7 +55,7 @@ char *dt_lib_export_metadata_get_conf(void)
         {
           formula[0] = '\0';
           formula ++;
-          dt_util_str_cat(&metadata_presets,"\1%s\1%s", nameformula, formula);
+          metadata_presets = dt_util_dstrcat(metadata_presets,"\1%s\1%s", nameformula, formula);
         }
       }
       g_free(nameformula);
@@ -77,19 +77,19 @@ void dt_lib_export_metadata_set_conf(const char *metadata_presets)
   int i = 0;
   char *conf_keyword = NULL;
   char *nameformula = NULL;
-  if(!g_list_is_empty(list))
+  if (list)
   {
     char *flags_hexa = list->data;
     dt_conf_set_string(flags_keyword, flags_hexa);
     list = g_list_remove(list, flags_hexa);
     g_free(flags_hexa);
-    if(!g_list_is_empty(list))
+    if (list)
     {
-      for(GList *tags = list; tags; tags = g_list_next(tags))
+      for (GList *tags = list; tags; tags = g_list_next(tags))
       {
         const char *tagname = (char *)tags->data;
         tags = g_list_next(tags);
-        if(!tags) break;
+        if (!tags) break;
         const char *formula = (char *)tags->data;
         nameformula = g_strdup_printf("%s;%s", tagname, formula);
         conf_keyword = g_strdup_printf("%s%d", formula_keyword, i);
@@ -105,7 +105,7 @@ void dt_lib_export_metadata_set_conf(const char *metadata_presets)
 
   // clean up deprecated formulas
   conf_keyword = g_strdup_printf("%s%d", formula_keyword, i);
-  while(dt_conf_key_exists(conf_keyword))
+  while (dt_conf_key_exists(conf_keyword))
   {
     dt_conf_set_string(conf_keyword, "");
     g_free(conf_keyword);
@@ -115,8 +115,6 @@ void dt_lib_export_metadata_set_conf(const char *metadata_presets)
   g_free(conf_keyword);
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

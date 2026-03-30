@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2019-2024 darktable developers.
+    Copyright (C) 2019-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -29,12 +29,22 @@
 #include "common/darktable.h"
 #include "common/imagebuf.h"
 
-
-/* NOTE: this code complies with the optimizations in "common/extra_optimizations.h".
- * Consider including that at the beginning of a *.c file where you use this
- * header (provided the rest of the code complies).
+/** Note :
+ * we use finite-math-only and fast-math because divisions by zero are manually avoided in the code
+ * fp-contract=fast enables hardware-accelerated Fused Multiply-Add
+ * the rest is loop reorganization and vectorization optimization
  **/
 
+#if defined(__GNUC__)
+#pragma GCC optimize ("unroll-loops", "tree-loop-if-convert", \
+                      "tree-loop-distribution", "no-strict-aliasing", \
+                      "loop-interchange", "loop-nest-optimize", "tree-loop-im", \
+                      "unswitch-loops", "tree-loop-ivcanon", "ira-loop-pressure", \
+                      "split-ivs-in-unroller", "variable-expansion-in-unroller", \
+                      "split-loops", "ivopts", "predictive-commoning",\
+                      "tree-loop-linear", "loop-block", "loop-strip-mine", \
+                      "finite-math-only", "fp-contract=fast", "fast-math")
+#endif
 
 #define MIN_FLOAT exp2f(-16.0f)
 
@@ -81,7 +91,9 @@ typedef enum dt_iop_guided_filter_blending_t
  **/
 
 
- DT_OMP_DECLARE_SIMD()
+ #ifdef _OPENMP
+#pragma omp declare simd
+#endif
 __DT_CLONE_TARGETS__
 static inline float fast_clamp(const float value, const float bottom, const float top)
 {
@@ -91,16 +103,16 @@ static inline float fast_clamp(const float value, const float bottom, const floa
 
 
 __DT_CLONE_TARGETS__
-static inline void interpolate_bilinear(const float *const restrict in,
-                                        const size_t width_in,
-                                        const size_t height_in,
-                                        float *const restrict out,
-                                        const size_t width_out,
-                                        const size_t height_out,
+static inline void interpolate_bilinear(const float *const restrict in, const size_t width_in, const size_t height_in,
+                                        float *const restrict out, const size_t width_out, const size_t height_out,
                                         const size_t ch)
 {
   // Fast vectorized bilinear interpolation on ch channels
-  DT_OMP_FOR(collapse(2))
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) default(none) \
+  dt_omp_firstprivate(in, out, width_out, height_out, width_in, height_in, ch) \
+  schedule(simd:static)
+#endif
   for(size_t i = 0; i < height_out; i++)
   {
     for(size_t j = 0; j < width_out; j++)
@@ -156,10 +168,8 @@ __DT_CLONE_TARGETS__
 static inline void variance_analyse(const float *const restrict guide, // I
                                     const float *const restrict mask, //p
                                     float *const restrict ab,
-                                    const size_t width,
-                                    const size_t height,
-                                    const int radius,
-                                    const float feathering)
+                                    const size_t width, const size_t height,
+                                    const int radius, const float feathering)
 {
   // Compute a box average (filter) on a grey image over a window of size 2*radius + 1
   // then get the variance of the guide and covariance with its mask
@@ -175,7 +185,11 @@ static inline void variance_analyse(const float *const restrict guide, // I
   float *const restrict input = dt_alloc_align_float(Ndimch);
 
   // Pre-multiply guide and mask and pack all inputs into an array of 4×1 SIMD struct
-  DT_OMP_FOR_SIMD()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(guide, mask, Ndim, radius, input) \
+  schedule(simd:static)
+#endif
   for(size_t k = 0; k < Ndim; k++)
   {
     const size_t index = k * 4;
@@ -189,7 +203,11 @@ static inline void variance_analyse(const float *const restrict guide, // I
   dt_box_mean(input, height, width, 4, radius, 1);
 
   // blend the result and store in output buffer
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(ab, input, width, height, feathering) \
+  schedule(static)
+#endif
   for(size_t idx = 0; idx < width*height; idx++)
   {
     const float d = fmaxf((input[4*idx+2] - input[4*idx+0] * input[4*idx+0]) + feathering, 1e-15f); // avoid division by 0.
@@ -208,7 +226,11 @@ static inline void apply_linear_blending(float *const restrict image,
                                          const float *const restrict ab,
                                          const size_t num_elem)
 {
-  DT_OMP_FOR_SIMD(aligned(image, ab:64))
+#ifdef _OPENMP
+#pragma omp parallel for simd default(none) \
+dt_omp_firstprivate(image, ab, num_elem) \
+schedule(simd:static) aligned(image, ab:64)
+#endif
   for(size_t k = 0; k < num_elem; k++)
   {
     // Note : image[k] is positive at the outside of the luminance mask
@@ -222,7 +244,11 @@ static inline void apply_linear_blending_w_geomean(float *const restrict image,
                                                    const float *const restrict ab,
                                                    const size_t num_elem)
 {
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for simd default(none) \
+dt_omp_firstprivate(image, ab, num_elem) \
+schedule(simd:static) aligned(image, ab:64)
+#endif
   for(size_t k = 0; k < num_elem; k++)
   {
     // Note : image[k] is positive at the outside of the luminance mask
@@ -235,9 +261,7 @@ __DT_CLONE_TARGETS__
 static inline void quantize(const float *const restrict image,
                             float *const restrict out,
                             const size_t num_elem,
-                            const float sampling,
-                            const float clip_min,
-                            const float clip_max)
+                            const float sampling, const float clip_min, const float clip_max)
 {
   // Quantize in exposure levels evenly spaced in log by sampling
 
@@ -249,7 +273,11 @@ static inline void quantize(const float *const restrict image,
   else if(sampling == 1.0f)
   {
     // fast track
-    DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for simd default(none) \
+dt_omp_firstprivate(image, out, num_elem, sampling, clip_min, clip_max) \
+schedule(simd:static) aligned(image, out:64)
+#endif
     for(size_t k = 0; k < num_elem; k++)
       out[k] = fast_clamp(exp2f(floorf(log2f(image[k]))), clip_min, clip_max);
   }
@@ -257,7 +285,11 @@ static inline void quantize(const float *const restrict image,
   else
   {
     // slow track
-    DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for simd default(none) \
+dt_omp_firstprivate(image, out, num_elem, sampling, clip_min, clip_max) \
+schedule(simd:static) aligned(image, out:64)
+#endif
     for(size_t k = 0; k < num_elem; k++)
       out[k] = fast_clamp(exp2f(floorf(log2f(image[k]) / sampling) * sampling), clip_min, clip_max);
   }
@@ -266,16 +298,10 @@ static inline void quantize(const float *const restrict image,
 
 __DT_CLONE_TARGETS__
 static inline void fast_surface_blur(float *const restrict image,
-                                      const size_t width,
-                                      const size_t height,
-                                      const int radius,
-                                      float feathering,
-                                      const int iterations,
-                                      const dt_iop_guided_filter_blending_t filter,
-                                      const float scale,
-                                      const float quantization,
-                                      const float quantize_min,
-                                      const float quantize_max)
+                                      const size_t width, const size_t height,
+                                      const int radius, float feathering, const int iterations,
+                                      const dt_iop_guided_filter_blending_t filter, const float scale,
+                                      const float quantization, const float quantize_min, const float quantize_max)
 {
   // Works in-place on a grey image
 
@@ -290,14 +316,13 @@ static inline void fast_surface_blur(float *const restrict image,
   const size_t num_elem_ds = ds_width * ds_height;
   const size_t num_elem = width * height;
 
-  float *const restrict ds_image = dt_alloc_align_float(num_elem_ds);
-  float *const restrict ds_mask = dt_alloc_align_float(num_elem_ds);
-  float *const restrict ds_ab = dt_alloc_align_float(num_elem_ds * 2);
-  float *const restrict ab = dt_alloc_align_float(num_elem * 2);
+  float *const restrict ds_image = dt_alloc_sse_ps(dt_round_size_sse(num_elem_ds));
+  float *const restrict ds_mask = dt_alloc_sse_ps(dt_round_size_sse(num_elem_ds));
+  float *const restrict ds_ab = dt_alloc_sse_ps(dt_round_size_sse(num_elem_ds * 2));
+  float *const restrict ab = dt_alloc_sse_ps(dt_round_size_sse(num_elem * 2));
 
   if(!ds_image || !ds_mask || !ds_ab || !ab)
   {
-    dt_print(DT_DEBUG_PIPE, "fast guided filter failed to allocate memory");
     dt_control_log(_("fast guided filter failed to allocate memory, check your RAM settings"));
     goto clean;
   }
@@ -335,15 +360,8 @@ static inline void fast_surface_blur(float *const restrict image,
     apply_linear_blending_w_geomean(image, ab, num_elem);
 
 clean:
-  dt_free_align(ab);
-  dt_free_align(ds_ab);
-  dt_free_align(ds_mask);
-  dt_free_align(ds_image);
+  if(ab) dt_free_align(ab);
+  if(ds_ab) dt_free_align(ds_ab);
+  if(ds_mask) dt_free_align(ds_mask);
+  if(ds_image) dt_free_align(ds_image);
 }
-
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
-// vim: shiftwidth=2 expandtab tabstop=2 cindent
-// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

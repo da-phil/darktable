@@ -35,29 +35,18 @@
 // 2.4.0 was 5.0.0 (going to lua 5.3 is a major API bump)
 // 3.2.0 was 6.0.0 (removed facebook, flickr, and picasa from types.dt_imageio_storage_module_t)
 // 3.6.0 was 7.0.0 (added naming to events, selections, and actions)
-// 3.8.0 was 8.0.0 (moved to lua 5.4 and added some events)
-// 4.2.0 was 9.0.0 (view toolbox functions and snapshot filename removed)
-// 4.4.0 was 9.1.0 (added mimic and dt_lua_image_t changes)
-// 4.6.0 was 9.2.0 (added change_timestamp to dt_image_t)
-// 4.8.0 was 9.3.0 (added button and box widget enhancements)
-// 5.0.0 was 9.4.0 (added group events and uuid)
-// 5.2.0 was 9.5.0 (added apply_sidecar to image)
-// 5.4.0 was 9.6.0 (added event querying)
 /* incompatible API change */
-#define LUA_API_VERSION_MAJOR 9
+#define LUA_API_VERSION_MAJOR 8
 /* backward compatible API change */
-#define LUA_API_VERSION_MINOR 6
+#define LUA_API_VERSION_MINOR 0
 /* bugfixes that should not change anything to the API */
 #define LUA_API_VERSION_PATCH 0
 /* suffix for unstable version */
-#define LUA_API_VERSION_SUFFIX ""
+#define LUA_API_VERSION_SUFFIX "dev"
 
 /** initialize lua stuff at DT start time */
 int dt_lua_init_configuration(lua_State *L);
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

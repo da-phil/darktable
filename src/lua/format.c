@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2014-2025 darktable developers.
+   Copyright (C) 2014-2020 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -15,9 +15,8 @@
    You should have received a copy of the GNU General Public License
    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
  */
-
+#include "common/imageio.h"
 #include "control/conf.h"
-#include "imageio/imageio_common.h"
 #include "lua/image.h"
 #include "lua/modules.h"
 #include "lua/types.h"
@@ -164,21 +163,10 @@ static int write_image(lua_State *L)
   // TODO: expose icc overwrites to the user!
   dt_colorspaces_color_profile_type_t icc_type = dt_conf_get_int("plugins/lighttable/export/icctype");
   const char *icc_filename = dt_conf_get_string_const("plugins/lighttable/export/iccprofile");
-
-  // scaling
-  const gboolean is_scaling =
-    dt_conf_is_equal("plugins/lighttable/export/resizing", "scaling");
-
-  double _num, _denum;
-  dt_imageio_resizing_factor_get_and_parsing(&_num, &_denum);
-  const double scale_factor = is_scaling? _num / _denum : 1.0;
-    
-  gboolean result = dt_imageio_export(imgid, filename, format, fdata, high_quality, upscale, is_scaling, scale_factor,
-                                      FALSE, export_masks,
+  gboolean result = dt_imageio_export(imgid, filename, format, fdata, high_quality, upscale, FALSE, export_masks,
                                       icc_type, icc_filename, DT_INTENT_LAST, NULL, NULL, 1, 1, NULL);
   dt_lua_lock();
-  // mitigate 17938 by returning sane values (true for success, false for failure)
-  lua_pushboolean(L, !result);
+  lua_pushboolean(L, result);
   format->free_params(format, fdata);
   return 1;
 }
@@ -232,9 +220,6 @@ int dt_lua_init_early_format(lua_State *L)
   lua_pop(L, 1);
   return 0;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

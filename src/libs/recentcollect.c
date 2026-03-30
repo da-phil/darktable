@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2024 darktable developers.
+    Copyright (C) 2011-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -23,10 +23,10 @@
 #include "dtgtk/thumbtable.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
-#include "gui/preferences_dialogs.h"
 #include "libs/collect.h"
 #include "libs/lib.h"
 #include "libs/lib_api.h"
+#include "gui/preferences_dialogs.h"
 #include <gdk/gdkkeysyms.h>
 
 #ifdef GDK_WINDOWING_QUARTZ
@@ -36,17 +36,16 @@
 DT_MODULE(1)
 
 /** this module stores recently used image collection queries and displays
- * them as one-click buttons to the user. */
+  * them as one-click buttons to the user. */
 
-static int _conf_get_max_saved_items()
+static int _conf_get_max_items()
 {
-  return (MAX(dt_conf_get_int("plugins/lighttable/recentcollect/max_items"),
-              dt_conf_get_int("plugins/lighttable/collect/history_max")));
+  return(dt_conf_get_int("plugins/lighttable/recentcollect/max_items"));
 }
 
-static int _conf_get_max_shown_items()
+static int _conf_get_num_items()
 {
-  return (dt_conf_get_int("plugins/lighttable/recentcollect/max_items"));
+  return(dt_conf_get_int("plugins/lighttable/recentcollect/num_items"));
 }
 
 typedef struct dt_lib_recentcollect_item_t
@@ -68,15 +67,10 @@ const char *name(dt_lib_module_t *self)
   return _("recently used collections");
 }
 
-const char *description(dt_lib_module_t *self)
+const char **views(dt_lib_module_t *self)
 {
-  return _("select among the most recent search\n"
-           "criteria set in the collections module");
-}
-
-dt_view_type_flags_t views(dt_lib_module_t *self)
-{
-  return DT_VIEW_MULTI;
+  static const char *v[] = {"lighttable", "map", NULL};
+  return v;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -84,9 +78,32 @@ uint32_t container(dt_lib_module_t *self)
   return DT_UI_CONTAINER_PANEL_LEFT_CENTER;
 }
 
-int position(const dt_lib_module_t *self)
+int position()
 {
-  return 380;
+  return 350;
+}
+
+static gboolean _goto_previous(GtkAccelGroup *accel_group, GObject *acceleratable, guint keyval,
+                               GdkModifierType modifier, gpointer data)
+{
+  const char *line = dt_conf_get_string_const("plugins/lighttable/recentcollect/line1");
+  if(line)
+  {
+    dt_collection_deserialize(line);
+  }
+  return TRUE;
+}
+
+void init_key_accels(dt_lib_module_t *self)
+{
+  dt_accel_register_lib(self, NC_("accel", "jump back to previous collection"), GDK_KEY_k, GDK_CONTROL_MASK);
+}
+
+
+void connect_key_accels(dt_lib_module_t *self)
+{
+  GClosure *closure = g_cclosure_new(G_CALLBACK(_goto_previous), (gpointer)self, NULL);
+  dt_accel_connect_lib(self, "jump back to previous collection", closure);
 }
 
 static void pretty_print(const char *buf, char *out, size_t outsize)
@@ -141,15 +158,16 @@ static void pretty_print(const char *buf, char *out, size_t outsize)
   }
 }
 
-static void _button_pressed(GtkButton *button, dt_lib_module_t *self)
+static void _button_pressed(GtkButton *button, gpointer user_data)
 {
-  dt_lib_recentcollect_t *d = self->data;
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_recentcollect_t *d = (dt_lib_recentcollect_t *)self->data;
 
   // deserialize this button's preset
   int linenumber = 0;
   int found = FALSE;
   GList *k = d->items;
-  while(k != NULL && !found)
+  while (k != NULL && !found)
   {
     GList *next = k->next;
     dt_lib_recentcollect_item_t *current = k->data;
@@ -165,33 +183,104 @@ static void _button_pressed(GtkButton *button, dt_lib_module_t *self)
   if(!found) return;
 
   char confname[200];
-  snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history_pos%1d", linenumber);
-  const int pos = dt_conf_get_int(confname);
-  snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history%1d", linenumber);
+  snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", linenumber);
   const char *line = dt_conf_get_string_const(confname);
   if(line)
   {
-    // we store the wanted offset which will be set by thumbtable on collection_change signal
-    dt_conf_set_int("plugins/lighttable/collect/history_next_pos", pos);
-
-    dt_collection_deserialize(line, FALSE);
+    dt_collection_deserialize(line);
+    // position will be updated when the list of recent collections is.
+    // that way it'll also catch cases when this is triggered by a signal,
+    // not only our button press here.
   }
 }
 
 static void _lib_recentcollection_updated(gpointer instance, dt_collection_change_t query_change,
                                           dt_collection_properties_t changed_property, gpointer imgs, int next,
-                                          dt_lib_module_t *self)
+                                          gpointer user_data)
 {
-  dt_lib_recentcollect_t *d = self->data;
-
-  // update button descriptions:
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_recentcollect_t *d = (dt_lib_recentcollect_t *)self->data;
+  dt_thumbtable_t *table = dt_ui_thumbtable(darktable.gui->ui);
+  // serialize, check for recently used
   char confname[200] = { 0 };
+
+  char buf[4096];
+  if(dt_collection_serialize(buf, sizeof(buf))) return;
+
+  // is the current position, i.e. the one to be stored with the old collection (pos0, pos1-to-be)
+  uint32_t curr_pos = table->offset;
+  uint32_t new_pos = -1;
+
+  if(!d->inited)
+  {
+    new_pos = dt_conf_get_int("plugins/lighttable/recentcollect/pos0");
+    d->inited = 1;
+    dt_thumbtable_set_offset(table, new_pos, TRUE);
+  }
+  else if(curr_pos != -1)
+  {
+    dt_conf_set_int("plugins/lighttable/recentcollect/pos0", curr_pos);
+  }
+
+  int n = -1;
+  for(int k = 0; k < CLAMPS(_conf_get_num_items(), 0, _conf_get_max_items()); k++)
+  {
+    // is it already in the current list?
+    snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", k);
+    const char *line = dt_conf_get_string_const(confname);
+    if(!line) continue;
+    if(!strcmp(line, buf))
+    {
+      snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/pos%1d", k);
+      new_pos = dt_conf_get_int(confname);
+      n = k;
+      break;
+    }
+  }
+  if(n < 0)
+  {
+    const int num_items = CLAMPS(_conf_get_num_items(), 0, _conf_get_max_items());
+
+    if (num_items < _conf_get_max_items())
+    {
+      // new, unused entry
+      n = num_items;
+      dt_conf_set_int("plugins/lighttable/recentcollect/num_items", num_items + 1);
+    }
+    else
+    {
+      // kill least recently used entry:
+      n = num_items - 1;
+    }
+  }
+  if(n >= 0 && n < _conf_get_max_items())
+  {
+    // sort n to the top
+    for(int k = n; k > 0; k--)
+    {
+      snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", k - 1);
+      const gchar *line1 = dt_conf_get_string_const(confname);
+      snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/pos%1d", k - 1);
+      uint32_t pos1 = dt_conf_get_int(confname);
+      if(line1 && line1[0] != '\0')
+      {
+        snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", k);
+        dt_conf_set_string(confname, line1);
+        snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/pos%1d", k);
+        dt_conf_set_int(confname, pos1);
+      }
+    }
+    dt_conf_set_string("plugins/lighttable/recentcollect/line0", buf);
+    dt_conf_set_int("plugins/lighttable/recentcollect/pos0",
+                    (new_pos != -1 ? new_pos : (curr_pos != -1 ? curr_pos : 0)));
+  }
+  // update button descriptions:
   GList *current = d->items;
   for(int k = 0; current; k++)
   {
     char str[2048] = { 0 };
-    dt_lib_recentcollect_item_t *item = current->data;
-    snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history%1d", k);
+    dt_lib_recentcollect_item_t *item = (dt_lib_recentcollect_item_t *)current->data;
+    snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", k);
     const char *line2 = dt_conf_get_string_const(confname);
     if(line2 && line2[0] != '\0') pretty_print(line2, str, sizeof(str));
     gtk_widget_set_tooltip_text(item->button, str);
@@ -210,17 +299,15 @@ static void _lib_recentcollection_updated(gpointer instance, dt_collection_chang
   }
 
   current = d->items;
-  for(int k = 0; k < CLAMPS(_conf_get_max_shown_items(), 0, _conf_get_max_saved_items()) && current; k++)
+  for(int k = 0; k < CLAMPS(_conf_get_num_items(), 0, _conf_get_max_items()); k++)
   {
-    dt_lib_recentcollect_item_t *item = current->data;
-    const gchar *line = gtk_button_get_label(GTK_BUTTON(item->button));
-    if(line && line[0] != '\0')
-    {
-      gtk_widget_set_no_show_all(item->button, FALSE);
-      gtk_widget_set_visible(item->button, TRUE);
-    }
+    dt_lib_recentcollect_item_t *item = (dt_lib_recentcollect_item_t *)current->data;
+    gtk_widget_set_no_show_all(item->button, FALSE);
+    gtk_widget_set_visible(item->button, TRUE);
     current = g_list_next(current);
   }
+
+  dt_thumbtable_set_offset(table, new_pos, TRUE);
 }
 
 void _menuitem_preferences(GtkMenuItem *menuitem, dt_lib_module_t *self)
@@ -229,64 +316,62 @@ void _menuitem_preferences(GtkMenuItem *menuitem, dt_lib_module_t *self)
   GtkWidget *win = dt_ui_main_window(darktable.gui->ui);
   GtkWidget *dialog = gtk_dialog_new_with_buttons(_("recent collections settings"), GTK_WINDOW(win),
                                                   GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                  _("_cancel"), GTK_RESPONSE_NONE,
-                                                  _("_save"), GTK_RESPONSE_ACCEPT, NULL);
-  gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+                                                 _("cancel"), GTK_RESPONSE_NONE,
+                                                 _("save"), GTK_RESPONSE_YES, NULL);
   dt_prefs_init_dialog_recentcollect(dialog);
-  g_signal_connect(dialog, "key-press-event", G_CALLBACK(dt_handle_dialog_enter), NULL);
 
 #ifdef GDK_WINDOWING_QUARTZ
   dt_osx_disallow_fullscreen(dialog);
 #endif
   gtk_widget_show_all(dialog);
 
-  const int old_nb_items = _conf_get_max_saved_items(); // preserve previous value
+  const int old_nb_items = _conf_get_max_items(); // preserve previous value
 
-  if(gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
+  if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES)
   {
     dt_lib_recentcollect_t *d = self->data;
 
-    const int new_nb_items = _conf_get_max_saved_items();
+    const int new_nb_items = _conf_get_max_items();
     const int delta = new_nb_items - old_nb_items;
-    if(delta < 0)
+    if (delta < 0)
     {
       // destroy old items
       GList *current = g_list_nth(d->items, new_nb_items);
-      while(current)
+      while (current)
       {
-        dt_lib_recentcollect_item_t *item = current->data;
-        snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history%1d", item->confid);
+        dt_lib_recentcollect_item_t *item = (dt_lib_recentcollect_item_t *)current->data;
+        snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", item->confid);
         dt_conf_set_string(confname, "");
-        snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history_pos%1d", item->confid);
+        snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/pos%1d", item->confid);
         dt_conf_set_int(confname, 0);
         gtk_widget_destroy(item->button);
         free(item);
         GList *old = current;
         current = g_list_next(current);
-        d->items = g_list_delete_link(d->items, old);
+        d->items = g_list_delete_link (d->items, old);
       }
+      const int num_items = dt_conf_get_int("plugins/lighttable/recentcollect/num_items");
+      dt_conf_set_int("plugins/lighttable/recentcollect/num_items", MIN(num_items, new_nb_items));
     }
-    if(delta > 0)
+    if (delta > 0)
     {
       // create new items
       for(int k = old_nb_items; k < new_nb_items; k++)
       {
         GtkWidget *box = GTK_WIDGET(d->box);
-        dt_lib_recentcollect_item_t *item = malloc(sizeof(dt_lib_recentcollect_item_t));
-        if(item)
-        {
-          d->items = g_list_append(d->items, item);
-          item->button = gtk_button_new();
-          gtk_box_pack_start(GTK_BOX(box), item->button, FALSE, TRUE, 0);
-          g_signal_connect(G_OBJECT(item->button), "clicked", G_CALLBACK(_button_pressed), (gpointer)self);
-          gtk_widget_set_no_show_all(item->button, TRUE);
-          gtk_widget_set_name(GTK_WIDGET(item->button), "recent-collection-button");
-          gtk_widget_set_visible(item->button, FALSE);
-        }
+        dt_lib_recentcollect_item_t *item =
+                  (dt_lib_recentcollect_item_t *)malloc(sizeof(dt_lib_recentcollect_item_t));
+        d->items = g_list_append(d->items, item);
+        item->button = gtk_button_new();
+        gtk_box_pack_start(GTK_BOX(box), item->button, FALSE, TRUE, 0);
+        g_signal_connect(G_OBJECT(item->button), "clicked", G_CALLBACK(_button_pressed), (gpointer)self);
+        gtk_widget_set_no_show_all(item->button, TRUE);
+        gtk_widget_set_name(GTK_WIDGET(item->button), "recent-collection-button");
+        gtk_widget_set_visible(item->button, FALSE);
       }
     }
 
-    _lib_recentcollection_updated(NULL, DT_COLLECTION_CHANGE_NEW_QUERY, DT_COLLECTION_PROP_UNDEF, NULL, -1, self);
+  _lib_recentcollection_updated(NULL, DT_COLLECTION_CHANGE_NEW_QUERY, DT_COLLECTION_PROP_UNDEF, NULL, -1, self);
   }
 
   gtk_widget_destroy(dialog);
@@ -301,13 +386,14 @@ void set_preferences(void *menu, dt_lib_module_t *self)
 
 void gui_reset(dt_lib_module_t *self)
 {
+  dt_conf_set_int("plugins/lighttable/recentcollect/num_items", 0);
   char confname[200] = { 0 };
 
-  for(int k = 0; k < _conf_get_max_saved_items(); k++)
+  for(int k = 0; k < _conf_get_max_items(); k++)
   {
-    snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history%1d", k);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/line%1d", k);
     dt_conf_set_string(confname, "");
-    snprintf(confname, sizeof(confname), "plugins/lighttable/collect/history_pos%1d", k);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/recentcollect/pos%1d", k);
     dt_conf_set_int(confname, 0);
   }
   _lib_recentcollection_updated(NULL, DT_COLLECTION_CHANGE_NEW_QUERY, DT_COLLECTION_PROP_UNDEF, NULL, -1, self);
@@ -315,48 +401,46 @@ void gui_reset(dt_lib_module_t *self)
 
 void gui_init(dt_lib_module_t *self)
 {
-  dt_lib_recentcollect_t *d = malloc(sizeof(dt_lib_recentcollect_t));
+  dt_lib_recentcollect_t *d;
+  d = (dt_lib_recentcollect_t *)malloc(sizeof(dt_lib_recentcollect_t));
   d->items = NULL;
   self->data = (void *)d;
 
   GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  gtk_container_add(GTK_CONTAINER(self->widget),
-                    dt_ui_resize_wrap(box, 50, "plugins/lighttable/recentcollect/windowheight"));
+  self->widget = dt_ui_scroll_wrap(box, 50, "plugins/lighttable/recentcollect/windowheight");
+  dt_gui_add_help_link(self->widget, dt_get_help_url(self->plugin_name));
   d->box = box;
   d->inited = 0;
 
   // add buttons in the list, set them all to invisible
-  for(int k = 0; k < _conf_get_max_shown_items(); k++)
+  for(int k = 0; k < _conf_get_max_items(); k++)
   {
-    dt_lib_recentcollect_item_t *item = malloc(sizeof(dt_lib_recentcollect_item_t));
+    dt_lib_recentcollect_item_t *item =
+            (dt_lib_recentcollect_item_t *)malloc(sizeof(dt_lib_recentcollect_item_t));
     d->items = g_list_append(d->items, item);
     item->button = gtk_button_new();
     gtk_box_pack_start(GTK_BOX(box), item->button, FALSE, TRUE, 0);
     g_signal_connect(G_OBJECT(item->button), "clicked", G_CALLBACK(_button_pressed), (gpointer)self);
     gtk_widget_set_no_show_all(item->button, TRUE);
-    dt_gui_add_class(GTK_WIDGET(item->button), "dt_transparent_background");
     gtk_widget_set_name(GTK_WIDGET(item->button), "recent-collection-button");
     gtk_widget_set_visible(item->button, FALSE);
   }
   _lib_recentcollection_updated(NULL, DT_COLLECTION_CHANGE_NEW_QUERY, DT_COLLECTION_PROP_UNDEF, NULL, -1, self);
 
   /* connect collection changed signal */
-  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_COLLECTION_CHANGED, _lib_recentcollection_updated);
-
-  darktable.view_manager->proxy.module_recentcollect.module = self;
+  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_COLLECTION_CHANGED,
+                            G_CALLBACK(_lib_recentcollection_updated), (gpointer)self);
 }
 
 void gui_cleanup(dt_lib_module_t *self)
 {
   const int curr_pos = dt_ui_thumbtable(darktable.gui->ui)->offset;
-  dt_conf_set_int("plugins/lighttable/collect/history_pos0", curr_pos);
+  dt_conf_set_int("plugins/lighttable/recentcollect/pos0", curr_pos);
+  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_lib_recentcollection_updated), self);
   free(self->data);
   self->data = NULL;
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

@@ -30,12 +30,6 @@ static int lua_dgettext(lua_State*L)
 {
   const char* domainname = luaL_checkstring(L,1);
   const char* msgid = luaL_checkstring(L,2);
-
-  #ifdef _WIN32
-  // on Windows, ensure UTF-8 output
-  bind_textdomain_codeset(domainname,"UTF-8");
-  #endif
-
   lua_pushstring(L,dgettext(domainname,msgid));
   return 1;
 }
@@ -92,9 +86,6 @@ int dt_lua_init_gettext(lua_State *L)
   lua_pop(L,1);
   return 0;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

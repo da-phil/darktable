@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2024 darktable developers.
+    Copyright (C) 2009-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -47,7 +47,14 @@ static void dt_iop_equalizer_wtf(float *const buf, float **weight_a, const int l
 
   size_t scratch_size;
   float *const restrict tmp_width_buf = dt_alloc_perthread_float(width, &scratch_size);
-  DT_OMP_FOR(private(ch))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(height, l, st, step, tmp_width_buf, scratch_size, wd, width) \
+  dt_omp_sharedconst(buf) \
+  shared(weight_a) \
+  private(ch) \
+  schedule(static)
+#endif
   for(int j = 0; j < height; j++)
   {
     // rows
@@ -75,7 +82,14 @@ static void dt_iop_equalizer_wtf(float *const buf, float **weight_a, const int l
   dt_free_align(tmp_width_buf);
 
   float *const restrict tmp_height_buf = dt_alloc_perthread_float(height, &scratch_size);
-  DT_OMP_FOR(private(ch))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(height, l, st, step, tmp_height_buf, scratch_size, wd, width) \
+  dt_omp_sharedconst(buf) \
+  shared(weight_a) \
+  private(ch) \
+  schedule(static)
+#endif
   for(int i = 0; i < width; i++)
   {
     // cols
@@ -111,7 +125,12 @@ static void dt_iop_equalizer_iwtf(float *buf, float **weight_a, const int l, con
 
   size_t scratch_size;
   float *const restrict tmp_height_buf = dt_alloc_perthread_float(height, &scratch_size);
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(height, l, st, step, tmp_height_buf, scratch_size, wd, width) \
+  shared(weight_a, buf) \
+  schedule(static)
+#endif
   for(int i = 0; i < width; i++)
   {
     // cols
@@ -138,7 +157,12 @@ static void dt_iop_equalizer_iwtf(float *buf, float **weight_a, const int l, con
   dt_free_align(tmp_height_buf);
 
   float *const restrict tmp_width_buf = dt_alloc_perthread_float(width, &scratch_size);
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(height, l, st, step, tmp_width_buf, scratch_size, wd, width) \
+  shared(weight_a, buf) \
+  schedule(static)
+#endif
   for(int j = 0; j < height; j++)
   {
     // rows
@@ -167,9 +191,6 @@ static void dt_iop_equalizer_iwtf(float *buf, float **weight_a, const int l, con
 
 #undef gbuf
 #undef gweight
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

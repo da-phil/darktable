@@ -1,7 +1,7 @@
 #!/usr/bin/env lua
 
 --[[
-Takes two mandatory and one optional argument
+Takes two mandatory and one optiona argument
 * a file containing a dump of the old API
 * a file containing a dump of the new API
 * optionally "true" or "nodes"

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2025 darktable developers.
+    Copyright (C) 2016-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -16,26 +16,17 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "common/darktable.h"        // for darktable, darktable_t, dt_code...
-#include "common/interpolation.h"    // for dt_interpolation_new, dt_interp...
-#include "common/math.h"             // for dt_vector_powf
-#include "develop/imageop.h"         // for dt_iop_roi_t
 #include "develop/imageop_math.h"
-#include "imageio/imageio_common.h"          // for FILTERS_ARE_4BAYER
-
 #include <assert.h> // for assert
 #include <glib.h> // for MIN, MAX, CLAMP, inline
 #include <math.h> // for round, floorf, fmaxf
+#include "common/darktable.h"        // for darktable, darktable_t, dt_code...
+#include "common/imageio.h"          // for FILTERS_ARE_4BAYER
+#include "common/interpolation.h"    // for dt_interpolation_new, dt_interp...
+#include "develop/imageop.h"         // for dt_iop_roi_t
 
-void dt_iop_flip_and_zoom_8(const uint8_t *in,
-                            const int32_t iw,
-                            const int32_t ih,
-                            uint8_t *out,
-                            const int32_t ow,
-                            const int32_t oh,
-                            const dt_image_orientation_t orientation,
-                            uint32_t *width,
-                            uint32_t *height)
+void dt_iop_flip_and_zoom_8(const uint8_t *in, int32_t iw, int32_t ih, uint8_t *out, int32_t ow, int32_t oh,
+                            const dt_image_orientation_t orientation, uint32_t *width, uint32_t *height)
 {
   // init strides:
   const uint32_t iwd = (orientation & ORIENTATION_SWAP_XY) ? ih : iw;
@@ -66,7 +57,12 @@ void dt_iop_flip_and_zoom_8(const uint8_t *in,
   const int32_t half_pixel = .5f * scale;
   const int32_t offm = half_pixel * bpp * MIN(MIN(0, si), MIN(sj, si + sj));
   const int32_t offM = half_pixel * bpp * MAX(MAX(0, si), MAX(sj, si + sj));
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(bpp, half_pixel, ht, offM, offm, scale, wd) \
+  shared(in, out, jj, ii, sj, si, iw, ih) \
+  schedule(static)
+#endif
   for(uint32_t j = 0; j < ht; j++)
   {
     uint8_t *out2 = out + bpp * wd * j;
@@ -83,8 +79,7 @@ void dt_iop_flip_and_zoom_8(const uint8_t *in,
       {
         for(int k = 0; k < 3; k++)
           out2[k] = // in3[k];
-              CLAMP(((int32_t)in3[bpp * half_pixel * sj + k]
-                     + (int32_t)in3[bpp * half_pixel * (si + sj) + k]
+              CLAMP(((int32_t)in3[bpp * half_pixel * sj + k] + (int32_t)in3[bpp * half_pixel * (si + sj) + k]
                      + (int32_t)in3[bpp * half_pixel * si + k] + (int32_t)in3[k])
                         / 4,
                     0, 255);
@@ -95,20 +90,9 @@ void dt_iop_flip_and_zoom_8(const uint8_t *in,
   }
 }
 
-void dt_iop_clip_and_zoom_8(const uint8_t *i,
-                            const int32_t ix,
-                            const int32_t iy,
-                            const int32_t iw,
-                            const int32_t ih,
-                            const int32_t ibw,
-                            const int32_t ibh,
-                            uint8_t *o,
-                            const int32_t ox,
-                            const int32_t oy,
-                            const int32_t ow,
-                            const int32_t oh,
-                            const int32_t obw,
-                            const int32_t obh)
+void dt_iop_clip_and_zoom_8(const uint8_t *i, int32_t ix, int32_t iy, int32_t iw, int32_t ih, int32_t ibw,
+                            int32_t ibh, uint8_t *o, int32_t ox, int32_t oy, int32_t ow, int32_t oh,
+                            int32_t obw, int32_t obh)
 {
   const float scalex = iw / (float)ow;
   const float scaley = ih / (float)oh;
@@ -145,111 +129,52 @@ void dt_iop_clip_and_zoom_8(const uint8_t *i,
   }
 }
 
-/* apply clip and zoom on parts of a supplied full image, roi_in and roi_out define which part to work on.
-    gamma correction around scaling supported.
-    We don't do full RGB->linear and transformation but only use a gamma as that is fully sufficient
-    for scaling.
-*/
-void dt_iop_clip_and_zoom(float *out,
-                          const float *const in,
-                          const dt_iop_roi_t *const roi_out,
-                          const dt_iop_roi_t *const roi_in,
-                          const gboolean gamma)
+// apply clip and zoom on parts of a supplied full image.
+// roi_in and roi_out define which part to work on.
+void dt_iop_clip_and_zoom(float *out, const float *const in, const dt_iop_roi_t *const roi_out,
+                          const dt_iop_roi_t *const roi_in, const int32_t out_stride, const int32_t in_stride)
 {
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
-  float *linear = gamma ? dt_alloc_align_float((size_t)roi_in->width * roi_in->height * 4) : NULL;
-  if(!linear)
-    return dt_interpolation_resample(itor, out, roi_out, in, roi_in);
-
-  static const dt_aligned_pixel_t two_point_four = { 2.4f, 2.4f, 2.4f, 2.4f };
-  static const dt_aligned_pixel_t rev_two_point_four = { 1.0f / 2.4f, 1.0f / 2.4f, 1.0f / 2.4f, 1.0f / 2.4f };
-
-  DT_OMP_SIMD(aligned(in, linear : 16))
-  for(size_t k = 0; k < (size_t)roi_in->width * roi_in->height*4; k += 4)
-    dt_vector_powf(&in[k], two_point_four, &linear[k]);
-
-  dt_interpolation_resample(itor, out, roi_out, linear, roi_in);
-  dt_free_align(linear);
-
-  DT_OMP_SIMD(aligned(out : 16))
-  for(size_t k = 0; k < (size_t)roi_out->width * roi_out->height * 4; k += 4)
-    dt_vector_powf(&out[k], rev_two_point_four, &out[k]);
+  const struct dt_interpolation *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  dt_interpolation_resample(itor, out, roi_out, out_stride * 4 * sizeof(float), in, roi_in,
+                            in_stride * 4 * sizeof(float));
 }
 
 // apply clip and zoom on the image region supplied in the input buffer.
-// roi_in and roi_out describe which part of the full image this relates to but shifts are ignored.
-void dt_iop_clip_and_zoom_roi(float *out,
-                              const float *const in,
-                              const dt_iop_roi_t *const roi_out,
-                              const dt_iop_roi_t *const roi_in)
+// roi_in and roi_out describe which part of the full image this relates to.
+void dt_iop_clip_and_zoom_roi(float *out, const float *const in, const dt_iop_roi_t *const roi_out,
+                              const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                              const int32_t in_stride)
 {
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
-  dt_interpolation_resample_roi(itor, out, roi_out, in, roi_in);
+  const struct dt_interpolation *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  dt_interpolation_resample_roi(itor, out, roi_out, out_stride * 4 * sizeof(float), in, roi_in,
+                                in_stride * 4 * sizeof(float));
 }
 
 #ifdef HAVE_OPENCL
 // apply clip and zoom on parts of a supplied full image.
 // roi_in and roi_out define which part to work on.
-int dt_iop_clip_and_zoom_cl(int devid,
-                            cl_mem dev_out,
-                            cl_mem dev_in,
-                            const dt_iop_roi_t *const roi_out,
+int dt_iop_clip_and_zoom_cl(int devid, cl_mem dev_out, cl_mem dev_in, const dt_iop_roi_t *const roi_out,
                             const dt_iop_roi_t *const roi_in)
 {
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const struct dt_interpolation *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
   return dt_interpolation_resample_cl(itor, devid, dev_out, roi_out, dev_in, roi_in);
 }
 
 // apply clip and zoom on the image region supplied in the input buffer.
-// roi_in and roi_out describe which part of the full image this relates to but shifts are ignored.
-int dt_iop_clip_and_zoom_roi_cl(int devid,
-                                cl_mem dev_out,
-                                cl_mem dev_in,
-                                const dt_iop_roi_t *const roi_out,
+// roi_in and roi_out describe which part of the full image this relates to.
+int dt_iop_clip_and_zoom_roi_cl(int devid, cl_mem dev_out, cl_mem dev_in, const dt_iop_roi_t *const roi_out,
                                 const dt_iop_roi_t *const roi_in)
 {
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
-  cl_int err = dt_interpolation_resample_roi_cl(itor, devid, dev_out,
-                                                roi_out, dev_in, roi_in);
-  if(err == CL_INVALID_WORK_GROUP_SIZE)
-  {
-    // We ran into a "vertical number of taps exceeds the vertical workgroupsize" problem
-    // Instead of redoing the whole thing later we do an internal fallback to cpu here
-    float *in = dt_alloc_align_float((size_t)roi_in->width * roi_in->height * 4);
-    float *out = dt_alloc_align_float((size_t)roi_out->width * roi_out->height * 4);
-    if(out && in)
-    {
-      err = dt_opencl_copy_device_to_host(devid, in, dev_in, roi_in->width, roi_in->height, 4 * sizeof(float));
-      if(err == CL_SUCCESS)
-      {
-        dt_iop_clip_and_zoom_roi(out, in, roi_out, roi_in);
-        err = dt_opencl_write_host_to_device
-              (devid, out, dev_out, roi_out->width, roi_out->height, 4 * sizeof(float));
-      }
-
-    }
-    if(err == CL_SUCCESS)
-      dt_print_pipe(DT_DEBUG_OPENCL, "clip and zoom roi", NULL, NULL, devid, roi_in, roi_out,
-          "did fast cpu fallback");
-    else
-      dt_print_pipe(DT_DEBUG_OPENCL, "clip and zoom roi", NULL, NULL, devid, roi_in, roi_out,
-          "fast cpu fallback failing: %s", cl_errstr(err));
-
-    dt_free_align(in);
-    dt_free_align(out);
-  }
-  return err;
+  const struct dt_interpolation *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return dt_interpolation_resample_roi_cl(itor, devid, dev_out, roi_out, dev_in, roi_in);
 }
 
 #endif
 
-void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out,
-                                           const uint16_t *const in,
-                                           const dt_iop_roi_t *const roi_out,
-                                           const dt_iop_roi_t *const roi_in,
-                                           const int32_t out_stride,
-                                           const int32_t in_stride,
-                                           const uint32_t filters)
+void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out, const uint16_t *const in,
+                                                 const dt_iop_roi_t *const roi_out,
+                                                 const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                                                 const int32_t in_stride, const uint32_t filters)
 {
   // adjust to pixel region and don't sample more than scale/2 nbs!
   // pixel footprint on input buffer, radius:
@@ -279,21 +204,23 @@ void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out,
       clut[c][++clut[c][0]] = x + y * in_stride;
     }
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(filters, in, in_stride, out, out_stride, px_footprint, rggbx, rggby, roi_in, roi_out) \
+  shared(clut) schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     uint16_t *outc = out + out_stride * y;
 
-    const float fy = y * px_footprint;
-    const int miny = (CLAMPS((int)floorf(fy - px_footprint),
-                             0, roi_in->height-3) & ~1u) + rggby;
+    const float fy = (y + roi_out->y) * px_footprint;
+    const int miny = (CLAMPS((int)floorf(fy - px_footprint), 0, roi_in->height-3) & ~1u) + rggby;
     const int maxy = MIN(roi_in->height-1, (int)ceilf(fy + px_footprint));
 
-    float fx = 0.0f;
+    float fx = roi_out->x * px_footprint;
     for(int x = 0; x < roi_out->width; x++, fx += px_footprint, outc++)
     {
-      const int minx = (CLAMPS((int)floorf(fx - px_footprint),
-                               0, roi_in->width-3) & ~1u) + rggbx;
+      const int minx = (CLAMPS((int)floorf(fx - px_footprint), 0, roi_in->width-3) & ~1u) + rggbx;
       const int maxx = MIN(roi_in->width-1, (int)ceilf(fx + px_footprint));
 
       const int c = FC(y, x, filters);
@@ -305,7 +232,7 @@ void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out,
         {
           col += in[clut[c][1] + xx + in_stride * yy];
           num++;
-          if(clut[c][0] == 2)
+          if (clut[c][0] == 2)
           { // G in RGGB CFA
             col += in[clut[c][2] + xx + in_stride * yy];
             num++;
@@ -316,13 +243,10 @@ void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out,
   }
 }
 
-void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out,
-                                             const float *const in,
-                                             const dt_iop_roi_t *const roi_out,
-                                             const dt_iop_roi_t *const roi_in,
-                                             const int32_t out_stride,
-                                             const int32_t in_stride,
-                                             const uint32_t filters)
+void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out, const float *const in,
+                                                   const dt_iop_roi_t *const roi_out,
+                                                   const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                                                   const int32_t in_stride, const uint32_t filters)
 {
   // adjust to pixel region and don't sample more than scale/2 nbs!
   // pixel footprint on input buffer, radius:
@@ -340,12 +264,16 @@ void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out,
   }
   const int rggbx = trggbx, rggby = trggby;
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out, out_stride, px_footprint, rggbx, rggby, roi_in, roi_out, samples) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     float *outc = out + out_stride * y;
 
-    const float fy = y * px_footprint;
+    const float fy = (y + roi_out->y) * px_footprint;
     int py = (int)fy & ~1;
     const float dy = (fy - py) / 2;
     py = MIN(((roi_in->height - 6) & ~1u), py) + rggby;
@@ -356,7 +284,7 @@ void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out,
     {
       dt_aligned_pixel_t col = { 0, 0, 0, 0 };
 
-      const float fx = x * px_footprint;
+      const float fx = (x + roi_out->x) * px_footprint;
       int px = (int)fx & ~1;
       const float dx = (fx - px) / 2;
       px = MIN(((roi_in->width - 6) & ~1u), px) + rggbx;
@@ -507,28 +435,29 @@ void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out,
  * downscales and clips a Fujifilm X-Trans mosaiced buffer (in) to the given region of interest (r_*)
  * and writes it to out.
  */
-void dt_iop_clip_and_zoom_mosaic_third_size_xtrans(uint16_t *const out,
-                                                   const uint16_t *const in,
+void dt_iop_clip_and_zoom_mosaic_third_size_xtrans(uint16_t *const out, const uint16_t *const in,
                                                    const dt_iop_roi_t *const roi_out,
-                                                   const dt_iop_roi_t *const roi_in,
-                                                   const int32_t out_stride,
-                                                   const int32_t in_stride,
-                                                   const uint8_t (*const xtrans)[6])
+                                                   const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                                                   const int32_t in_stride, const uint8_t (*const xtrans)[6])
 {
   const float px_footprint = 1.f / roi_out->scale;
   // Use box filter of width px_footprint*2+1 centered on the current
   // sample (rounded to nearest input pixel) to anti-alias. Higher MP
   // images need larger filters to avoid artifacts.
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out, out_stride, px_footprint, roi_in, roi_out, xtrans) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     uint16_t *outc = out + out_stride * y;
 
-    const float fy = y * px_footprint;
+    const float fy = (y + roi_out->y) * px_footprint;
     const int miny = MAX(0, (int)roundf(fy - px_footprint));
     const int maxy = MIN(roi_in->height-1, (int)roundf(fy + px_footprint));
 
-    float fx = 0.0f;
+    float fx = roi_out->x * px_footprint;
     for(int x = 0; x < roi_out->width; x++, fx += px_footprint, outc++)
     {
       const int minx = MAX(0, (int)roundf(fx - px_footprint));
@@ -550,25 +479,26 @@ void dt_iop_clip_and_zoom_mosaic_third_size_xtrans(uint16_t *const out,
   }
 }
 
-void dt_iop_clip_and_zoom_mosaic_third_size_xtrans_f(float *const out,
-                                                     const float *const in,
+void dt_iop_clip_and_zoom_mosaic_third_size_xtrans_f(float *const out, const float *const in,
                                                      const dt_iop_roi_t *const roi_out,
-                                                     const dt_iop_roi_t *const roi_in,
-                                                     const int32_t out_stride,
-                                                     const int32_t in_stride,
-                                                     const uint8_t (*const xtrans)[6])
+                                                     const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                                                     const int32_t in_stride, const uint8_t (*const xtrans)[6])
 {
   const float px_footprint = 1.f / roi_out->scale;
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out, out_stride, px_footprint, roi_in, roi_out, xtrans) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     float *outc = out + out_stride * y;
 
-    const float fy = y * px_footprint;
+    const float fy = (y + roi_out->y) * px_footprint;
     const int miny = MAX(0, (int)roundf(fy - px_footprint));
     const int maxy = MIN(roi_in->height-1, (int)roundf(fy + px_footprint));
 
-    float fx = 0.0f;
+    float fx = roi_out->x * px_footprint;
     for(int x = 0; x < roi_out->width; x++, fx += px_footprint, outc++)
     {
       const int minx = MAX(0, (int)roundf(fx - px_footprint));
@@ -590,12 +520,11 @@ void dt_iop_clip_and_zoom_mosaic_third_size_xtrans_f(float *const out,
   }
 }
 
-void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out,
-                                                            const float *const in,
-                                                            const dt_iop_roi_t *const roi_out,
-                                                            const dt_iop_roi_t *const roi_in,
-                                                            const int32_t out_stride,
-                                                            const int32_t in_stride)
+void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out, const float *const in,
+                                                                  const dt_iop_roi_t *const roi_out,
+                                                                  const dt_iop_roi_t *const roi_in,
+                                                                  const int32_t out_stride,
+                                                                  const int32_t in_stride)
 {
   // adjust to pixel region and don't sample more than scale/2 nbs!
   // pixel footprint on input buffer, radius:
@@ -603,12 +532,17 @@ void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out,
   // how many pixels can be sampled inside that area
   const int samples = round(px_footprint);
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out_stride, px_footprint, roi_in, roi_out, samples) \
+  shared(out) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     float *outc = out + 4 * (out_stride * y);
 
-    const float fy = y * px_footprint;
+    const float fy = (y + roi_out->y) * px_footprint;
     int py = (int)fy;
     const float dy = fy - py;
     py = MIN(((roi_in->height - 3)), py);
@@ -619,7 +553,7 @@ void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out,
     {
       float col = 0.0f;
 
-      const float fx = x * px_footprint;
+      const float fx = (x + roi_out->x) * px_footprint;
       int px = (int)fx;
       const float dx = fx - px;
       px = MIN(((roi_in->width - 3)), px);
@@ -720,7 +654,7 @@ void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out,
         num = ((maxi - px) / 2 + 1 - dx) * ((maxj - py) / 2 + 1 - dy);
       }
 
-      const float pix = (num) ? fmaxf(0.0f, col) / num : 0.0f;
+      const float pix = (num) ? col / num : 0.0f;
       outc[0] = pix;
       outc[1] = pix;
       outc[2] = pix;
@@ -730,13 +664,10 @@ void dt_iop_clip_and_zoom_demosaic_passthrough_monochrome_f(float *out,
   }
 }
 
-void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
-                                               const float *const in,
-                                               const dt_iop_roi_t *const roi_out,
-                                               const dt_iop_roi_t *const roi_in,
-                                               const int32_t out_stride,
-                                               const int32_t in_stride,
-                                               const uint32_t filters)
+void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out, const float *const in,
+                                                     const dt_iop_roi_t *const roi_out,
+                                                     const dt_iop_roi_t *const roi_in, const int32_t out_stride,
+                                                     const int32_t in_stride, const uint32_t filters)
 {
   // adjust to pixel region and don't sample more than scale/2 nbs!
   // pixel footprint on input buffer, radius:
@@ -754,12 +685,17 @@ void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
   }
   const int rggbx = trggbx, rggby = trggby;
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out_stride, px_footprint, rggbx, rggby, roi_in, roi_out, samples) \
+  shared(out) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     float *outc = out + 4 * (out_stride * y);
 
-    const float fy = y * px_footprint;
+    const float fy = (y + roi_out->y) * px_footprint;
     int py = (int)fy & ~1;
     const float dy = (fy - py) / 2;
     py = MIN(((roi_in->height - 6) & ~1u), py) + rggby;
@@ -770,7 +706,7 @@ void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
     {
       dt_aligned_pixel_t col = { 0, 0, 0, 0 };
 
-      const float fx = x * px_footprint;
+      const float fx = (x + roi_out->x) * px_footprint;
       int px = (int)fx & ~1;
       const float dx = (fx - px) / 2;
       px = MIN(((roi_in->width - 6) & ~1u), px) + rggbx;
@@ -848,8 +784,7 @@ void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
 
         // lower right 2x2 block
         p[0] = in[maxi + 2 + in_stride * (maxj + 2)];
-        p[1] = in[maxi + 3 + in_stride * (maxj + 2)]
-               + in[maxi + 2 + in_stride * (maxj + 3)];
+        p[1] = in[maxi + 3 + in_stride * (maxj + 2)] + in[maxi + 2 + in_stride * (maxj + 3)];
         p[2] = in[maxi + 3 + in_stride * (maxj + 3)];
         for(int c = 0; c < 3; c++) col[c] += (dx * dy) * p[c];
 
@@ -898,9 +833,9 @@ void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
         num = ((maxi - px) / 2 + 1 - dx) * ((maxj - py) / 2 + 1 - dy);
       }
 
-      outc[0] = fmaxf(0.0f, col[0]) / num;
-      outc[1] = fmaxf(0.0f, col[1]) / num / 2.0f;
-      outc[2] = fmaxf(0.0f, col[2]) / num;
+      outc[0] = col[0] / num;
+      outc[1] = (col[1] / num) / 2.0f;
+      outc[2] = col[2] / num;
       outc[3] = 0.0f;
       outc += 4;
     }
@@ -908,12 +843,10 @@ void dt_iop_clip_and_zoom_demosaic_half_size_f(float *out,
 }
 
 
-void dt_iop_clip_and_zoom_demosaic_third_size_xtrans_f(float *out,
-                                                       const float *const in,
+void dt_iop_clip_and_zoom_demosaic_third_size_xtrans_f(float *out, const float *const in,
                                                        const dt_iop_roi_t *const roi_out,
                                                        const dt_iop_roi_t *const roi_in,
-                                                       const int32_t out_stride,
-                                                       const int32_t in_stride,
+                                                       const int32_t out_stride, const int32_t in_stride,
                                                        const uint8_t (*const xtrans)[6])
 {
   const float px_footprint = 1.f / roi_out->scale;
@@ -927,41 +860,150 @@ void dt_iop_clip_and_zoom_demosaic_third_size_xtrans_f(float *out,
   // fractional pixel offset of top/left of pattern nor oversampling
   // by non-integer number of samples.
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(in, in_stride, out_stride, px_footprint, roi_in, roi_out, samples, xtrans) \
+  shared(out) \
+  schedule(static)
+#endif
   for(int y = 0; y < roi_out->height; y++)
   {
     float *outc = out + 4 * (out_stride * y);
-    const int py = CLAMPS((int)round((y - 0.5f) * px_footprint),
-                          0, roi_in->height - 3);
+    const int py = CLAMPS((int)round((y + roi_out->y - 0.5f) * px_footprint), 0, roi_in->height - 3);
     const int ymax = MIN(roi_in->height - 3, py + 3 * samples);
 
     for(int x = 0; x < roi_out->width; x++, outc += 4)
     {
       dt_aligned_pixel_t col = { 0.0f };
       int num = 0;
-      const int px = CLAMPS((int)round((x - 0.5f) * px_footprint),
-                            0, roi_in->width - 3);
+      const int px = CLAMPS((int)round((x + roi_out->x - 0.5f) * px_footprint), 0, roi_in->width - 3);
       const int xmax = MIN(roi_in->width - 3, px + 3 * samples);
       for(int yy = py; yy <= ymax; yy += 3)
         for(int xx = px; xx <= xmax; xx += 3)
         {
           for(int j = 0; j < 3; ++j)
             for(int i = 0; i < 3; ++i)
-              col[FCxtrans(yy + j, xx + i, NULL, xtrans)]
-                += in[xx + i + in_stride * (yy + j)];
+              col[FCxtrans(yy + j, xx + i, roi_in, xtrans)] += in[xx + i + in_stride * (yy + j)];
           num++;
         }
 
       // X-Trans RGB weighting averages to 2:5:2 for each 3x3 cell
-      outc[0] = fmaxf(0.0f, col[0]) / (num * 2);
-      outc[1] = fmaxf(0.0f, col[1]) / (num * 5);
-      outc[2] = fmaxf(0.0f, col[2]) / (num * 2);
+      outc[0] = col[0] / (num * 2);
+      outc[1] = col[1] / (num * 5);
+      outc[2] = col[2] / (num * 2);
     }
   }
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+void dt_iop_RGB_to_YCbCr(const dt_aligned_pixel_t rgb, dt_aligned_pixel_t yuv)
+{
+  yuv[0] = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+  yuv[1] = -0.147 * rgb[0] - 0.289 * rgb[1] + 0.437 * rgb[2];
+  yuv[2] = 0.615 * rgb[0] - 0.515 * rgb[1] - 0.100 * rgb[2];
+}
+
+void dt_iop_YCbCr_to_RGB(const dt_aligned_pixel_t yuv, dt_aligned_pixel_t rgb)
+{
+  rgb[0] = yuv[0] + 1.140 * yuv[2];
+  rgb[1] = yuv[0] - 0.394 * yuv[1] - 0.581 * yuv[2];
+  rgb[2] = yuv[0] + 2.028 * yuv[1];
+}
+
+static inline void mat4inv(const float X[][4], float R[][4])
+{
+  const float det = X[0][3] * X[1][2] * X[2][1] * X[3][0] - X[0][2] * X[1][3] * X[2][1] * X[3][0]
+                    - X[0][3] * X[1][1] * X[2][2] * X[3][0] + X[0][1] * X[1][3] * X[2][2] * X[3][0]
+                    + X[0][2] * X[1][1] * X[2][3] * X[3][0] - X[0][1] * X[1][2] * X[2][3] * X[3][0]
+                    - X[0][3] * X[1][2] * X[2][0] * X[3][1] + X[0][2] * X[1][3] * X[2][0] * X[3][1]
+                    + X[0][3] * X[1][0] * X[2][2] * X[3][1] - X[0][0] * X[1][3] * X[2][2] * X[3][1]
+                    - X[0][2] * X[1][0] * X[2][3] * X[3][1] + X[0][0] * X[1][2] * X[2][3] * X[3][1]
+                    + X[0][3] * X[1][1] * X[2][0] * X[3][2] - X[0][1] * X[1][3] * X[2][0] * X[3][2]
+                    - X[0][3] * X[1][0] * X[2][1] * X[3][2] + X[0][0] * X[1][3] * X[2][1] * X[3][2]
+                    + X[0][1] * X[1][0] * X[2][3] * X[3][2] - X[0][0] * X[1][1] * X[2][3] * X[3][2]
+                    - X[0][2] * X[1][1] * X[2][0] * X[3][3] + X[0][1] * X[1][2] * X[2][0] * X[3][3]
+                    + X[0][2] * X[1][0] * X[2][1] * X[3][3] - X[0][0] * X[1][2] * X[2][1] * X[3][3]
+                    - X[0][1] * X[1][0] * X[2][2] * X[3][3] + X[0][0] * X[1][1] * X[2][2] * X[3][3];
+  R[0][0] = (X[1][2] * X[2][3] * X[3][1] - X[1][3] * X[2][2] * X[3][1] + X[1][3] * X[2][1] * X[3][2]
+             - X[1][1] * X[2][3] * X[3][2] - X[1][2] * X[2][1] * X[3][3] + X[1][1] * X[2][2] * X[3][3])
+            / det;
+  R[1][0] = (X[1][3] * X[2][2] * X[3][0] - X[1][2] * X[2][3] * X[3][0] - X[1][3] * X[2][0] * X[3][2]
+             + X[1][0] * X[2][3] * X[3][2] + X[1][2] * X[2][0] * X[3][3] - X[1][0] * X[2][2] * X[3][3])
+            / det;
+  R[2][0] = (X[1][1] * X[2][3] * X[3][0] - X[1][3] * X[2][1] * X[3][0] + X[1][3] * X[2][0] * X[3][1]
+             - X[1][0] * X[2][3] * X[3][1] - X[1][1] * X[2][0] * X[3][3] + X[1][0] * X[2][1] * X[3][3])
+            / det;
+  R[3][0] = (X[1][2] * X[2][1] * X[3][0] - X[1][1] * X[2][2] * X[3][0] - X[1][2] * X[2][0] * X[3][1]
+             + X[1][0] * X[2][2] * X[3][1] + X[1][1] * X[2][0] * X[3][2] - X[1][0] * X[2][1] * X[3][2])
+            / det;
+
+  R[0][1] = (X[0][3] * X[2][2] * X[3][1] - X[0][2] * X[2][3] * X[3][1] - X[0][3] * X[2][1] * X[3][2]
+             + X[0][1] * X[2][3] * X[3][2] + X[0][2] * X[2][1] * X[3][3] - X[0][1] * X[2][2] * X[3][3])
+            / det;
+  R[1][1] = (X[0][2] * X[2][3] * X[3][0] - X[0][3] * X[2][2] * X[3][0] + X[0][3] * X[2][0] * X[3][2]
+             - X[0][0] * X[2][3] * X[3][2] - X[0][2] * X[2][0] * X[3][3] + X[0][0] * X[2][2] * X[3][3])
+            / det;
+  R[2][1] = (X[0][3] * X[2][1] * X[3][0] - X[0][1] * X[2][3] * X[3][0] - X[0][3] * X[2][0] * X[3][1]
+             + X[0][0] * X[2][3] * X[3][1] + X[0][1] * X[2][0] * X[3][3] - X[0][0] * X[2][1] * X[3][3])
+            / det;
+  R[3][1] = (X[0][1] * X[2][2] * X[3][0] - X[0][2] * X[2][1] * X[3][0] + X[0][2] * X[2][0] * X[3][1]
+             - X[0][0] * X[2][2] * X[3][1] - X[0][1] * X[2][0] * X[3][2] + X[0][0] * X[2][1] * X[3][2])
+            / det;
+
+  R[0][2] = (X[0][2] * X[1][3] * X[3][1] - X[0][3] * X[1][2] * X[3][1] + X[0][3] * X[1][1] * X[3][2]
+             - X[0][1] * X[1][3] * X[3][2] - X[0][2] * X[1][1] * X[3][3] + X[0][1] * X[1][2] * X[3][3])
+            / det;
+  R[1][2] = (X[0][3] * X[1][2] * X[3][0] - X[0][2] * X[1][3] * X[3][0] - X[0][3] * X[1][0] * X[3][2]
+             + X[0][0] * X[1][3] * X[3][2] + X[0][2] * X[1][0] * X[3][3] - X[0][0] * X[1][2] * X[3][3])
+            / det;
+  R[2][2] = (X[0][1] * X[1][3] * X[3][0] - X[0][3] * X[1][1] * X[3][0] + X[0][3] * X[1][0] * X[3][1]
+             - X[0][0] * X[1][3] * X[3][1] - X[0][1] * X[1][0] * X[3][3] + X[0][0] * X[1][1] * X[3][3])
+            / det;
+  R[3][2] = (X[0][2] * X[1][1] * X[3][0] - X[0][1] * X[1][2] * X[3][0] - X[0][2] * X[1][0] * X[3][1]
+             + X[0][0] * X[1][2] * X[3][1] + X[0][1] * X[1][0] * X[3][2] - X[0][0] * X[1][1] * X[3][2])
+            / det;
+
+  R[0][3] = (X[0][3] * X[1][2] * X[2][1] - X[0][2] * X[1][3] * X[2][1] - X[0][3] * X[1][1] * X[2][2]
+             + X[0][1] * X[1][3] * X[2][2] + X[0][2] * X[1][1] * X[2][3] - X[0][1] * X[1][2] * X[2][3])
+            / det;
+  R[1][3] = (X[0][2] * X[1][3] * X[2][0] - X[0][3] * X[1][2] * X[2][0] + X[0][3] * X[1][0] * X[2][2]
+             - X[0][0] * X[1][3] * X[2][2] - X[0][2] * X[1][0] * X[2][3] + X[0][0] * X[1][2] * X[2][3])
+            / det;
+  R[2][3] = (X[0][3] * X[1][1] * X[2][0] - X[0][1] * X[1][3] * X[2][0] - X[0][3] * X[1][0] * X[2][1]
+             + X[0][0] * X[1][3] * X[2][1] + X[0][1] * X[1][0] * X[2][3] - X[0][0] * X[1][1] * X[2][3])
+            / det;
+  R[3][3] = (X[0][1] * X[1][2] * X[2][0] - X[0][2] * X[1][1] * X[2][0] + X[0][2] * X[1][0] * X[2][1]
+             - X[0][0] * X[1][2] * X[2][1] - X[0][1] * X[1][0] * X[2][2] + X[0][0] * X[1][1] * X[2][2])
+            / det;
+}
+
+static void mat4mulv(float dst[4], const float mat[4][4], const float v[4])
+{
+  for(int k = 0; k < 4; k++)
+  {
+    float x = 0.0f;
+    for(int i = 0; i < 4; i++) x += mat[k][i] * v[i];
+    dst[k] = x;
+  }
+}
+
+void dt_iop_estimate_cubic(const float x[4], const float y[4], float a[4])
+{
+  // we want to fit a spline
+  // [y]   [x^3 x^2 x^1 1] [a^3]
+  // |y| = |x^3 x^2 x^1 1| |a^2|
+  // |y|   |x^3 x^2 x^1 1| |a^1|
+  // [y]   [x^3 x^2 x^1 1] [ 1 ]
+  // and do that by inverting the matrix X:
+
+  const float X[4][4] = { { x[0] * x[0] * x[0], x[0] * x[0], x[0], 1.0f },
+                          { x[1] * x[1] * x[1], x[1] * x[1], x[1], 1.0f },
+                          { x[2] * x[2] * x[2], x[2] * x[2], x[2], 1.0f },
+                          { x[3] * x[3] * x[3], x[3] * x[3], x[3], 1.0f } };
+  float X_inv[4][4];
+  mat4inv(X, X_inv);
+  mat4mulv(a, X_inv, y);
+}
+
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

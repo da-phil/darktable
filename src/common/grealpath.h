@@ -31,12 +31,12 @@ static inline gchar *g_realpath(const char *path)
 
   char* res = realpath(path, buffer);
 
-  if(res)
+  if(res) 
   {
     return g_strdup(buffer);
   }
-  else
-  {
+  else 
+  {     
     fprintf(stderr, "path lookup '%s' fails with: '%s'\n", path, strerror(errno));
     exit(EXIT_FAILURE);
   }
@@ -69,9 +69,6 @@ static inline gchar *g_realpath(const char *path)
 #endif
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

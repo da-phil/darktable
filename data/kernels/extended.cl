@@ -34,7 +34,7 @@ graduatedndp (read_only image2d_t in, write_only image2d_t out, const int width,
 
   const float len = length_base + y*length_inc_y + x*length_inc_x;
 
-  const float t = 0.693147181f * (density * clipf(0.5f+len)/8.0f);
+  const float t = 0.693147181f * (density * clamp(0.5f+len, 0.0f, 1.0f)/8.0f);
   const float d1 = t * t * 0.5f;
   const float d2 = d1 * t * 0.333333333f;
   const float d3 = d2 * t * 0.25f;
@@ -62,7 +62,7 @@ graduatedndm (read_only image2d_t in, write_only image2d_t out, const int width,
 
   const float len = length_base + y*length_inc_y + x*length_inc_x;
 
-  const float t = 0.693147181f * (-density * clipf(0.5f-len)/8.0f);
+  const float t = 0.693147181f * (-density * clamp(0.5f-len, 0.0f, 1.0f)/8.0f);
   const float d1 = t * t * 0.5f;
   const float d2 = d1 * t * 0.333333333f;
   const float d3 = d2 * t * 0.25f;
@@ -122,12 +122,12 @@ relight (read_only image2d_t in, write_only image2d_t out, const int width, cons
   if(isnan(gauss) || isinf(gauss))
     gauss = 0.0f;
 
-  float relight = 1.0f / exp2(-ev * clipf(gauss));
+  float relight = 1.0f / exp2(-ev * clamp(gauss, 0.0f, 1.0f));
 
   if(isnan(relight) || isinf(relight))
     relight = 1.0f;
 
-  pixel.x = 100.0f * clipf(lightness*relight);
+  pixel.x = 100.0f * clamp(lightness*relight, 0.0f, 1.0f);
 
   write_imagef (out, (int2)(x, y), pixel);
 }
@@ -170,9 +170,9 @@ channelmixer (read_only image2d_t in, write_only image2d_t out, const int width,
       break;
 
     case OPERATION_MODE_HSL_V1:
-      hmix = clipf(pixel.x * hsl_matrix[0]) + pixel.y * hsl_matrix[1] + pixel.z * hsl_matrix[2];
-      smix = clipf(pixel.x * hsl_matrix[3]) + pixel.y * hsl_matrix[4] + pixel.z * hsl_matrix[5];
-      lmix = clipf(pixel.x * hsl_matrix[6]) + pixel.y * hsl_matrix[7] + pixel.z * hsl_matrix[8];
+      hmix = clamp(pixel.x * hsl_matrix[0], 0.0f, 1.0f) + pixel.y * hsl_matrix[1] + pixel.z * hsl_matrix[2];
+      smix = clamp(pixel.x * hsl_matrix[3], 0.0f, 1.0f) + pixel.y * hsl_matrix[4] + pixel.z * hsl_matrix[5];
+      lmix = clamp(pixel.x * hsl_matrix[6], 0.0f, 1.0f) + pixel.y * hsl_matrix[7] + pixel.z * hsl_matrix[8];
 
       if( hmix != 0.0f || smix != 0.0f || lmix != 0.0f )
       {
@@ -183,18 +183,18 @@ channelmixer (read_only image2d_t in, write_only image2d_t out, const int width,
         pixel = HSL_2_RGB(hsl);
       }
 
-      opixel.x = clipf(pixel.x * rgb_matrix[0] + pixel.y * rgb_matrix[1] + pixel.z * rgb_matrix[2]);
-      opixel.y = clipf(pixel.x * rgb_matrix[3] + pixel.y * rgb_matrix[4] + pixel.z * rgb_matrix[5]);
-      opixel.z = clipf(pixel.x * rgb_matrix[6] + pixel.y * rgb_matrix[7] + pixel.z * rgb_matrix[8]);
+      opixel.x = clamp(pixel.x * rgb_matrix[0] + pixel.y * rgb_matrix[1] + pixel.z * rgb_matrix[2], 0.0f, 1.0f);
+      opixel.y = clamp(pixel.x * rgb_matrix[3] + pixel.y * rgb_matrix[4] + pixel.z * rgb_matrix[5], 0.0f, 1.0f);
+      opixel.z = clamp(pixel.x * rgb_matrix[6] + pixel.y * rgb_matrix[7] + pixel.z * rgb_matrix[8], 0.0f, 1.0f);
       break;
 
     case OPERATION_MODE_HSL_V2:
-      hmix = clipf(pixel.x * hsl_matrix[0] + pixel.y * hsl_matrix[1] + pixel.z * hsl_matrix[2]);
-      smix = clipf(pixel.x * hsl_matrix[3] + pixel.y * hsl_matrix[4] + pixel.z * hsl_matrix[5]);
-      lmix = clipf(pixel.x * hsl_matrix[6] + pixel.y * hsl_matrix[7] + pixel.z * hsl_matrix[8]);
+      hmix = clamp(pixel.x * hsl_matrix[0] + pixel.y * hsl_matrix[1] + pixel.z * hsl_matrix[2], 0.0f, 1.0f);
+      smix = clamp(pixel.x * hsl_matrix[3] + pixel.y * hsl_matrix[4] + pixel.z * hsl_matrix[5], 0.0f, 1.0f);
+      lmix = clamp(pixel.x * hsl_matrix[6] + pixel.y * hsl_matrix[7] + pixel.z * hsl_matrix[8], 0.0f, 1.0f);
       if( hmix != 0.0f || smix != 0.0f || lmix != 0.0f )
       {
-        pixel = (float4)(clipf(pixel.x), clipf(pixel.y), clipf(pixel.z), pixel.w);
+        pixel = (float4)(clamp(pixel.x, 0.0f, 1.0f), clamp(pixel.y, 0.0f, 1.0f), clamp(pixel.z, 0.0f, 1.0f), pixel.w);
         float4 hsl = RGB_2_HSL(pixel);
         hsl.x = (hmix != 0.0f ) ? hmix : hsl.x;
         hsl.y = (smix != 0.0f ) ? smix : hsl.y;
@@ -223,19 +223,19 @@ velvia (read_only image2d_t in, write_only image2d_t out, const int width, const
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
 
   // calculate vibrance, and apply boost velvia saturation at least saturated pixels
-  const float pmax = fmax(pixel.x, fmax(pixel.y, pixel.z));     // max value in RGB set
-  const float pmin = fmin(pixel.x, fmin(pixel.y, pixel.z));     // min value in RGB set
-  const float plum = (pmax + pmin) / 2.0f;                // pixel luminocity
-  const float psat = (plum <= 0.5f) ? (pmax-pmin)/(1e-5f + pmax+pmin) : (pmax-pmin)/(1e-5f + fmax(0.0f, 2.0f-pmax-pmin));
+  float pmax = fmax(pixel.x, fmax(pixel.y, pixel.z));     // max value in RGB set
+  float pmin = fmin(pixel.x, fmin(pixel.y, pixel.z));     // min value in RGB set
+  float plum = (pmax + pmin) / 2.0f;                // pixel luminocity
+  float psat = (plum <= 0.5f) ? (pmax-pmin)/(1e-5f + pmax+pmin) : (pmax-pmin)/(1e-5f + fmax(0.0f, 2.0f-pmax-pmin));
 
-  const float pweight = clipf(((1.0f- (1.5f*psat)) + ((1.0f+(fabs(plum-0.5f)*2.0f))*(1.0f-bias))) / (1.0f+(1.0f-bias))); // The weight of pixel
-  const float saturation = strength*pweight;      // So lets calculate the final affection of filter on pixel
+  float pweight = clamp(((1.0f- (1.5f*psat)) + ((1.0f+(fabs(plum-0.5f)*2.0f))*(1.0f-bias))) / (1.0f+(1.0f-bias)), 0.0f, 1.0f); // The weight of pixel
+  float saturation = strength*pweight;      // So lets calculate the final affection of filter on pixel
 
   float4 opixel;
 
-  opixel.x = clipf(pixel.x + saturation*(pixel.x-0.5f*(pixel.y+pixel.z)));
-  opixel.y = clipf(pixel.y + saturation*(pixel.y-0.5f*(pixel.z+pixel.x)));
-  opixel.z = clipf(pixel.z + saturation*(pixel.z-0.5f*(pixel.x+pixel.y)));
+  opixel.x = clamp(pixel.x + saturation*(pixel.x-0.5f*(pixel.y+pixel.z)), 0.0f, 1.0f);
+  opixel.y = clamp(pixel.y + saturation*(pixel.y-0.5f*(pixel.z+pixel.x)), 0.0f, 1.0f);
+  opixel.z = clamp(pixel.z + saturation*(pixel.z-0.5f*(pixel.x+pixel.y)), 0.0f, 1.0f);
   opixel.w = pixel.w;
 
   write_imagef (out, (int2)(x, y), opixel);
@@ -288,9 +288,9 @@ void
 encrypt_tea(unsigned int *arg)
 {
   const unsigned int key[] = {0xa341316c, 0xc8013ea4, 0xad90777d, 0x7e95761e};
-  const unsigned int delta = 0x9e3779b9;
   unsigned int v0 = arg[0], v1 = arg[1];
   unsigned int sum = 0;
+  unsigned int delta = 0x9e3779b9;
   for(int i = 0; i < TEA_ROUNDS; i++)
   {
     sum += delta;
@@ -344,14 +344,14 @@ vignette (read_only image2d_t in, write_only image2d_t out, const int width, con
 
   if(weight > 0.0f)
   {
-    const float falloff = brightness < 0.0f ? 1.0f + (weight * brightness) : weight * brightness;
+    float falloff = brightness < 0.0f ? 1.0f + (weight * brightness) : weight * brightness;
 
     pixel.xyz = (brightness < 0.0f ? pixel * falloff + dith : pixel + falloff + dith).xyz;
 
     pixel.xyz = unbound ? pixel.xyz : clamp(pixel, (float4)0.0f, (float4)1.0f).xyz;
 
-    const float mv = (pixel.x + pixel.y + pixel.z) / 3.0f;
-    const float wss = weight * saturation;
+    float mv = (pixel.x + pixel.y + pixel.z) / 3.0f;
+    float wss = weight * saturation;
 
     pixel.xyz = (pixel - (mv - pixel)* wss).xyz,
 
@@ -381,8 +381,8 @@ splittoning (read_only image2d_t in, write_only image2d_t out, const int width, 
   {
     hsl.x = hsl.z < balance ? shadow_hue : highlight_hue;
     hsl.y = hsl.z < balance ? shadow_saturation : highlight_saturation;
-    const float ra = hsl.z < balance ? clipf(2.0f*fabs(-balance + compress + hsl.z))
-                                     : clipf(2.0f*fabs(-balance - compress + hsl.z));
+    float ra = hsl.z < balance ? clamp(2.0f*fabs(-balance + compress + hsl.z), 0.0f, 1.0f) :
+               clamp(2.0f*fabs(-balance - compress + hsl.z), 0.0f, 1.0f);
 
     float4 mixrgb = HSL_2_RGB(hsl);
 
@@ -415,8 +415,8 @@ pixelmax_first (read_only image2d_t in, const int width, const int height, globa
   {
     if (l < offset)
     {
-      const float other = buffer[l + offset];
-      const float mine =  buffer[l];
+      float other = buffer[l + offset];
+      float mine =  buffer[l];
       buffer[l] = (mine > other) ? mine : other;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -445,7 +445,7 @@ pixelmax_second(global float* input, global float *result, const int length, loc
     x += get_global_size(0);
   }
 
-  const int lid = get_local_id(0);
+  int lid = get_local_id(0);
   buffer[lid] = accu;
 
   barrier(CLK_LOCAL_MEM_FENCE);
@@ -480,7 +480,7 @@ global_tonemap_reinhard (read_only image2d_t in, write_only image2d_t out, const
 
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
 
-  const float l = pixel.x * 0.01f;
+  float l = pixel.x * 0.01f;
 
   pixel.x = 100.0f * (l/(1.0f + l));
 
@@ -506,7 +506,7 @@ global_tonemap_drago (read_only image2d_t in, write_only image2d_t out, const in
 
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
 
-  const float lw = pixel.x * 0.01f;
+  float lw = pixel.x * 0.01f;
 
   pixel.x = 100.0f * (ldc * log(fmax(eps, lw + 1.0f)) / log(fmax(eps, 2.0f + (pow(lw/lwmax,bl)) * 8.0f)));
 
@@ -526,8 +526,8 @@ global_tonemap_filmic (read_only image2d_t in, write_only image2d_t out, const i
 
   float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
 
-  const float l = pixel.x * 0.01f;
-  const float m = fmax(0.0f, l - 0.004f);
+  float l = pixel.x * 0.01f;
+  float m = fmax(0.0f, l - 0.004f);
 
   pixel.x = 100.0f * ((m*(6.2f*m+0.5f))/(m*(6.2f*m+1.7f)+0.06f));
 
@@ -565,7 +565,7 @@ colormapping_histogram (read_only image2d_t in, write_only image2d_t out, const 
 
   if(x >= width || y >= height) return;
 
-  const float L = read_imagef(in, sampleri, (int2)(x, y)).x;
+  float L = read_imagef(in, sampleri, (int2)(x, y)).x;
 
   float dL = 0.5f*((L * (1.0f - equalization) + source_ihist[target_hist[(int)clamp(HISTN*L/100.0f, 0.0f, (float)HISTN-1.0f)]] * equalization) - L) + 50.0f;
   dL = clamp(dL, 0.0f, 100.0f);
@@ -583,7 +583,7 @@ colormapping_mapping (read_only image2d_t in, read_only image2d_t tmp, write_onl
   if(x >= width || y >= height) return;
 
   float4 ipixel = read_imagef(in, sampleri, (int2)(x, y));
-  const float dL = read_imagef(tmp, sampleri, (int2)(x, y)).x;
+  float dL = read_imagef(tmp, sampleri, (int2)(x, y)).x;
   float weight[MAXN];
   float4 opixel = (float4)0.0f;
 
@@ -620,9 +620,9 @@ colorbalance (read_only image2d_t in, write_only image2d_t out, const int width,
   float4 sRGB = XYZ_to_sRGB(Lab_to_XYZ(Lab));
 
   // Lift gamma gain
-  sRGB = (sRGB <= (float4)0.0031308f) ? 12.92f * sRGB : (1.0f + 0.055f) * dtcl_pow(sRGB, (float4)1.0f/2.4f) - (float4)0.055f;
-  sRGB = dtcl_pow(fmax(((sRGB - (float4)1.0f) * lift + (float4)1.0f) * gain, (float4)0.0f), gamma_inv);
-  sRGB = (sRGB <= (float4)0.04045f) ? sRGB / 12.92f : dtcl_pow((sRGB + (float4)0.055f) / (1.0f + 0.055f), (float4)2.4f);
+  sRGB = (sRGB <= (float4)0.0031308f) ? 12.92f * sRGB : (1.0f + 0.055f) * native_powr(sRGB, (float4)1.0f/2.4f) - (float4)0.055f;
+  sRGB = native_powr(fmax(((sRGB - (float4)1.0f) * lift + (float4)1.0f) * gain, (float4)0.0f), gamma_inv);
+  sRGB = (sRGB <= (float4)0.04045f) ? sRGB / 12.92f : native_powr((sRGB + (float4)0.055f) / (1.0f + 0.055f), (float4)2.4f);
   Lab.xyz = XYZ_to_Lab(sRGB_to_XYZ(sRGB)).xyz;
 
   write_imagef (out, (int2)(x, y), Lab);
@@ -650,9 +650,9 @@ colorbalance_lgg (read_only image2d_t in, write_only image2d_t out, const int wi
   }
 
   // Lift gamma gain
-  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : dtcl_pow(RGB, (float4)1.0f/2.2f);
+  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : native_powr(RGB, (float4)1.0f/2.2f);
   RGB = ((RGB - (float4)1.0f) * lift + (float4)1.0f) * gain;
-  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : dtcl_pow(RGB, gamma_inv * (float4)2.2f);
+  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : native_powr(RGB, gamma_inv * (float4)2.2f);
 
   // saturation output
   if (saturation_out != 1.0f)
@@ -698,7 +698,7 @@ colorbalance_cdl (read_only image2d_t in, write_only image2d_t out, const int wi
 
   // lift power slope
   RGB = RGB * gain + lift;
-  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : dtcl_pow(RGB, gamma_inv);
+  RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : native_powr(RGB, gamma_inv);
 
   // saturation output
   if (saturation_out != 1.0f)
@@ -713,7 +713,7 @@ colorbalance_cdl (read_only image2d_t in, write_only image2d_t out, const int wi
   {
     const float4 contrast4 = contrast;
     const float4 grey4 = grey;
-    RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : dtcl_pow(RGB / grey4, contrast4) * grey4;
+    RGB = (RGB <= (float4)0.0f) ? (float4)0.0f : native_powr(RGB / grey4, contrast4) * grey4;
   }
 
   Lab.xyz = prophotorgb_to_Lab(RGB).xyz;
@@ -735,9 +735,9 @@ static inline float4 opacity_masks(const float x,
   float4 output;
   const float x_offset = (x - mask_grey_fulcrum);
   const float x_offset_norm = x_offset / mask_grey_fulcrum;
-  const float alpha = 1.f / (1.f + dtcl_exp(x_offset_norm * shadows_weight));    // opacity of shadows
-  const float beta = 1.f / (1.f + dtcl_exp(-x_offset_norm * highlights_weight)); // opacity of highlights
-  const float gamma = dtcl_exp(-sqf(x_offset) * midtones_weight / 4.f) * sqf(1.f - alpha) * sqf(1.f - beta) * 8.f; // opacity of midtones
+  const float alpha = 1.f / (1.f + native_exp(x_offset_norm * shadows_weight));    // opacity of shadows
+  const float beta = 1.f / (1.f + native_exp(-x_offset_norm * highlights_weight)); // opacity of highlights
+  const float gamma = native_exp(-sqf(x_offset) * midtones_weight / 4.f) * sqf(1.f - alpha) * sqf(1.f - beta) * 8.f; // opacity of midtones
 
   output.x = alpha;
   output.y = gamma;
@@ -747,11 +747,53 @@ static inline float4 opacity_masks(const float x,
   return output;
 }
 
-typedef enum dt_iop_colorbalancrgb_saturation_t
+
+#define LUT_ELEM 360 // gamut LUT number of elements: resolution of 1°
+
+static inline float lookup_gamut(read_only image2d_t gamut_lut, const float x)
 {
-  DT_COLORBALANCE_SATURATION_JZAZBZ = 0, // $DESCRIPTION: "JzAzBz (2021)"
-  DT_COLORBALANCE_SATURATION_DTUCS = 1   // $DESCRIPTION: "darktable UCS (2022)"
-} dt_iop_colorbalancrgb_saturation_t;
+  // WARNING : x should be between [-pi ; pi ], which is the default output of atan2 anyway
+
+  // convert in LUT coordinate
+  const float x_test = (LUT_ELEM - 1) * (x + M_PI_F) / (2.f * M_PI_F);
+
+  // find the 2 closest integer coordinates (next/previous)
+  float x_prev = floor(x_test);
+  float x_next = ceil(x_test);
+
+  // get the 2 closest LUT elements at integer coordinates
+  // cycle on the hue ring if out of bounds
+  int xi = (int)x_prev;
+  if(xi < 0) xi = LUT_ELEM - 1;
+  else if(xi > LUT_ELEM - 1) xi = 0;
+
+  int xii = (int)x_next;
+  if(xii < 0) xii = LUT_ELEM - 1;
+  else if(xii > LUT_ELEM - 1) xii = 0;
+
+  // fetch the corresponding y values
+  const float y_prev = read_imagef(gamut_lut, sampleri, (int2)(xi, 0)).x;
+  const float y_next = read_imagef(gamut_lut, sampleri, (int2)(xii, 0)).x;
+
+  // assume that we are exactly on an integer LUT element
+  float out = y_prev;
+
+  if(x_next != x_prev)
+    // we are between 2 LUT elements : do linear interpolation
+    // actually, we only add the slope term on the previous one
+    out += (x_test - x_prev) * (y_next - y_prev) / (x_next - x_prev);
+
+  return out;
+}
+
+
+static inline float soft_clip(const float x, const float soft_threshold, const float hard_threshold)
+{
+  // use an exponential soft clipping above soft_threshold
+  // hard threshold must be > soft threshold
+  const float norm = hard_threshold - soft_threshold;
+  return (x > soft_threshold) ? soft_threshold + (1.f - native_exp(-(x - soft_threshold) / norm)) * norm : x;
+}
 
 
 kernel void
@@ -759,7 +801,7 @@ colorbalancergb (read_only image2d_t in, write_only image2d_t out,
                  const int width, const int height,
                  constant const dt_colorspaces_iccprofile_info_cl_t *const profile_info,
                  constant const float *const matrix_in, constant const float *const matrix_out,
-                 global const float *gamut_lut,
+                 read_only image2d_t gamut_lut,
                  const float shadows_weight, const float highlights_weight, const float midtones_weight, const float mask_grey_fulcrum,
                  const float hue_angle, const float chroma_global, const float4 chroma, const float vibrance,
                  const float4 global_offset, const float4 shadows, const float4 highlights, const float4 midtones,
@@ -768,15 +810,12 @@ colorbalancergb (read_only image2d_t in, write_only image2d_t out,
                  const float brilliance_global, const float4 brilliance,
                  const float saturation_global, const float4 saturation,
                  const int mask_display, const int mask_type, const int checker_1, const int checker_2,
-                 const float4 checker_color_1, const float4 checker_color_2, const float L_white,
-                 const dt_iop_colorbalancrgb_saturation_t saturation_formula,
-                 constant const float *const hue_rotation_matrix)
+                 const float4 checker_color_1, const float4 checker_color_2)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
   if(x >= width || y >= height) return;
-  // we clip pipeline RGB while reading; this also ensures a proper alpha
-  const float4 pix_in = fmax(0.0f, read_imagef(in, sampleri, (int2)(x, y)));
+  const float4 pix_in = read_imagef(in, sampleri, (int2)(x, y));
 
   float4 XYZ_D65 = 0.f;
   float4 LMS = 0.f;
@@ -784,7 +823,8 @@ colorbalancergb (read_only image2d_t in, write_only image2d_t out,
   float4 Yrg = 0.f;
   float4 Ych = 0.f;
 
-  RGB = pix_in;
+  // clip pipeline RGB
+  RGB = fmax(pix_in, 0.f);
 
   // go to CIE 2006 LMS D65
   LMS = matrix_product_float4(RGB, matrix_in);
@@ -797,27 +837,48 @@ colorbalancergb (read_only image2d_t in, write_only image2d_t out,
 
   // Sanitize input : no negative luminance
   Ych.x = fmax(Ych.x, 0.f);
-  const float4 opacities = opacity_masks(dtcl_pow(Ych.x, 0.4101205819200422f), // center middle grey in 50 %
+  const float4 opacities = opacity_masks(native_powr(Ych.x, 0.4101205819200422f), // center middle grey in 50 %
                                          shadows_weight, highlights_weight, midtones_weight, mask_grey_fulcrum);
   const float4 opacities_comp = (float4)1.f - opacities;
 
   // Hue shift - do it now because we need the gamut limit at output hue right after
-  // The hue rotation is implemented as a matrix multiplication.
-  const float cos_h = Ych.z;
-  const float sin_h = Ych.w;
-  Ych.z = hue_rotation_matrix[0] * cos_h + hue_rotation_matrix[1] * sin_h;
-  Ych.w = hue_rotation_matrix[2] * cos_h + hue_rotation_matrix[3] * sin_h;
+  Ych.z += hue_angle;
+
+  // Ensure hue ± correction is in [-PI; PI]
+  if(Ych.z > M_PI_F) Ych.z -= 2.f * M_PI_F;
+  else if(Ych.z < -M_PI_F) Ych.z += 2.f * M_PI_F;
 
   // Linear chroma : distance to achromatic at constant luminance in scene-referred
   const float chroma_boost = chroma_global + dot(opacities, chroma);
-  const float vib = vibrance * (1.0f - dtcl_pow(Ych.y, fabs(vibrance)));
+  const float vib = vibrance * (1.0f - native_powr(Ych.y, fabs(vibrance)));
   const float chroma_factor = fmax(1.f + chroma_boost + vib, 0.f);
   Ych.y *= chroma_factor;
 
-  // clip chroma at constant Y and hue
-  Ych = gamut_check_Yrg(Ych);
+  // Do a test conversion to Yrg
+  Yrg = Ych_to_Yrg(Ych);
 
-  // go to Yrg for real
+  // Gamut-clip in Yrg at constant hue and luminance
+  // e.g. find the max chroma value that fits in gamut at the current hue
+  const float D65[4] = { 0.21962576f, 0.54487092f, 0.23550333f, 0.f };
+  float max_c = Ych.y;
+  const float cos_h = native_cos(Ych.z);
+  const float sin_h = native_sin(Ych.z);
+
+  if(Yrg.y < 0.f)
+  {
+    max_c = fmin(-D65[0] / cos_h, max_c);
+  }
+  if(Yrg.z < 0.f)
+  {
+    max_c = fmin(-D65[1] / sin_h, max_c);
+  }
+  if(Yrg.y + Yrg.z > 1.f)
+  {
+    max_c = fmin((1.f - D65[0] - D65[1]) / (cos_h + sin_h), max_c);
+  }
+
+  // Overwrite chroma with the sanitized value and go to Yrg for real
+  Ych.y = max_c;
   Yrg = Ych_to_Yrg(Ych);
 
   // Go to LMS
@@ -836,151 +897,104 @@ colorbalancergb (read_only image2d_t in, write_only image2d_t out,
   // factorization of : (RGB[c] * (1.f - alpha) + RGB[c] * d->shadows[c] * alpha) * (1.f - beta)  + RGB[c] * d->highlights[c] * beta;
 
   // midtones : power with sign preservation
-  RGB = sign(RGB) * dtcl_pow(fabs(RGB) / white_fulcrum, midtones) * white_fulcrum;
+  RGB = sign(RGB) * native_powr(fabs(RGB) / white_fulcrum, midtones) * white_fulcrum;
 
   // for the non-linear ops we need to go in Yrg again because RGB doesn't preserve color
   LMS = gradingRGB_to_LMS(RGB);
   Yrg = LMS_to_Yrg(LMS);
 
   // Y midtones power (gamma)
-  Yrg.x = dtcl_pow(fmax(Yrg.x / white_fulcrum, 0.f), midtones_Y) * white_fulcrum;
+  Yrg.x = native_powr(fmax(Yrg.x / white_fulcrum, 0.f), midtones_Y) * white_fulcrum;
 
   // Y fulcrumed contrast
-  Yrg.x = grey_fulcrum * dtcl_pow(Yrg.x / grey_fulcrum, contrast);
+  Yrg.x = grey_fulcrum * native_powr(Yrg.x / grey_fulcrum, contrast);
 
   LMS = Yrg_to_LMS(Yrg);
   XYZ_D65 = LMS_to_XYZ(LMS);
 
   // Perceptual color adjustments
-  if(saturation_formula == DT_COLORBALANCE_SATURATION_JZAZBZ)
-  {
 
-    // Go to JzAzBz for perceptual saturation
-    float4 Jab = XYZ_to_JzAzBz(XYZ_D65);
+  // Go to JzAzBz for perceptual saturation
+  float4 Jab = XYZ_to_JzAzBz(XYZ_D65);
 
-    // Convert to JCh
-    float JC[2] = { Jab.x, hypot(Jab.y, Jab.z) };               // brightness/chroma vector
-    const float h = atan2(Jab.z, Jab.y);  // hue : (a, b) angle
+  // Convert to JCh
+  float JC[2] = { Jab.x, hypot(Jab.y, Jab.z) };               // brightness/chroma vector
+  const float h = atan2(Jab.z, Jab.y);  // hue : (a, b) angle
 
-    // Project JC onto S, the saturation eigenvector, with orthogonal vector O.
-    // Note : O should be = (C * cosf(T) - J * sinf(T)) = 0 since S is the eigenvector,
-    // so we add the chroma projected along the orthogonal axis to get some control value
-    const float T = atan2(JC[1], JC[0]); // angle of the eigenvector over the hue plane
-    const float sin_T = dtcl_sin(T);
-    const float cos_T = dtcl_cos(T);
-    const float M_rot_dir[2][2] = { {  cos_T,  sin_T },
-                                    { -sin_T,  cos_T } };
-    const float M_rot_inv[2][2] = { {  cos_T, -sin_T },
-                                    {  sin_T,  cos_T } };
-    float SO[2];
+  // Project JC onto S, the saturation eigenvector, with orthogonal vector O.
+  // Note : O should be = (C * cosf(T) - J * sinf(T)) = 0 since S is the eigenvector,
+  // so we add the chroma projected along the orthogonal axis to get some control value
+  const float T = atan2(JC[1], JC[0]); // angle of the eigenvector over the hue plane
+  const float sin_T = native_sin(T);
+  const float cos_T = native_cos(T);
+  const float M_rot_dir[2][2] = { {  cos_T,  sin_T },
+                                  { -sin_T,  cos_T } };
+  const float M_rot_inv[2][2] = { {  cos_T, -sin_T },
+                                  {  sin_T,  cos_T } };
+  float SO[2];
 
-    // brilliance & Saturation : mix of chroma and luminance
-    const float boosts[2] = { 1.f + brilliance_global + dot(opacities, brilliance),     // move in S direction
-                              saturation_global + dot(opacities, saturation) }; // move in O direction
+  // brilliance & Saturation : mix of chroma and luminance
+  const float boosts[2] = { 1.f + brilliance_global + dot(opacities, brilliance),     // move in S direction
+                            saturation_global + dot(opacities, saturation) }; // move in O direction
 
-    SO[0] = JC[0] * M_rot_dir[0][0] + JC[1] * M_rot_dir[0][1];
-    SO[1] = SO[0] * clamp(T * boosts[1], -T, M_PI_F / 2.f - T);
-    SO[0] = fmax(SO[0] * boosts[0], 0.f);
+  SO[0] = JC[0] * M_rot_dir[0][0] + JC[1] * M_rot_dir[0][1];
+  SO[1] = SO[0] * clamp(T * boosts[1], -T, M_PI_F / 2.f - T);
+  SO[0] = fmax(SO[0] * boosts[0], 0.f);
 
-    // Project back to JCh, that is rotate back of -T angle
-    JC[0] = fmax(SO[0] * M_rot_inv[0][0] + SO[1] * M_rot_inv[0][1], 0.f);
-    JC[1] = fmax(SO[0] * M_rot_inv[1][0] + SO[1] * M_rot_inv[1][1], 0.f);
+  // Project back to JCh, that is rotate back of -T angle
+  JC[0] = fmax(SO[0] * M_rot_inv[0][0] + SO[1] * M_rot_inv[0][1], 0.f);
+  JC[1] = fmax(SO[0] * M_rot_inv[1][0] + SO[1] * M_rot_inv[1][1], 0.f);
 
-    // Gamut mapping
-    const float out_max_sat_h = lookup_gamut(gamut_lut, h);
-    // if JC[0] == 0.f, the saturation / luminance ratio is infinite - assign the largest practical value we have
-    const float sat = (JC[0] > 0.f) ? soft_clip(JC[1] / JC[0], 0.8f * out_max_sat_h, out_max_sat_h)
-                                    : out_max_sat_h;
-    const float max_C_at_sat = JC[0] * sat;
-    // if sat == 0.f, the chroma is zero - assign the original luminance because there's no need to gamut map
-    const float max_J_at_sat = (sat > 0.f) ? JC[1] / sat : JC[0];
-    JC[0] = (JC[0] + max_J_at_sat) / 2.f;
-    JC[1] = (JC[1] + max_C_at_sat) / 2.f;
+  // Gamut mapping
+  const float out_max_sat_h = lookup_gamut(gamut_lut, h);
+  // if JC[0] == 0.f, the saturation / luminance ratio is infinite - assign the largest practical value we have
+  const float sat = (JC[0] > 0.f) ? soft_clip(JC[1] / JC[0], 0.8f * out_max_sat_h, out_max_sat_h)
+                                  : out_max_sat_h;
+  const float max_C_at_sat = JC[0] * sat;
+  // if sat == 0.f, the chroma is zero - assign the original luminance because there's no need to gamut map
+  const float max_J_at_sat = (sat > 0.f) ? JC[1] / sat : JC[0];
+  JC[0] = (JC[0] + max_J_at_sat) / 2.f;
+  JC[1] = (JC[1] + max_C_at_sat) / 2.f;
 
-    // Gamut-clip in Jch at constant hue and lightness,
-    // e.g. find the max chroma available at current hue that doesn't
-    // yield negative L'M'S' values, which will need to be clipped during conversion
-    const float cos_H = dtcl_cos(h);
-    const float sin_H = dtcl_sin(h);
+  // Gamut-clip in Jch at constant hue and lightness,
+  // e.g. find the max chroma available at current hue that doesn't
+  // yield negative L'M'S' values, which will need to be clipped during conversion
+  const float cos_H = native_cos(h);
+  const float sin_H = native_sin(h);
 
-    const float d0 = 1.6295499532821566e-11f;
-    const float d = -0.56f;
-    float Iz = JC[0] + d0;
-    Iz /= (1.f + d - d * Iz);
-    Iz = fmax(Iz, 0.f);
+  const float d0 = 1.6295499532821566e-11f;
+  const float d = -0.56f;
+  float Iz = JC[0] + d0;
+  Iz /= (1.f + d - d * Iz);
+  Iz = fmax(Iz, 0.f);
 
-    const float4 AI[3] = { {  1.0f,  0.1386050432715393f,  0.0580473161561189f, 0.0f },
-                          {  1.0f, -0.1386050432715393f, -0.0580473161561189f, 0.0f },
-                          {  1.0f, -0.0960192420263190f, -0.8118918960560390f, 0.0f } };
+  const float4 AI[3] = { {  1.0f,  0.1386050432715393f,  0.0580473161561189f, 0.0f },
+                         {  1.0f, -0.1386050432715393f, -0.0580473161561189f, 0.0f },
+                         {  1.0f, -0.0960192420263190f, -0.8118918960560390f, 0.0f } };
 
-    // Do a test conversion to L'M'S'
-    const float4 IzAzBz = { Iz, JC[1] * cos_H, JC[1] * sin_H, 0.f };
-    LMS.x = dot(AI[0], IzAzBz);
-    LMS.y = dot(AI[1], IzAzBz);
-    LMS.z = dot(AI[2], IzAzBz);
+  // Do a test conversion to L'M'S'
+  const float4 IzAzBz = { Iz, JC[1] * cos_H, JC[1] * sin_H, 0.f };
+  LMS.x = dot(AI[0], IzAzBz);
+  LMS.y = dot(AI[1], IzAzBz);
+  LMS.z = dot(AI[2], IzAzBz);
 
-    // Clip chroma
-    float max_C = JC[1];
-    if(LMS.x < 0.f)
-      max_C = fmin(-Iz / (AI[0].y * cos_H + AI[0].z * sin_H), max_C);
+  // Clip chroma
+  float max_C = JC[1];
+  if(LMS.x < 0.f)
+    max_C = fmin(-Iz / (AI[0].y * cos_H + AI[0].z * sin_H), max_C);
 
-    if(LMS.y < 0.f)
-      max_C = fmin(-Iz / (AI[1].y * cos_H + AI[1].z * sin_H), max_C);
+  if(LMS.y < 0.f)
+    max_C = fmin(-Iz / (AI[1].y * cos_H + AI[1].z * sin_H), max_C);
 
-    if(LMS.z < 0.f)
-      max_C = fmin(-Iz / (AI[2].y * cos_H + AI[2].z * sin_H), max_C);
+  if(LMS.z < 0.f)
+    max_C = fmin(-Iz / (AI[2].y * cos_H + AI[2].z * sin_H), max_C);
 
-    // Project back to JzAzBz for real
-    Jab.x = JC[0];
-    Jab.y = max_C * cos_H;
-    Jab.z = max_C * sin_H;
+  // Project back to JzAzBz for real
+  Jab.x = JC[0];
+  Jab.y = max_C * cos_H;
+  Jab.z = max_C * sin_H;
 
-    XYZ_D65 = JzAzBz_2_XYZ(Jab);
-  }
-  else
-  {
-    float4 xyY = dt_D65_XYZ_to_xyY(XYZ_D65);
-    float4 JCH = xyY_to_dt_UCS_JCH(xyY, L_white);
-    float4 HCB = dt_UCS_JCH_to_HCB(JCH);
-
-    const float radius = hypot(HCB.y, HCB.z);
-    const float sin_T = (radius > 0.f) ? HCB.y / radius : 0.f;
-    const float cos_T = (radius > 0.f) ? HCB.z / radius : 0.f;
-    const float M_rot_inv[2][2] = { { cos_T,  sin_T }, { -sin_T, cos_T } };
-    // This would be the full matrice of direct rotation if we didn't need only its last row
-    //const float M_rot_dir[2][2] = { { cos_T, -sin_T }, {  sin_T, cos_T } };
-
-    const float P = fmax(FLT_MIN, HCB.y);
-    const float W = sin_T * HCB.y + cos_T * HCB.z;
-
-    float a = fmax(1.f + saturation_global + dot(opacities, saturation), 0.f);
-    const float b = fmax(1.f + brilliance_global + dot(opacities, brilliance), 0.f);
-
-    const float max_a = hypot(P, W) / P;
-    a = soft_clip(a, 0.5f * max_a, max_a);
-
-    const float P_prime = (a - 1.f) * P;
-    const float W_prime = dtcl_sqrt(sqf(P) * (1.f - sqf(a)) + sqf(W)) * b;
-
-    HCB.y = fmax(M_rot_inv[0][0] * P_prime + M_rot_inv[0][1] * W_prime, 0.f);
-    HCB.z = fmax(M_rot_inv[1][0] * P_prime + M_rot_inv[1][1] * W_prime, 0.f);
-
-    JCH = dt_UCS_HCB_to_JCH(HCB);
-
-    // Gamut mapping
-    const float max_colorfulness = lookup_gamut(gamut_lut, JCH.z); // WARNING : this is M²
-    const float max_chroma = 15.932993652962535f * dtcl_pow(JCH.x * L_white, 0.6523997524738018f) * dtcl_pow(max_colorfulness, 0.6007557017508491f) / L_white;
-    const float4 JCH_gamut_boundary = { JCH.x, max_chroma, JCH.z, 0.f };
-    const float4 HSB_gamut_boundary = dt_UCS_JCH_to_HSB(JCH_gamut_boundary);
-
-    // Clip saturation at constant brightness
-    float4 HSB = { HCB.x, (HCB.z > 0.f) ? HCB.y / HCB.z : 0.f, HCB.z, 0.f };
-    HSB.y = soft_clip(HSB.y, 0.8f * HSB_gamut_boundary.y, HSB_gamut_boundary.y);
-
-    JCH = dt_UCS_HSB_to_JCH(HSB);
-    xyY = dt_UCS_JCH_to_xyY(JCH, L_white);
-    XYZ_D65 = dt_xyY_to_XYZ(xyY);
-  }
+  XYZ_D65 = JzAzBz_2_XYZ(Jab);
 
   // Project back to D50 pipeline RGB
   RGB = matrix_product_float4(XYZ_D65, matrix_out);
@@ -1074,21 +1088,4 @@ colorchecker (read_only image2d_t in, write_only image2d_t out, const int width,
   opixel.w = w;
 
   write_imagef (out, (int2)(x, y), opixel);
-}
-
-kernel void
-primaries(read_only image2d_t in,
-          write_only image2d_t out,
-          const int width,
-          const int height,
-          constant const float *const matrix)
-{
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-  if(x >= width || y >= height) return;
-
-  const float4 ipixel = read_imagef(in, sampleri, (int2)(x, y));
-  float4 opixel = matrix_product_float4(ipixel, matrix);
-  opixel.w = ipixel.w;
-  write_imagef(out, (int2)(x, y), opixel);
 }

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2014-2025 darktable developers.
+    Copyright (C) 2014-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 #include "common/collection.h"
 #include "common/colorspaces.h"
 #include "common/cups_print.h"
+#include "common/file_location.h"
 #include "common/image_cache.h"
 #include "common/metadata.h"
 #include "common/pdf.h"
@@ -32,7 +33,6 @@
 #include "common/variables.h"
 #include "control/jobs.h"
 #include "dtgtk/resetlabel.h"
-#include "dtgtk/stylemenu.h"
 #include "gui/accelerators.h"
 #include "gui/drag_and_drop.h"
 #include "gui/gtk.h"
@@ -41,16 +41,15 @@
 
 DT_MODULE(4)
 
-#define PRINT_CONFIG_PREFIX "plugins/print/print/"
-
 const char *name(dt_lib_module_t *self)
 {
   return _("print settings");
 }
 
-dt_view_type_flags_t views(dt_lib_module_t *self)
+const char **views(dt_lib_module_t *self)
 {
-  return DT_VIEW_PRINT;
+  static const char *v[] = {"print", NULL};
+  return v;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -71,18 +70,6 @@ typedef enum _set_controls
   BOX_ALL          = BOX_LEFT | BOX_RIGHT | BOX_TOP | BOX_BOTTOM
 } dt_box_control_set;
 
-typedef enum _unit_t
-{
-  UNIT_MM = 0,
-  UNIT_CM,
-  UNIT_IN,
-  UNIT_N // needs to be the last one
-} _unit_t;
-
-
-static const float units[UNIT_N] = { 1.0f, 0.1f, 1.0f/25.4f };
-static const gchar *_unit_names[] = { N_("mm"), N_("cm"), N_("inch"), NULL };
-
 typedef struct dt_lib_print_settings_t
 {
   GtkWidget *profile, *intent, *style, *style_mode, *papers, *media;
@@ -98,12 +85,12 @@ typedef struct dt_lib_print_settings_t
   GtkButton *print_button;
   GtkToggleButton *lock_button;
   GtkWidget *b_top, *b_bottom, *b_left, *b_right;
-  GtkDarktableToggleButton *dtba[9];	             // Alignment buttons
+  GtkDarktableToggleButton *dtba[9];	                                   // Alignment buttons
   GList *paper_list, *media_list;
   gboolean lock_activated;
   dt_print_info_t prt;
   dt_images_box imgs;
-  _unit_t unit;
+  int unit;
   int v_intent, v_pintent;
   int v_icctype, v_picctype;
   char *v_iccprofile, *v_piccprofile, *v_style;
@@ -119,9 +106,6 @@ typedef struct dt_lib_print_settings_t
   dt_box_control_set sel_controls; // which border/corner is selected
   float click_pos_x, click_pos_y;
   gboolean has_changed;
-
-  GList *printer_list;
-  dt_pthread_mutex_t printer_list_mutex;
 } dt_lib_print_settings_t;
 
 typedef struct dt_lib_print_job_t
@@ -152,21 +136,22 @@ typedef struct _dialog_description
   const char *name;
 } dialog_description_t;
 
+static const float units[3] = { 1.0f, 0.1f, 1.0f/25.4f };
+
 static void _update_slider(dt_lib_print_settings_t *ps);
 static void _width_changed(GtkWidget *widget, gpointer user_data);
 static void _height_changed(GtkWidget *widget, gpointer user_data);
 static void _x_changed(GtkWidget *widget, gpointer user_data);
 static void _y_changed(GtkWidget *widget, gpointer user_data);
 
-int position(const dt_lib_module_t *self)
+int
+position()
 {
   return 990;
 }
 
-/* get paper dimension for the orientation (in mm) */
-static void _get_page_dimension(dt_print_info_t *prt,
-                                float *width,
-                                float *height)
+/* get paper dimention for the orientation (in mm) */
+static void _get_page_dimention(dt_print_info_t *prt, float *width, float *height)
 {
   if(prt->page.landscape)
   {
@@ -180,91 +165,53 @@ static void _get_page_dimension(dt_print_info_t *prt,
   }
 }
 
-static void _precision_by_unit(const _unit_t unit,
-                               int *n_digits,
-                               float *incr,
-                               char **format)
-{
-  // this gives us these precisions
-  //  unit  precision  increment
-  //   mm      1          1
-  //   cm      0.1        0.1
-  //   in      0.01       0.05
-  //
-  // This allows for >= 1mm precision display regardless of unit, and
-  // allows for entering common fractions (e.g. 1/4 as .25) for
-  // inches. Increment is kept to 1mm except in the cases of inches,
-  // where we round up from 0.03937 (1mm) to 0.05 to keep to a factor
-  // of a power of ten.
-  *n_digits = ceilf(log10f(1.0f / units[unit]));
-  if(incr)
-  {
-    *incr = roundf(units[unit] * 20.0f) / 20.0f;
-  }
-  if(format)
-  {
-    *format = g_strdup_printf("%%.%df", *n_digits);
-  }
-}
-
 // unit conversion
 
-static float _to_mm(dt_lib_print_settings_t *ps,
-                    const double value)
+static float to_mm(dt_lib_print_settings_t *ps, double value)
 {
   return value / units[ps->unit];
 }
 
 // horizontal mm to pixels
-static float _mm_to_hscreen(dt_lib_print_settings_t *ps,
-                            const float value,
-                            const gboolean offset)
+static float _mm_to_hscreen(dt_lib_print_settings_t *ps, const float value, const gboolean offset)
 {
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   return (offset ? ps->imgs.screen.page.x : 0)
     + (ps->imgs.screen.page.width * value / width);
 }
 
-// vertical mm to pixels
-static float _mm_to_vscreen(dt_lib_print_settings_t *ps,
-                            const float value,
-                            const gboolean offset)
+// vertial mm to pixels
+static float _mm_to_vscreen(dt_lib_print_settings_t *ps, const float value, const gboolean offset)
 {
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   return (offset ? ps->imgs.screen.page.y : 0)
     + (ps->imgs.screen.page.height * value / height);
 }
 
-static float _hscreen_to_mm(dt_lib_print_settings_t *ps,
-                            const float value,
-                            const gboolean offset)
+static float _hscreen_to_mm(dt_lib_print_settings_t *ps, const float value, const gboolean offset)
 {
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   return width * (value - (offset ? ps->imgs.screen.page.x : 0.0f))
     / ps->imgs.screen.page.width;
 }
 
-static float _vscreen_to_mm(dt_lib_print_settings_t *ps,
-                            const float value,
-                            const gboolean offset)
+static float _vscreen_to_mm(dt_lib_print_settings_t *ps, const float value, const gboolean offset)
 {
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   return height * (value - (offset ? ps->imgs.screen.page.y : 0.0f))
     / ps->imgs.screen.page.height;
 }
 
 
-static inline float _percent_unit_of(dt_lib_print_settings_t *ps,
-                                     const float ref,
-                                     const float value)
+static inline float _percent_unit_of(dt_lib_print_settings_t *ps, float ref, float value)
 {
   return value * ref * units[ps->unit];
 }
@@ -295,27 +242,14 @@ static const char *mime(dt_imageio_module_data_t *data)
   return "memory";
 }
 
-static int write_image(dt_imageio_module_data_t *data,
-                       const char *filename,
-                       const void *in,
-                       dt_colorspaces_color_profile_type_t over_type,
-                       const char *over_filename,
-                       void *exif, int exif_len,
-                       const dt_imgid_t imgid,
-                       const int num,
-                       const int total,
-                       dt_dev_pixelpipe_t *pipe,
+static int write_image(dt_imageio_module_data_t *data, const char *filename, const void *in,
+                       dt_colorspaces_color_profile_type_t over_type, const char *over_filename,
+                       void *exif, int exif_len, int imgid, int num, int total, dt_dev_pixelpipe_t *pipe,
                        const gboolean export_masks)
 {
   dt_print_format_t *d = (dt_print_format_t *)data;
 
-  d->params->buf =
-    (uint16_t *)malloc((size_t)3 * (d->bpp == 8?1:2) * d->head.width * d->head.height);
-  if(!d->params->buf)
-  {
-    dt_print(DT_DEBUG_ALWAYS, "[print] unable to allocate memory for image %s", filename);
-    return 1;
-  }
+  d->params->buf = (uint16_t *)malloc((size_t)3 * (d->bpp == 8?1:2) * d->head.width * d->head.height);
 
   if(d->bpp == 8)
   {
@@ -341,8 +275,8 @@ static int write_image(dt_imageio_module_data_t *data,
   return 0;
 }
 
-// export image imgid with given max_width & max_height, set iwidth &
-// iheight with the final image size as exported.
+// export image imgid with given max_width & max_height, set iwidth & iheight with the
+// final image size as exported.
 static int _export_image(dt_job_t *job, dt_image_box *img)
 {
   dt_lib_print_job_t *params = dt_control_job_get_params(job);
@@ -365,20 +299,16 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
 
   // let the user know something is happening
   dt_control_job_set_progress(job, 0.05);
-  dt_control_log(_("processing `%s' for `%s'"),
-                 params->job_title, params->prt.printer.name);
+  dt_control_log(_("processing `%s' for `%s'"), params->job_title, params->prt.printer.name);
 
   const gboolean high_quality = TRUE;
   const gboolean upscale = TRUE;
   const gboolean export_masks = FALSE;
-  const gboolean is_scaling = FALSE;
-  const double scale_factor = 1.0;
 
   dt_imageio_export_with_flags
     (img->imgid, "unused", &buf, (dt_imageio_module_data_t *)&dat, TRUE, FALSE,
-     high_quality, upscale, is_scaling, scale_factor, FALSE, NULL,
-     FALSE, export_masks, params->buf_icc_type,
-     params->buf_icc_profile, params->buf_icc_intent,  NULL, NULL, 1, 1, NULL, -1);
+     high_quality, upscale, FALSE, NULL, FALSE, export_masks, params->buf_icc_type,
+     params->buf_icc_profile, params->buf_icc_intent,  NULL, NULL, 1, 1, NULL);
 
   img->exp_width = dat.head.width;
   img->exp_height = dat.head.height;
@@ -397,9 +327,7 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
     if(!pprof)
     {
       dt_control_log(_("cannot open printer profile `%s'"), params->p_icc_profile);
-      dt_print(DT_DEBUG_ALWAYS,
-               "cannot open printer profile `%s'",
-               params->p_icc_profile);
+      fprintf(stderr, "cannot open printer profile `%s'\n", params->p_icc_profile);
       dt_control_queue_redraw();
       return 1;
     }
@@ -408,22 +336,16 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
       if(!buf_profile || !buf_profile->profile)
       {
         dt_control_log(_("error getting output profile for image %d"), img->imgid);
-        dt_print(DT_DEBUG_ALWAYS,
-                 "error getting output profile for image %d",
-                 img->imgid);
+        fprintf(stderr, "error getting output profile for image %d\n", img->imgid);
         dt_control_queue_redraw();
         return 1;
       }
       if(dt_apply_printer_profile
-         ((void **)&(params->buf), dat.head.width, dat.head.height,
-          dat.bpp, buf_profile->profile,
+         ((void **)&(params->buf), dat.head.width, dat.head.height, dat.bpp, buf_profile->profile,
           pprof->profile, params->p_icc_intent, params->black_point_compensation))
       {
-        dt_control_log(_("cannot apply printer profile `%s'"),
-                       params->p_icc_profile);
-        dt_print(DT_DEBUG_ALWAYS,
-                 "cannot apply printer profile `%s'",
-                 params->p_icc_profile);
+        dt_control_log(_("cannot apply printer profile `%s'"), params->p_icc_profile);
+        fprintf(stderr, "cannot apply printer profile `%s'\n", params->p_icc_profile);
         dt_control_queue_redraw();
         return 1;
       }
@@ -436,10 +358,7 @@ static int _export_image(dt_job_t *job, dt_image_box *img)
   return 0;
 }
 
-static void _create_pdf(dt_job_t *job,
-                        dt_images_box imgs,
-                        const float width,
-                        const float height)
+static void _create_pdf(dt_job_t *job, dt_images_box imgs, const float width, const float height)
 {
   dt_lib_print_job_t *params = dt_control_job_get_params(job);
 
@@ -451,12 +370,11 @@ static void _create_pdf(dt_job_t *job,
 
   // create the PDF page
   dt_pdf_t *pdf = dt_pdf_start(params->pdf_filename, page_width, page_height,
-                               params->prt.printer.resolution,
-                               DT_PDF_STREAM_ENCODER_FLATE);
+                               params->prt.printer.resolution, DT_PDF_STREAM_ENCODER_FLATE);
 
 /*
   // ??? should a profile be embedded here?
-  if(*printer_profile)
+  if (*printer_profile)
     icc_id = dt_pdf_add_icc(pdf, printer_profile);
 */
   int32_t count = 0;
@@ -466,7 +384,7 @@ static void _create_pdf(dt_job_t *job,
     const int resolution = params->prt.printer.resolution;
     const dt_image_box *box = &imgs.box[k];
 
-    if(dt_is_valid_imgid(box->imgid))
+    if(box->imgid > -1)
     {
       pdf_image[count] =
         dt_pdf_add_image(pdf, (uint8_t *)box->buf, box->exp_width, box->exp_height,
@@ -502,7 +420,7 @@ void _fill_box_values(dt_lib_print_settings_t *ps)
     dt_image_box *box = &ps->imgs.box[ps->last_selected];
 
     float width, height;
-    _get_page_dimension(&ps->prt, &width, &height);
+    _get_page_dimention(&ps->prt, &width, &height);
 
     x       = _percent_unit_of(ps, width, box->pos.x);
     y       = _percent_unit_of(ps, height, box->pos.y);
@@ -530,22 +448,19 @@ void _fill_box_values(dt_lib_print_settings_t *ps)
   --darktable.gui->reset;
 }
 
-static int _export_and_setup_pos(dt_job_t *job,
-                                 dt_image_box *img,
-                                 const int32_t idx)
+static int _export_and_setup_pos(dt_job_t *job, dt_image_box *img, const int32_t idx)
 {
   dt_lib_print_job_t *params = dt_control_job_get_params(job);
 
   float width, height;
-  _get_page_dimension(&params->prt, &width, &height);
+  _get_page_dimention(&params->prt, &width, &height);
 
   dt_printing_setup_page(&params->imgs, width, height, params->prt.printer.resolution);
 
-  dt_print(DT_DEBUG_PRINT, "[print] max image size %d x %d (at resolution %d)",
+  dt_print(DT_DEBUG_PRINT, "[print] max image size %d x %d (at resolution %d)\n",
            img->max_width, img->max_height, params->prt.printer.resolution);
 
-  if(_export_image(job, img))
-    return 1;
+  if(_export_image(job, img)) return 1;
 
   dt_printing_setup_image(&params->imgs, idx,
                           img->imgid, img->exp_width, img->exp_height, img->alignment);
@@ -557,24 +472,16 @@ static int _print_job_run(dt_job_t *job)
 {
   dt_lib_print_job_t *params = dt_control_job_get_params(job);
 
-  // get first image on a box, needed as print leader
-
-  dt_imgid_t imgid = NO_IMGID;
-
   // compute the needed size for picture for the given printer resolution
 
   for(int k=0; k<params->imgs.count; k++)
   {
-    if(dt_is_valid_imgid(params->imgs.box[k].imgid))
-    {
-      if(!dt_is_valid_imgid(imgid)) imgid = params->imgs.box[k].imgid;
+    if(params->imgs.box[k].imgid > -1)
       if(_export_and_setup_pos(job, &params->imgs.box[k], k))
         return 1;
-    }
   }
 
-  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED)
-    return 0;
+  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) return 0;
   dt_control_job_set_progress(job, 0.9);
 
   dt_loc_get_tmp_dir(params->pdf_filename, sizeof(params->pdf_filename));
@@ -583,14 +490,14 @@ static int _print_job_run(dt_job_t *job)
   const gint fd = g_mkstemp(params->pdf_filename);
   if(fd == -1)
   {
-    dt_control_log(_("failed to create temporary PDF for printing"));
-    dt_print(DT_DEBUG_ALWAYS, "failed to create temporary PDF for printing");
+    dt_control_log(_("failed to create temporary pdf for printing"));
+    fprintf(stderr, "failed to create temporary pdf for printing\n");
     return 1;
   }
   close(fd);
 
   float width, height;
-  _get_page_dimension(&params->prt, &width, &height);
+  _get_page_dimention(&params->prt, &width, &height);
 
   _create_pdf(job, params->imgs, width, height);
 
@@ -599,7 +506,7 @@ static int _print_job_run(dt_job_t *job)
 
   // send to CUPS
 
-  dt_print_file(imgid, params->pdf_filename, params->job_title, &params->prt);
+  dt_print_file (params->imgs.box[0].imgid, params->pdf_filename, params->job_title, &params->prt);
   dt_control_job_set_progress(job, 1.0);
 
   // add tag for this image
@@ -609,23 +516,23 @@ static int _print_job_run(dt_job_t *job)
   snprintf (tag, sizeof(tag), "darktable|printed|%s", params->prt.printer.name);
   dt_tag_new(tag, &tagid);
 
-  for(int k=0; k < params->imgs.count; k++)
+  for(int k=0; k<params->imgs.count; k++)
   {
-    if(dt_is_valid_imgid(params->imgs.box[k].imgid))
-    {
+    if(params->imgs.box[k].imgid > -1)
       if(dt_tag_attach(tagid, params->imgs.box[k].imgid, FALSE, FALSE))
-        DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
-      /* register print timestamp in cache */
-      dt_image_cache_set_print_timestamp(params->imgs.box[k].imgid);
-    }
+        DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_TAG_CHANGED);
+
+    /* register print timestamp in cache */
+    dt_image_cache_set_print_timestamp(darktable.image_cache, params->imgs.box[k].imgid);
   }
 
   return 0;
 }
 
-static void _page_new_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
+static void _page_new_area_clicked(GtkWidget *widget, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   if(ps->imgs.count == MAX_IMAGE_PER_PAGE)
   {
@@ -633,14 +540,15 @@ static void _page_new_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
     return;
   }
 
-  dt_control_change_cursor("cell");
+  dt_control_change_cursor(GDK_PLUS);
   ps->creation = TRUE;
   ps->has_changed = TRUE;
 }
 
-static void _page_clear_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
+static void _page_clear_area_clicked(GtkWidget *widget, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   ps->has_changed = TRUE;
   dt_printing_clear_boxes(&ps->imgs);
@@ -648,14 +556,14 @@ static void _page_clear_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
   dt_control_queue_redraw_center();
 }
 
-static void _page_delete_area(const dt_lib_module_t *self,
-                              const int box_index)
+static void _page_delete_area_clicked(GtkWidget *widget, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-  if(box_index == -1) return;
+  if(ps->last_selected == -1) return;
 
-  for(int k=box_index; k<MAX_IMAGE_PER_PAGE-1; k++)
+  for(int k=ps->last_selected; k<MAX_IMAGE_PER_PAGE-1; k++)
   {
     memcpy(&ps->imgs.box[k], &ps->imgs.box[k+1], sizeof(dt_image_box));
   }
@@ -675,13 +583,6 @@ static void _page_delete_area(const dt_lib_module_t *self,
   dt_control_queue_redraw_center();
 }
 
-static void _page_delete_area_clicked(GtkWidget *widget, dt_lib_module_t *self)
-{
-  dt_lib_print_settings_t *ps = self->data;
-
-  _page_delete_area(self, ps->last_selected);
-}
-
 static void _print_job_cleanup(void *p)
 {
   dt_lib_print_job_t *params = p;
@@ -695,24 +596,14 @@ static void _print_job_cleanup(void *p)
   free(params);
 }
 
-static void _print_button_clicked(GtkWidget *widget, dt_lib_module_t *self)
+static void _print_button_clicked(GtkWidget *widget, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-  dt_imgid_t imgid = NO_IMGID;
+  const int imgid = ps->imgs.box[0].imgid;
 
-  // at least one image on a box
-
-  for(int k=0; k<ps->imgs.count; k++)
-  {
-    if(dt_is_valid_imgid(ps->imgs.box[k].imgid))
-    {
-      imgid = ps->imgs.box[k].imgid;
-      break;
-    }
-  }
-
-  if(!dt_is_valid_imgid(imgid))
+  if(imgid == -1)
   {
     dt_control_log(_("cannot print until a picture is selected"));
     return;
@@ -738,17 +629,16 @@ static void _print_button_clicked(GtkWidget *widget, dt_lib_module_t *self)
   memcpy(&params->imgs, &ps->imgs, sizeof(ps->imgs));
 
   // what to call the image?
-  GList *res = dt_metadata_get_lock(imgid, "Xmp.dc.title", NULL);
-  if(res != NULL)
+  GList *res;
+  if((res = dt_metadata_get(params->imgs.box[0].imgid, "Xmp.dc.title", NULL)) != NULL)
   {
-    // FIXME: in metadata_view.c, non-printables are filtered, should
-    // we do this here?
+    // FIXME: in metadata_view.c, non-printables are filtered, should we do this here?
     params->job_title = g_strdup((gchar *)res->data);
     g_list_free_full(res, &g_free);
   }
   else
   {
-    const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+    const dt_image_t *img = dt_image_cache_get(darktable.image_cache, params->imgs.box[0].imgid, 'r');
     if(!img)
     {
       // in this case no need to release from cache what we couldn't get
@@ -757,35 +647,33 @@ static void _print_button_clicked(GtkWidget *widget, dt_lib_module_t *self)
       return;
     }
     params->job_title = g_strdup(img->filename);
-    dt_image_cache_read_release(img);
+    dt_image_cache_read_release(darktable.image_cache, img);
   }
   // FIXME: ellipsize title/printer as the export completed message is ellipsized
-  gchar *message = g_strdup_printf(_("processing `%s' for `%s'"),
-                                   params->job_title, params->prt.printer.name);
+  gchar *message = g_strdup_printf(_("processing `%s' for `%s'"), params->job_title, params->prt.printer.name);
   dt_control_job_add_progress(job, message, TRUE);
   g_free(message);
 
   // FIXME: getting this from conf as w/prior code, but switch to getting from ps
-  params->style = dt_conf_get_string(PRINT_CONFIG_PREFIX "style");
+  params->style = dt_conf_get_string("plugins/print/print/style");
   params->style_append = ps->v_style_append;
 
   // FIXME: getting these from conf as w/prior code, but switch to getting them from ps
-  params->buf_icc_type = dt_conf_get_int(PRINT_CONFIG_PREFIX "icctype");
-  params->buf_icc_profile = dt_conf_get_string(PRINT_CONFIG_PREFIX "iccprofile");
-  params->buf_icc_intent = dt_conf_get_int(PRINT_CONFIG_PREFIX "iccintent");
+  params->buf_icc_type = dt_conf_get_int("plugins/print/print/icctype");
+  params->buf_icc_profile = dt_conf_get_string("plugins/print/print/iccprofile");
+  params->buf_icc_intent = dt_conf_get_int("plugins/print/print/iccintent");
 
   params->p_icc_type = ps->v_picctype;
   params->p_icc_profile = g_strdup(ps->v_piccprofile);
   params->p_icc_intent = ps->v_pintent;
   params->black_point_compensation = ps->v_black_point_compensation;
 
-  dt_control_add_job(DT_JOB_QUEUE_USER_EXPORT, job);
+  dt_control_add_job(darktable.control, DT_JOB_QUEUE_USER_EXPORT, job);
 }
 
-static void _set_printer(const dt_lib_module_t *self,
-                         const char *printer_name)
+static void _set_printer(const dt_lib_module_t *self, const char *printer_name)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   dt_get_printer_info(printer_name, &ps->prt.printer);
 
@@ -794,33 +682,84 @@ static void _set_printer(const dt_lib_module_t *self,
   if(ps->prt.printer.is_turboprint)
     dt_bauhaus_combobox_set(ps->pprofile, 0);
 
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "printer", printer_name);
+  dt_conf_set_string("plugins/print/print/printer", printer_name);
 
-  // add papers for the given printer
+  const char *default_paper = dt_conf_get_string_const("plugins/print/print/paper");
+
+  // next add corresponding papers
+
+  // first clear current list
+
   dt_bauhaus_combobox_clear(ps->papers);
+
+  // then add papers for the given printer
+
   if(ps->paper_list) g_list_free_full(ps->paper_list, free);
+
   ps->paper_list = dt_get_papers (&ps->prt.printer);
+  int np = 0;
+  gboolean ispaperset = FALSE;
+
   for(const GList *papers = ps->paper_list; papers; papers = g_list_next (papers))
   {
-    const dt_paper_info_t *p = papers->data;
+    const dt_paper_info_t *p = (dt_paper_info_t *)papers->data;
     dt_bauhaus_combobox_add(ps->papers, p->common_name);
-  }
-  const char *default_paper = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "paper");
-  if(!dt_bauhaus_combobox_set_from_text(ps->papers, default_paper))
-    dt_bauhaus_combobox_set(ps->papers, 0);
 
-  // add corresponding supported media
+    if(ispaperset == FALSE && (!g_strcmp0(default_paper, p->common_name) || default_paper[0] == '\0'))
+    {
+      dt_bauhaus_combobox_set(ps->papers, np);
+      ispaperset = TRUE;
+    }
+
+    np++;
+  }
+
+  //  paper not found in this printer
+  if(!ispaperset) dt_bauhaus_combobox_set(ps->papers, 0);
+
+  const dt_paper_info_t *paper = dt_get_paper(ps->paper_list, default_paper);
+
+  if(paper)
+    memcpy(&ps->prt.paper, paper, sizeof(dt_paper_info_t));
+
+  // next add corresponding supported media
+
+  const char *default_medium = dt_conf_get_string_const("plugins/print/print/medium");
+
+  // first clear current list
+
   dt_bauhaus_combobox_clear(ps->media);
+
+  // then add papers for the given printer
+
   if(ps->media_list) g_list_free_full(ps->media_list, free);
-  ps->media_list = dt_get_media_type(&ps->prt.printer);
+
+  ps->media_list = dt_get_media_type (&ps->prt.printer);
+  gboolean ismediaset = FALSE;
+
+  np = 0;
+
   for(const GList *media = ps->media_list; media; media = g_list_next (media))
   {
-    const dt_medium_info_t *m = media->data;
+    const dt_medium_info_t *m = (dt_medium_info_t *)media->data;
     dt_bauhaus_combobox_add(ps->media, m->common_name);
+
+    if(ismediaset == FALSE && (!g_strcmp0(default_medium, m->common_name) || default_medium[0] == '\0'))
+    {
+      dt_bauhaus_combobox_set(ps->media, np);
+      ismediaset = TRUE;
+    }
+
+    np++;
   }
-  const char *default_medium = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "medium");
-  if(!dt_bauhaus_combobox_set_from_text(ps->media, default_medium))
-    dt_bauhaus_combobox_set(ps->media, 0);
+
+  //  media not found in this printer
+  if(!ismediaset) dt_bauhaus_combobox_set(ps->media, 0);
+
+  const dt_medium_info_t *medium = dt_get_medium(ps->media_list, default_medium);
+
+  if(medium)
+    memcpy(&ps->prt.medium, medium, sizeof(dt_medium_info_t));
 
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 }
@@ -837,7 +776,7 @@ _printer_changed(GtkWidget *combo, const dt_lib_module_t *self)
 static void
 _paper_changed(GtkWidget *combo, const dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   const gchar *paper_name = dt_bauhaus_combobox_get_text(combo);
 
@@ -849,11 +788,11 @@ _paper_changed(GtkWidget *combo, const dt_lib_module_t *self)
     memcpy(&ps->prt.paper, paper, sizeof(dt_paper_info_t));
 
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   dt_printing_setup_page(&ps->imgs, width, height, ps->prt.printer.resolution);
 
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "paper", paper_name);
+  dt_conf_set_string("plugins/print/print/paper", paper_name);
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 
   _update_slider(ps);
@@ -862,7 +801,7 @@ _paper_changed(GtkWidget *combo, const dt_lib_module_t *self)
 static void
 _media_changed(GtkWidget *combo, const dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   const gchar *medium_name = dt_bauhaus_combobox_get_text(combo);
 
@@ -873,7 +812,7 @@ _media_changed(GtkWidget *combo, const dt_lib_module_t *self)
   if(medium)
     memcpy(&ps->prt.medium, medium, sizeof(dt_medium_info_t));
 
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "medium", medium_name);
+  dt_conf_set_string("plugins/print/print/medium", medium_name);
   dt_view_print_settings(darktable.view_manager, &ps->prt, &ps->imgs);
 
   _update_slider(ps);
@@ -886,9 +825,8 @@ _update_slider(dt_lib_print_settings_t *ps)
 
   // if widget are created, let's display the current image size
 
-  // FIXME: why doesn't this update when units are changed?
   if(ps->selected != -1
-     && dt_is_valid_imgid(ps->imgs.box[ps->selected].imgid)
+     && ps->imgs.box[ps->selected].imgid != -1
      && ps->width && ps->height
      && ps->info)
   {
@@ -900,18 +838,15 @@ _update_slider(dt_lib_print_settings_t *ps)
 
     const double w = box_size_mm.width * units[ps->unit];
     const double h = box_size_mm.height * units[ps->unit];
-    char *value, *precision;
-    int n_digits;
-    _precision_by_unit(ps->unit, &n_digits, NULL, &precision);
+    char *value;
 
-    value = g_strdup_printf(precision, w);
+    value = g_strdup_printf("%3.2f", w);
     gtk_label_set_text(GTK_LABEL(ps->width), value);
     g_free(value);
 
-    value = g_strdup_printf(precision, h);
+    value = g_strdup_printf("%3.2f", h);
     gtk_label_set_text(GTK_LABEL(ps->height), value);
     g_free(value);
-    g_free(precision);
 
     // compute the image down/up scale and report information
 
@@ -934,77 +869,82 @@ _update_slider(dt_lib_print_settings_t *ps)
 }
 
 static void
-_top_border_callback(GtkWidget *spin, dt_lib_module_t *self)
+_top_border_callback(GtkWidget *spin, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const double value = gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin));
 
-  dt_conf_set_float(PRINT_CONFIG_PREFIX "top_margin", value);
+  dt_conf_set_float("plugins/print/print/top_margin", value);
 
-  ps->prt.page.margin_top = _to_mm(ps, value);
+  ps->prt.page.margin_top = to_mm(ps, value);
 
   if(ps->lock_activated == TRUE)
   {
-    ps->prt.page.margin_bottom = _to_mm(ps, value);
-    ps->prt.page.margin_left = _to_mm(ps, value);
-    ps->prt.page.margin_right = _to_mm(ps, value);
+    ps->prt.page.margin_bottom = to_mm(ps, value);
+    ps->prt.page.margin_left = to_mm(ps, value);
+    ps->prt.page.margin_right = to_mm(ps, value);
 
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_bottom), value);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_left), value);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_right), value);
 
-    dt_conf_set_float(PRINT_CONFIG_PREFIX "bottom_margin", value);
-    dt_conf_set_float(PRINT_CONFIG_PREFIX "left_margin", value);
-    dt_conf_set_float(PRINT_CONFIG_PREFIX "right_margin", value);
+    dt_conf_set_float("plugins/print/print/bottom_margin", value);
+    dt_conf_set_float("plugins/print/print/left_margin", value);
+    dt_conf_set_float("plugins/print/print/right_margin", value);
   }
 
   _update_slider(ps);
 }
 
 static void
-_bottom_border_callback(GtkWidget *spin, dt_lib_module_t *self)
+_bottom_border_callback(GtkWidget *spin, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const double value = gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin));
 
-  dt_conf_set_float(PRINT_CONFIG_PREFIX "bottom_margin", value);
+  dt_conf_set_float("plugins/print/print/bottom_margin", value);
 
-  ps->prt.page.margin_bottom = _to_mm(ps, value);
+  ps->prt.page.margin_bottom = to_mm(ps, value);
   _update_slider(ps);
 }
 
 static void
-_left_border_callback(GtkWidget *spin, dt_lib_module_t *self)
+_left_border_callback(GtkWidget *spin, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const double value = gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin));
 
-  dt_conf_set_float(PRINT_CONFIG_PREFIX "left_margin", value);
+  dt_conf_set_float("plugins/print/print/left_margin", value);
 
-  ps->prt.page.margin_left = _to_mm(ps, value);
+  ps->prt.page.margin_left = to_mm(ps, value);
   _update_slider(ps);
 }
 
 static void
-_right_border_callback(GtkWidget *spin, dt_lib_module_t *self)
+_right_border_callback(GtkWidget *spin, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const double value = gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin));
 
-  dt_conf_set_float(PRINT_CONFIG_PREFIX "right_margin", value);
+  dt_conf_set_float("plugins/print/print/right_margin", value);
 
-  ps->prt.page.margin_right = _to_mm(ps, value);
+  ps->prt.page.margin_right = to_mm(ps, value);
   _update_slider(ps);
 }
 
 static void
-_lock_callback(GtkWidget *button, dt_lib_module_t *self)
+_lock_callback(GtkWidget *button, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   ps->lock_activated = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(button));
 
-  dt_conf_set_bool(PRINT_CONFIG_PREFIX "lock_borders", ps->lock_activated);
+  dt_conf_set_bool("plugins/print/print/lock_borders", ps->lock_activated);
 
   gtk_widget_set_sensitive(GTK_WIDGET(ps->b_bottom), !ps->lock_activated);
   gtk_widget_set_sensitive(GTK_WIDGET(ps->b_left), !ps->lock_activated);
@@ -1021,17 +961,18 @@ _lock_callback(GtkWidget *button, dt_lib_module_t *self)
 }
 
 static void
-_alignment_callback(GtkWidget *tb, dt_lib_module_t *self)
+_alignment_callback(GtkWidget *tb, gpointer user_data)
 {
   if(darktable.gui->reset) return;
 
   int index=-1;
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   for(int i=0; i<9; i++)
   {
     /* block signal handler */
-    g_signal_handlers_block_by_func(ps->dtba[i],_alignment_callback, self);
+    g_signal_handlers_block_by_func(ps->dtba[i],_alignment_callback, user_data);
 
     if(GTK_WIDGET(ps->dtba[i]) == tb)
     {
@@ -1041,7 +982,7 @@ _alignment_callback(GtkWidget *tb, dt_lib_module_t *self)
     else gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ps->dtba[i]), FALSE);
 
     /* unblock signal handler */
-    g_signal_handlers_unblock_by_func(ps->dtba[i], _alignment_callback, self);
+    g_signal_handlers_unblock_by_func(ps->dtba[i], _alignment_callback, user_data);
   }
 
   if(ps->last_selected != -1)
@@ -1056,7 +997,7 @@ _alignment_callback(GtkWidget *tb, dt_lib_module_t *self)
 static void
 _orientation_changed(GtkWidget *combo, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   ps->prt.page.landscape = dt_bauhaus_combobox_get(combo);
 
@@ -1079,9 +1020,9 @@ static void _grid_size_changed(GtkWidget *widget, dt_lib_module_t *self)
 {
   if(darktable.gui->reset) return;
 
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const float value = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ps->grid_size));
-  dt_conf_set_float(PRINT_CONFIG_PREFIX "grid_size", _to_mm(ps, value));
+  dt_conf_set_float("plugins/print/print/grid_size", to_mm(ps, value));
 
   dt_control_queue_redraw_center();
 }
@@ -1091,183 +1032,120 @@ _unit_changed(GtkWidget *combo, dt_lib_module_t *self)
 {
   if(darktable.gui->reset) return;
 
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-  const float grid_size = dt_conf_get_float(PRINT_CONFIG_PREFIX "grid_size");
+  const float grid_size = dt_conf_get_float("plugins/print/print/grid_size");
 
   const int unit = dt_bauhaus_combobox_get(combo);
   if(unit < 0) return; // shouldn't happen, but it could be -1 if nothing is selected
   ps->unit = unit;
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "unit", _unit_names[unit]);
+  dt_conf_set_int("plugins/print/print/unit", ps->unit);
 
   const double margin_top = ps->prt.page.margin_top;
   const double margin_left = ps->prt.page.margin_left;
   const double margin_right = ps->prt.page.margin_right;
   const double margin_bottom = ps->prt.page.margin_bottom;
 
-  int n_digits;
-  float incr;
-  _precision_by_unit(ps->unit, &n_digits, &incr, NULL);
+  const int n_digits = (int)(1.0 / (units[ps->unit] * 10.0));
 
   ++darktable.gui->reset;
 
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_top), n_digits);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_top),    n_digits);
   gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_bottom), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_left), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_right), n_digits);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_top), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_bottom), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_left), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_right), incr, 10.f*incr);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_left),   n_digits);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_right),  n_digits);
 
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_x), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_y), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_width), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_height), n_digits);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_x), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_y), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_width), incr, 10.f*incr);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_height), incr, 10.f*incr);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->grid_size),  n_digits);
 
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->grid_size), n_digits);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->grid_size), incr, 10.f*incr);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_x),      2);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_y),      2);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_width),  2);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(ps->b_height), 2);
+
+  const float incr = units[ps->unit];
+
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_top), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_bottom), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_left), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_right), incr, incr);
+
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_x), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_y), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_width), incr, incr);
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->b_height), incr, incr);
+
+  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(ps->grid_size), incr, incr);
 
   _update_slider(ps);
 
   // convert margins to new unit
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_top),
-                            margin_top * units[ps->unit]);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_bottom),
-                            margin_bottom * units[ps->unit]);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_left),
-                            margin_left * units[ps->unit]);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_right),
-                            margin_right * units[ps->unit]);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_top),    margin_top * units[ps->unit]);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_bottom), margin_bottom * units[ps->unit]);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_left),   margin_left * units[ps->unit]);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_right),  margin_right * units[ps->unit]);
 
   // grid size
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->grid_size),
-                            grid_size * units[ps->unit]);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->grid_size), grid_size * units[ps->unit]);
 
   --darktable.gui->reset;
 
   _fill_box_values(ps);
 }
 
-static inline gboolean _is_style_set(const char *name)
+static void
+_style_callback(GtkWidget *widget, dt_lib_module_t *self)
 {
-  return name && name[0] && strcmp(name, _("none")) && dt_styles_exists(name);
-}
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-static void _update_style_label(dt_lib_print_settings_t *ps, const char *name)
-{
-  if(!ps)
-    return;
-
-  const gboolean is_style_set = _is_style_set(name);
-
-  if(ps->style_mode)
+  if(dt_bauhaus_combobox_get(ps->style) == 0)
   {
-    gtk_widget_set_visible(GTK_WIDGET(ps->style_mode), is_style_set);
+    dt_conf_set_string("plugins/print/print/style", "");
+    gtk_widget_set_sensitive(GTK_WIDGET(ps->style_mode), FALSE);
+  }
+  else
+  {
+    const gchar *style = dt_bauhaus_combobox_get_text(ps->style);
+    dt_conf_set_string("plugins/print/print/style", style);
+    gtk_widget_set_sensitive(GTK_WIDGET(ps->style_mode), TRUE);
   }
 
-  // We use the string "none" to indicate that we don't apply any style to the export
-  char *localized_style = is_style_set
-    ? dt_util_localize_segmented_name(name, TRUE)
-    : g_strdup(_("none"));
-
-  // Use only the leaf part of the segmented style name in the tooltip
-  char *leaf = strrchr(localized_style, '|');
-  leaf = leaf ? leaf+1 : localized_style;
-  gtk_label_set_text(GTK_LABEL(ps->style), leaf);
-  char *tooltip = g_strdup_printf(_("style to be applied on print:\n<b>%s</b>"),
-                                  localized_style);
-  g_free(localized_style);
-  gtk_widget_set_tooltip_markup(ps->style, tooltip);
-  g_free(tooltip);
   g_free(ps->v_style);
-  ps->v_style = g_strdup(is_style_set ? name : "");
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "style", is_style_set ? name : "");
-}
-
-static void _update_style(const dt_stylemenu_data_t *menu_data)
-{
-  _update_style_label(menu_data->user_data, menu_data->name);
-}
-
-static void _apply_style_activate_callback(GtkMenuItem *menuitem,
-                                           const dt_stylemenu_data_t *menu_data)
-{
-  GdkEvent *event = gtk_get_current_event();
-  if(event && event->type == GDK_KEY_PRESS)
-  {
-    _update_style(menu_data);
-  }
-  gdk_event_free(event);
-}
-
-static gboolean _apply_style_button_callback(GtkMenuItem *menuitem,
-                                             GdkEventButton *event,
-                                             const dt_stylemenu_data_t *menu_data)
-{
-  if(event->button == GDK_BUTTON_PRIMARY)
-  {
-    _update_style(menu_data);
-  }
-  else
-  {
-    //??? dt_shortcut_copy_lua(NULL, name);
-  }
-  return FALSE;
-}
-
-static void _style_popupmenu_callback(GtkWidget *w, gpointer user_data)
-{
-  /* if we got any styles, lets popup menu for selection */
-  GtkMenuShell *menu = dtgtk_build_style_menu_hierarchy(TRUE,
-                                                        _apply_style_activate_callback,
-                                                        _apply_style_button_callback,
-                                                        user_data);
-  if(menu)
-  {
-    dt_gui_menu_popup(GTK_MENU(menu), w, GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
-  }
-  else
-    dt_control_log(_("no styles have been created yet"));
+  ps->v_style = dt_conf_get_string("plugins/print/print/style");
 }
 
 static void
 _style_mode_changed(GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   if(dt_bauhaus_combobox_get(ps->style_mode) == 0)
     ps->v_style_append = FALSE;
   else
     ps->v_style_append = TRUE;
 
-  dt_conf_set_bool(PRINT_CONFIG_PREFIX "style_append", ps->v_style_append);
+  dt_conf_set_bool("plugins/print/print/style_append", ps->v_style_append);
 }
 
 static void
 _profile_changed(GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const int pos = dt_bauhaus_combobox_get(widget);
   for(const GList *prof = ps->profiles; prof; prof = g_list_next(prof))
   {
-    dt_lib_export_profile_t *pp = prof->data;
+    dt_lib_export_profile_t *pp = (dt_lib_export_profile_t *)prof->data;
     if(pp->pos == pos)
     {
-      dt_conf_set_int(PRINT_CONFIG_PREFIX "icctype", pp->type);
-      dt_conf_set_string(PRINT_CONFIG_PREFIX "iccprofile", pp->filename);
+      dt_conf_set_int("plugins/print/print/icctype", pp->type);
+      dt_conf_set_string("plugins/print/print/iccprofile", pp->filename);
       g_free(ps->v_iccprofile);
       ps->v_icctype = pp->type;
       ps->v_iccprofile = g_strdup(pp->filename);
       return;
     }
   }
-  dt_conf_set_int(PRINT_CONFIG_PREFIX "icctype", DT_COLORSPACE_NONE);
-  dt_conf_set_string(PRINT_CONFIG_PREFIX "iccprofile", "");
+  dt_conf_set_int("plugins/print/print/icctype", DT_COLORSPACE_NONE);
+  dt_conf_set_string("plugins/print/print/iccprofile", "");
   g_free(ps->v_iccprofile);
   ps->v_icctype = DT_COLORSPACE_NONE;
   ps->v_iccprofile = g_strdup("");
@@ -1276,11 +1154,11 @@ _profile_changed(GtkWidget *widget, dt_lib_module_t *self)
 static void
 _printer_profile_changed(GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const int pos = dt_bauhaus_combobox_get(widget);
   for(const GList *prof = ps->profiles; prof; prof = g_list_next(prof))
   {
-    dt_lib_export_profile_t *pp = prof->data;
+    dt_lib_export_profile_t *pp = (dt_lib_export_profile_t *)prof->data;
     if(pp->ppos == pos)
     {
       dt_conf_set_int("plugins/print/printer/icctype", pp->type);
@@ -1305,7 +1183,7 @@ _printer_profile_changed(GtkWidget *widget, dt_lib_module_t *self)
 static void
 _printer_intent_callback (GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const int pos = dt_bauhaus_combobox_get(widget);
   dt_conf_set_int("plugins/print/printer/iccintent", pos);
   ps->v_pintent = pos;
@@ -1315,27 +1193,26 @@ _printer_intent_callback (GtkWidget *widget, dt_lib_module_t *self)
 static void
 _printer_bpc_callback(GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
-  ps->v_black_point_compensation =
-    gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ps->black_point_compensation));
-  dt_conf_set_bool(PRINT_CONFIG_PREFIX "black_point_compensation",
-                   ps->v_black_point_compensation);
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
+  ps->v_black_point_compensation = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ps->black_point_compensation));
+  dt_conf_set_bool("plugins/print/print/black_point_compensation", ps->v_black_point_compensation);
 }
 
 static void
 _intent_callback(GtkWidget *widget, dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
   const int pos = dt_bauhaus_combobox_get(widget);
   // record the intent that will override the out rendering module on export
-  dt_conf_set_int(PRINT_CONFIG_PREFIX "iccintent", pos - 1);
+  dt_conf_set_int("plugins/print/print/iccintent", pos - 1);
   ps->v_intent = pos - 1;
 }
 
-static void _set_orientation(dt_lib_print_settings_t *ps, dt_imgid_t imgid)
+static void _set_orientation(dt_lib_print_settings_t *ps, int32_t imgid)
 {
   dt_mipmap_buffer_t buf;
-  dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_0, DT_MIPMAP_BEST_EFFORT, 'r');
+  dt_mipmap_cache_get(darktable.mipmap_cache, &buf,
+                      imgid, DT_MIPMAP_0, DT_MIPMAP_BEST_EFFORT, 'r');
 
   // If there's a mipmap available, figure out orientation based upon
   // its dimensions. Otherwise, don't touch orientation until the
@@ -1347,12 +1224,11 @@ static void _set_orientation(dt_lib_print_settings_t *ps, dt_imgid_t imgid)
     dt_bauhaus_combobox_set(ps->orientation, ps->prt.page.landscape == TRUE ? 1 : 0);
   }
 
-  dt_mipmap_cache_release(&buf);
+  dt_mipmap_cache_release(darktable.mipmap_cache, &buf);
   dt_control_queue_redraw_center();
 }
 
-static void _load_image_full_page(dt_lib_print_settings_t *ps,
-                                  const dt_imgid_t imgid)
+static void _load_image_full_page(dt_lib_print_settings_t *ps, int32_t imgid)
 {
   _set_orientation(ps, imgid);
 
@@ -1360,7 +1236,7 @@ static void _load_image_full_page(dt_lib_print_settings_t *ps,
                         ps->imgs.screen.page.x, ps->imgs.screen.page.y,
                         ps->imgs.screen.page.width, ps->imgs.screen.page.height);
   float width, height;
-  _get_page_dimension(&ps->prt, &width, &height);
+  _get_page_dimention(&ps->prt, &width, &height);
 
   dt_printing_setup_page(&ps->imgs, width, height, ps->prt.printer.resolution);
 
@@ -1369,38 +1245,17 @@ static void _load_image_full_page(dt_lib_print_settings_t *ps,
   dt_control_queue_redraw_center();
 }
 
-static void _print_settings_update_callback(gpointer instance,
-                                            const dt_imgid_t imgid,
-                                            dt_lib_module_t *self)
+static void _print_settings_activate_or_update_callback(gpointer instance, int imgid, gpointer user_data)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-  // if a mipmap has arrived for an image just activated in fullpage
-  // mode, reorient the page (landscape or portrait) based on the
-  // mipmap's orientation
-  if(ps->imgs.count == 1
-     && ps->imgs.box[0].imgid == imgid
-     && !ps->has_changed)
-  {
-    dt_printing_clear_box(&ps->imgs.box[0]);
-    _load_image_full_page(ps, imgid);
-  }
-}
-
-static void _print_settings_activate_callback(gpointer instance,
-                                              const dt_imgid_t imgid,
-                                              dt_lib_module_t *self)
-{
-  dt_lib_print_settings_t *ps = self->data;
-
-  // load an image with a simple click on the filmstrip only if a
-  // single image is present
+  // load an image with a simple click on the filmstrip only if a single image is present
   if(ps->imgs.count == 1)
   {
     if(ps->has_changed)
     {
       dt_printing_setup_image(&ps->imgs, 0, imgid, 100, 100, ps->imgs.box[0].alignment);
-      dt_control_queue_redraw_center();
     }
     else
     {
@@ -1415,14 +1270,14 @@ static GList* _get_profiles()
   //  Create list of profiles
   GList *list = NULL;
 
-  dt_lib_export_profile_t *prof = g_malloc0(sizeof(dt_lib_export_profile_t));
+  dt_lib_export_profile_t *prof = (dt_lib_export_profile_t *)g_malloc0(sizeof(dt_lib_export_profile_t));
   prof->type = DT_COLORSPACE_SRGB;
-  dt_utf8_strlcpy(prof->name, _("sRGB"), sizeof(prof->name));
+  dt_utf8_strlcpy(prof->name, _("sRGB (web-safe)"), sizeof(prof->name));
   prof->pos = -2;
   prof->ppos = -2;
   list = g_list_prepend(list, prof);
 
-  prof = g_malloc0(sizeof(dt_lib_export_profile_t));
+  prof = (dt_lib_export_profile_t *)g_malloc0(sizeof(dt_lib_export_profile_t));
   prof->type = DT_COLORSPACE_ADOBERGB;
   dt_utf8_strlcpy(prof->name, _("Adobe RGB (compatible)"), sizeof(prof->name));
   prof->pos = -2;
@@ -1432,10 +1287,10 @@ static GList* _get_profiles()
   // add the profiles from datadir/color/out/*.icc
   for(GList *iter = darktable.color_profiles->profiles; iter; iter = g_list_next(iter))
   {
-    dt_colorspaces_color_profile_t *p = iter->data;
+    dt_colorspaces_color_profile_t *p = (dt_colorspaces_color_profile_t *)iter->data;
     if(p->type == DT_COLORSPACE_FILE)
     {
-      prof = g_malloc0(sizeof(dt_lib_export_profile_t));
+      prof = (dt_lib_export_profile_t *)g_malloc0(sizeof(dt_lib_export_profile_t));
       g_strlcpy(prof->name, p->name, sizeof(prof->name));
       g_strlcpy(prof->filename, p->filename, sizeof(prof->filename));
       prof->type = DT_COLORSPACE_FILE;
@@ -1448,88 +1303,69 @@ static GList* _get_profiles()
   return g_list_reverse(list);  // list was built in reverse order, so un-reverse it
 }
 
-static void _new_printer_callback(dt_printer_info_t *printer,
-                                  void *user_data)
+static void _new_printer_callback(dt_printer_info_t *printer, void *user_data)
 {
+  static int count = 0;
   const dt_lib_module_t *self = (dt_lib_module_t *)user_data;
-  dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)self->data;
+  const dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)self->data;
 
-  dt_pthread_mutex_lock(&d->printer_list_mutex);
-  d->printer_list = g_list_append(d->printer_list, g_strdup(printer->name));
-  dt_pthread_mutex_unlock(&d->printer_list_mutex);
+  char *default_printer = dt_conf_get_string("plugins/print/print/printer");
 
-  d->prt.num_printers++;
+  g_signal_handlers_block_by_func(G_OBJECT(d->printers), G_CALLBACK(_printer_changed), NULL);
+
+  dt_bauhaus_combobox_add(d->printers, printer->name);
+
+  if(!g_strcmp0(default_printer, printer->name) || default_printer[0]=='\0')
+  {
+    dt_bauhaus_combobox_set(d->printers, count);
+    _set_printer(self, printer->name);
+  }
+  count++;
+  g_free(default_printer);
+
+  g_signal_handlers_unblock_by_func(G_OBJECT(d->printers), G_CALLBACK(_printer_changed), NULL);
 }
 
-void view_enter(struct dt_lib_module_t *self,
-                struct dt_view_t *old_view,
-                struct dt_view_t *new_view)
+void view_enter(struct dt_lib_module_t *self,struct dt_view_t *old_view,struct dt_view_t *new_view)
 {
-  dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)self->data;
-
-  dt_pthread_mutex_lock(&d->printer_list_mutex);
-  if(d->printer_list != NULL)
-  {
-    // The printer list was filled by dt_printers_discovery() in a background job.
-    // Now we fill the printer combo with the found printers.
-    char *default_printer = dt_conf_get_string(PRINT_CONFIG_PREFIX "printer");
-
-    for(const GList *iter = d->printer_list; iter; iter = g_list_next(iter))
-    {
-      const gchar *printer_name = iter->data;
-      dt_bauhaus_combobox_add(d->printers, printer_name);
-    }
-
-    if(default_printer[0] == '\0'
-       || !dt_bauhaus_combobox_set_from_text(d->printers, default_printer))
-    {
-      // no default printer or default printer not found
-      dt_bauhaus_combobox_set(d->printers, 0);
-    }
-
-    g_free(default_printer);
-    g_list_free_full(d->printer_list, g_free);
-    d->printer_list = NULL;
-  }
-  dt_pthread_mutex_unlock(&d->printer_list_mutex);
-
   // user activated a new image via the filmstrip or user entered view
   // mode which activates an image: get image_id and orientation
-  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, _print_settings_activate_callback);
+  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE,
+                            G_CALLBACK(_print_settings_activate_or_update_callback), self);
 
   // when an updated mipmap, we may have new orientation information
-  // about the current image.
-  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_MIPMAP_UPDATED, _print_settings_update_callback);
+  // about the current image. This updates the image_id as well and
+  // zeros out dimensions, but there should be no harm in that
+  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals,
+                            DT_SIGNAL_DEVELOP_MIPMAP_UPDATED,
+                            G_CALLBACK(_print_settings_activate_or_update_callback),
+                            self);
 
-  // NOTE: it would be proper to set image_id here to -1, but this
-  // seems to make no difference
+  // NOTE: it would be proper to set image_id here to -1, but this seems to make no difference
 }
 
-void view_leave(struct dt_lib_module_t *self,
-                struct dt_view_t *old_view,
-                struct dt_view_t *new_view)
+void view_leave(struct dt_lib_module_t *self,struct dt_view_t *old_view,struct dt_view_t *new_view)
 {
-  DT_CONTROL_SIGNAL_DISCONNECT(_print_settings_activate_callback, self);
-  DT_CONTROL_SIGNAL_DISCONNECT(_print_settings_update_callback, self);
+  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals,
+                               G_CALLBACK(_print_settings_activate_or_update_callback),
+                               self);
 }
 
 static gboolean _expose_again(gpointer user_data)
 {
   dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)user_data;
 
-  if(dt_is_valid_imgid(ps->imgs.imgid_to_load))
+  if(ps->imgs.imgid_to_load != -1)
   {
     _load_image_full_page(ps, ps->imgs.imgid_to_load);
-    ps->imgs.imgid_to_load = NO_IMGID;
+    ps->imgs.imgid_to_load = -1;
   }
 
   dt_control_queue_redraw_center();
   return FALSE;
 }
 
-void _get_control(dt_lib_print_settings_t *ps,
-                  const float x,
-                  const float y)
+void _get_control(dt_lib_print_settings_t *ps, float x, float y)
 {
   const float dist = 20.0;
 
@@ -1554,7 +1390,7 @@ void _get_control(dt_lib_print_settings_t *ps,
 
 int mouse_leave(struct dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   if(ps->last_selected != -1)
   {
@@ -1564,15 +1400,12 @@ int mouse_leave(struct dt_lib_module_t *self)
   return 0;
 }
 
-static void _snap_to_grid(dt_lib_print_settings_t *ps,
-                          float *x,
-                          float *y)
+static void _snap_to_grid(dt_lib_print_settings_t *ps, float *x, float *y)
 {
   if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ps->snap_grid)))
   {
     // V lines
-    const float step =
-      gtk_spin_button_get_value(GTK_SPIN_BUTTON(ps->grid_size)) / units[ps->unit];
+    const float step = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ps->grid_size)) * units[ps->unit];
 
     // only display the grid if a step of 5 pixels
     const float diff = DT_PIXEL_APPLY_DPI(5);
@@ -1598,21 +1431,16 @@ static void _snap_to_grid(dt_lib_print_settings_t *ps,
       grid_pos += v_step;
     }
   }
-  // FIXME: should clamp values to page size here?
 }
 
-int mouse_moved(struct dt_lib_module_t *self,
-                const double x,
-                const double y,
-                const double pressure,
-                const int which)
+int mouse_moved(struct dt_lib_module_t *self, double x, double y, double pressure, int which)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   gboolean expose = FALSE;
 
   if(ps->creation)
-    dt_control_change_cursor("cell");
+    dt_control_change_cursor(GDK_PLUS);
 
   if(ps->creation && ps->dragging)
   {
@@ -1703,13 +1531,9 @@ static void _swap(float *a, float *b)
   *b = tmp;
 }
 
-int button_released(struct dt_lib_module_t *self,
-                    const double x,
-                    const double y,
-                    const int which,
-                    const uint32_t state)
+int button_released(struct dt_lib_module_t *self, double x, double y, int which, uint32_t state)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   if(ps->dragging)
   {
@@ -1750,20 +1574,15 @@ int button_released(struct dt_lib_module_t *self,
   ps->creation = FALSE;
   ps->dragging = FALSE;
 
-  dt_control_change_cursor("default");
+  dt_control_change_cursor(GDK_LEFT_PTR);
 
   return 0;
 }
 
-int button_pressed(struct dt_lib_module_t *self,
-                   const double x,
-                   const double y,
-                   const double pressure,
-                   const int which,
-                   const int type,
-                   const uint32_t state)
+int button_pressed(struct dt_lib_module_t *self, double x, double y, double pressure,
+                   int which, int type, uint32_t state)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   ps->click_pos_x = x;
   ps->click_pos_y = y;
@@ -1779,16 +1598,15 @@ int button_pressed(struct dt_lib_module_t *self,
     _snap_to_grid(ps, &ps->x1, &ps->y1);
   }
   else if(ps->selected > 0
-          && (which == GDK_BUTTON_MIDDLE || (which == GDK_BUTTON_PRIMARY && dt_modifier_is(state, GDK_CONTROL_MASK))))
+          && (which == 2 || (which == 1 && dt_modifier_is(state, GDK_CONTROL_MASK))))
   {
     // middle click (or ctrl-click), move selected image down
     dt_image_box b;
     memcpy(&b, &ps->imgs.box[ps->selected], sizeof(dt_image_box));
-    memcpy(&ps->imgs.box[ps->selected], &ps->imgs.box[ps->selected-1],
-           sizeof(dt_image_box));
+    memcpy(&ps->imgs.box[ps->selected], &ps->imgs.box[ps->selected-1], sizeof(dt_image_box));
     memcpy(&ps->imgs.box[ps->selected-1], &b, sizeof(dt_image_box));
   }
-  else if(ps->selected != -1 && which == GDK_BUTTON_PRIMARY)
+  else if(ps->selected != -1 && which == 1)
   {
     dt_image_box *b = &ps->imgs.box[ps->selected];
 
@@ -1803,17 +1621,17 @@ int button_pressed(struct dt_lib_module_t *self,
 
     _get_control(ps, x, y);
 
-    dt_control_change_cursor("pointer");
+    dt_control_change_cursor(GDK_HAND1);
   }
-  else if(ps->selected != -1 && which == GDK_BUTTON_SECONDARY)
+  else if(ps->selected != -1 && which == 3)
   {
     dt_image_box *b = &ps->imgs.box[ps->selected];
 
     // if image present remove it, otherwise remove the box
-    if(dt_is_valid_imgid(b->imgid))
-      b->imgid = NO_IMGID;
+    if(b->imgid != -1)
+      b->imgid = -1;
     else
-      _page_delete_area(self, ps->selected);
+      dt_printing_clear_box(b);
 
     ps->last_selected = ps->selected;
     ps->has_changed = TRUE;
@@ -1822,12 +1640,8 @@ int button_pressed(struct dt_lib_module_t *self,
   return 0;
 }
 
-void _cairo_rectangle(cairo_t *cr,
-                      const int sel_controls,
-                      const int x1,
-                      const int y1,
-                      const int x2,
-                      const int y2)
+void _cairo_rectangle(cairo_t *cr, const int sel_controls,
+                               const int x1, const int y1, const int x2, const int y2)
 {
   const float sel_width = DT_PIXEL_APPLY_DPI(3.0);
   const float std_width = DT_PIXEL_APPLY_DPI(1.0);
@@ -1899,16 +1713,12 @@ void _cairo_rectangle(cairo_t *cr,
   }
 }
 
-void gui_post_expose(struct dt_lib_module_t *self,
-                     cairo_t *cr,
-                     const int32_t width,
-                     const int32_t height,
-                     const int32_t pointerx,
-                     const int32_t pointery)
+void gui_post_expose(struct dt_lib_module_t *self, cairo_t *cr, int32_t width, int32_t height,
+                     int32_t pointerx, int32_t pointery)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
-  if(dt_is_valid_imgid(ps->imgs.imgid_to_load))
+  if(ps->imgs.imgid_to_load != -1)
   {
     // we set orientation and delay the reload to ensure the
     // page is properly set before trying to display the image.
@@ -1920,8 +1730,7 @@ void gui_post_expose(struct dt_lib_module_t *self,
 
   // 1mm
 
-  const float step =
-    gtk_spin_button_get_value(GTK_SPIN_BUTTON(ps->grid_size)) / units[ps->unit];
+  const float step = gtk_spin_button_get_value(GTK_SPIN_BUTTON(ps->grid_size)) / units[ps->unit];
 
   // only display grid if spacing more than 5 pixels
   if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ps->grid))
@@ -1938,14 +1747,8 @@ void gui_post_expose(struct dt_lib_module_t *self,
 
     while(grid_pos < ps->imgs.screen.page.x + ps->imgs.screen.page.width)
     {
-      cairo_set_dash(cr,
-                     dash, ((n % 5) == 0)
-                     ? 0
-                     : 2, DT_PIXEL_APPLY_DPI(5));
-      cairo_set_line_width(cr,
-                           ((n % 5) == 0)
-                           ? DT_PIXEL_APPLY_DPI(1.0)
-                           : DT_PIXEL_APPLY_DPI(0.5));
+      cairo_set_dash(cr, dash, ((n % 5) == 0) ? 0 : 2, DT_PIXEL_APPLY_DPI(5));
+      cairo_set_line_width(cr, ((n % 5) == 0) ? DT_PIXEL_APPLY_DPI(1.0) : DT_PIXEL_APPLY_DPI(0.5));
       cairo_move_to(cr, grid_pos, ps->imgs.screen.page.y);
       cairo_line_to(cr, grid_pos, ps->imgs.screen.page.y + ps->imgs.screen.page.height);
       cairo_stroke(cr);
@@ -1961,15 +1764,8 @@ void gui_post_expose(struct dt_lib_module_t *self,
 
     while(grid_pos < ps->imgs.screen.page.y + ps->imgs.screen.page.height)
     {
-      cairo_set_dash(cr, dash,
-                     ((n % 5) == 0)
-                     ? 0
-                     : 2, DT_PIXEL_APPLY_DPI(5));
-      cairo_set_line_width(cr,
-                           ((n % 5) == 0)
-                           ? DT_PIXEL_APPLY_DPI(1.0)
-                           : DT_PIXEL_APPLY_DPI(0.5));
-
+      cairo_set_dash(cr, dash, ((n % 5) == 0) ? 0 : 2, DT_PIXEL_APPLY_DPI(5));
+      cairo_set_line_width(cr, ((n % 5) == 0) ? DT_PIXEL_APPLY_DPI(1.0) : DT_PIXEL_APPLY_DPI(0.5));
       cairo_move_to(cr, ps->imgs.screen.page.x, grid_pos);
       cairo_line_to(cr, ps->imgs.screen.page.x + ps->imgs.screen.page.width, grid_pos);
       cairo_stroke(cr);
@@ -1988,7 +1784,7 @@ void gui_post_expose(struct dt_lib_module_t *self,
   {
     dt_image_box *img = &ps->imgs.box[k];
 
-    if(dt_is_valid_imgid(img->imgid))
+    if(img->imgid != -1)
     {
       cairo_surface_t *surf = NULL;
 
@@ -2006,7 +1802,7 @@ void gui_post_expose(struct dt_lib_module_t *self,
       {
         // if the image is missing, we reload it again
         g_timeout_add(250, _expose_again, ps);
-        if(!ps->busy) dt_control_busy_enter();
+        if(!ps->busy) dt_control_log_busy_enter();
         ps->busy = TRUE;
       }
       else
@@ -2015,46 +1811,27 @@ void gui_post_expose(struct dt_lib_module_t *self,
         cairo_translate(cr, screen.x, screen.y);
         cairo_scale(cr, scaler, scaler);
         cairo_set_source_surface(cr, surf, 0, 0);
-        const double alpha =
-          (ps->dragging
-           || (ps->selected != -1 && ps->selected != k))
-          ? 0.25
-          : 1.0;
-
-        cairo_paint_with_alpha(cr, alpha);
+        cairo_paint_with_alpha(cr, ps->dragging ? 0.5 : 1.0);
         cairo_surface_destroy(surf);
         cairo_restore(cr);
-        if(ps->busy) dt_control_busy_leave();
+        if(ps->busy) dt_control_log_busy_leave();
         ps->busy = FALSE;
       }
     }
 
-    if(k == ps->selected || !dt_is_valid_imgid(img->imgid))
+    if(k == ps->selected || img->imgid == -1)
     {
       cairo_set_source_rgba(cr, .4, .4, .4, 1.0);
       _cairo_rectangle(cr, (k == ps->selected) ? ps->sel_controls : 0,
                        img->screen.x, img->screen.y,
-                       img->screen.x + img->screen.width,
-                       img->screen.y + img->screen.height);
-      cairo_stroke(cr);
-    }
-    else if(k == ps->last_selected)
-    {
-      const double dash[] = { DT_PIXEL_APPLY_DPI(5.0), DT_PIXEL_APPLY_DPI(5.0) };
-      cairo_set_line_width(cr, 1);
-      cairo_set_dash(cr, dash, 1, DT_PIXEL_APPLY_DPI(5));
-      cairo_set_source_rgba(cr, .6, .6, .6, 1.0);
-      cairo_rectangle(cr,
-                      img->screen.x,     img->screen.y,
-                      img->screen.width, img->screen.height);
+                       img->screen.x + img->screen.width, img->screen.y + img->screen.height);
       cairo_stroke(cr);
     }
 
     if(k == ps->imgs.motion_over)
     {
       cairo_set_source_rgba(cr, .2, .2, .2, 1.0);
-      cairo_rectangle(cr, img->screen.x, img->screen.y,
-                      img->screen.width, img->screen.height);
+      cairo_rectangle(cr, img->screen.x, img->screen.y, img->screen.width, img->screen.height);
       cairo_fill(cr);
     }
   }
@@ -2065,9 +1842,6 @@ void gui_post_expose(struct dt_lib_module_t *self,
     float dx1, dy1, dx2, dy2, dwidth, dheight; // displayed values
     float x1, y1, x2, y2;                      // box screen coordinates
 
-    float pwidth, pheight;
-    _get_page_dimension(&ps->prt, &pwidth, &pheight);
-
     if(ps->dragging)
     {
       x1      = ps->x1;
@@ -2075,10 +1849,10 @@ void gui_post_expose(struct dt_lib_module_t *self,
       x2      = ps->x2;
       y2      = ps->y2;
 
-      dx1     = _hscreen_to_mm(ps, ps->x1, TRUE) * units[ps->unit];
-      dy1     = _vscreen_to_mm(ps, ps->y1, TRUE) * units[ps->unit];
-      dx2     = _hscreen_to_mm(ps, ps->x2, TRUE) * units[ps->unit];
-      dy2     = _vscreen_to_mm(ps, ps->y2, TRUE) * units[ps->unit];
+      dx1     = _hscreen_to_mm(ps, ps->x1, TRUE);
+      dy1     = _vscreen_to_mm(ps, ps->y1, TRUE);
+      dx2     = _hscreen_to_mm(ps, ps->x2, TRUE);
+      dy2     = _vscreen_to_mm(ps, ps->y2, TRUE);
       dwidth  = fabsf(dx2 - dx1);
       dheight = fabsf(dy2 - dy1);
     }
@@ -2087,8 +1861,11 @@ void gui_post_expose(struct dt_lib_module_t *self,
       const dt_image_box *box = &ps->imgs.box[ps->selected];
 
       // we could use a simpler solution but we want to use the same formulae used
-      // to fill the editable box values to avoid discrepancies between values due
+      // to fill the editable box values to avoid discrepencies between values due
       // to rounding errors.
+
+      float pwidth, pheight;
+      _get_page_dimention(&ps->prt, &pwidth, &pheight);
 
       dx1     = _percent_unit_of(ps, pwidth, box->pos.x);
       dy1     = _percent_unit_of(ps, pheight, box->pos.y);
@@ -2106,193 +1883,42 @@ void gui_post_expose(struct dt_lib_module_t *self,
     cairo_set_source_rgba(cr, .4, .4, .4, 1.0);
     _cairo_rectangle(cr, ps->sel_controls, x1, y1, x2, y2);
 
-    // display corner coordinates
-    // FIXME: here and elsewhere eliminate hardcoded RGB values -- use CSS
-    char dimensions[16];
+    // display size-box
+    char dimensions[100];
     PangoLayout *layout;
     PangoRectangle ext;
-    PangoFontDescription *desc =
-      pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+    PangoFontDescription *desc = pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
     pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
     pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(16) * PANGO_SCALE);
     layout = pango_cairo_create_layout(cr);
     pango_layout_set_font_description(layout, desc);
-    const double text_h = DT_PIXEL_APPLY_DPI(16+2);
-    const double margin = DT_PIXEL_APPLY_DPI(6);
-    const double dash = DT_PIXEL_APPLY_DPI(4.0);
-    int n_digits;
-    char *precision;
-    _precision_by_unit(ps->unit, &n_digits, NULL, &precision);
-    double xp, yp;
 
-    yp = y1 + (y2 - y1 - text_h) * 0.5;
+    snprintf(dimensions, sizeof(dimensions),
+             "(%.2f %.2f) -> (%.2f %.2f) | (%.2f x %.2f)",
+             dx1 * units[ps->unit],    dy1 * units[ps->unit],
+             dx2 * units[ps->unit],    dy2 * units[ps->unit],
+             dwidth * units[ps->unit], dheight * units[ps->unit]);
 
-    if(x1 >= ps->imgs.screen.page.x
-       && x1 <= (ps->imgs.screen.page.x + ps->imgs.screen.page.width))
-    {
-      snprintf(dimensions, sizeof(dimensions), precision, dx1);
-      pango_layout_set_text(layout, dimensions, -1);
-      pango_layout_get_pixel_extents(layout, NULL, &ext);
-      xp = ps->imgs.screen.page.x
-        + (x1 - text_h - ps->imgs.screen.page.x - ext.width) * 0.5;
-      if(xp < ps->imgs.screen.page.x + 3 * margin)
-      {
-        xp = x1 + 2 * margin;
-        // somewhat hacky, assumes that all numeric labels are about
-        // the same width
-        yp = MIN(y2 - text_h, yp + ext.width + 0.5 * text_h + margin * 3);
-      }
-      cairo_set_source_rgba(cr, .7, .7, .7, .9);
-      cairo_move_to(cr, ps->imgs.screen.page.x, yp + text_h * 0.5);
-      cairo_line_to(cr, x1, yp + text_h * 0.5);
-      cairo_stroke_preserve(cr);
-      cairo_set_source_rgba(cr, .5, .5, .5, .9);
-      cairo_set_dash(cr, &dash, 1, dash);
-      cairo_stroke(cr);
-      cairo_set_dash(cr, NULL, 0, 0);
-      dt_gui_draw_rounded_rectangle(cr,
-                                    ext.width + 2 * margin,
-                                    text_h + 2 * margin,
-                                    xp - margin,
-                                    yp - margin);
-      cairo_set_source_rgb(cr, .8, .8, .8);
-      cairo_move_to(cr, xp, yp);
-      pango_cairo_show_layout(cr, layout);
-    }
-
-    if(x2 >= ps->imgs.screen.page.x
-       && x2 <= (ps->imgs.screen.page.x + ps->imgs.screen.page.width))
-    {
-      snprintf(dimensions, sizeof(dimensions), precision, pwidth * units[ps->unit] - dx2);
-      pango_layout_set_text(layout, dimensions, -1);
-      pango_layout_get_pixel_extents(layout, NULL, &ext);
-      xp = x2 + (ps->imgs.screen.page.x
-                 + ps->imgs.screen.page.width - x2 - ext.width) * 0.5;
-      if(xp + ext.width + margin > ps->imgs.screen.page.x + ps->imgs.screen.page.width)
-        xp = x2 - ext.width - 2 * margin;
-      cairo_set_source_rgba(cr, .7, .7, .7, .9);
-      cairo_move_to(cr, x2, yp + text_h * 0.5);
-      cairo_line_to(cr,
-                    ps->imgs.screen.page.x + ps->imgs.screen.page.width,
-                    yp + text_h * 0.5);
-      cairo_stroke_preserve(cr);
-      cairo_set_source_rgba(cr, .5, .5, .5, .9);
-      cairo_set_dash(cr, &dash, 1, dash);
-      cairo_stroke(cr);
-      cairo_set_dash(cr, NULL, 0, 0);
-      dt_gui_draw_rounded_rectangle(cr, ext.width + 2 * margin, text_h + 2 * margin,
-                                    xp - margin, yp - margin);
-      cairo_set_source_rgb(cr, .8, .8, .8);
-      cairo_move_to(cr, xp, yp);
-      pango_cairo_show_layout(cr, layout);
-    }
-
-    xp = x1 + (x2 - x1 - text_h) * 0.5;
-
-    if(y1 >= ps->imgs.screen.page.y
-       && y1 <= (ps->imgs.screen.page.y + ps->imgs.screen.page.height))
-    {
-      snprintf(dimensions, sizeof(dimensions), precision, dy1);
-      pango_layout_set_text(layout, dimensions, -1);
-      pango_layout_get_pixel_extents(layout, NULL, &ext);
-      yp = ps->imgs.screen.page.y
-        + (y1 - text_h - ps->imgs.screen.page.y - ext.width) * 0.5;
-      if(yp < ps->imgs.screen.page.y + 3 * margin)
-      {
-        xp = MIN(x2 - text_h, xp + ext.width + 0.5 * text_h + margin * 3);
-        yp = y1 + 2 * margin;
-      }
-      cairo_set_source_rgba(cr, .7, .7, .7, .9);
-      cairo_move_to(cr, xp + text_h * 0.5, ps->imgs.screen.page.y);
-      cairo_line_to(cr, xp + text_h * 0.5, y1);
-      cairo_stroke_preserve(cr);
-      cairo_set_source_rgba(cr, .5, .5, .5, .9);
-      cairo_set_dash(cr, &dash, 1, dash);
-      cairo_stroke(cr);
-      cairo_set_dash(cr, NULL, 0, 0);
-      dt_gui_draw_rounded_rectangle(cr, text_h + 2 * margin, ext.width + 2 * margin,
-                                    xp - margin, yp - margin);
-      cairo_set_source_rgb(cr, .8, .8, .8);
-      cairo_move_to(cr, xp + text_h * 0.5, yp + ext.width * 0.5);
-      cairo_save(cr);
-      cairo_rotate(cr, -M_PI_2);
-      cairo_rel_move_to(cr, -0.5 * ext.width, -0.5 * text_h);
-      pango_cairo_update_layout(cr, layout);
-      pango_cairo_show_layout(cr, layout);
-      cairo_restore(cr);
-    }
-
-    if(y2 >= ps->imgs.screen.page.y
-       && y2 <= (ps->imgs.screen.page.y + ps->imgs.screen.page.height))
-    {
-      snprintf(dimensions, sizeof(dimensions), precision, pheight * units[ps->unit] - dy2);
-      pango_layout_set_text(layout, dimensions, -1);
-      pango_layout_get_pixel_extents(layout, NULL, &ext);
-      yp = y2 + (ps->imgs.screen.page.y
-                 + ps->imgs.screen.page.height - y2 - ext.width) * 0.5;
-      if(yp + ext.width + margin > ps->imgs.screen.page.y + ps->imgs.screen.page.height)
-        yp = y2 - ext.width - 2 * margin;
-      cairo_set_source_rgba(cr, .7, .7, .7, .9);
-      cairo_move_to(cr, xp + text_h * 0.5, y2);
-      cairo_line_to(cr,
-                    xp + text_h * 0.5,
-                    ps->imgs.screen.page.y + ps->imgs.screen.page.height);
-      cairo_stroke_preserve(cr);
-      cairo_set_source_rgba(cr, .5, .5, .5, .9);
-      cairo_set_dash(cr, &dash, 1, dash);
-      cairo_stroke(cr);
-      cairo_set_dash(cr, NULL, 0, 0);
-      dt_gui_draw_rounded_rectangle(cr, text_h + 2 * margin, ext.width + 2 * margin,
-                                    xp - margin, yp - margin);
-      cairo_set_source_rgb(cr, .8, .8, .8);
-      cairo_move_to(cr, xp + text_h * 0.5, yp + ext.width * 0.5);
-      cairo_save(cr);
-      cairo_rotate(cr, -M_PI_2);
-      cairo_rel_move_to(cr, -0.5 * ext.width, -0.5 * text_h);
-      pango_cairo_update_layout(cr, layout);
-      pango_cairo_show_layout(cr, layout);
-      cairo_restore(cr);
-    }
-
-    // display width and height
-    snprintf(dimensions, sizeof(dimensions), precision, dwidth);
     pango_layout_set_text(layout, dimensions, -1);
     pango_layout_get_pixel_extents(layout, NULL, &ext);
-    xp = (x1 + x2 - ext.width) * .5;
-    if(y1 > text_h * 0.5 + margin)
-      yp = y1 - text_h * 0.5;
-    else
-      yp = y1 + text_h - 2 * margin;
+    const float text_w = ext.width;
+    const float text_h = DT_PIXEL_APPLY_DPI(16+2);
+    const float margin = DT_PIXEL_APPLY_DPI(6);
+    const float xp = (x1 + x2 - text_w) * .5f;
+    float yp = y1 - text_h - (margin * 2.0f);
+
+    // put text in the center if not enought space on top
+    if(yp < text_h)
+      yp = (y1 + y2 - text_h) * .5f;
+
     cairo_set_source_rgba(cr, .5, .5, .5, .9);
-    dt_gui_draw_rounded_rectangle(cr, ext.width + 2 * margin, text_h + 2 * margin,
+    dt_gui_draw_rounded_rectangle(cr, text_w + 2 * margin, text_h + 2 * margin,
                                   xp - margin, yp - margin);
     cairo_set_source_rgb(cr, .8, .8, .8);
     cairo_move_to(cr, xp, yp);
     pango_cairo_show_layout(cr, layout);
-
-    snprintf(dimensions, sizeof(dimensions), precision, dheight);
-    pango_layout_set_text(layout, dimensions, -1);
-    pango_layout_get_pixel_extents(layout, NULL, &ext);
-    if(x1 > text_h * 0.5 + margin)
-      xp = x1 - text_h * 0.5;
-    else
-      xp = x1 + text_h - 2 * margin;
-    yp = (y1 + y2) * .5;
-    cairo_set_source_rgba(cr, .5, .5, .5, .9);
-    dt_gui_draw_rounded_rectangle(cr, text_h + 2 * margin, ext.width + 2 * margin,
-                                  xp - margin, yp - margin - 0.5 * ext.width);
-    cairo_set_source_rgb(cr, .8, .8, .8);
-    cairo_move_to(cr, xp + text_h * 0.5, yp);
-    cairo_save(cr);
-    cairo_rotate(cr, -M_PI_2);
-    cairo_rel_move_to(cr, -0.5 * ext.width, -0.5 * text_h);
-    pango_cairo_update_layout(cr, layout);
-    pango_cairo_show_layout(cr, layout);
-    cairo_restore(cr);
-
     pango_font_description_free(desc);
     g_object_unref(layout);
-    g_free(precision);
   }
 
   if(ps->imgs.screen.borderless)
@@ -2320,8 +1946,7 @@ static void _width_changed(GtkWidget *widget, gpointer user_data)
   dt_control_queue_redraw_center();
 }
 
-static void _height_changed(GtkWidget *widget,
-                            gpointer user_data)
+static void _height_changed(GtkWidget *widget, gpointer user_data)
 {
   if(darktable.gui->reset) return;
 
@@ -2340,8 +1965,7 @@ static void _height_changed(GtkWidget *widget,
   dt_control_queue_redraw_center();
 }
 
-static void _x_changed(GtkWidget *widget,
-                       gpointer user_data)
+static void _x_changed(GtkWidget *widget, gpointer user_data)
 {
   if(darktable.gui->reset) return;
 
@@ -2360,8 +1984,7 @@ static void _x_changed(GtkWidget *widget,
   dt_control_queue_redraw_center();
 }
 
-static void _y_changed(GtkWidget *widget,
-                       gpointer user_data)
+static void _y_changed(GtkWidget *widget, gpointer user_data)
 {
   if(darktable.gui->reset) return;
 
@@ -2382,10 +2005,17 @@ static void _y_changed(GtkWidget *widget,
 
 void gui_init(dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *d = malloc(sizeof(dt_lib_print_settings_t));
+  dt_lib_print_settings_t *d = (dt_lib_print_settings_t*)malloc(sizeof(dt_lib_print_settings_t));
   self->data = d;
   self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-  dt_gui_add_help_link(self->widget, "print_overview");
+  dt_gui_add_help_link(self->widget, dt_get_help_url("print_overview"));
+
+  char datadir[PATH_MAX] = { 0 };
+  char confdir[PATH_MAX] = { 0 };
+  dt_loc_get_user_config_dir(confdir, sizeof(confdir));
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  char *system_profile_dir = g_build_filename(datadir, "color", "out", NULL);
+  char *user_profile_dir = g_build_filename(confdir, "color", "out", NULL);
 
   GtkWidget *label;
 
@@ -2401,9 +2031,6 @@ void gui_init(dt_lib_module_t *self)
   d->last_selected = -1;
   d->has_changed = FALSE;
 
-  d->printer_list = NULL;
-  dt_pthread_mutex_init(&d->printer_list_mutex, NULL);
-
   dt_init_print_info(&d->prt);
   dt_view_print_settings(darktable.view_manager, &d->prt, &d->imgs);
 
@@ -2411,54 +2038,34 @@ void gui_init(dt_lib_module_t *self)
 
   d->imgs.motion_over = -1;
 
-  const char *str = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "unit");
-  const char **names = _unit_names;
-  for(_unit_t i=0; *names; names++, i++)
-    if(g_strcmp0(str, *names) == 0)
-      d->unit = i;
-
   dt_printing_clear_boxes(&d->imgs);
 
   // set all margins + unit from settings
 
-  const float top_b = dt_conf_get_float(PRINT_CONFIG_PREFIX "top_margin");
-  const float bottom_b = dt_conf_get_float(PRINT_CONFIG_PREFIX "bottom_margin");
-  const float left_b = dt_conf_get_float(PRINT_CONFIG_PREFIX "left_margin");
-  const float right_b = dt_conf_get_float(PRINT_CONFIG_PREFIX "right_margin");
+  const float top_b = dt_conf_get_float("plugins/print/print/top_margin");
+  const float bottom_b = dt_conf_get_float("plugins/print/print/bottom_margin");
+  const float left_b = dt_conf_get_float("plugins/print/print/left_margin");
+  const float right_b = dt_conf_get_float("plugins/print/print/right_margin");
 
-  d->prt.page.margin_top = _to_mm(d, top_b);
-  d->prt.page.margin_bottom = _to_mm(d, bottom_b);
-  d->prt.page.margin_left = _to_mm(d, left_b);
-  d->prt.page.margin_right = _to_mm(d, right_b);
+  d->unit = dt_conf_get_int("plugins/print/print/unit");
+  d->prt.page.margin_top = to_mm(d, top_b);
+  d->prt.page.margin_bottom = to_mm(d, bottom_b);
+  d->prt.page.margin_left = to_mm(d, left_b);
+  d->prt.page.margin_right = to_mm(d, right_b);
 
-  //  create the spin-button now as values could be set when the
-  //  printer has no hardware margin
+  //  create the spin-button now as values could be set when the printer has no hardware margin
 
-  // FIXME: set digits/increments on all of these by calling _unit_changed() later?
-  int n_digits;
-  float incr;
-  _precision_by_unit(d->unit, &n_digits, &incr, NULL);
+  d->b_top    = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_left   = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_right  = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_bottom = gtk_spin_button_new_with_range(0, 1000, 1);
 
-  d->b_top    = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_left   = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_right  = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_bottom = gtk_spin_button_new_with_range(0, 1000, incr);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_top),    n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_bottom), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_left),   n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_right),  n_digits);
+  d->b_x      = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_y      = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_width  = gtk_spin_button_new_with_range(0, 1000, 1);
+  d->b_height = gtk_spin_button_new_with_range(0, 1000, 1);
 
-  d->b_x      = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_y      = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_width  = gtk_spin_button_new_with_range(0, 1000, incr);
-  d->b_height = gtk_spin_button_new_with_range(0, 1000, incr);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_x), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_y), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_width), n_digits);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->b_height), n_digits);
-
-  d->grid_size = gtk_spin_button_new_with_range(0, 100, incr);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(d->grid_size),  n_digits);
+  d->grid_size = gtk_spin_button_new_with_range(0, 100, 0.1);
 
   gtk_entry_set_alignment(GTK_ENTRY(d->b_top), 1);
   gtk_entry_set_alignment(GTK_ENTRY(d->b_left), 1);
@@ -2478,14 +2085,13 @@ void gui_init(dt_lib_module_t *self)
   // create papers combo as filled when adding printers
   d->papers = dt_bauhaus_combobox_new_action(DT_ACTION(self));
 
-  label = dt_ui_section_label_new(C_("section", "printer"));
+  label = dt_ui_section_label_new(_("printer"));
   gtk_box_pack_start(GTK_BOX(self->widget), label, TRUE, TRUE, 0);
-  dt_gui_add_help_link(self->widget, "print_settings_printer");
+  dt_gui_add_help_link(self->widget, dt_get_help_url("print_settings_printer"));
   d->printers = dt_bauhaus_combobox_new_action(DT_ACTION(self));
 
   gtk_box_pack_start(GTK_BOX(self->widget), d->printers, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(d->printers), "value-changed",
-                   G_CALLBACK(_printer_changed), self);
+  g_signal_connect(G_OBJECT(d->printers), "value-changed", G_CALLBACK(_printer_changed), self);
 
   //// media
 
@@ -2493,8 +2099,7 @@ void gui_init(dt_lib_module_t *self)
 
   dt_bauhaus_widget_set_label(d->media, N_("printer"), N_("media"));
 
-  g_signal_connect(G_OBJECT(d->media), "value-changed",
-                   G_CALLBACK(_media_changed), self);
+  g_signal_connect(G_OBJECT(d->media), "value-changed", G_CALLBACK(_media_changed), self);
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->media), TRUE, TRUE, 0);
 
   //  Add printer profile combo
@@ -2505,25 +2110,22 @@ void gui_init(dt_lib_module_t *self)
   int combo_idx, n;
 
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->pprofile), TRUE, TRUE, 0);
-  int printer_profile_type =
-    dt_conf_get_int("plugins/print/printer/icctype");
-  const char *printer_profile =
-    dt_conf_get_string_const("plugins/print/printer/iccprofile");
+  int printer_profile_type = dt_conf_get_int("plugins/print/printer/icctype");
+  const char *printer_profile = dt_conf_get_string_const("plugins/print/printer/iccprofile");
   combo_idx = -1;
   n = 0;
 
   dt_bauhaus_combobox_add(d->pprofile, _("color management in printer driver"));
   for(const GList *l = d->profiles; l; l = g_list_next(l))
   {
-    dt_lib_export_profile_t *prof = l->data;
+    dt_lib_export_profile_t *prof = (dt_lib_export_profile_t *)l->data;
     // do not add built-in profiles, these are in no way for printing
     if(prof->type == DT_COLORSPACE_FILE)
     {
       dt_bauhaus_combobox_add(d->pprofile, prof->name);
       prof->ppos = ++n;
-      if(prof->type == printer_profile_type
-         && (prof->type != DT_COLORSPACE_FILE
-             || !g_strcmp0(prof->filename, printer_profile)))
+      if(prof->type == printer_profile_type &&
+        (prof->type != DT_COLORSPACE_FILE || !g_strcmp0(prof->filename, printer_profile)))
       {
         g_free(d->v_piccprofile);
         d->v_picctype = printer_profile_type;
@@ -2545,50 +2147,45 @@ void gui_init(dt_lib_module_t *self)
   }
   dt_bauhaus_combobox_set(d->pprofile, combo_idx);
 
-  char *tooltip = dt_ioppr_get_location_tooltip("out", _("printer ICC profiles"));
-  gtk_widget_set_tooltip_markup(d->pprofile, tooltip);
+  char *tooltip = g_strdup_printf(_("printer ICC profiles in %s or %s"), user_profile_dir, system_profile_dir);
+  gtk_widget_set_tooltip_text(d->pprofile, tooltip);
   g_free(tooltip);
 
-  g_signal_connect(G_OBJECT(d->pprofile), "value-changed",
-                   G_CALLBACK(_printer_profile_changed), (gpointer)self);
+  g_signal_connect(G_OBJECT(d->pprofile), "value-changed", G_CALLBACK(_printer_profile_changed), (gpointer)self);
 
   //  Add printer intent combo
 
-  d->v_pintent = dt_conf_get_int("plugins/print/printer/iccintent");
-  DT_BAUHAUS_COMBOBOX_NEW_FULL(d->pintent, self, N_("printer"), N_("intent"), NULL,
-                               d->v_pintent, _printer_intent_callback, self,
-                               N_("perceptual"),
-                               N_("relative colorimetric"),
-                               NC_("rendering intent", "saturation"),
-                               N_("absolute colorimetric"));
+  d->pintent = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_widget_set_label(d->pintent, N_("printer"), N_("intent"));
+  dt_bauhaus_combobox_add(d->pintent, _("perceptual"));
+  dt_bauhaus_combobox_add(d->pintent, _("relative colorimetric"));
+  dt_bauhaus_combobox_add(d->pintent, C_("rendering intent", "saturation"));
+  dt_bauhaus_combobox_add(d->pintent, _("absolute colorimetric"));
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->pintent), TRUE, TRUE, 0);
 
+  d->v_pintent = dt_conf_get_int("plugins/print/printer/iccintent");
+  dt_bauhaus_combobox_set(d->pintent, d->v_pintent);
+
+  g_signal_connect (G_OBJECT (d->pintent), "value-changed", G_CALLBACK (_printer_intent_callback), (gpointer)self);
   d->prt.printer.intent = d->v_pintent;
 
-  d->black_point_compensation =
-    gtk_check_button_new_with_label(_("black point compensation"));
-  gtk_box_pack_start(GTK_BOX(self->widget),
-                     GTK_WIDGET(d->black_point_compensation), TRUE, FALSE, 0);
-  g_signal_connect(d->black_point_compensation, "toggled",
-                   G_CALLBACK(_printer_bpc_callback), (gpointer)self);
+  d->black_point_compensation = gtk_check_button_new_with_label(_("black point compensation"));
+  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->black_point_compensation), TRUE, FALSE, 0);
+  g_signal_connect(d->black_point_compensation, "toggled", G_CALLBACK(_printer_bpc_callback), (gpointer)self);
 
-  d->v_black_point_compensation =
-    dt_conf_get_bool(PRINT_CONFIG_PREFIX "black_point_compensation");
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->black_point_compensation),
-                               d->v_black_point_compensation);
+  d->v_black_point_compensation = dt_conf_get_bool("plugins/print/print/black_point_compensation");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->black_point_compensation), d->v_black_point_compensation);
 
-  gtk_widget_set_tooltip_text
-    (d->black_point_compensation,
-     _("activate black point compensation when applying the printer profile"));
+  gtk_widget_set_tooltip_text(d->black_point_compensation,
+                              _("activate black point compensation when applying the printer profile"));
 
-  gtk_widget_set_sensitive(GTK_WIDGET(d->black_point_compensation),
-                           combo_idx == 0 ? FALSE : TRUE);
+  gtk_widget_set_sensitive(GTK_WIDGET(d->black_point_compensation), combo_idx==0?FALSE:TRUE);
 
   ////////////////////////// PAGE SETTINGS
 
-  label = dt_ui_section_label_new(C_("section", "page"));
+  label = dt_ui_section_label_new(_("page"));
   gtk_box_pack_start(GTK_BOX(self->widget), label, TRUE, TRUE, 0);
-  dt_gui_add_help_link(self->widget, "print_settings_page");
+  dt_gui_add_help_link(self->widget, dt_get_help_url("print_settings_page"));
 
   //// papers
 
@@ -2599,26 +2196,31 @@ void gui_init(dt_lib_module_t *self)
 
   //// portrait / landscape
 
-  DT_BAUHAUS_COMBOBOX_NEW_FULL(d->orientation, self, NULL, N_("orientation"), NULL,
-                               d->prt.page.landscape?1:0, _orientation_changed, self,
-                               N_("portrait"), N_("landscape"));
+  d->orientation = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_widget_set_label(d->orientation, NULL, N_("orientation"));
+  dt_bauhaus_combobox_add(d->orientation, _("portrait"));
+  dt_bauhaus_combobox_add(d->orientation, _("landscape"));
+
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->orientation), TRUE, TRUE, 0);
 
-  // NOTE: units has no label, which makes for cleaner UI but means
-  // that no action can be assigned
-  GtkWidget *ucomb =
-    dt_bauhaus_combobox_new_full(DT_ACTION(self), NULL, NULL,
-                                 _("measurement units"),
-                                 d->unit, (GtkCallback)_unit_changed, self,
-                                 _unit_names);
+  GtkWidget *ucomb = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_combobox_add(ucomb, _("mm"));
+  dt_bauhaus_combobox_add(ucomb, _("cm"));
+  dt_bauhaus_combobox_add(ucomb, _("inch"));
   gtk_box_pack_start(GTK_BOX(self->widget), ucomb, TRUE, TRUE, 0);
+
+  g_signal_connect(G_OBJECT(d->orientation), "value-changed", G_CALLBACK(_orientation_changed), self);
+  g_signal_connect(G_OBJECT(ucomb), "value-changed", G_CALLBACK(_unit_changed), self);
+
+  dt_bauhaus_combobox_set(ucomb, d->unit);
+
+  dt_bauhaus_combobox_set(d->orientation, d->prt.page.landscape?1:0);
 
   //// image dimensions, create them now as we need them
 
   GtkWidget *hboxdim = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
   label = gtk_label_new(_("image width/height"));
-  gtk_box_pack_start(GTK_BOX(hboxdim), GTK_WIDGET(label), TRUE, TRUE,
-                     DT_PIXEL_APPLY_DPI(3));
+  gtk_box_pack_start(GTK_BOX(hboxdim), GTK_WIDGET(label), TRUE, TRUE, DT_PIXEL_APPLY_DPI(3));
   d->width = gtk_label_new(_("width"));
   gtk_box_pack_start(GTK_BOX(hboxdim), GTK_WIDGET(d->width), TRUE, TRUE, 0);
   label = gtk_label_new(_(" x "));
@@ -2630,8 +2232,7 @@ void gui_init(dt_lib_module_t *self)
 
   GtkWidget *hboxinfo = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
   label = gtk_label_new(_("scale factor"));
-  gtk_box_pack_start(GTK_BOX(hboxinfo), GTK_WIDGET(label), TRUE, TRUE,
-                     DT_PIXEL_APPLY_DPI(3));
+  gtk_box_pack_start(GTK_BOX(hboxinfo), GTK_WIDGET(label), TRUE, TRUE, DT_PIXEL_APPLY_DPI(3));
   d->info = gtk_label_new("1.0");
   gtk_box_pack_start(GTK_BOX(hboxinfo), GTK_WIDGET(d->info), TRUE, TRUE, 0);
   gtk_widget_set_tooltip_text(hboxinfo,
@@ -2657,8 +2258,7 @@ void gui_init(dt_lib_module_t *self)
   gtk_grid_attach(bds, GTK_WIDGET(d->b_left), 0, 1, 1, 1);
 
   d->lock_button = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label(_("lock")));
-  gtk_widget_set_tooltip_text(GTK_WIDGET(d->lock_button),
-                              _("change all margins uniformly"));
+  gtk_widget_set_tooltip_text(GTK_WIDGET(d->lock_button), _("change all margins uniformly"));
   gtk_grid_attach(bds, GTK_WIDGET(d->lock_button), 1, 1, 1, 1);
 
   //d->b_right  = gtk_spin_button_new_with_range(0, 10000, 1);
@@ -2691,7 +2291,7 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_set_halign(GTK_WIDGET(hboxdim), GTK_ALIGN_CENTER);
   gtk_widget_set_halign(GTK_WIDGET(hboxinfo), GTK_ALIGN_CENTER);
 
-  const gboolean lock_active = dt_conf_get_bool(PRINT_CONFIG_PREFIX "lock_borders");
+  const gboolean lock_active = dt_conf_get_bool("plugins/print/print/lock_borders");
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->lock_button), lock_active);
 
   // grid & snap grid
@@ -2704,9 +2304,8 @@ void gui_init(dt_lib_module_t *self)
     gtk_box_pack_start(GTK_BOX(hbox), GTK_WIDGET(d->grid), TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(hbox), GTK_WIDGET(d->grid_size), TRUE, TRUE, 0);
 
-    gtk_spin_button_set_value
-      (GTK_SPIN_BUTTON(d->grid_size),
-       dt_conf_get_float(PRINT_CONFIG_PREFIX "grid_size") * units[d->unit]);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(d->grid_size),
+                              dt_conf_get_float("plugins/print/print/grid_size") * units[d->unit]);
 
     gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(hbox), TRUE, TRUE, 0);
 
@@ -2715,12 +2314,9 @@ void gui_init(dt_lib_module_t *self)
 
     gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(vbox), TRUE, TRUE, 0);
 
-    g_signal_connect(G_OBJECT(d->grid_size), "value-changed",
-                     G_CALLBACK(_grid_size_changed), self);
-    g_signal_connect(G_OBJECT(d->grid), "toggled",
-                     G_CALLBACK(_grid_callback), self);
-    g_signal_connect(d->snap_grid, "toggled",
-                     G_CALLBACK(_snap_grid_callback), (gpointer)self);
+    g_signal_connect(G_OBJECT(d->grid_size), "value-changed", G_CALLBACK(_grid_size_changed), self);
+    g_signal_connect(G_OBJECT(d->grid), "toggled", G_CALLBACK(_grid_callback), self);
+    g_signal_connect(d->snap_grid, "toggled", G_CALLBACK(_snap_grid_callback), (gpointer)self);
   }
 
   d->borderless = gtk_check_button_new_with_label(_("borderless mode required"));
@@ -2733,9 +2329,9 @@ void gui_init(dt_lib_module_t *self)
 
   // pack image dimension hbox here
 
-  label = dt_ui_section_label_new(C_("section", "image layout"));
+  label = dt_ui_section_label_new(_("image layout"));
   gtk_box_pack_start(GTK_BOX(self->widget), label, TRUE, TRUE, 0);
-  dt_gui_add_help_link(self->widget, "print_image_layout");
+  dt_gui_add_help_link(self->widget, dt_get_help_url("print_image_layout"));
 
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(hboxdim), TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(hboxinfo), TRUE, TRUE, 0);
@@ -2748,12 +2344,9 @@ void gui_init(dt_lib_module_t *self)
   gtk_grid_set_column_spacing(bat, DT_PIXEL_APPLY_DPI(3));
   for(int i=0; i<9; i++)
   {
-    d->dtba[i]
-        = DTGTK_TOGGLEBUTTON(dtgtk_togglebutton_new(dtgtk_cairo_paint_alignment,
-                                                    (CPF_SPECIAL_FLAG << i), NULL));
+    d->dtba[i] = DTGTK_TOGGLEBUTTON (dtgtk_togglebutton_new (dtgtk_cairo_paint_alignment,CPF_STYLE_FLAT|(CPF_SPECIAL_FLAG<<i), NULL));
     gtk_grid_attach (GTK_GRID (bat), GTK_WIDGET (d->dtba[i]), (i%3), i/3, 1, 1);
-    g_signal_connect (G_OBJECT (d->dtba[i]), "toggled",
-                      G_CALLBACK (_alignment_callback), self);
+    g_signal_connect (G_OBJECT (d->dtba[i]), "toggled",G_CALLBACK (_alignment_callback), self);
   }
 
   GtkWidget *hbox22 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
@@ -2773,22 +2366,21 @@ void gui_init(dt_lib_module_t *self)
   gtk_grid_set_column_homogeneous(fitbut, TRUE);
   gtk_grid_set_row_homogeneous(fitbut, TRUE);
 
-  GtkWidget *bnew = dt_action_button_new
-    (self, N_("new image area"),
-     _page_new_area_clicked, self,
-     _("add a new image area on the page\n"
-       "click and drag on the page to place the area\n"
-       "drag and drop image from film strip on it"), 0, 0);
+  GtkWidget *bnew = gtk_button_new_with_label(_("new image area"));
+  gtk_widget_set_tooltip_text(bnew, _("add a new image area on the page\n"
+                                      "click and drag on the page to place the area\n"
+                                      "drag&drop image from film strip on it"));
 
-  d->del = dt_action_button_new(self, N_("delete image area"),
-                                _page_delete_area_clicked, self,
-                                _("delete the currently selected image area"), 0, 0);
+  g_signal_connect(G_OBJECT(bnew), "clicked", G_CALLBACK(_page_new_area_clicked), (gpointer)self);
+
+  d->del = gtk_button_new_with_label(_("delete image area"));
+  gtk_widget_set_tooltip_text(d->del, _("delete the currently selected image area"));
+  g_signal_connect(G_OBJECT(d->del), "clicked", G_CALLBACK(_page_delete_area_clicked), (gpointer)self);
   gtk_widget_set_sensitive(d->del, FALSE);
 
-  GtkWidget *bclear = dt_action_button_new(self, N_("clear layout"),
-                                           _page_clear_area_clicked, self,
-                                           _("remove all image areas from the page"),
-                                           0, 0);
+  GtkWidget *bclear = gtk_button_new_with_label(_("clear layout"));
+  gtk_widget_set_tooltip_text(bclear, _("remove all image area from the page"));
+  g_signal_connect(G_OBJECT(bclear), "clicked", G_CALLBACK(_page_clear_area_clicked), (gpointer)self);
 
   gtk_grid_attach(fitbut, GTK_WIDGET(bnew), 0, 0, 2, 1);
   gtk_grid_attach(fitbut, GTK_WIDGET(d->del), 0, 1, 1, 1);
@@ -2799,8 +2391,6 @@ void gui_init(dt_lib_module_t *self)
 
   // X x Y
   GtkWidget *box;
-  // FIXME: add labels to x/y/width/height as otherwise are obscure --
-  // and there is the horizontal space to do this
 
   box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
   // d->b_x = gtk_spin_button_new_with_range(0, 1000, 1);
@@ -2838,20 +2428,16 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_add_events(d->b_width, GDK_BUTTON_PRESS_MASK);
   gtk_widget_add_events(d->b_height, GDK_BUTTON_PRESS_MASK);
 
-  g_signal_connect(G_OBJECT(d->b_x), "value-changed",
-                   G_CALLBACK(_x_changed), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->b_y), "value-changed",
-                   G_CALLBACK(_y_changed), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->b_width), "value-changed",
-                   G_CALLBACK(_width_changed), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->b_height), "value-changed",
-                   G_CALLBACK(_height_changed), (gpointer)d);
+  g_signal_connect(G_OBJECT(d->b_x), "value-changed", G_CALLBACK(_x_changed), (gpointer)d);
+  g_signal_connect(G_OBJECT(d->b_y), "value-changed", G_CALLBACK(_y_changed), (gpointer)d);
+  g_signal_connect(G_OBJECT(d->b_width), "value-changed", G_CALLBACK(_width_changed), (gpointer)d);
+  g_signal_connect(G_OBJECT(d->b_height), "value-changed", G_CALLBACK(_height_changed), (gpointer)d);
 
   ////////////////////////// PRINT SETTINGS
 
-  label = dt_ui_section_label_new(C_("section", "print settings"));
+  label = dt_ui_section_label_new(_("print settings"));
   gtk_box_pack_start(GTK_BOX(self->widget), label, TRUE, TRUE, 0);
-  dt_gui_add_help_link(self->widget, "print_settings");
+  dt_gui_add_help_link(self->widget, dt_get_help_url("print_settings"));
 
   //  Add export profile combo
 
@@ -2861,14 +2447,14 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->profile), TRUE, TRUE, 0);
   dt_bauhaus_combobox_add(d->profile, _("image settings"));
 
-  const int icctype = dt_conf_get_int(PRINT_CONFIG_PREFIX "icctype");
-  const gchar *iccprofile = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "iccprofile");
+  const int icctype = dt_conf_get_int("plugins/print/print/icctype");
+  const gchar *iccprofile = dt_conf_get_string_const("plugins/print/print/iccprofile");
   combo_idx = -1;
   n = 0;
 
   for(const GList *l = d->profiles; l; l = g_list_next(l))
   {
-    dt_lib_export_profile_t *prof = l->data;
+    dt_lib_export_profile_t *prof = (dt_lib_export_profile_t *)l->data;
     dt_bauhaus_combobox_add(d->profile, prof->name);
     prof->pos = ++n;
     if(prof->type == icctype
@@ -2883,8 +2469,8 @@ void gui_init(dt_lib_module_t *self)
 
   if(combo_idx == -1)
   {
-    dt_conf_set_int(PRINT_CONFIG_PREFIX "icctype", DT_COLORSPACE_NONE);
-    dt_conf_set_string(PRINT_CONFIG_PREFIX "iccprofile", "");
+    dt_conf_set_int("plugins/print/print/icctype", DT_COLORSPACE_NONE);
+    dt_conf_set_string("plugins/print/print/iccprofile", "");
     g_free(d->v_iccprofile);
     d->v_icctype = DT_COLORSPACE_NONE;
     d->v_iccprofile = g_strdup("");
@@ -2893,83 +2479,114 @@ void gui_init(dt_lib_module_t *self)
 
   dt_bauhaus_combobox_set(d->profile, combo_idx);
 
-  tooltip = dt_ioppr_get_location_tooltip("out", _("output ICC profiles"));
-  gtk_widget_set_tooltip_markup(d->profile, tooltip);
+  tooltip = g_strdup_printf(_("output ICC profiles in %s or %s"), user_profile_dir, system_profile_dir);
+  gtk_widget_set_tooltip_text(d->profile, tooltip);
   g_free(tooltip);
 
-  g_signal_connect(G_OBJECT(d->profile), "value-changed",
-                   G_CALLBACK(_profile_changed), (gpointer)self);
+  g_signal_connect(G_OBJECT(d->profile), "value-changed", G_CALLBACK(_profile_changed), (gpointer)self);
 
   //  Add export intent combo
 
-  DT_BAUHAUS_COMBOBOX_NEW_FULL(d->intent, self, NULL, N_("intent"), NULL,
-                               dt_conf_get_int(PRINT_CONFIG_PREFIX "iccintent") + 1,
-                               _intent_callback, self,
-                               N_("image settings"),
-                               N_("perceptual"),
-                               N_("relative colorimetric"),
-                               NC_("rendering intent", "saturation"),
-                               N_("absolute colorimetric"));
+  d->intent = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_widget_set_label(d->intent, NULL, N_("intent"));
+
+  dt_bauhaus_combobox_add(d->intent, _("image settings"));
+  dt_bauhaus_combobox_add(d->intent, _("perceptual"));
+  dt_bauhaus_combobox_add(d->intent, _("relative colorimetric"));
+  dt_bauhaus_combobox_add(d->intent, C_("rendering intent", "saturation"));
+  dt_bauhaus_combobox_add(d->intent, _("absolute colorimetric"));
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->intent), TRUE, TRUE, 0);
+
+  dt_bauhaus_combobox_set(d->intent, dt_conf_get_int("plugins/print/print/iccintent") + 1);
+
+  g_signal_connect (G_OBJECT (d->intent), "value-changed", G_CALLBACK (_intent_callback), (gpointer)self);
 
   //  Add export style combo
 
-  const char *current_style_name = dt_conf_get_string_const(PRINT_CONFIG_PREFIX "style");
+  d->style = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_widget_set_label(d->style, NULL, N_("style"));
 
-  GtkWidget *styles_button = dtgtk_button_new(dtgtk_cairo_paint_styles, 0, NULL);
-  gtk_widget_set_halign(styles_button,GTK_ALIGN_END);
-  g_signal_connect(G_OBJECT(styles_button), "clicked", G_CALLBACK(_style_popupmenu_callback), (gpointer)d);
-  gtk_widget_set_tooltip_text(styles_button, _("select style to be applied on printing"));
-  GtkBox *style_box = (GtkBox*)gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
-  gtk_widget_set_tooltip_text(GTK_WIDGET(style_box), _("temporary style to use while printing"));
-  GtkWidget *styles_label = gtk_label_new(_("style"));
-  gtk_box_pack_start(style_box, styles_label, FALSE, FALSE, 0);
-  GtkWidget *current_style = gtk_label_new("");
-  gtk_widget_set_halign(current_style,GTK_ALIGN_END);
-  gtk_label_set_justify(GTK_LABEL(current_style), GTK_JUSTIFY_RIGHT);
-  gtk_label_set_ellipsize(GTK_LABEL(current_style), PANGO_ELLIPSIZE_MIDDLE);
-  gtk_box_pack_start(style_box, current_style, TRUE, TRUE, 0);
-  gtk_box_pack_start(style_box, styles_button, FALSE, FALSE, 0);
+  dt_bauhaus_combobox_add(d->style, _("none"));
 
-  d->style = GTK_WIDGET(current_style);
-  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(style_box), FALSE, TRUE, 0);
+  GList *styles = dt_styles_get_list("");
+  const char *current_style = dt_conf_get_string_const("plugins/print/print/style");
+  combo_idx = -1; n=0;
+
+  for(const GList *st_iter = styles; st_iter; st_iter = g_list_next(st_iter))
+  {
+    dt_style_t *style=(dt_style_t *)st_iter->data;
+    dt_bauhaus_combobox_add(d->style, style->name);
+    n++;
+    if(g_strcmp0(style->name,current_style)==0)
+    {
+      g_free(d->v_style);
+      d->v_style = g_strdup(current_style);
+      combo_idx=n;
+    }
+  }
+  g_list_free_full(styles, dt_style_free);
+  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->style), TRUE, TRUE, 0);
+  gtk_widget_set_tooltip_text(d->style, _("temporary style to use while printing"));
+
+  // style not found, maybe a style has been removed? revert to none
+  if(combo_idx == -1)
+  {
+    dt_conf_set_string("plugins/print/print/style", "");
+    g_free(d->v_style);
+    d->v_style = g_strdup("");
+    combo_idx=0;
+  }
+  dt_bauhaus_combobox_set(d->style, combo_idx);
+
+  g_signal_connect (G_OBJECT (d->style), "value-changed",
+                    G_CALLBACK (_style_callback),
+                    (gpointer)self);
 
   //  Whether to add/replace style items
 
-  d->v_style_append = dt_conf_get_bool(PRINT_CONFIG_PREFIX "style_append");
-  DT_BAUHAUS_COMBOBOX_NEW_FULL
-    (d->style_mode, self, NULL, N_("mode"),
-     _("whether the style items are appended to the history or replacing the history"),
-     d->v_style_append?1:0, _style_mode_changed, self,
-     N_("replace history"), N_("append history"));
-  gtk_widget_set_no_show_all(d->style_mode, TRUE);
-  const gboolean is_style_set = _is_style_set(current_style_name);
-  gtk_widget_set_visible(GTK_WIDGET(d->style_mode), is_style_set);
-  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->style_mode), TRUE, TRUE, 0);
+  d->style_mode = dt_bauhaus_combobox_new_action(DT_ACTION(self));
+  dt_bauhaus_widget_set_label(d->style_mode, NULL, N_("mode"));
 
-  _update_style_label(d, is_style_set ? current_style_name : "");
+  dt_bauhaus_combobox_add(d->style_mode, _("replace history"));
+  dt_bauhaus_combobox_add(d->style_mode, _("append history"));
+
+  d->v_style_append = dt_conf_get_bool("plugins/print/print/style_append");
+  dt_bauhaus_combobox_set(d->style_mode, d->v_style_append?1:0);
+
+  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(d->style_mode), TRUE, TRUE, 0);
+  gtk_widget_set_tooltip_text(d->style_mode,
+                              _("whether the style items are appended to the history or replacing the history"));
+
+  gtk_widget_set_sensitive(GTK_WIDGET(d->style_mode), combo_idx==0?FALSE:TRUE);
+
+  g_signal_connect(G_OBJECT(d->style_mode), "value-changed", G_CALLBACK(_style_mode_changed), (gpointer)self);
 
   // Print button
 
-  GtkWidget *button = dt_action_button_new(self, N_("print"),
-                                           _print_button_clicked, self,
-                                           _("print with current settings"),
-                                           GDK_KEY_p, GDK_CONTROL_MASK);
-  d->print_button = GTK_BUTTON(button);
-  gtk_box_pack_start(GTK_BOX(self->widget), button, TRUE, TRUE, 0);
-  dt_gui_add_help_link(button, "print_settings_button");
+  GtkButton *button = GTK_BUTTON(gtk_button_new_with_label(_("print")));
+  d->print_button = button;
+  gtk_widget_set_tooltip_text(GTK_WIDGET(button), _("print with current settings"));
+  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(button), TRUE, TRUE, 0);
+  dt_gui_add_help_link(GTK_WIDGET(button), dt_get_help_url("print_settings_button"));
+
+  g_signal_connect (G_OBJECT (button), "clicked",
+                    G_CALLBACK (_print_button_clicked),
+                    (gpointer)self);
+
+  g_free(system_profile_dir);
+  g_free(user_profile_dir);
 
   // Let's start the printer discovery now
 
   dt_printers_discovery(_new_printer_callback, self);
 }
 
-void *legacy_params(dt_lib_module_t *self,
-                    const void *const old_params,
-                    const size_t old_params_size,
-                    const int old_version,
-                    int *new_version,
-                    size_t *new_size)
+void init_presets(dt_lib_module_t *self)
+{
+}
+
+void *legacy_params(dt_lib_module_t *self, const void *const old_params, const size_t old_params_size,
+                    const int old_version, int *new_version, size_t *new_size)
 {
   if(old_version == 1)
   {
@@ -3026,8 +2643,7 @@ void *legacy_params(dt_lib_module_t *self,
     buf += pprofile_len;
 
 
-    // now we got all fields from the start of the buffer and buf
-    // points to the beginning or <rest>
+    // now we got all fields from the start of the buffer and buf points to the beginning or <rest>
 
     // find the new values for the two profiles
     dt_colorspaces_color_profile_type_t profile_type, pprofile_type;
@@ -3081,33 +2697,31 @@ void *legacy_params(dt_lib_module_t *self,
 
     size_t pos = 0;
     //   char *printer
-    memcpy((uint8_t *)new_params + pos, printer, printer_len);
+    memcpy(new_params + pos, printer, printer_len);
     pos += printer_len;
     //   char *paper
-    memcpy((uint8_t *)new_params + pos, paper, paper_len);
+    memcpy(new_params + pos, paper, paper_len);
     pos += paper_len;
     //   int32_t landscape
-    memcpy((uint8_t *)new_params + pos, &landscape, sizeof(int32_t));
+    memcpy(new_params + pos, &landscape, sizeof(int32_t));
     pos += sizeof(int32_t);
     //   int32_t f_profile_type
-    memcpy((uint8_t *)new_params + pos, &profile_type, sizeof(int32_t));
+    memcpy(new_params + pos, &profile_type, sizeof(int32_t));
     pos += sizeof(int32_t);
     //   char *f_profile
-    memcpy((uint8_t *)new_params + pos, profile_filename, new_profile_len);
+    memcpy(new_params + pos, profile_filename, new_profile_len);
     pos += new_profile_len;
     //   int32_t intent
-    memcpy((uint8_t *)new_params + pos, &intent, sizeof(int32_t));
+    memcpy(new_params + pos, &intent, sizeof(int32_t));
     pos += sizeof(int32_t);
     //   int32_t f_pprofile_type
-    memcpy((uint8_t *)new_params + pos, &pprofile_type, sizeof(int32_t));
+    memcpy(new_params + pos, &pprofile_type, sizeof(int32_t));
     pos += sizeof(int32_t);
     //   char *f_pprofile
-    memcpy((uint8_t *)new_params + pos, pprofile_filename, new_pprofile_len);
+    memcpy(new_params + pos, pprofile_filename, new_pprofile_len);
     pos += new_pprofile_len;
     //   <rest>
-    memcpy((uint8_t *)new_params + pos,
-           buf,
-           old_params_size - ((char *)buf - (char *)old_params));
+    memcpy(new_params + pos, buf, old_params_size - ((char *)buf - (char *)old_params));
 
     *new_size = new_params_size;
     *new_version = 2;
@@ -3138,15 +2752,15 @@ void *legacy_params(dt_lib_module_t *self,
     // single image box specified (there is no way to create a box on the size
     // of the page at this stage).
     int32_t idx = old_params_size;
-    *(int32_t *)((uint8_t *)new_params + idx) = 1;
+    *(int32_t *)(new_params + idx) = 1;
     idx += sizeof(int32_t);
-    *(float *)((uint8_t *)new_params + idx) = 0.05f;
+    *(float *)(new_params + idx) = 0.05f;
     idx += sizeof(float);
-    *(float *)((uint8_t *)new_params + idx) = 0.05f;
+    *(float *)(new_params + idx) = 0.05f;
     idx += sizeof(float);
-    *(float *)((uint8_t *)new_params + idx) = 0.90f;
+    *(float *)(new_params + idx) = 0.90f;
     idx += sizeof(float);
-    *(float *)((uint8_t *)new_params + idx) = 0.90f;
+    *(float *)(new_params + idx) = 0.90f;
     // idx += sizeof(float);
 
     *new_size = new_params_size;
@@ -3157,11 +2771,9 @@ void *legacy_params(dt_lib_module_t *self,
   return NULL;
 }
 
-int set_params(dt_lib_module_t *self,
-               const void *params,
-               const int size)
+int set_params(dt_lib_module_t *self, const void *params, int size)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   if(!params) return 1;
 
@@ -3251,12 +2863,7 @@ int set_params(dt_lib_module_t *self,
   }
 
   // ensure that the size is correct
-  if(size != printer_len + paper_len + media_len + profile_len
-     + pprofile_len + style_len
-     + 8 * sizeof(int32_t)
-     + 4 * sizeof(double)
-     + sizeof(int32_t)
-     + (ps->imgs.count * 4 * sizeof(float)))
+  if(size != printer_len + paper_len + media_len + profile_len + pprofile_len + style_len + 8 * sizeof(int32_t) + 4 * sizeof(double) + sizeof(int32_t) + (ps->imgs.count * 4 * sizeof(float)))
     return 1;
 
   // set the GUI with corresponding values
@@ -3274,9 +2881,8 @@ int set_params(dt_lib_module_t *self,
   dt_bauhaus_combobox_set(ps->profile, 0);
   for(GList *iter = ps->profiles; iter; iter = g_list_next(iter))
   {
-    dt_lib_export_profile_t *p = iter->data;
-    if(f_profile_type == p->type && (f_profile_type != DT_COLORSPACE_FILE
-                                     || !g_strcmp0(f_profile, p->filename)))
+    dt_lib_export_profile_t *p = (dt_lib_export_profile_t *)iter->data;
+    if(f_profile_type == p->type && (f_profile_type != DT_COLORSPACE_FILE || !g_strcmp0(f_profile, p->filename)))
     {
       dt_bauhaus_combobox_set(ps->profile, p->pos);
       break;
@@ -3288,9 +2894,8 @@ int set_params(dt_lib_module_t *self,
   dt_bauhaus_combobox_set(ps->pprofile, 0);
   for(GList *iter = ps->profiles; iter; iter = g_list_next(iter))
   {
-    dt_lib_export_profile_t *p = iter->data;
-    if(f_pprofile_type == p->type && (f_pprofile_type != DT_COLORSPACE_FILE
-                                      || !g_strcmp0(f_pprofile, p->filename)))
+    dt_lib_export_profile_t *p = (dt_lib_export_profile_t *)iter->data;
+    if(f_pprofile_type == p->type && (f_pprofile_type != DT_COLORSPACE_FILE || !g_strcmp0(f_pprofile, p->filename)))
     {
       dt_bauhaus_combobox_set(ps->pprofile, p->ppos);
       break;
@@ -3300,7 +2905,8 @@ int set_params(dt_lib_module_t *self,
   dt_bauhaus_combobox_set (ps->pintent, pintent);
   ps->prt.printer.intent = pintent;
 
-  _update_style_label(ps,style);
+  if(style[0] != '\0')
+    dt_bauhaus_combobox_set_from_text(ps->style, style);
   dt_bauhaus_combobox_set (ps->style_mode, style_mode);
 
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_top), b_top * units[ps->unit]);
@@ -3318,7 +2924,7 @@ int set_params(dt_lib_module_t *self,
 
 void *get_params(dt_lib_module_t *self, int *size)
 {
-  const dt_lib_print_settings_t *ps = self->data;
+  const dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   // get the data
   const char *printer = dt_bauhaus_combobox_get_text(ps->printers);
@@ -3326,25 +2932,23 @@ void *get_params(dt_lib_module_t *self, int *size)
   const char *media = dt_bauhaus_combobox_get_text(ps->media);
   const int32_t profile_pos = dt_bauhaus_combobox_get(ps->profile);
   const int32_t intent =  dt_bauhaus_combobox_get(ps->intent);
-  const char *style = gtk_label_get_text(GTK_LABEL(ps->style));
+  const char *style = dt_bauhaus_combobox_get_text(ps->style);
   const int32_t style_mode = dt_bauhaus_combobox_get(ps->style_mode);
   const int32_t pprofile_pos = dt_bauhaus_combobox_get(ps->pprofile);
   const int32_t pintent =  dt_bauhaus_combobox_get(ps->pintent);
   const int32_t landscape = dt_bauhaus_combobox_get(ps->orientation);
-  const int32_t bpc = gtk_toggle_button_get_active
-    (GTK_TOGGLE_BUTTON(ps->black_point_compensation));
+  const int32_t bpc = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ps->black_point_compensation));
   const double b_top = ps->prt.page.margin_top;
   const double b_bottom = ps->prt.page.margin_bottom;
   const double b_left = ps->prt.page.margin_left;
   const double b_right = ps->prt.page.margin_right;
   const int32_t alignment = 0;
 
-  dt_colorspaces_color_profile_type_t profile_type =
-    DT_COLORSPACE_NONE, pprofile_type = DT_COLORSPACE_NONE;
+  dt_colorspaces_color_profile_type_t profile_type = DT_COLORSPACE_NONE, pprofile_type = DT_COLORSPACE_NONE;
   const char *profile = "", *pprofile = "";
   for(GList *iter = ps->profiles; iter; iter = g_list_next(iter))
   {
-    dt_lib_export_profile_t *p = iter->data;
+    dt_lib_export_profile_t *p = (dt_lib_export_profile_t *)iter->data;
     if(p->pos == profile_pos)
     {
       profile_type = p->type;
@@ -3371,12 +2975,7 @@ void *get_params(dt_lib_module_t *self, int *size)
   const int32_t style_len = strlen (style) + 1;
 
   // compute the size of all parameters
-  *size = printer_len + paper_len + media_len
-    + profile_len + pprofile_len + style_len
-    + 8 * sizeof(int32_t)
-    + 4 * sizeof(double)
-    + sizeof(int32_t)
-    + (ps->imgs.count * 4 * sizeof(float));
+  *size = printer_len + paper_len + media_len + profile_len + pprofile_len + style_len + 8 * sizeof(int32_t) + 4 * sizeof(double) + sizeof(int32_t) + (ps->imgs.count * 4 * sizeof(float));
 
   // allocate the parameter buffer
   char *params = (char *)malloc(*size);
@@ -3443,19 +3042,7 @@ void *get_params(dt_lib_module_t *self, int *size)
 
 void gui_cleanup(dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
-
-  // these can be called on shutdown, resulting in null-pointer
-  // dereference and division by zero -- not sure what interaction
-  // makes them called, but better to disconnect and not have segfault
-  g_signal_handlers_disconnect_by_func(G_OBJECT(ps->b_top),
-                                       G_CALLBACK(_top_border_callback), self);
-  g_signal_handlers_disconnect_by_func(G_OBJECT(ps->b_bottom),
-                                       G_CALLBACK(_bottom_border_callback), self);
-  g_signal_handlers_disconnect_by_func(G_OBJECT(ps->b_left),
-                                       G_CALLBACK(_left_border_callback), self);
-  g_signal_handlers_disconnect_by_func(G_OBJECT(ps->b_right),
-                                       G_CALLBACK(_right_border_callback), self);
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   g_list_free_full(ps->profiles, g_free);
   g_list_free_full(ps->paper_list, free);
@@ -3471,7 +3058,7 @@ void gui_cleanup(dt_lib_module_t *self)
 
 void gui_reset(dt_lib_module_t *self)
 {
-  dt_lib_print_settings_t *ps = self->data;
+  dt_lib_print_settings_t *ps = (dt_lib_print_settings_t *)self->data;
 
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_top), 17 * units[ps->unit]);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(ps->b_bottom), 17 * units[ps->unit]);
@@ -3484,7 +3071,7 @@ void gui_reset(dt_lib_module_t *self)
   dt_bauhaus_combobox_set(ps->profile, 0);
   dt_bauhaus_combobox_set(ps->pprofile, 0);
   dt_bauhaus_combobox_set(ps->pintent, 0);
-  _update_style_label(ps,"");
+  dt_bauhaus_combobox_set(ps->style, 0);
   dt_bauhaus_combobox_set(ps->intent, 0);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ps->black_point_compensation), TRUE);
   gtk_widget_set_sensitive(GTK_WIDGET(ps->pintent), TRUE);
@@ -3493,7 +3080,7 @@ void gui_reset(dt_lib_module_t *self)
 
   // reset page orientation to fit the picture if a single one is displayed
 
-  const dt_imgid_t imgid = (ps->imgs.count > 0) ? ps->imgs.box[0].imgid : NO_IMGID;
+  const int32_t imgid = (ps->imgs.count > 0) ? ps->imgs.box[0].imgid : -1;
   dt_printing_clear_boxes(&ps->imgs);
   ps->imgs.imgid_to_load = imgid;
 
@@ -3505,8 +3092,18 @@ void gui_reset(dt_lib_module_t *self)
   dt_control_queue_redraw_center();
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+void init_key_accels(dt_lib_module_t *self)
+{
+  dt_accel_register_lib(self, NC_("accel", "print"), GDK_KEY_p, GDK_CONTROL_MASK);
+}
+
+void connect_key_accels(dt_lib_module_t *self)
+{
+  dt_lib_print_settings_t *d = (dt_lib_print_settings_t *)self->data;
+
+  dt_accel_connect_button_lib(self, "print", GTK_WIDGET(d->print_button));
+}
+
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

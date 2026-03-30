@@ -20,7 +20,9 @@
 
 #ifdef FULL_API_H
 
-G_BEGIN_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <cairo/cairo.h>
 #include <glib.h>
@@ -42,7 +44,7 @@ OPTIONAL(void, gui_init, struct dt_view_t *self);       // create gtk elements, 
 OPTIONAL(void, cleanup, struct dt_view_t *self);        // cleanup *data
 OPTIONAL(void, expose, struct dt_view_t *self, cairo_t *cr, int32_t width, int32_t height, int32_t pointerx,
                        int32_t pointery);         // expose the module (gtk callback)
-OPTIONAL(gboolean, try_enter, struct dt_view_t *self); // test if enter can succeed.
+OPTIONAL(int, try_enter, struct dt_view_t *self); // test if enter can succeed.
 OPTIONAL(void, enter, struct dt_view_t *self);    // mode entered, this module got focus. return non-null on failure.
 OPTIONAL(void, leave, struct dt_view_t *self);    // mode left (is called after the new try_enter has succeeded).
 OPTIONAL(void, reset, struct dt_view_t *self);    // reset default appearance
@@ -58,8 +60,10 @@ OPTIONAL(int, button_pressed, struct dt_view_t *self, double x, double y, double
 OPTIONAL(void, configure, struct dt_view_t *self, int width, int height);
 OPTIONAL(void, scrolled, struct dt_view_t *self, double x, double y, int up, int state); // mouse scrolled in view
 OPTIONAL(void, scrollbar_changed, struct dt_view_t *self, double x, double y); // scrollbars changed in view
-OPTIONAL(gboolean, gesture_pan, struct dt_view_t *self, double x, double y, double dx, double dy, int state);
-OPTIONAL(gboolean, gesture_pinch, struct dt_view_t *self, double x, double y, int phase, double scale, int state);
+
+// keyboard accel callbacks
+OPTIONAL(void, init_key_accels, struct dt_view_t *self);
+OPTIONAL(void, connect_key_accels, struct dt_view_t *self);
 
 // list of mouse actions
 OPTIONAL(GSList *, mouse_actions, const struct dt_view_t *self);
@@ -68,13 +72,12 @@ OPTIONAL(GSList *, mouse_actions, const struct dt_view_t *self);
 
 #pragma GCC visibility pop
 
-G_END_DECLS
+#ifdef __cplusplus
+}
+#endif
 
 #endif // FULL_API_H
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

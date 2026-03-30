@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2020-2023 - darktable developers.
+   Copyright (C) 2020 - darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -22,9 +22,50 @@
 
 #pragma once
 
-/* Bring our own optimized maths functions */
 
-DT_OMP_DECLARE_SIMD()
+#if defined(_OPENMP) && !defined(_WIN32) && !defined(__GNUC__)
+
+#pragma omp declare simd
+extern float fmaxf(const float x, const float y);
+
+#pragma omp declare simd
+extern float fminf(const float x, const float y);
+
+#pragma omp declare simd
+extern float fabsf(const float x);
+
+#pragma omp declare simd
+extern float powf(const float x, const float y);
+
+#pragma omp declare simd
+extern float sqrtf(const float x);
+
+#pragma omp declare simd
+extern float cbrtf(const float x);
+
+#pragma omp declare simd
+extern float log2f(const float x);
+
+#pragma omp declare simd
+extern float exp2f(const float x);
+
+#pragma omp declare simd
+extern float log10f(const float x);
+
+#pragma omp declare simd
+extern float expf(const float x);
+
+#pragma omp declare simd
+extern float logf(const float x);
+
+#endif
+
+
+/* Bring our own optimized maths functions because Clang makes dumb shit */
+
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float fast_exp10f(const float x)
 {
   // we use the property : 10^x = exp(log(10) * x) = 2^(log(10) * x / log(2))
@@ -33,7 +74,9 @@ static inline float fast_exp10f(const float x)
 }
 
 // Since we are at it, write an optimized expf
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float fast_expf(const float x)
 {
   // we use the property : exp(x) = 2^(x / log(2))
@@ -42,7 +85,9 @@ static inline float fast_expf(const float x)
 }
 
 
-DT_OMP_DECLARE_SIMD(aligned(vector:16))
+#ifdef _OPENMP
+#pragma omp declare simd aligned(vector:16)
+#endif
 static inline float v_maxf(const float vector[3])
 {
   // Find the max over an RGB vector
@@ -50,44 +95,59 @@ static inline float v_maxf(const float vector[3])
 }
 
 
-DT_OMP_DECLARE_SIMD(aligned(vector:16))
+#ifdef _OPENMP
+#pragma omp declare simd aligned(vector:16)
+#endif
 static inline float v_minf(const float vector[3])
 {
   // Find the min over an RGB vector
   return fminf(fminf(vector[0], vector[1]), vector[2]);
 }
 
-DT_OMP_DECLARE_SIMD(aligned(vector:16))
+#ifdef _OPENMP
+#pragma omp declare simd aligned(vector:16)
+#endif
 static inline float v_sumf(const float vector[3])
 {
   return vector[0] + vector[1] + vector[2];
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float fmaxabsf(const float a, const float b)
 {
   // Find the max in absolute value and return it with its sign
-  return (fabsf(a) > fabsf(b)) ? a : (dt_isnan(b)) ? 0.f : b;
+  return (fabsf(a) > fabsf(b) && !isnan(a)) ? a :
+                                            (isnan(b)) ? 0.f : b;
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float fminabsf(const float a, const float b)
 {
   // Find the min in absolute value and return it with its sign
-  return (fabsf(a) < fabsf(b)) ? a : (dt_isnan(b)) ? 0.f : b;
+  return (fabsf(a) < fabsf(b) && !isnan(a)) ? a :
+                                            (isnan(b)) ? 0.f : b;
 }
 
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline float clamp_simd(const float x)
 {
   return fminf(fmaxf(x, 0.0f), 1.0f);
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
-// vim: shiftwidth=2 expandtab tabstop=2 cindent
-// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
 
+
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
+static inline float sqf(const float x)
+{
+  return x * x;
+}

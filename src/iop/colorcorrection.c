@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2023 darktable developers.
+    Copyright (C) 2009-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,6 +15,9 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces.h"
 #include "common/opencl.h"
@@ -68,7 +71,7 @@ const char *name()
   return _("color correction");
 }
 
-const char **description(dt_iop_module_t *self)
+const char *description(struct dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("correct white balance selectively for blacks and whites"),
                                       _("corrective or creative"),
@@ -87,11 +90,9 @@ int default_group()
   return IOP_GROUP_COLOR | IOP_GROUP_GRADING;
 }
 
-dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
-                                            dt_dev_pixelpipe_t *pipe,
-                                            dt_dev_pixelpipe_iop_t *piece)
+int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_LAB;
+  return iop_cs_Lab;
 }
 
 void init_presets(dt_iop_module_so_t *self)
@@ -104,7 +105,7 @@ void init_presets(dt_iop_module_so_t *self)
   p.hib = 3.0f;
   p.saturation = 1.0f;
   dt_gui_presets_add_generic(_("warm tone"), self->op,
-                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   p.loa = 3.55f;
   p.lob = 0.0f;
@@ -112,7 +113,7 @@ void init_presets(dt_iop_module_so_t *self)
   p.hib = 4.5f;
   p.saturation = 1.0f;
   dt_gui_presets_add_generic(_("warming filter"), self->op,
-                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   p.loa = -3.55f;
   p.lob = -0.0f;
@@ -120,16 +121,16 @@ void init_presets(dt_iop_module_so_t *self)
   p.hib = -4.5f;
   p.saturation = 1.0f;
   dt_gui_presets_add_generic(_("cooling filter"), self->op,
-                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
 }
 
-void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const i, void *const o,
+void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const i, void *const o,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_colorcorrection_data_t *const d = piece->data;
+  const dt_iop_colorcorrection_data_t *const d = (dt_iop_colorcorrection_data_t *)piece->data;
   const float *const restrict in = (float *)DT_IS_ALIGNED(i);
   float *const restrict out = (float *)DT_IS_ALIGNED(o);
-  if(!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, self, piece->colors,
+  if (!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, self, piece->colors,
                                          in, out, roi_in, roi_out))
     return; // image has been copied through to output and module's trouble flag has been updated
 
@@ -140,7 +141,11 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const float a_base = d->a_base;
   const float b_scale = d->b_scale;
   const float b_base = d->b_base;
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(roi_out, saturation, a_scale, a_base, b_scale, b_base, in, out) \
+  schedule(static)
+#endif
   for(size_t k = 0; k < (size_t)4 * roi_out->width * roi_out->height; k += 4)
   {
     out[k] = in[k];
@@ -151,46 +156,64 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 }
 
 #ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_colorcorrection_data_t *d = piece->data;
-  dt_iop_colorcorrection_global_data_t *gd = self->global_data;
+  dt_iop_colorcorrection_data_t *d = (dt_iop_colorcorrection_data_t *)piece->data;
+  dt_iop_colorcorrection_global_data_t *gd = (dt_iop_colorcorrection_global_data_t *)self->global_data;
 
+  cl_int err = -999;
   const int devid = piece->pipe->devid;
+
   const int width = roi_out->width;
   const int height = roi_out->height;
 
-  return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_colorcorrection, width, height,
-    CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(d->saturation), CLARG(d->a_scale),
-    CLARG(d->a_base), CLARG(d->b_scale), CLARG(d->b_base));
+  size_t sizes[2] = { ROUNDUPWD(width), ROUNDUPHT(height) };
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 0, sizeof(cl_mem), &dev_in);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 1, sizeof(cl_mem), &dev_out);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 2, sizeof(int), &width);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 3, sizeof(int), &height);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 4, sizeof(float), &d->saturation);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 5, sizeof(float), &d->a_scale);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 6, sizeof(float), &d->a_base);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 7, sizeof(float), &d->b_scale);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colorcorrection, 8, sizeof(float), &d->b_base);
+  err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_colorcorrection, sizes);
+  if(err != CL_SUCCESS) goto error;
+
+  return TRUE;
+
+error:
+  dt_print(DT_DEBUG_OPENCL, "[opencl_colorcorrection] couldn't enqueue kernel! %d\n", err);
+  return FALSE;
 }
 #endif
 
 
-void init_global(dt_iop_module_so_t *self)
+void init_global(dt_iop_module_so_t *module)
 {
   const int program = 2; // basic.cl from programs.conf
-  dt_iop_colorcorrection_global_data_t *gd = malloc(sizeof(dt_iop_colorcorrection_global_data_t));
-  self->data = gd;
+  dt_iop_colorcorrection_global_data_t *gd
+      = (dt_iop_colorcorrection_global_data_t *)malloc(sizeof(dt_iop_colorcorrection_global_data_t));
+  module->data = gd;
   gd->kernel_colorcorrection = dt_opencl_create_kernel(program, "colorcorrection");
 }
 
 
-void cleanup_global(dt_iop_module_so_t *self)
+void cleanup_global(dt_iop_module_so_t *module)
 {
-  dt_iop_colorcorrection_global_data_t *gd = self->data;
+  dt_iop_colorcorrection_global_data_t *gd = (dt_iop_colorcorrection_global_data_t *)module->data;
   dt_opencl_free_kernel(gd->kernel_colorcorrection);
-  free(self->data);
-  self->data = NULL;
+  free(module->data);
+  module->data = NULL;
 }
 
 
-void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
+void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)p1;
-  dt_iop_colorcorrection_data_t *d = piece->data;
+  dt_iop_colorcorrection_data_t *d = (dt_iop_colorcorrection_data_t *)piece->data;
   d->a_scale = (p->hia - p->loa) / 100.0;
   d->a_base = p->loa;
   d->b_scale = (p->hib - p->lob) / 100.0;
@@ -198,50 +221,51 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->saturation = p->saturation;
 }
 
-void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = malloc(sizeof(dt_iop_colorcorrection_data_t));
 }
 
-void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
 }
 
-void gui_update(dt_iop_module_t *self)
+void gui_update(struct dt_iop_module_t *self)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  dt_iop_colorcorrection_params_t *p = self->params;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+  dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
   dt_bauhaus_slider_set(g->slider, p->saturation);
-  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(self->widget);
 }
 
-static gboolean dt_iop_colorcorrection_draw(GtkWidget *widget, cairo_t *cr,
-                                            dt_iop_module_t *self);
+static gboolean dt_iop_colorcorrection_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data);
 static gboolean dt_iop_colorcorrection_motion_notify(GtkWidget *widget, GdkEventMotion *event,
-                                                     dt_iop_module_t *self);
+                                                     gpointer user_data);
 static gboolean dt_iop_colorcorrection_button_press(GtkWidget *widget, GdkEventButton *event,
-                                                    dt_iop_module_t *self);
+                                                    gpointer user_data);
 static gboolean dt_iop_colorcorrection_leave_notify(GtkWidget *widget, GdkEventCrossing *event,
-                                                    dt_iop_module_t *self);
-static gboolean dt_iop_colorcorrection_scrolled(GtkWidget *widget, GdkEventScroll *event,
-                                                dt_iop_module_t *self);
-static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey *event,
-                                                 dt_iop_module_t *self);
+                                                    gpointer user_data);
+static gboolean dt_iop_colorcorrection_scrolled(GtkWidget *widget, GdkEventScroll *event, gpointer user_data);
+static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data);
 
-void gui_init(dt_iop_module_t *self)
+void gui_init(struct dt_iop_module_t *self)
 {
   dt_iop_colorcorrection_gui_data_t *g = IOP_GUI_ALLOC(colorcorrection);
 
   g->selected = 0;
 
-  g->area = GTK_DRAWING_AREA(dtgtk_drawing_area_new_with_height(0));
+  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE);
+
+  g->area = GTK_DRAWING_AREA(dtgtk_drawing_area_new_with_aspect_ratio(1.0));
   g_object_set_data(G_OBJECT(g->area), "iop-instance", self);
   dt_action_define_iop(self, NULL, N_("grid"), GTK_WIDGET(g->area), NULL);
+  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(g->area), TRUE, TRUE, 0);
   gtk_widget_set_tooltip_text(GTK_WIDGET(g->area), _("drag the line for split-toning. "
                                                      "bright means highlights, dark means shadows. "
                                                      "use mouse wheel to change saturation."));
+
   gtk_widget_add_events(GTK_WIDGET(g->area), GDK_POINTER_MOTION_MASK | darktable.gui->scroll_mask
                                            | GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
                                            | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
@@ -256,7 +280,6 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(G_OBJECT(g->area), "scroll-event", G_CALLBACK(dt_iop_colorcorrection_scrolled), self);
   g_signal_connect(G_OBJECT(g->area), "key-press-event", G_CALLBACK(dt_iop_colorcorrection_key_press), self);
 
-  self->widget = dt_gui_vbox(g->area);
   g->slider = dt_bauhaus_slider_from_params(self, N_("saturation"));
   gtk_widget_set_tooltip_text(g->slider, _("set the global saturation"));
 
@@ -265,16 +288,19 @@ void gui_init(dt_iop_module_t *self)
   g->xform = cmsCreateTransform(hLab, TYPE_Lab_DBL, hsRGB, TYPE_RGB_DBL, INTENT_PERCEPTUAL, 0);
 }
 
-void gui_cleanup(dt_iop_module_t *self)
+void gui_cleanup(struct dt_iop_module_t *self)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
   cmsDeleteTransform(g->xform);
+
+  IOP_GUI_FREE;
 }
 
-static gboolean dt_iop_colorcorrection_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
+static gboolean dt_iop_colorcorrection_draw(GtkWidget *widget, cairo_t *crf, gpointer user_data)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  dt_iop_colorcorrection_params_t *p = self->params;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+  dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
 
   const int inset = DT_COLORCORRECTION_INSET;
   GtkAllocation allocation;
@@ -347,10 +373,11 @@ static gboolean dt_iop_colorcorrection_draw(GtkWidget *widget, cairo_t *crf, dt_
 }
 
 static gboolean dt_iop_colorcorrection_motion_notify(GtkWidget *widget, GdkEventMotion *event,
-                                                     dt_iop_module_t *self)
+                                                     gpointer user_data)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  dt_iop_colorcorrection_params_t *p = self->params;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+  dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
   const int inset = DT_COLORCORRECTION_INSET;
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
@@ -386,18 +413,19 @@ static gboolean dt_iop_colorcorrection_motion_notify(GtkWidget *widget, GdkEvent
       g->selected = 2;
   }
   if(g->selected > 0) gtk_widget_grab_focus(widget);
-  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(self->widget);
   return TRUE;
 }
 
 static gboolean dt_iop_colorcorrection_button_press(GtkWidget *widget, GdkEventButton *event,
-                                                    dt_iop_module_t *self)
+                                                    gpointer user_data)
 {
-  if(event->button == GDK_BUTTON_PRIMARY && event->type == GDK_2BUTTON_PRESS)
+  if(event->button == 1 && event->type == GDK_2BUTTON_PRESS)
   {
     // double click resets:
-    dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-    dt_iop_colorcorrection_params_t *p = self->params;
+    dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+    dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+    dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
     switch(g->selected)
     {
       case 1: // only reset lo
@@ -410,7 +438,7 @@ static gboolean dt_iop_colorcorrection_button_press(GtkWidget *widget, GdkEventB
         break;
       default: // reset everything
       {
-        const dt_iop_colorcorrection_params_t *const d = self->default_params;
+        dt_iop_colorcorrection_params_t *d = (dt_iop_colorcorrection_params_t *)self->default_params;
         memcpy(p, d, sizeof(*p));
         dt_dev_add_history_item(darktable.develop, self, TRUE);
       }
@@ -421,22 +449,23 @@ static gboolean dt_iop_colorcorrection_button_press(GtkWidget *widget, GdkEventB
 }
 
 static gboolean dt_iop_colorcorrection_leave_notify(GtkWidget *widget, GdkEventCrossing *event,
-                                                    dt_iop_module_t *self)
+                                                    gpointer user_data)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  gtk_widget_queue_draw(self->widget);
   return TRUE;
 }
 
-static gboolean dt_iop_colorcorrection_scrolled(GtkWidget *widget, GdkEventScroll *event, dt_iop_module_t *self)
+static gboolean dt_iop_colorcorrection_scrolled(GtkWidget *widget, GdkEventScroll *event, gpointer user_data)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  dt_iop_colorcorrection_params_t *p = self->params;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+  dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
 
   if(dt_gui_ignore_scroll(event)) return FALSE;
 
   int delta_y;
-  if(dt_gui_get_scroll_unit_delta(event, &delta_y))
+  if(dt_gui_get_scroll_unit_deltas(event, NULL, &delta_y))
   {
      p->saturation = CLAMP(p->saturation - 0.1 * delta_y, -3.0, 3.0);
      dt_bauhaus_slider_set(g->slider, p->saturation);
@@ -448,10 +477,11 @@ static gboolean dt_iop_colorcorrection_scrolled(GtkWidget *widget, GdkEventScrol
 
 #define COLORCORRECTION_DEFAULT_STEP (0.5f)
 
-static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey *event, dt_iop_module_t *self)
+static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data)
 {
-  dt_iop_colorcorrection_gui_data_t *g = self->gui_data;
-  dt_iop_colorcorrection_params_t *p = self->params;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_colorcorrection_gui_data_t *g = (dt_iop_colorcorrection_gui_data_t *)self->gui_data;
+  dt_iop_colorcorrection_params_t *p = (dt_iop_colorcorrection_params_t *)self->params;
   if(g->selected < 1) return FALSE;
 
   int handled = 0;
@@ -479,7 +509,21 @@ static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey 
 
   if(!handled) return FALSE;
 
-  float multiplier = dt_accel_get_speed_multiplier(widget, event->state);
+  float multiplier;
+
+  if(dt_modifier_is(event->state, GDK_SHIFT_MASK))
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_rough_step_multiplier");
+  }
+  else if(dt_modifier_is(event->state, GDK_CONTROL_MASK))
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_precise_step_multiplier");
+  }
+  else
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_step_multiplier");
+  }
+
   dx *= multiplier;
   dy *= multiplier;
 
@@ -501,9 +545,6 @@ static gboolean dt_iop_colorcorrection_key_press(GtkWidget *widget, GdkEventKey 
   return TRUE;
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

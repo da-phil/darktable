@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2025 darktable developers.
+    Copyright (C) 2016-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU Lesser General Public License as published by
@@ -16,12 +16,13 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "common/darktable.h"
 #include "common/module_api.h"
 
 #ifdef FULL_API_H
 
-G_BEGIN_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <glib.h>
 #include <stdint.h>
@@ -65,23 +66,17 @@ OPTIONAL(int, initialize_store, struct dt_imageio_module_storage_t *self, struct
                                 struct dt_imageio_module_format_t **format, struct dt_imageio_module_data_t **fdata,
                                 GList **images, const gboolean high_quality, const gboolean upscale);
 /* this actually does the work */
-REQUIRED(int, store, struct dt_imageio_module_storage_t *self, struct dt_imageio_module_data_t *self_data, const dt_imgid_t imgid,
+REQUIRED(int, store, struct dt_imageio_module_storage_t *self, struct dt_imageio_module_data_t *self_data, const int imgid,
                      struct dt_imageio_module_format_t *format, struct dt_imageio_module_data_t *fdata, const int num,
-                     const int total, const gboolean high_quality, const gboolean upscale,
-                     const gboolean is_scaling, const double scale_factor,
-                     const gboolean export_masks,
+                     const int total, const gboolean high_quality, const gboolean upscale, const gboolean export_masks,
                      const enum dt_colorspaces_color_profile_type_t icc_type, const gchar *icc_filename,
                      enum dt_iop_color_intent_t icc_intent, struct dt_export_metadata_t *metadata);
 /* called once at the end (after exporting all images), if implemented. */
 OPTIONAL(void, finalize_store, struct dt_imageio_module_storage_t *self, struct dt_imageio_module_data_t *data);
 
-OPTIONAL(void *, legacy_params,
-         struct dt_imageio_module_storage_t *self,
-         const void *const old_params,
-         const size_t old_params_size,
-         const int old_version,
-         int *new_version,
-         size_t *new_size);
+OPTIONAL(void *, legacy_params, struct dt_imageio_module_storage_t *self, const void *const old_params,
+                 const size_t old_params_size, const int old_version, const int new_version,
+                 size_t *new_size);
 REQUIRED(size_t, params_size, struct dt_imageio_module_storage_t *self);
 REQUIRED(void *, get_params, struct dt_imageio_module_storage_t *self);
 REQUIRED(void, free_params, struct dt_imageio_module_storage_t *self, struct dt_imageio_module_data_t *data);
@@ -91,22 +86,16 @@ OPTIONAL(void, export_dispatched, struct dt_imageio_module_storage_t *self);
 
 OPTIONAL(char *, ask_user_confirmation, struct dt_imageio_module_storage_t *self);
 
-/* ask the storage if export is currently possible */
-OPTIONAL(gboolean, export_enabled, struct dt_imageio_module_storage_t *self);
-
-/* for storage modules which require a login */
-OPTIONAL(gboolean, storage_login, struct dt_imageio_module_storage_t *self);
-
 #ifdef FULL_API_H
 
 #pragma GCC visibility pop
 
-G_END_DECLS
+#ifdef __cplusplus
+}
+#endif
 
 #endif // FULL_API_H
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

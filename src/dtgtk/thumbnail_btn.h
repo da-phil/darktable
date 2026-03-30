@@ -20,20 +20,30 @@
 
 #include "paint.h"
 #include <gtk/gtk.h>
-
 G_BEGIN_DECLS
+#define DTGTK_THUMBNAIL_BTN(obj)                                                                                  \
+  G_TYPE_CHECK_INSTANCE_CAST(obj, dtgtk_thumbnail_btn_get_type(), GtkDarktableThumbnailBtn)
+#define DTGTK_THUMBNAIL_BTN_CLASS(klass)                                                                          \
+  G_TYPE_CHECK_CLASS_CAST(klass, dtgtk_button_get_type(), GtkDarktableThumbnailBtnClass)
+#define DTGTK_IS_THUMBNAIL_BTN(obj) G_TYPE_CHECK_INSTANCE_TYPE(obj, dtgtk_thumbnail_btn_get_type())
+#define DTGTK_IS_THUMBNAIL_BTN_CLASS(klass) G_TYPE_CHECK_CLASS_TYPE(obj, dtgtk_thumbnail_btn_get_type())
 
-#define DTGTK_TYPE_THUMBNAIL_BTN dtgtk_thumbnail_btn_get_type()
-G_DECLARE_FINAL_TYPE(GtkDarktableThumbnailBtn, dtgtk_thumbnail_btn, DTGTK, THUMBNAIL_BTN, GtkDrawingArea)
 
-struct _GtkDarktableThumbnailBtn
+typedef struct _GtkDarktableThumbnailBtn
 {
   GtkDrawingArea widget;
   DTGTKCairoPaintIconFunc icon;
   gint icon_flags;
   void *icon_data;
   gboolean hidden;
-};
+} GtkDarktableThumbnailBtn;
+
+typedef struct _GtkDarktableThumbnailBtnClass
+{
+  GtkDrawingAreaClass parent_class;
+} GtkDarktableThumbnailBtnClass;
+
+GType dtgtk_thumbnail_btn_get_type(void);
 
 /** instantiate a new darktable button control passing paint function as content */
 GtkWidget *dtgtk_thumbnail_btn_new(DTGTKCairoPaintIconFunc paint, gint paintflags, void *paintdata);
@@ -42,9 +52,6 @@ gboolean dtgtk_thumbnail_btn_is_hidden(GtkWidget *widget);
 
 G_END_DECLS
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

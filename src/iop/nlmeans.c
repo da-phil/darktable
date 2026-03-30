@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2025 darktable developers.
+    Copyright (C) 2011-2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,6 +15,9 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bauhaus/bauhaus.h"
 #include "common/nlmeans_core.h"
 #include "common/opencl.h"
@@ -29,6 +32,10 @@
 #include <gtk/gtk.h>
 #include <stdlib.h>
 
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
+
 // which version of the non-local means code should be used?  0=old (this file), 1=new (src/common/nlmeans_core.c)
 #define USE_NEW_IMPL_CL 0
 
@@ -39,6 +46,12 @@
 // this is the version of the modules parameters,
 // and includes version information about compile-time dt
 DT_MODULE_INTROSPECTION(2, dt_iop_nlmeans_params_t)
+
+typedef struct dt_iop_nlmeans_params_v1_t
+{
+  float luma;
+  float chroma;
+} dt_iop_nlmeans_params_v1_t;
 
 typedef struct dt_iop_nlmeans_params_t
 {
@@ -80,57 +93,31 @@ const char *aliases()
   return _("denoise (non-local means)");
 }
 
-const char **description(dt_iop_module_t *self)
+const char *description(struct dt_iop_module_t *self)
 {
-  return dt_iop_set_description(self, _("apply a poisson noise removal\n"
-                                        "best suited for astrophotography"),
+  return dt_iop_set_description(self, _("apply a poisson noise removal best suited for astrophotography"),
                                       _("corrective"),
                                       _("non-linear, Lab, display-referred"),
                                       _("non-linear, Lab"),
                                       _("non-linear, Lab, display-referred"));
 }
 
-dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
-                                            dt_dev_pixelpipe_t *pipe,
-                                            dt_dev_pixelpipe_iop_t *piece)
+int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_LAB;
+  return iop_cs_Lab;
 }
 
-int legacy_params(dt_iop_module_t *self,
-                  const void *const old_params,
-                  const int old_version,
-                  void **new_params,
-                  int32_t *new_params_size,
-                  int *new_version)
+int legacy_params(dt_iop_module_t *self, const void *const old_params, const int old_version,
+                  void *new_params, const int new_version)
 {
-  typedef struct dt_iop_nlmeans_params_v2_t
+  if(old_version == 1 && new_version == 2)
   {
-    float radius;
-    float strength;
-    float luma;
-    float chroma;
-  } dt_iop_nlmeans_params_v2_t;
-
-  if(old_version == 1)
-  {
-    typedef struct dt_iop_nlmeans_params_v1_t
-    {
-      float luma;
-      float chroma;
-    } dt_iop_nlmeans_params_v1_t;
-
-    const dt_iop_nlmeans_params_v1_t *o = (dt_iop_nlmeans_params_v1_t *)old_params;
-    dt_iop_nlmeans_params_v2_t *n = malloc(sizeof(dt_iop_nlmeans_params_v2_t));
-
+    dt_iop_nlmeans_params_v1_t *o = (dt_iop_nlmeans_params_v1_t *)old_params;
+    dt_iop_nlmeans_params_t *n = (dt_iop_nlmeans_params_t *)new_params;
     n->luma = o->luma;
     n->chroma = o->chroma;
     n->strength = 100.0f;
     n->radius = 3;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_nlmeans_params_v2_t);
-    *new_version = 2;
     return 0;
   }
   return 1;
@@ -157,11 +144,11 @@ static int bucket_next(unsigned int *state, unsigned int max)
   return next;
 }
 
-int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_nlmeans_params_t *d = piece->data;
-  dt_iop_nlmeans_global_data_t *gd = self->global_data;
+  dt_iop_nlmeans_params_t *d = (dt_iop_nlmeans_params_t *)piece->data;
+  dt_iop_nlmeans_global_data_t *gd = (dt_iop_nlmeans_global_data_t *)self->global_data;
 #if USE_NEW_IMPL_CL
   const int width = roi_in->width;
   const int height = roi_in->height;
@@ -180,7 +167,10 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   const int devid = piece->pipe->devid;
   cl_mem dev_U2 = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * width * height);
   if(dev_U2 == NULL)
-     return DT_OPENCL_SYSMEM_ALLOCATION;
+  {
+    dt_print(DT_DEBUG_OPENCL, "[opencl_nlmeans] couldn't allocate GPU buffer\n");
+    return FALSE;
+  }
 
   const dt_nlmeans_param_t params =
   {
@@ -202,22 +192,31 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
     .kernel_accu = gd->kernel_nlmeans_accu
   };
   cl_int err = nlmeans_denoise_cl(&params, devid, dev_in, dev_U2, roi_in);
-  if(err == CL_SUCCESS)
+  if (err == CL_SUCCESS)
   {
     // normalize and blend
+    size_t sizes[] = { ROUNDUPWD(width), ROUNDUPHT(height), 1 };
     const float weight[4] = { d->luma, d->chroma, d->chroma, 1.0f };
-    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_finish, width, height,
-      CLARG(dev_in), CLARG(dev_U2), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(weight));
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 0, sizeof(cl_mem), (void *)&dev_in);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 1, sizeof(cl_mem), (void *)&dev_U2);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 2, sizeof(cl_mem), (void *)&dev_out);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 3, sizeof(int), (void *)&width);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 4, sizeof(int), (void *)&height);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 5, 4 * sizeof(float), (void *)&weight);
+    err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_nlmeans_finish, sizes);
   }
   // clean up and check whether all kernels ran successfully
   dt_opencl_release_mem_object(dev_U2);
-  return err;
+  if (err == CL_SUCCESS)
+    return TRUE;
+  dt_print(DT_DEBUG_OPENCL, "[opencl_nlmeans] couldn't enqueue kernel! %d\n", err);
+  return FALSE;
 
 #else // old code
   const int width = roi_in->width;
   const int height = roi_in->height;
 
-  cl_int err = DT_OPENCL_DEFAULT_ERROR;
+  cl_int err = -999;
 
   const float scale = fminf(roi_in->scale, 2.0f) / fmaxf(piece->iscale, 1.0f);
   const int P = ceilf(d->radius * scale); // pixel filter size
@@ -248,7 +247,7 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
                                   .cellsize = sizeof(float), .overhead = 0,
                                   .sizex = 1 << 16, .sizey = 1 };
 
-  if(dt_opencl_local_buffer_opt(devid, gd->kernel_nlmeans_horiz, &hlocopt) == CL_SUCCESS)
+  if(dt_opencl_local_buffer_opt(devid, gd->kernel_nlmeans_horiz, &hlocopt))
     hblocksize = hlocopt.sizex;
   else
     hblocksize = 1;
@@ -259,17 +258,22 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
                                   .cellsize = sizeof(float), .overhead = 0,
                                   .sizex = 1, .sizey = 1 << 16 };
 
-  if(dt_opencl_local_buffer_opt(devid, gd->kernel_nlmeans_vert, &vlocopt) == CL_SUCCESS)
+  if(dt_opencl_local_buffer_opt(devid, gd->kernel_nlmeans_vert, &vlocopt))
     vblocksize = vlocopt.sizey;
   else
     vblocksize = 1;
 
+
   size_t sizesl[3];
   size_t local[3];
+  size_t sizes[] = { ROUNDUPWD(width), ROUNDUPHT(height), 1 };
 
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_init, width, height,
-          CLARG(dev_U2), CLARG(width), CLARG(height));
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_init, 0, sizeof(cl_mem), (void *)&dev_U2);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_init, 1, sizeof(int), (void *)&width);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_init, 2, sizeof(int), (void *)&height);
+  err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_nlmeans_init, sizes);
   if(err != CL_SUCCESS) goto error;
+
 
   const size_t bwidth = ROUNDUP(width, hblocksize);
   const size_t bheight = ROUNDUP(height, vblocksize);
@@ -280,69 +284,105 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
       int q[2] = { i, j };
 
       cl_mem dev_U4 = buckets[bucket_next(&state, NUM_BUCKETS)];
-
-      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_dist, width, height,
-        CLARG(dev_in), CLARG(dev_U4), CLARG(width),
-        CLARG(height), CLARG(q), CLARG(nL2), CLARG(nC2));
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 0, sizeof(cl_mem), (void *)&dev_in);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 1, sizeof(cl_mem), (void *)&dev_U4);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 2, sizeof(int), (void *)&width);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 3, sizeof(int), (void *)&height);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 4, 2 * sizeof(int), (void *)&q);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 5, sizeof(float), (void *)&nL2);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_dist, 6, sizeof(float), (void *)&nC2);
+      err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_nlmeans_dist, sizes);
       if(err != CL_SUCCESS) goto error;
 
       sizesl[0] = bwidth;
-      sizesl[1] = ROUNDUPDHT(height, devid);
+      sizesl[1] = ROUNDUPHT(height);
       sizesl[2] = 1;
       local[0] = hblocksize;
       local[1] = 1;
       local[2] = 1;
       cl_mem dev_U4_t = buckets[bucket_next(&state, NUM_BUCKETS)];
-      err = dt_opencl_enqueue_kernel_2d_local_args(devid, gd->kernel_nlmeans_horiz, sizesl, local,
-        CLARG(dev_U4), CLARG(dev_U4_t), CLARG(width),
-        CLARG(height), CLARG(q), CLARG(P), CLLOCAL((hblocksize + 2 * P) * sizeof(float)));
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 0, sizeof(cl_mem), (void *)&dev_U4);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 1, sizeof(cl_mem), (void *)&dev_U4_t);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 2, sizeof(int), (void *)&width);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 3, sizeof(int), (void *)&height);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 4, 2 * sizeof(int), (void *)&q);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 5, sizeof(int), (void *)&P);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_horiz, 6, (hblocksize + 2 * P) * sizeof(float), NULL);
+      err = dt_opencl_enqueue_kernel_2d_with_local(devid, gd->kernel_nlmeans_horiz, sizesl, local);
       if(err != CL_SUCCESS) goto error;
 
 
-      sizesl[0] = ROUNDUPDWD(width, devid);
+      sizesl[0] = ROUNDUPWD(width);
       sizesl[1] = bheight;
       sizesl[2] = 1;
       local[0] = 1;
       local[1] = vblocksize;
       local[2] = 1;
       cl_mem dev_U4_tt = buckets[bucket_next(&state, NUM_BUCKETS)];
-      err = dt_opencl_enqueue_kernel_2d_local_args(devid, gd->kernel_nlmeans_vert, sizesl, local,
-        CLARG(dev_U4_t), CLARG(dev_U4_tt),
-        CLARG(width), CLARG(height), CLARG(q), CLARG(P), CLARG(sharpness), CLLOCAL((vblocksize + 2 * P) * sizeof(float)));
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 0, sizeof(cl_mem), (void *)&dev_U4_t);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 1, sizeof(cl_mem), (void *)&dev_U4_tt);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 2, sizeof(int), (void *)&width);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 3, sizeof(int), (void *)&height);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 4, 2 * sizeof(int), (void *)&q);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 5, sizeof(int), (void *)&P);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 6, sizeof(float), (void *)&sharpness);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_vert, 7, (vblocksize + 2 * P) * sizeof(float), NULL);
+      err = dt_opencl_enqueue_kernel_2d_with_local(devid, gd->kernel_nlmeans_vert, sizesl, local);
       if(err != CL_SUCCESS) goto error;
 
-      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_accu, width, height,
-        CLARG(dev_in), CLARG(dev_U2), CLARG(dev_U4_tt),
-        CLARG(width), CLARG(height), CLARG(q));
+
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 0, sizeof(cl_mem), (void *)&dev_in);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 1, sizeof(cl_mem), (void *)&dev_U2);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 2, sizeof(cl_mem), (void *)&dev_U4_tt);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 3, sizeof(int), (void *)&width);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 4, sizeof(int), (void *)&height);
+      dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_accu, 5, 2 * sizeof(int), (void *)&q);
+      err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_nlmeans_accu, sizes);
       if(err != CL_SUCCESS) goto error;
 
-      dt_opencl_finish_sync_pipe(devid, piece->pipe->type);
+      if(!darktable.opencl->async_pixelpipe || piece->pipe->type == DT_DEV_PIXELPIPE_EXPORT)
+        dt_opencl_finish(devid);
 
       // indirectly give gpu some air to breathe (and to do display related stuff)
-      dt_opencl_micro_nap(devid);
+      dt_iop_nap(darktable.opencl->micro_nap);
     }
 
   // normalize and blend
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_finish, width, height,
-    CLARG(dev_in), CLARG(dev_U2), CLARG(dev_out),
-    CLARG(width), CLARG(height), CLARG(weight));
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 0, sizeof(cl_mem), (void *)&dev_in);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 1, sizeof(cl_mem), (void *)&dev_U2);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 2, sizeof(cl_mem), (void *)&dev_out);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 3, sizeof(int), (void *)&width);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 4, sizeof(int), (void *)&height);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_nlmeans_finish, 5, 4 * sizeof(float), (void *)&weight);
+  err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_nlmeans_finish, sizes);
+  if(err != CL_SUCCESS) goto error;
+
+  dt_opencl_release_mem_object(dev_U2);
+  for(int k = 0; k < NUM_BUCKETS; k++)
+  {
+    dt_opencl_release_mem_object(buckets[k]);
+  }
+  return TRUE;
 
 error:
   dt_opencl_release_mem_object(dev_U2);
   for(int k = 0; k < NUM_BUCKETS; k++)
-     dt_opencl_release_mem_object(buckets[k]);
+  {
+    dt_opencl_release_mem_object(buckets[k]);
+  }
 
-  return err;
+  dt_print(DT_DEBUG_OPENCL, "[opencl_nlmeans] couldn't enqueue kernel! %d\n", err);
+  return FALSE;
 #endif /* USE_NEW_IMPL_CL */
 }
 #endif
 
 
-void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+void tiling_callback(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
-                     dt_develop_tiling_t *tiling)
+                     struct dt_develop_tiling_t *tiling)
 {
-  dt_iop_nlmeans_params_t *d = piece->data;
+  dt_iop_nlmeans_params_t *d = (dt_iop_nlmeans_params_t *)piece->data;
   const int P = ceilf(d->radius * fmin(roi_in->scale, 2.0f) / fmax(piece->iscale, 1.0f)); // pixel filter size
   const int K = ceilf(7 * fmin(roi_in->scale, 2.0f) / fmax(piece->iscale, 1.0f));         // nbhood
 
@@ -350,19 +390,22 @@ void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   tiling->maxbuf = 1.0f;
   tiling->overhead = 0;
   tiling->overlap = P + K;
-  tiling->align = 1;
+  tiling->xalign = 1;
+  tiling->yalign = 1;
+  return;
 }
 
-void process(
-        dt_iop_module_t *self,
-        dt_dev_pixelpipe_iop_t *piece,
-        const void *const ivoid,
-        void *const ovoid,
-        const dt_iop_roi_t *const roi_in,
-        const dt_iop_roi_t *const roi_out)
+static void process_cpu(dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+                        void *const ovoid, const dt_iop_roi_t *const roi_in,
+                        const dt_iop_roi_t *const roi_out,
+                        void (*denoiser)(const float *const inbuf, float *const outbuf,
+                                         const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out,
+                                         const dt_nlmeans_param_t *const params))
 {
-  const dt_iop_nlmeans_params_t *const d = piece->data;
-  if(!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, piece->module, piece->colors,
+  // this is called for preview and full pipe separately, each with its own pixelpipe piece.
+  // get our data struct:
+  const dt_iop_nlmeans_params_t *const d = (dt_iop_nlmeans_params_t *)piece->data;
+  if (!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, piece->module, piece->colors,
                                          ivoid, ovoid, roi_in, roi_out))
     return; // image has been copied through to output and module's trouble flag has been updated
 
@@ -373,12 +416,12 @@ void process(
   const float sharpness = 3000.0f / (1.0f + d->strength);
 
   // adjust to Lab, make L more important
-  const float max_L = 120.0f, max_C = 512.0f;
-  const float nL = 1.0f / max_L, nC = 1.0f / max_C;
+  float max_L = 120.0f, max_C = 512.0f;
+  float nL = 1.0f / max_L, nC = 1.0f / max_C;
   const dt_aligned_pixel_t norm2 = { nL * nL, nC * nC, nC * nC, 1.0f };
 
   // faster but less accurate processing by skipping half the patches on previews and thumbnails
-  const int decimate = (piece->pipe->type & (DT_DEV_PIXELPIPE_PREVIEW | DT_DEV_PIXELPIPE_THUMBNAIL));
+  int decimate = (piece->pipe->type == DT_DEV_PIXELPIPE_PREVIEW || piece->pipe->type == DT_DEV_PIXELPIPE_THUMBNAIL);
 
   const dt_nlmeans_param_t params = { .scattering = 0,
                                       .scale = scale,
@@ -390,15 +433,34 @@ void process(
                                       .search_radius = K,
                                       .decimate = decimate,
                                       .norm = norm2 };
-
-  nlmeans_denoise(ivoid, ovoid, roi_in, roi_out, &params);
+  denoiser(ivoid,ovoid,roi_in,roi_out,&params);
+  if(piece->pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
+    dt_iop_alpha_copy(ivoid, ovoid, roi_out->width, roi_out->height);
 }
 
-void init_global(dt_iop_module_so_t *self)
+void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+             void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  process_cpu(piece,ivoid,ovoid,roi_in,roi_out,nlmeans_denoise);
+  return;
+}
+
+#if defined(__SSE__)
+/** process, all real work is done here. */
+void process_sse2(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+                  void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  process_cpu(piece,ivoid,ovoid,roi_in,roi_out,nlmeans_denoise_sse2);
+  return;
+}
+#endif
+
+void init_global(dt_iop_module_so_t *module)
 {
   const int program = 5; // nlmeans.cl, from programs.conf
-  dt_iop_nlmeans_global_data_t *gd = malloc(sizeof(dt_iop_nlmeans_global_data_t));
-  self->data = gd;
+  dt_iop_nlmeans_global_data_t *gd
+      = (dt_iop_nlmeans_global_data_t *)malloc(sizeof(dt_iop_nlmeans_global_data_t));
+  module->data = gd;
   gd->kernel_nlmeans_init = dt_opencl_create_kernel(program, "nlmeans_init");
   gd->kernel_nlmeans_dist = dt_opencl_create_kernel(program, "nlmeans_dist");
   gd->kernel_nlmeans_horiz = dt_opencl_create_kernel(program, "nlmeans_horiz");
@@ -407,39 +469,50 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_nlmeans_finish = dt_opencl_create_kernel(program, "nlmeans_finish");
 }
 
-void cleanup_global(dt_iop_module_so_t *self)
+void cleanup_global(dt_iop_module_so_t *module)
 {
-  dt_iop_nlmeans_global_data_t *gd = self->data;
+  dt_iop_nlmeans_global_data_t *gd = (dt_iop_nlmeans_global_data_t *)module->data;
   dt_opencl_free_kernel(gd->kernel_nlmeans_init);
   dt_opencl_free_kernel(gd->kernel_nlmeans_dist);
   dt_opencl_free_kernel(gd->kernel_nlmeans_horiz);
   dt_opencl_free_kernel(gd->kernel_nlmeans_vert);
   dt_opencl_free_kernel(gd->kernel_nlmeans_accu);
   dt_opencl_free_kernel(gd->kernel_nlmeans_finish);
-  free(self->data);
-  self->data = NULL;
+  free(module->data);
+  module->data = NULL;
 }
 
 /** commit is the synch point between core and gui, so it copies params to pipe data. */
-void commit_params(dt_iop_module_t *self, dt_iop_params_t *params, dt_dev_pixelpipe_t *pipe,
+void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *params, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_nlmeans_params_t *p = (dt_iop_nlmeans_params_t *)params;
-  dt_iop_nlmeans_data_t *d = piece->data;
+  dt_iop_nlmeans_data_t *d = (dt_iop_nlmeans_data_t *)piece->data;
   memcpy(d, p, sizeof(*d));
   d->luma = MAX(0.0001f, p->luma);
   d->chroma = MAX(0.0001f, p->chroma);
 }
 
-void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = malloc(sizeof(dt_iop_nlmeans_data_t));
 }
 
-void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
+}
+
+void gui_update(dt_iop_module_t *self)
+{
+  // let gui slider match current parameters:
+  dt_iop_nlmeans_gui_data_t *g = (dt_iop_nlmeans_gui_data_t *)self->gui_data;
+  dt_iop_nlmeans_params_t *p = (dt_iop_nlmeans_params_t *)self->params;
+  dt_bauhaus_slider_set_soft(g->radius, p->radius);
+  dt_bauhaus_slider_set_soft(g->strength, p->strength);
+  dt_bauhaus_slider_set(g->luma, p->luma);
+  dt_bauhaus_slider_set(g->chroma, p->chroma);
 }
 
 void gui_init(dt_iop_module_t *self)
@@ -449,22 +522,23 @@ void gui_init(dt_iop_module_t *self)
   g->radius = dt_bauhaus_slider_from_params(self, "radius");
   dt_bauhaus_slider_set_soft_max(g->radius, 4.0f);
   dt_bauhaus_slider_set_digits(g->radius, 0);
+  dt_bauhaus_slider_set_format(g->radius, "%.0f");
   gtk_widget_set_tooltip_text(g->radius, _("radius of the patches to match"));
   g->strength = dt_bauhaus_slider_from_params(self, N_("strength"));
   dt_bauhaus_slider_set_soft_max(g->strength, 100.0f);
   dt_bauhaus_slider_set_digits(g->strength, 0);
-  dt_bauhaus_slider_set_format(g->strength, "%");
+  dt_bauhaus_slider_set_format(g->strength, "%.0f%%");
   gtk_widget_set_tooltip_text(g->strength, _("strength of the effect"));
   g->luma = dt_bauhaus_slider_from_params(self, N_("luma"));
-  dt_bauhaus_slider_set_format(g->luma, "%");
+  dt_bauhaus_slider_set_factor(g->luma, 100.0f);
+  dt_bauhaus_slider_set_format(g->luma, "%.0f%%");
   gtk_widget_set_tooltip_text(g->luma, _("how much to smooth brightness"));
   g->chroma = dt_bauhaus_slider_from_params(self, N_("chroma"));
-  dt_bauhaus_slider_set_format(g->chroma, "%");
+  dt_bauhaus_slider_set_factor(g->chroma, 100.0f);
+  dt_bauhaus_slider_set_format(g->chroma, "%.0f%%");
   gtk_widget_set_tooltip_text(g->chroma, _("how much to smooth colors"));
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

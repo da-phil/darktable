@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2012-2024 darktable developers.
+    Copyright (C) 2012-2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,116 +15,8 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-
 #include "gtkentry.h"
 #include "common/darktable.h"
-
-typedef struct completion_spec
-{
-  gchar *varname;
-  gchar *description;
-} dt_gtkentry_completion_spec;
-
-typedef enum
-{
-  COMPL_ID = 0,
-  COMPL_VARNAME,
-  COMPL_DESCRIPTION
-} dtGtkEntryCompletionSpecCol;
-
-
-static dt_gtkentry_completion_spec _default_path_compl_list[]
-  = { { "ROLL.NAME[]", N_("$(ROLL.NAME[n]) - roll of the input image, n: levels used") },
-      { "FILE.FOLDER", N_("$(FILE.FOLDER) - folder containing the input image") },
-      { "FILE.NAME", N_("$(FILE.NAME) - basename of the input image") },
-      { "FILE.EXTENSION", N_("$(FILE.EXTENSION) - extension of the input image") },
-      { "VERSION", N_("$(VERSION) - duplicate version") },
-      { "VERSION.IF_MULTI", N_("$(VERSION.IF_MULTI) - same as $(VERSION) but null string if only one version exists") },
-      { "VERSION.NAME", N_("$(VERSION.NAME) - version name from metadata") },
-      { "JOBCODE", N_("$(JOBCODE) - job code for import") },
-      { "SEQUENCE[4,1]", N_("$(SEQUENCE[n,m]) - sequence number, n: number of digits, m: start number") },
-      { "WIDTH.MAX", N_("$(WIDTH.MAX) - maximum image export width") },
-      { "WIDTH.SENSOR", N_("$(WIDTH.SENSOR) - image sensor width") },
-      { "WIDTH.RAW", N_("$(WIDTH.RAW) - RAW image width") },
-      { "WIDTH.CROP", N_("$(WIDTH.CROP) - image width after crop") },
-      { "WIDTH.EXPORT", N_("$(WIDTH.EXPORT) - exported image width") },
-      { "HEIGHT.MAX", N_("$(HEIGHT.MAX) - maximum image export height") },
-      { "HEIGHT.SENSOR", N_("$(HEIGHT.SENSOR) - image sensor height") },
-      { "HEIGHT.RAW", N_("$(HEIGHT.RAW) - RAW image height") },
-      { "HEIGHT.CROP", N_("$(HEIGHT.CROP) - image height after crop") },
-      { "HEIGHT.EXPORT", N_("$(HEIGHT.EXPORT) - exported image height") },
-      { "YEAR", N_("$(YEAR) - year") },
-      { "YEAR.SHORT", N_("$(YEAR.SHORT) - year without century") },
-      { "MONTH", N_("$(MONTH) - month") },
-      { "MONTH.SHORT", N_("$(MONTH.SHORT) - abbreviated month name according to the current locale") },
-      { "MONTH.LONG", N_("$(MONTH.LONG) - full month name according to the current locale") },
-      { "DAY", N_("$(DAY) - day") },
-      { "HOUR", N_("$(HOUR) - hour") },
-      { "HOUR.AMPM", N_("$(HOUR.AMPM) - hour, 12-hour clock") },
-      { "MINUTE", N_("$(MINUTE) - minute") },
-      { "SECOND", N_("$(SECOND) - second") },
-      { "MSEC", N_("$(MSEC) - millisecond") },
-      { "EXIF.DATE.REGIONAL", N_("$(EXIF.DATE.REGIONAL) - localized EXIF date") },
-      { "EXIF.TIME.REGIONAL", N_("$(EXIF.TIME.REGIONAL) - localized EXIF time") },
-      { "EXIF.YEAR", N_("$(EXIF.YEAR) - EXIF year") },
-      { "EXIF.YEAR.SHORT", N_("$(EXIF.YEAR.SHORT) - EXIF year without century") },
-      { "EXIF.MONTH", N_("$(EXIF.MONTH) - EXIF month") },
-      { "EXIF.MONTH.SHORT", N_("$(EXIF.MONTH.SHORT) - abbreviated EXIF month name according to the current locale") },
-      { "EXIF.MONTH.LONG", N_("$(EXIF.MONTH.LONG) - full EXIF month name according to the current locale") },
-      { "EXIF.DAY", N_("$(EXIF.DAY) - EXIF day") },
-      { "EXIF.HOUR", N_("$(EXIF.HOUR) - EXIF hour") },
-      { "EXIF.HOUR.AMPM", N_("$(EXIF.HOUR.AMPM) - EXIF hour, 12-hour clock") },
-      { "EXIF.MINUTE", N_("$(EXIF.MINUTE) - EXIF minute") },
-      { "EXIF.SECOND", N_("$(EXIF.SECOND) - EXIF second") },
-      { "EXIF.MSEC", N_("$(EXIF.MSEC) - EXIF millisecond") },
-      { "EXIF.ISO", N_("$(EXIF.ISO) - ISO value") },
-      { "EXIF.EXPOSURE.BIAS", N_("$(EXIF.EXPOSURE.BIAS) - EXIF exposure bias") },
-      { "EXIF.EXPOSURE.PROGRAM", N_("$(EXIF.EXPOSURE.PROGRAM) - EXIF exposure program") },
-      { "EXIF.EXPOSURE", N_("$(EXIF.EXPOSURE) - EXIF exposure") },
-      { "EXIF.APERTURE", N_("$(EXIF.APERTURE) - EXIF aperture") },
-      { "EXIF.CROP_FACTOR", N_("$(EXIF.CROP_FACTOR) - EXIF crop factor") },
-      { "EXIF.FOCAL.LENGTH", N_("$(EXIF.FOCAL.LENGTH) - EXIF focal length") },
-      { "EXIF.FOCAL.LENGTH.EQUIV", N_("$(EXIF.FOCAL.LENGTH.EQUIV) - EXIF 35 mm equivalent focal length") },
-      { "EXIF.FOCUS.DISTANCE", N_("$(EXIF.FOCUS.DISTANCE) - EXIF focal distance") },
-      { "EXIF.MAKER", N_("$(EXIF.MAKER) - camera maker") },
-      { "EXIF.MODEL", N_("$(EXIF.MODEL) - camera model") },
-      { "EXIF.WHITEBALANCE", N_("$(EXIF.WHITEBALANCE) - EXIF selected white balance") },
-      { "EXIF.METERING", N_("$(EXIF.METERING) - EXIF exposure metering mode") },
-      { "EXIF.LENS", N_("$(EXIF.LENS) - lens") },
-      { "EXIF.FLASH.ICON", N_("$(EXIF.FLASH.ICON) - icon indicating whether flash was used") },
-      { "EXIF.FLASH", N_("$(EXIF.FLASH) - was flash used (yes/no/--)") },
-      { "GPS.LONGITUDE", N_("$(GPS.LONGITUDE) - longitude") },
-      { "GPS.LATITUDE", N_("$(GPS.LATITUDE) - latitude") },
-      { "GPS.ELEVATION", N_("$(GPS.ELEVATION) - elevation") },
-      { "GPS.LOCATION.ICON", N_("$(GPS.LOCATION.ICON) - icon indicating whether GPS location is known") },
-      { "LONGITUDE", N_("$(LONGITUDE) - longitude") },
-      { "LATITUDE", N_("$(LATITUDE) - latitude") },
-      { "ELEVATION", N_("$(ELEVATION) - elevation") },
-      { "STARS", N_("$(STARS) - star rating as number (-1 for rejected)") },
-      { "RATING.ICONS", N_("$(RATING.ICONS) - star/reject rating in icon form") },
-      { "LABELS", N_("$(LABELS) - color labels as text") },
-      { "LABELS.ICONS", N_("$(LABELS.ICONS) - color labels as icons") },
-      { "IMAGE.TAGS.HIERARCHY", N_("$(IMAGE.TAGS.HIERARCHY) - tags as set in metadata settings, preserving hierarchy") },
-      { "IMAGE.TAGS", N_("$(IMAGE.TAGS) - tags as set in metadata settings, flattened") },
-      { "IMAGE.ID", N_("$(IMAGE.ID) - image ID") },
-      { "IMAGE.ID.NEXT", N_("$(IMAGE.ID.NEXT) - next image ID to be assigned on import") },
-      { "ID", N_("$(ID) - image ID") },
-      { "USERNAME", N_("$(USERNAME) - login name") },
-      { "FOLDER.PICTURES", N_("$(FOLDER.PICTURES) - pictures folder") },
-      { "FOLDER.HOME", N_("$(FOLDER.HOME) - home folder") },
-      { "FOLDER.DESKTOP", N_("$(FOLDER.DESKTOP) - desktop folder") },
-      { "OPENCL.ACTIVATED", N_("$(OPENCL.ACTIVATED) - whether OpenCL is activated") },
-      { "CATEGORY[,]", N_("$(CATEGORY[n,category]) - subtag of level n in hierarchical tags") },
-      { "TAGS", N_("$(TAGS) - tags as set in metadata settings") },
-      { "DARKTABLE.NAME", N_("$(DARKTABLE.NAME) - darktable name") },
-      { "DARKTABLE.VERSION", N_("$(DARKTABLE.VERSION) - current darktable version") },
-      { "SIDECAR_TXT", N_("$(SIDECAR_TXT) - contents of .txt sidecar file, if present") },
-      { "WORKSPACE.LABEL", N_("$(WORKSPACE.LABEL) - label of the current workspace") },
-      { NULL, NULL } };
-
-
-static GtkListStore *_completion_model = NULL;
-
 
 /**
  * Called when the user selects an entry from the autocomplete list.
@@ -136,10 +28,8 @@ static GtkListStore *_completion_model = NULL;
  *
  * @return Currently always true
  */
-static gboolean _on_match_select(GtkEntryCompletion *widget,
-                                 GtkTreeModel *model,
-                                 GtkTreeIter *iter,
-                                 gpointer user_data)
+static gboolean on_match_select(GtkEntryCompletion *widget, GtkTreeModel *model, GtkTreeIter *iter,
+                                gpointer user_data)
 {
 
   const gchar *varname;
@@ -188,10 +78,8 @@ static gboolean _on_match_select(GtkEntryCompletion *widget,
  * @param iter       Item in list of autocomplete database to compare key against.
  * @param user_data  Unused.
  */
-static gboolean _on_match_func(GtkEntryCompletion *completion,
-                               const gchar *key,
-                               GtkTreeIter *iter,
-                               gpointer user_data)
+static gboolean on_match_func(GtkEntryCompletion *completion, const gchar *key, GtkTreeIter *iter,
+                              gpointer user_data)
 {
   gboolean ret = FALSE;
 
@@ -244,85 +132,131 @@ static gboolean _on_match_func(GtkEntryCompletion *completion,
   return ret;
 }
 
-static void _init_completion_model()
+/**
+ * This function initializes entry with an autocomplete table
+ * specified by compl_list. To set the default darktable variables,
+ * use dt_gtkentry_get_default_path_compl_list().
+ *
+ * @param[in] entry GtkEntry
+ * @param[in] compl_list A {NULL,NULL} terminated array containing
+ *                       {variable,description} for each available
+ *                       completion text.
+ */
+void dt_gtkentry_setup_completion(GtkEntry *entry, const dt_gtkentry_completion_spec *compl_list)
 {
-  _completion_model = gtk_list_store_new(3,
-                                         G_TYPE_INT,
-                                         G_TYPE_STRING,
-                                         G_TYPE_STRING);
-  /* Populate the completion database. */
-  for(const dt_gtkentry_completion_spec *l = _default_path_compl_list; l && l->varname; l++)
-  {
-    gtk_list_store_insert_with_values(_completion_model, NULL, -1,
-                       COMPL_ID, -1,  // -1 = internal
-                       COMPL_VARNAME, l->varname,
-                       COMPL_DESCRIPTION, _(l->description),
-                       -1);
-  }
-
-  // metadata
-  dt_pthread_mutex_lock(&darktable.metadata_threadsafe);
-  for(GList *md_iter = dt_metadata_get_list(); md_iter; md_iter = md_iter->next)
-  {
-    dt_metadata_t *metadata = (dt_metadata_t *)md_iter->data;
-    if(!metadata->internal)
-      dt_gtkentry_variables_add_metadata(metadata);
-  }
-  dt_pthread_mutex_unlock(&darktable.metadata_threadsafe);
-}
-
-void dt_gtkentry_setup_variables_completion(GtkEntry *entry)
-{
-  if(!_completion_model)
-    _init_completion_model();
-
   GtkEntryCompletion *completion = gtk_entry_completion_new();
-  gtk_entry_completion_set_text_column(completion, COMPL_DESCRIPTION);
-  gtk_entry_set_completion(entry, completion);
-  g_signal_connect(G_OBJECT(completion), "match-selected", G_CALLBACK(_on_match_select), NULL);
-
-  gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(_completion_model));
-  gtk_entry_completion_set_match_func(completion, _on_match_func, NULL, NULL);
-}
-
-void dt_gtkentry_variables_add_metadata(dt_metadata_t *metadata)
-{
-  gchar *varname = g_strdup(metadata->tagname);
-  gchar *description = g_strdup_printf("$(%s) - %s", varname, _("from metadata"));
-  gtk_list_store_insert_with_values(_completion_model, NULL, -1,
-                      COMPL_ID, metadata->key,
-                      COMPL_VARNAME, varname,
-                      COMPL_DESCRIPTION, description,
-                      -1);
-  g_free(varname);
-  g_free(description);
-}
-
-void dt_gtkentry_variables_remove_metadata(dt_metadata_t *metadata)
-{
+  GtkListStore *model = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
   GtkTreeIter iter;
 
-  gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(_completion_model), &iter);
-  while(valid)
+  gtk_entry_completion_set_text_column(completion, COMPL_DESCRIPTION);
+  gtk_entry_set_completion(entry, completion);
+  g_signal_connect(G_OBJECT(completion), "match-selected", G_CALLBACK(on_match_select), NULL);
+
+  /* Populate the completion database. */
+  for(const dt_gtkentry_completion_spec *l = compl_list; l && l->varname; l++)
   {
-    int32_t id;
-    gtk_tree_model_get(GTK_TREE_MODEL(_completion_model), &iter,
-                       COMPL_ID, &id,
-                       -1);
-
-    if(id == metadata->key)
-    {
-      gtk_list_store_remove(_completion_model, &iter);
-      break;
-    }
-
-    valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(_completion_model), &iter);
+    gtk_list_store_append(model, &iter);
+    gtk_list_store_set(model, &iter, COMPL_VARNAME, l->varname, COMPL_DESCRIPTION, _(l->description), -1);
   }
+  gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(model));
+  gtk_entry_completion_set_match_func(completion, on_match_func, NULL, NULL);
+  g_object_unref(model);
+}
+
+/**
+ * The default set of image metadata of interest for use in image paths.
+ */
+const dt_gtkentry_completion_spec *dt_gtkentry_get_default_path_compl_list()
+{
+  static dt_gtkentry_completion_spec default_path_compl_list[]
+      = { { "ROLL_NAME", N_("$(ROLL_NAME) - roll of the input image") },
+          { "FILE_FOLDER", N_("$(FILE_FOLDER) - folder containing the input image") },
+          { "FILE_NAME", N_("$(FILE_NAME) - basename of the input image") },
+          { "FILE_EXTENSION", N_("$(FILE_EXTENSION) - extension of the input image") },
+          { "VERSION", N_("$(VERSION) - duplicate version") },
+          { "VERSION_IF_MULTI", N_("$(VERSION_IF_MULTI) - same as $(VERSION) but null string if only one version exists") },
+          { "VERSION_NAME", N_("$(VERSION_NAME) - version name from metadata") },
+          { "SEQUENCE", N_("$(SEQUENCE) - sequence number") },
+          { "MAX_WIDTH", N_("$(MAX_WIDTH) - maximum image export width") },
+          { "MAX_HEIGHT", N_("$(MAX_HEIGHT) - maximum image export height") },
+          { "SENSOR_WIDTH", N_("$(SENSOR_WIDTH) - image sensor width") },
+          { "SENSOR_HEIGHT", N_("$(SENSOR_HEIGHT) - image sensor height") },
+          { "RAW_WIDTH", N_("$(RAW_WIDTH) - RAW image width") },
+          { "RAW_HEIGHT", N_("$(RAW_HEIGHT) - RAW image height") },
+          { "CROP_WIDTH", N_("$(CROP_WIDTH) - image width after crop") },
+          { "CROP_HEIGHT", N_("$(CROP_HEIGHT) - image height after crop") },
+          { "EXPORT_WIDTH", N_("$(EXPORT_WIDTH) - exported image width") },
+          { "EXPORT_HEIGHT", N_("$(EXPORT_HEIGHT) - exported image height") },
+          { "YEAR", N_("$(YEAR) - year") },
+          { "MONTH", N_("$(MONTH) - month") },
+          { "DAY", N_("$(DAY) - day") },
+          { "HOUR", N_("$(HOUR) - hour") },
+          { "MINUTE", N_("$(MINUTE) - minute") },
+          { "SECOND", N_("$(SECOND) - second") },
+          { "EXIF_YEAR", N_("$(EXIF_YEAR) - EXIF year") },
+          { "EXIF_MONTH", N_("$(EXIF_MONTH) - EXIF month") },
+          { "EXIF_DAY", N_("$(EXIF_DAY) - EXIF day") },
+          { "EXIF_HOUR", N_("$(EXIF_HOUR) - EXIF hour") },
+          { "EXIF_MINUTE", N_("$(EXIF_MINUTE) - EXIF minute") },
+          { "EXIF_SECOND", N_("$(EXIF_SECOND) - EXIF second") },
+          { "EXIF_ISO", N_("$(EXIF_ISO) - ISO value") },
+          { "EXIF_EXPOSURE", N_("$(EXIF_EXPOSURE) - EXIF exposure") },
+          { "EXIF_EXPOSURE_BIAS", N_("$(EXIF_EXPOSURE_BIAS) - EXIF exposure bias") },
+          { "EXIF_APERTURE", N_("$(EXIF_APERTURE) - EXIF aperture") },
+          { "EXIF_FOCAL_LENGTH", N_("$(EXIF_FOCAL_LENGTH) - EXIF focal length") },
+          { "EXIF_FOCUS_DISTANCE", N_("$(EXIF_FOCUS_DISTANCE) - EXIF focal distance") },
+          { "LONGITUDE", N_("$(LONGITUDE) - longitude") },
+          { "LATITUDE", N_("$(LATITUDE) - latitude") },
+          { "ELEVATION", N_("$(ELEVATION) - elevation") },
+          { "STARS", N_("$(STARS) - star rating") },
+          { "LABELS", N_("$(LABELS) - colorlabels") },
+          { "MAKER", N_("$(MAKER) - camera maker") },
+          { "MODEL", N_("$(MODEL) - camera model") },
+          { "LENS", N_("$(LENS) - lens") },
+          { "TITLE", N_("$(TITLE) - title from metadata") },
+          { "DESCRIPTION", N_("$(DESCRIPTION) - description from metadata") },
+          { "CREATOR", N_("$(CREATOR) - creator from metadata") },
+          { "PUBLISHER", N_("$(PUBLISHER) - publisher from metadata") },
+          { "RIGHTS", N_("$(RIGHTS) - rights from metadata") },
+          { "PICTURES_FOLDER", N_("$(PICTURES_FOLDER) - pictures folder") },
+          { "HOME", N_("$(HOME) - home folder") },
+          { "DESKTOP", N_("$(DESKTOP) - desktop folder") },
+          { "OPENCL", N_("$(OPENCL_ACTIVATED) - whether OpenCL is activated") },
+          { "CATEGORY", N_("$(CATEGORY0(category)) - subtag of level 0 in hierarchical tags") },
+          { "TAGS", N_("$(TAGS) - tags as set in metadata settings") },
+          { NULL, NULL } };
+
+  return default_path_compl_list;
+}
+
+/**
+ * Builds the tooltip text for a GtkEntry. Uses the same datatype as
+ * used for initializing the auto completion table above.
+ *
+ * @return g_malloc()'ed string. Must be free'd by the caller.
+ */
+gchar *dt_gtkentry_build_completion_tooltip_text(const gchar *header,
+                                                 const dt_gtkentry_completion_spec *compl_list)
+{
+  size_t array_len = 0;
+  for(dt_gtkentry_completion_spec const *p = compl_list; p->description != NULL; p++) array_len++;
+  const gchar **lines = malloc(sizeof(gchar *) * (array_len + 2));
+  const gchar **l = lines;
+  *l++ = header;
+
+  for(dt_gtkentry_completion_spec const *p = compl_list; p->description != NULL; p++, l++)
+    *l = _(p->description);
+
+  *l = NULL;
+
+  gchar *ret = g_strjoinv("\n", (gchar **)lines);
+
+  free(lines);
+
+  return ret;
 }
 
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

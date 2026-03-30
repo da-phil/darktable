@@ -194,20 +194,15 @@ endif()
 # For registration to libraw_config.h
 MACRO_BOOL_TO_01(JPEG8_FOUND LIBRAW_USE_DNGLOSSYCODEC)
 
-# OpenMP check
-set(OPENMP_SUPPORT_CAN_BE_COMPILED false)
 if(ENABLE_OPENMP)
-    find_package(OpenMP)
-    if(OpenMP_FOUND)
-        set(OPENMP_SUPPORT_CAN_BE_COMPILED true)
-    endif()
+    find_package(OpenMP REQUIRED)
 endif()
 
 # For registration to libraw_config.h
-MACRO_BOOL_TO_01(OPENMP_SUPPORT_CAN_BE_COMPILED LIBRAW_USE_OPENMP)
+MACRO_BOOL_TO_01(OpenMP_FOUND LIBRAW_USE_OPENMP)
 
 # Jasper library check
-set(JASPER_SUPPORT_CAN_BE_COMPILED false)
+set(JASPER_FOUND false)
 if(ENABLE_JASPER)
     find_package(Jasper)
 
@@ -215,12 +210,11 @@ if(ENABLE_JASPER)
     if(JASPER_FOUND)
         add_definitions(-DUSE_JASPER)
         include_directories(${JASPER_INCLUDE_DIR})
-        set(JASPER_SUPPORT_CAN_BE_COMPILED true)
     endif()
 endif()
 
 # For registration to libraw_config.h
-MACRO_BOOL_TO_01(JASPER_SUPPORT_CAN_BE_COMPILED LIBRAW_USE_REDCINECODEC)
+MACRO_BOOL_TO_01(JASPER_FOUND LIBRAW_USE_REDCINECODEC)
 
 # For RawSpeed Codec Support
 
@@ -367,7 +361,7 @@ message(STATUS "----------------------------------------------------------------
 message(STATUS " Libraw ${RAW_LIB_VERSION_STRING} configuration            <http://www.libraw.org>")
 message(STATUS "")
 
-if(OPENMP_SUPPORT_CAN_BE_COMPILED)
+if(OpenMP_FOUND)
     message(STATUS " Libraw will be compiled with OpenMP support .................. YES")
 else()
     message(STATUS " Libraw will be compiled with OpenMP support .................. NO")
@@ -385,7 +379,7 @@ else()
     message(STATUS " Libraw will be compiled with example command-line programs ... NO")
 endif()
 
-if(JASPER_SUPPORT_CAN_BE_COMPILED)
+if(JASPER_FOUND)
     message(STATUS " Libraw will be compiled with RedCine codec support ........... YES")
 else()
     message(STATUS " Libraw will be compiled with RedCine codec support ........... NO")
@@ -491,7 +485,7 @@ if(WIN32)
     target_link_libraries(raw PUBLIC ws2_32)
 endif()
 
-if(OPENMP_SUPPORT_CAN_BE_COMPILED)
+if(OpenMP_FOUND)
     target_link_libraries(raw PUBLIC OpenMP::OpenMP_CXX)
     if(MINGW)
         target_compile_definitions(raw PRIVATE LIBRAW_FORCE_OPENMP)
@@ -510,7 +504,7 @@ if(JPEG8_FOUND)
     target_link_libraries(raw PUBLIC JPEG::JPEG)
 endif()
 
-if(JASPER_SUPPORT_CAN_BE_COMPILED)
+if(JASPER_FOUND)
     target_link_libraries(raw PUBLIC ${JASPER_LIBRARIES})
 endif()
 
@@ -558,7 +552,7 @@ if(WIN32)
     target_link_libraries(raw_r PUBLIC ws2_32)
 endif()
 
-if(OPENMP_SUPPORT_CAN_BE_COMPILED)
+if(OpenMP_FOUND)
     target_link_libraries(raw_r PUBLIC OpenMP::OpenMP_CXX)
     if(MINGW)
         target_compile_definitions(raw_r PRIVATE LIBRAW_FORCE_OPENMP)
@@ -577,7 +571,7 @@ if(JPEG8_FOUND)
     target_link_libraries(raw_r PUBLIC JPEG::JPEG)
 endif()
 
-if(JASPER_SUPPORT_CAN_BE_COMPILED)
+if(JASPER_FOUND)
     target_link_libraries(raw_r PUBLIC ${JASPER_LIBRARIES})
 endif()
 
@@ -625,7 +619,6 @@ if (LIBRAW_INSTALL)
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
            )
-
 
     if(NOT BUILD_SHARED_LIBS AND "${CMAKE_CXX_SIMULATE_ID}" STREQUAL "MSVC")
         message("ClangCl does not support pdb generation with static libraries")

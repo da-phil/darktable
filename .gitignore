@@ -12,7 +12,6 @@ cscope.out
 .*.swp
 .vscode/
 .clangd/
-.cache
 tags
 cscope.*
 compile_commands.json
@@ -21,9 +20,3 @@ compile_commands.json
 .settings/
 diff*png
 output*png
-*.code-workspace
-Brewfile.lock.json
-CMakeLists.txt.user
-workspace/
-cmake-build-debug/
-.idea/

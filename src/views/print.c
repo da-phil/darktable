@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2014-2023 darktable developers.
+    Copyright (C) 2014-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -46,6 +46,7 @@ typedef struct dt_print_t
 {
   dt_print_info_t *pinfo;
   dt_images_box *imgs;
+  int32_t last_selected;
 }
 dt_print_t;
 
@@ -59,81 +60,110 @@ uint32_t view(const dt_view_t *self)
   return DT_VIEW_PRINT;
 }
 
-static void _print_mipmaps_updated_signal_callback(gpointer instance,
-                                                   dt_imgid_t imgid,
-                                                   gpointer user_data)
+static void _print_mipmaps_updated_signal_callback(gpointer instance, int imgid, gpointer user_data)
 {
   dt_control_queue_redraw_center();
 }
 
-static void _view_print_settings(const dt_view_t *view,
-                                 dt_print_info_t *pinfo,
-                                 dt_images_box *imgs)
+static void _film_strip_activated(const int imgid, void *data)
 {
-  dt_print_t *prt = view->data;
+  const dt_view_t *self = (dt_view_t *)data;
+  dt_print_t *prt = (dt_print_t *)self->data;
+
+  prt->last_selected = imgid;
+
+  // only select from filmstrip if there is a single image displayed, otherwise
+  // we will drag and drop into different areas.
+
+  if(prt->imgs->count != 1) return;
+
+  // if the previous shown image is selected and the selection is unique
+  // then we change the selected image to the new one
+  if(prt->imgs->box[0].imgid > 0)
+  {
+    sqlite3_stmt *stmt;
+    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                                "SELECT m.imgid"
+                                " FROM memory.collected_images as m, main.selected_images as s"
+                                " WHERE m.imgid=s.imgid",
+                                -1, &stmt, NULL);
+    gboolean follow = FALSE;
+    if(sqlite3_step(stmt) == SQLITE_ROW)
+    {
+      if(sqlite3_column_int(stmt, 0) == prt->imgs->box[0].imgid
+         && sqlite3_step(stmt) != SQLITE_ROW)
+      {
+        follow = TRUE;
+      }
+    }
+    sqlite3_finalize(stmt);
+    if(follow)
+    {
+      dt_selection_select_single(darktable.selection, imgid);
+    }
+  }
+
+  prt->imgs->box[0].imgid = imgid;
+
+  dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui), imgid, TRUE);
+
+  // update the active images list
+  g_slist_free(darktable.view_manager->active_images);
+  darktable.view_manager->active_images = g_slist_prepend(NULL, GINT_TO_POINTER(imgid));
+  DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_ACTIVE_IMAGES_CHANGE);
+
+  // force redraw
+  dt_control_queue_redraw();
+}
+
+static void _view_print_filmstrip_activate_callback(gpointer instance, int imgid, gpointer user_data)
+{
+  if(imgid > 0) _film_strip_activated(imgid, user_data);
+}
+
+static void _view_print_settings(const dt_view_t *view, dt_print_info_t *pinfo, dt_images_box *imgs)
+{
+  dt_print_t *prt = (dt_print_t *)view->data;
 
   prt->pinfo = pinfo;
   prt->imgs = imgs;
   dt_control_queue_redraw();
 }
 
-static void _drag_and_drop_received(GtkWidget *widget,
-                                    GdkDragContext *context,
-                                    gint x,
-                                    gint y,
-                                    GtkSelectionData *selection_data,
-                                    guint target_type,
-                                    guint time,
-                                    gpointer user_data)
+static void _drag_and_drop_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y,
+                                   GtkSelectionData *selection_data, guint target_type, guint time,
+                                   gpointer data)
 {
-  const dt_view_t *self = (dt_view_t *)user_data;
-  dt_print_t *prt = self->data;
+  const dt_view_t *self = (dt_view_t *)data;
+  dt_print_t *prt = (dt_print_t *)self->data;
 
   const int bidx = dt_printing_get_image_box(prt->imgs, x, y);
 
-  gboolean success = FALSE;
-
   if(bidx != -1)
-  {
-    const int imgs_nb = gtk_selection_data_get_length(selection_data) / sizeof(dt_imgid_t);
-    if(imgs_nb)
-    {
-      dt_imgid_t *imgs = (dt_imgid_t *)gtk_selection_data_get_data(selection_data);
+    dt_printing_setup_image(prt->imgs, bidx, prt->last_selected,
+                            100, 100, ALIGNMENT_CENTER);
 
-      // imgs[0] is always the image selected when starting the d&d
-      const dt_imgid_t imgid = imgs[0];
-
-      dt_printing_setup_image(prt->imgs, bidx, imgid,
-                              100, 100, ALIGNMENT_CENTER);
-      success = TRUE;
-    }
-  }
-
-  gtk_drag_finish(context, success, FALSE, time);
   prt->imgs->motion_over = -1;
   dt_control_queue_redraw_center();
 }
 
-static gboolean _drag_motion_received(GtkWidget *widget,
-                                      GdkDragContext *dc,
-                                      const gint x,
-                                      const gint y,
-                                      const guint time,
+static gboolean _drag_motion_received(GtkWidget *widget, GdkDragContext *dc,
+                                      gint x, gint y, guint time,
                                       gpointer data)
 {
   const dt_view_t *self = (dt_view_t *)data;
-  dt_print_t *prt = self->data;
+  dt_print_t *prt = (dt_print_t *)self->data;
 
   const int bidx = dt_printing_get_image_box(prt->imgs, x, y);
   prt->imgs->motion_over = bidx;
 
-  if(bidx != -1)
-    dt_control_queue_redraw_center();
+  if(bidx != -1) dt_control_queue_redraw_center();
 
   return TRUE;
 }
 
-void init(dt_view_t *self)
+void
+init(dt_view_t *self)
 {
   self->data = calloc(1, sizeof(dt_print_t));
 
@@ -144,20 +174,16 @@ void init(dt_view_t *self)
 
 void cleanup(dt_view_t *self)
 {
-  dt_print_t *prt = self->data;
+  dt_print_t *prt = (dt_print_t *)self->data;
   free(prt);
 }
 
-static void _expose_print_page(dt_view_t *self,
-                               cairo_t *cr,
-                               const int32_t width,
-                               const int32_t height,
-                               const int32_t pointerx,
-                               const int32_t pointery)
+static void expose_print_page(dt_view_t *self, cairo_t *cr,
+                              int32_t width, int32_t height, int32_t pointerx, int32_t pointery)
 {
-  dt_print_t *prt = self->data;
+  dt_print_t *prt = (dt_print_t *)self->data;
 
-  if(prt->pinfo == NULL)
+  if (prt->pinfo == NULL)
     return;
 
   float px=.0f, py=.0f, pwidth=.0f, pheight=.0f;
@@ -251,38 +277,24 @@ static void _expose_print_page(dt_view_t *self,
   cairo_fill (cr);
 }
 
-void expose(dt_view_t *self,
-            cairo_t *cri,
-            int32_t width_i,
-            int32_t height_i,
-            int32_t pointerx,
-            int32_t pointery)
+void expose(dt_view_t *self, cairo_t *cri, int32_t width_i, int32_t height_i, int32_t pointerx, int32_t pointery)
 {
   // clear the current surface
   dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_PRINT_BG);
   cairo_paint(cri);
 
-  // print page & borders only. Images are displayed in
-  // gui_post_expose in print_settings module.
-
-  _expose_print_page(self, cri, width_i, height_i, pointerx, pointery);
+  // print page & borders only. Images are displayed in gui_post_expose in print_settings module
+  expose_print_page(self, cri, width_i, height_i, pointerx, pointery);
 }
 
-void mouse_moved(dt_view_t *self,
-                 double x,
-                 double y,
-                 double pressure,
-                 int which)
+void mouse_moved(dt_view_t *self, double x, double y, double pressure, int which)
 {
-  const dt_print_t *prt = self->data;
+  const dt_print_t *prt = (dt_print_t *)self->data;
 
-  // if we are not hovering over a thumbnail in the filmstrip -> show
-  // metadata of first opened image.
+  // if we are not hovering over a thumbnail in the filmstrip -> show metadata of first opened image.
+  const int32_t mouse_over_id = dt_control_get_mouse_over_id();
 
-  const dt_imgid_t mouse_over_id = dt_control_get_mouse_over_id();
-
-  if(prt->imgs->count == 1
-     && mouse_over_id != prt->imgs->box[0].imgid)
+  if(prt->imgs->count == 1 && mouse_over_id != prt->imgs->box[0].imgid)
   {
     dt_control_set_mouse_over_id(prt->imgs->box[0].imgid);
   }
@@ -290,7 +302,7 @@ void mouse_moved(dt_view_t *self,
   {
     const int bidx = dt_printing_get_image_box(prt->imgs, x, y);
     if(bidx == -1)
-      dt_control_set_mouse_over_id(NO_IMGID);
+      dt_control_set_mouse_over_id(-1);
     else if(mouse_over_id != prt->imgs->box[bidx].imgid)
     {
       dt_control_set_mouse_over_id(prt->imgs->box[bidx].imgid);
@@ -298,64 +310,62 @@ void mouse_moved(dt_view_t *self,
   }
 }
 
-gboolean try_enter(dt_view_t *self)
+int try_enter(dt_view_t *self)
 {
   dt_print_t *prt = (dt_print_t*)self->data;
 
-  if(prt->pinfo->num_printers == 0)
-  {
-    dt_control_log(_("no printers found!"));
-    return TRUE;
-  }
-
   //  now check that there is at least one selected image
 
-  const dt_imgid_t imgid = dt_act_on_get_main_image();
+  const int imgid = dt_view_get_image_to_act_on();
 
-  if(!dt_is_valid_imgid(imgid))
+  if(imgid < 0)
   {
     // fail :(
-    dt_control_log(_("no image to open!"));
-    return TRUE;
+    dt_control_log(_("no image to open !"));
+    return 1;
   }
 
   // this loads the image from db if needed:
-  const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+  const dt_image_t *img = dt_image_cache_get(darktable.image_cache, imgid, 'r');
   // get image and check if it has been deleted from disk first!
 
   char imgfilename[PATH_MAX] = { 0 };
   gboolean from_cache = TRUE;
-  if(img) dt_image_full_path(img->id, imgfilename, sizeof(imgfilename), &from_cache);
-  if(!img || !g_file_test(imgfilename, G_FILE_TEST_IS_REGULAR))
+  dt_image_full_path(img->id, imgfilename, sizeof(imgfilename), &from_cache);
+  if(!g_file_test(imgfilename, G_FILE_TEST_IS_REGULAR))
   {
     dt_control_log(_("image `%s' is currently unavailable"), img->filename);
-    dt_image_cache_read_release(img);
+    dt_image_cache_read_release(darktable.image_cache, img);
     return 1;
   }
   // and drop the lock again.
-  dt_image_cache_read_release(img);
+  dt_image_cache_read_release(darktable.image_cache, img);
 
   // we need to setup the selected image
   prt->imgs->imgid_to_load = imgid;
 
-  return FALSE;
+  return 0;
 }
 
 void enter(dt_view_t *self)
 {
-  dt_print_t *prt = (dt_print_t*)self->data;
+  dt_print_t *prt=(dt_print_t*)self->data;
 
   /* scroll filmstrip to the first selected image */
   if(prt->imgs->imgid_to_load >= 0)
   {
     // change active image
-    dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui),
-                                   prt->imgs->box[0].imgid, TRUE);
+    dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui), prt->imgs->box[0].imgid, TRUE);
     dt_view_active_images_reset(FALSE);
     dt_view_active_images_add(prt->imgs->imgid_to_load, TRUE);
   }
 
-  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_MIPMAP_UPDATED, _print_mipmaps_updated_signal_callback, self);
+  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_DEVELOP_MIPMAP_UPDATED,
+                            G_CALLBACK(_print_mipmaps_updated_signal_callback),
+                            (gpointer)self);
+
+  DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE,
+                            G_CALLBACK(_view_print_filmstrip_activate_callback), self);
 
   gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
 
@@ -371,20 +381,22 @@ void enter(dt_view_t *self)
 
 void leave(dt_view_t *self)
 {
-  dt_print_t *prt = (dt_print_t*)self->data;
-  GtkWidget *widget = dt_ui_center(darktable.gui->ui);
+  dt_print_t *prt=(dt_print_t*)self->data;
 
   /* disconnect from mipmap updated signal */
-  DT_CONTROL_SIGNAL_DISCONNECT_ALL(self, "print");
+  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_print_mipmaps_updated_signal_callback),
+                               (gpointer)self);
+
+  /* disconnect from filmstrip image activate */
+  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals,
+                               G_CALLBACK(_view_print_filmstrip_activate_callback),
+                               (gpointer)self);
 
   dt_printing_clear_boxes(prt->imgs);
-
-  g_signal_handlers_disconnect_by_func(widget, G_CALLBACK(_drag_and_drop_received), self);
-  g_signal_handlers_disconnect_by_func(widget, G_CALLBACK(_drag_motion_received), self);
+//  g_signal_disconnect(widget, "drag-data-received", G_CALLBACK(_drag_and_drop_received));
+//  g_signal_disconnect(widget, "drag-motion", G_CALLBACK(_drag_motion_received));
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

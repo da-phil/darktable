@@ -22,11 +22,15 @@
 
 #include "paint.h"
 #include <gtk/gtk.h>
-
 G_BEGIN_DECLS
-
-#define DTGTK_TYPE_GRADIENT_SLIDER dtgtk_gradient_slider_get_type()
-G_DECLARE_FINAL_TYPE(GtkDarktableGradientSlider, dtgtk_gradient_slider, DTGTK, GRADIENT_SLIDER, GtkDrawingArea)
+#define DTGTK_GRADIENT_SLIDER(obj)                                                                           \
+  G_TYPE_CHECK_INSTANCE_CAST(obj, dtgtk_gradient_slider_get_type(), GtkDarktableGradientSlider)
+#define DTGTK_GRADIENT_SLIDER_CLASS(klass)                                                                   \
+  G_TYPE_CHECK_CLASS_CAST(klass, dtgtk_gradient_slider_get_type(), GtkDarktableGradientSliderClass)
+#define DTGTK_IS_GRADIENT_SLIDER(obj)                                                                        \
+  G_TYPE_CHECK_INSTANCE_TYPE(obj, dtgtk_gradient_slider_get_type())
+#define DTGTK_IS_GRADIENT_SLIDER_CLASS(klass)                                                                \
+  G_TYPE_CHECK_CLASS_TYPE(obj, dtgtk_gradient_slider_get_type())
 
 #define DTGTK_GRADIENT_SLIDER_MULTIVALUE(obj)                                                                \
   G_TYPE_CHECK_INSTANCE_CAST(obj, dtgtk_gradient_slider_multivalue_get_type(), GtkDarktableGradientSlider)
@@ -88,7 +92,7 @@ enum
   PROPORTIONAL_MARKERS = 2
 };
 
-struct _GtkDarktableGradientSlider
+typedef struct _GtkDarktableGradientSlider
 {
   GtkDrawingArea widget;
   GList *colors;
@@ -111,7 +115,12 @@ struct _GtkDarktableGradientSlider
   gint markers_type;
   guint timeout_handle;
   float (*scale_callback)(GtkWidget*, float, int); // scale callback function
-};
+} GtkDarktableGradientSlider;
+
+typedef struct _GtkDarktableGradientSliderClass
+{
+  GtkDrawingAreaClass parent_class;
+} GtkDarktableGradientSliderClass;
 
 typedef struct _gradient_slider_stop_t
 {
@@ -194,9 +203,6 @@ void dtgtk_gradient_slider_multivalue_set_scale_callback(GtkDarktableGradientSli
 
 G_END_DECLS
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

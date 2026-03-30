@@ -1,6 +1,6 @@
 /*
   This file is part of darktable,
-  Copyright (C) 2016-2025 darktable developers.
+  Copyright (C) 2016-2020 darktable developers.
 
   darktable is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -138,7 +138,10 @@
  */
 /*----------------------------------------------------------------------------*/
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <float.h>
 #include "common/math.h"
 
 #ifndef FALSE
@@ -153,10 +156,10 @@
 #define NOTDEF -1024.0
 
 /** 3/2 pi */
-#define M_3_2_PI M_PI * 3.0 / 2.0
+#define M_3_2_PI 4.71238898038
 
 /** 2 pi */
-#define M_2__PI  2.0 * M_PI
+#define M_2__PI  6.28318530718
 
 /** Label for pixels not used in yet. */
 #define NOTUSED 0
@@ -188,7 +191,7 @@ struct point {int x,y;};
  */
 static void error(char * msg)
 {
-  dt_print(DT_DEBUG_ALWAYS,"LSD Error: %s",msg);
+  fprintf(stderr,"LSD Error: %s\n",msg);
   exit(EXIT_FAILURE);
 }
 
@@ -208,7 +211,7 @@ static void error(char * msg)
     should be related to the cumulated rounding error in the chain of
     computation. Here, as a simplification, a fixed factor is used.
  */
-static int double_equal(const double a, const double b)
+static int double_equal(double a, double b)
 {
   double abs_diff,aa,bb,abs_max;
 
@@ -234,7 +237,7 @@ static int double_equal(const double a, const double b)
 /*----------------------------------------------------------------------------*/
 /** Computes Euclidean distance between point (x1,y1) and point (x2,y2).
  */
-static double dist(const double x1, const double y1, const double x2, const double y2)
+static double dist(double x1, double y1, double x2, double y2)
 {
   return sqrt( (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1) );
 }
@@ -276,7 +279,7 @@ typedef struct ntuple_list_s
 /*----------------------------------------------------------------------------*/
 /** Free memory used in n-tuple 'in'.
  */
-static void free_ntuple_list(const ntuple_list in)
+static void free_ntuple_list(ntuple_list in)
 {
   if( in == NULL || in->values == NULL )
     error("free_ntuple_list: invalid n-tuple input.");
@@ -288,7 +291,7 @@ static void free_ntuple_list(const ntuple_list in)
 /** Create an n-tuple list and allocate memory for one element.
     @param dim the dimension (n) of the n-tuple.
  */
-static ntuple_list new_ntuple_list(const unsigned int dim)
+static ntuple_list new_ntuple_list(unsigned int dim)
 {
   ntuple_list n_tuple;
 
@@ -314,7 +317,7 @@ static ntuple_list new_ntuple_list(const unsigned int dim)
 /*----------------------------------------------------------------------------*/
 /** Enlarge the allocated memory of an n-tuple list.
  */
-static void enlarge_ntuple_list(const ntuple_list n_tuple)
+static void enlarge_ntuple_list(ntuple_list n_tuple)
 {
   /* check parameters */
   if( n_tuple == NULL || n_tuple->values == NULL || n_tuple->max_size == 0 )
@@ -332,8 +335,8 @@ static void enlarge_ntuple_list(const ntuple_list n_tuple)
 /*----------------------------------------------------------------------------*/
 /** Add a 7-tuple to an n-tuple list.
  */
-static void add_7tuple(const ntuple_list out, const double v1, const double v2, const double v3,
-                        const double v4, const double v5, const double v6, const double v7 )
+static void add_7tuple( ntuple_list out, double v1, double v2, double v3,
+                        double v4, double v5, double v6, double v7 )
 {
   /* check parameters */
   if( out == NULL ) error("add_7tuple: invalid n-tuple input.");
@@ -379,7 +382,7 @@ typedef struct image_char_s
 /*----------------------------------------------------------------------------*/
 /** Free memory used in image_char 'i'.
  */
-static void free_image_char(const image_char i)
+static void free_image_char(image_char i)
 {
   if( i == NULL || i->data == NULL )
     error("free_image_char: invalid input image.");
@@ -390,7 +393,7 @@ static void free_image_char(const image_char i)
 /*----------------------------------------------------------------------------*/
 /** Create a new image_char of size 'xsize' times 'ysize'.
  */
-static image_char new_image_char(const unsigned int xsize, const unsigned int ysize)
+static image_char new_image_char(unsigned int xsize, unsigned int ysize)
 {
   image_char image;
 
@@ -415,11 +418,11 @@ static image_char new_image_char(const unsigned int xsize, const unsigned int ys
 /** Create a new image_char of size 'xsize' times 'ysize',
     initialized to the value 'fill_value'.
  */
-static image_char new_image_char_ini(const unsigned int xsize, const unsigned int ysize,
-                                      const unsigned char fill_value )
+static image_char new_image_char_ini( unsigned int xsize, unsigned int ysize,
+                                      unsigned char fill_value )
 {
-  const image_char image = new_image_char(xsize,ysize); /* create image */
-  const unsigned int N = xsize*ysize;
+  image_char image = new_image_char(xsize,ysize); /* create image */
+  unsigned int N = xsize*ysize;
   unsigned int i;
 
   /* check parameters */
@@ -450,7 +453,7 @@ typedef struct image_int_s
 /*----------------------------------------------------------------------------*/
 /** Create a new image_int of size 'xsize' times 'ysize'.
  */
-static image_int new_image_int(const unsigned int xsize, const unsigned int ysize)
+static image_int new_image_int(unsigned int xsize, unsigned int ysize)
 {
   image_int image;
 
@@ -474,11 +477,11 @@ static image_int new_image_int(const unsigned int xsize, const unsigned int ysiz
 /** Create a new image_int of size 'xsize' times 'ysize',
     initialized to the value 'fill_value'.
  */
-static image_int new_image_int_ini(const unsigned int xsize, const unsigned int ysize,
-                                    const int fill_value )
+static image_int new_image_int_ini( unsigned int xsize, unsigned int ysize,
+                                    int fill_value )
 {
-  const image_int image = new_image_int(xsize,ysize); /* create image */
-  const unsigned int N = xsize*ysize;
+  image_int image = new_image_int(xsize,ysize); /* create image */
+  unsigned int N = xsize*ysize;
   unsigned int i;
 
   /* initialize */
@@ -505,7 +508,7 @@ typedef struct image_double_s
 /*----------------------------------------------------------------------------*/
 /** Free memory used in image_double 'i'.
  */
-static void free_image_double(const image_double i)
+static void free_image_double(image_double i)
 {
   if( i == NULL || i->data == NULL )
     error("free_image_double: invalid input image.");
@@ -516,7 +519,7 @@ static void free_image_double(const image_double i)
 /*----------------------------------------------------------------------------*/
 /** Create a new image_double of size 'xsize' times 'ysize'.
  */
-static image_double new_image_double(const unsigned int xsize, const unsigned int ysize)
+static image_double new_image_double(unsigned int xsize, unsigned int ysize)
 {
   image_double image;
 
@@ -540,8 +543,8 @@ static image_double new_image_double(const unsigned int xsize, const unsigned in
 /** Create a new image_double of size 'xsize' times 'ysize'
     with the data pointed by 'data'.
  */
-static image_double new_image_double_ptr(const unsigned int xsize,
-                                          const unsigned int ysize, double * data )
+static image_double new_image_double_ptr( unsigned int xsize,
+                                          unsigned int ysize, double * data )
 {
   image_double image;
 
@@ -575,7 +578,7 @@ static image_double new_image_double_ptr(const unsigned int xsize,
     in the middle point between values 'kernel->values[0]'
     and 'kernel->values[1]'.
  */
-static void gaussian_kernel(const ntuple_list kernel, const double sigma, const double mean)
+static void gaussian_kernel(ntuple_list kernel, double sigma, double mean)
 {
   double sum = 0.0;
   double val;
@@ -638,8 +641,8 @@ static void gaussian_kernel(const ntuple_list kernel, const double sigma, const 
     in the x axis, and then the combined Gaussian kernel and sampling
     in the y axis.
  */
-static image_double gaussian_sampler(const image_double in, const double scale,
-                                      const double sigma_scale )
+static image_double gaussian_sampler( image_double in, double scale,
+                                      double sigma_scale )
 {
   image_double aux,out;
   ntuple_list kernel;
@@ -779,9 +782,9 @@ static image_double gaussian_sampler(const image_double in, const double scale,
     - a pointer 'mem_p' to the memory used by 'list_p' to be able to
       free the memory when it is not used anymore.
  */
-static image_double ll_angle(const image_double in, const double threshold,
+static image_double ll_angle( image_double in, double threshold,
                               struct coorlist ** list_p, void ** mem_p,
-                              image_double * modgrad, const unsigned int n_bins )
+                              image_double * modgrad, unsigned int n_bins )
 {
   image_double g;
   unsigned int n,p,x,y,adr,i;
@@ -823,12 +826,7 @@ static image_double ll_angle(const image_double in, const double threshold,
   range_l_e = (struct coorlist **) calloc( (size_t) n_bins,
                                            sizeof(struct coorlist *) );
   if( list == NULL || range_l_s == NULL || range_l_e == NULL )
-  {
-    free(list);
-    free(range_l_s);
-    free(range_l_e);
     error("not enough memory.");
-  }
   for(i=0;i<n_bins;i++) range_l_s[i] = range_l_e[i] = NULL;
 
   /* 'undefined' on the down and right boundaries */
@@ -925,8 +923,8 @@ static image_double ll_angle(const image_double in, const double threshold,
 /*----------------------------------------------------------------------------*/
 /** Is point (x,y) aligned to angle theta, up to precision 'prec'?
  */
-static int isaligned(const int x, const int y, const image_double angles, double theta,
-                      const double prec )
+static int isaligned( int x, int y, image_double angles, double theta,
+                      double prec )
 {
   double a;
 
@@ -963,7 +961,7 @@ static int isaligned(const int x, const int y, const image_double angles, double
 /*----------------------------------------------------------------------------*/
 /** Absolute value angle difference.
  */
-static double angle_diff(double a, const double b)
+static double angle_diff(double a, double b)
 {
   a -= b;
   while( a <= -M_PI ) a += M_2__PI;
@@ -975,7 +973,7 @@ static double angle_diff(double a, const double b)
 /*----------------------------------------------------------------------------*/
 /** Signed angle difference.
  */
-static double angle_diff_signed(double a, const double b)
+static double angle_diff_signed(double a, double b)
 {
   a -= b;
   while( a <= -M_PI ) a += M_2__PI;
@@ -1012,7 +1010,7 @@ static double angle_diff_signed(double a, const double b)
       q5 = 83.8676043424,
       q6 = 2.50662827511.
  */
-static double log_gamma_lanczos(const double x)
+static double log_gamma_lanczos(double x)
 {
   static double q[7] = { 75122.6331530, 80916.6278952, 36308.2951477,
                          8687.24529705, 1168.92649479, 83.8676043424,
@@ -1046,7 +1044,7 @@ static double log_gamma_lanczos(const double x)
     @f]
     This formula is a good approximation when x > 15.
  */
-static double log_gamma_windschitl(const double x)
+static double log_gamma_windschitl(double x)
 {
   return 0.918938533204673 + (x-0.5)*log(x) - x
          + 0.5*x*log( x*sinh(1/x) + 1/(810.0*pow(x,6.0)) );
@@ -1124,9 +1122,9 @@ __attribute__((destructor)) static void invDestructor()
     of the terms are neglected based on a bound to the error obtained
     (an error of 10% in the result is accepted).
  */
-static double nfa(const int n, const int k, const double p, const double logNT)
+static double nfa(int n, int k, double p, double logNT)
 {
-  const double tolerance = 0.1;       /* an error of 10% in the result is accepted */
+  double tolerance = 0.1;       /* an error of 10% in the result is accepted */
   double log1term,term,bin_term,mult_term,bin_tail,err,p_term;
   int i;
 
@@ -1232,7 +1230,7 @@ struct rect
 /*----------------------------------------------------------------------------*/
 /** Copy one rectangle structure to another.
  */
-static void rect_copy(const struct rect * in, struct rect * out)
+static void rect_copy(struct rect * in, struct rect * out)
 {
   /* check parameters */
   if( in == NULL || out == NULL ) error("rect_copy: invalid 'in' or 'out'.");
@@ -1326,7 +1324,7 @@ typedef struct
     - x1 <= x
     - x  <= x2
  */
-static double inter_low(const double x, const double x1, const double y1, const double x2, const double y2)
+static double inter_low(double x, double x1, double y1, double x2, double y2)
 {
   /* check parameters */
   if( x1 > x2 || x < x1 || x > x2 )
@@ -1348,7 +1346,7 @@ static double inter_low(const double x, const double x1, const double y1, const 
     - x1 <= x
     - x  <= x2
  */
-static double inter_hi(const double x, const double x1, const double y1, const double x2, const double y2)
+static double inter_hi(double x, double x1, double y1, double x2, double y2)
 {
   /* check parameters */
   if( x1 > x2 || x < x1 || x > x2 )
@@ -1374,7 +1372,7 @@ static void ri_del(rect_iter * iter)
 
     See details in \ref rect_iter
  */
-static int ri_end(const rect_iter * i)
+static int ri_end(rect_iter * i)
 {
   /* check input */
   if( i == NULL ) error("ri_end: NULL iterator.");
@@ -1460,7 +1458,7 @@ static void ri_inc(rect_iter * i)
 
     See details in \ref rect_iter
  */
-static rect_iter * ri_ini(const struct rect * r)
+static rect_iter * ri_ini(struct rect * r)
 {
   double vx[4],vy[4];
   int n,offset;
@@ -1531,7 +1529,7 @@ static rect_iter * ri_ini(const struct rect * r)
 /*----------------------------------------------------------------------------*/
 /** Compute a rectangle's NFA value.
  */
-static double rect_nfa(const struct rect * rec, const image_double angles, const double logNT)
+static double rect_nfa(struct rect * rec, image_double angles, double logNT)
 {
   rect_iter * i;
   int pts = 0;
@@ -1617,8 +1615,8 @@ static double rect_nfa(const struct rect * rec, const image_double angles, const
     When |Ixx| > |Iyy| we use the first, otherwise the second (just to
     get better numeric precision).
  */
-static double get_theta(const struct point * reg, const int reg_size, const double x, const double y,
-                         const image_double modgrad, const double reg_angle, const double prec )
+static double get_theta( struct point * reg, int reg_size, double x, double y,
+                         image_double modgrad, double reg_angle, double prec )
 {
   double lambda,theta,weight;
   double Ixx = 0.0;
@@ -1660,9 +1658,9 @@ static double get_theta(const struct point * reg, const int reg_size, const doub
 /*----------------------------------------------------------------------------*/
 /** Computes a rectangle that covers a region of points.
  */
-static void region2rect(const struct point * reg, const int reg_size,
-                         const image_double modgrad, const double reg_angle,
-                         const double prec, const double p, struct rect * rec )
+static void region2rect( struct point * reg, int reg_size,
+                         image_double modgrad, double reg_angle,
+                         double prec, double p, struct rect * rec )
 {
   double x,y,dx,dy,l,w,theta,weight,sum,l_min,l_max,w_min,w_max;
   int i;
@@ -1753,9 +1751,9 @@ static void region2rect(const struct point * reg, const int reg_size,
 /** Build a region of pixels that share the same angle, up to a
     tolerance 'prec', starting at point (x,y).
  */
-static void region_grow(const int x, const int y, const image_double angles, struct point * reg,
-                         int * reg_size, double * reg_angle, const image_char used,
-                         const double prec )
+static void region_grow( int x, int y, image_double angles, struct point * reg,
+                         int * reg_size, double * reg_angle, image_char used,
+                         double prec )
 {
   double sumdx,sumdy;
   int xx,yy,i;
@@ -1805,13 +1803,13 @@ static void region_grow(const int x, const int y, const image_double angles, str
 /** Try some rectangles variations to improve NFA value. Only if the
     rectangle is not meaningful (i.e., log_nfa <= log_eps).
  */
-static double rect_improve( struct rect * rec, const image_double angles,
-                            const double logNT, const double log_eps )
+static double rect_improve( struct rect * rec, image_double angles,
+                            double logNT, double log_eps )
 {
   struct rect r;
   double log_nfa,log_nfa_new;
-  const double delta = 0.5;
-  const double delta_2 = delta / 2.0;
+  double delta = 0.5;
+  double delta_2 = delta / 2.0;
   int n;
 
   log_nfa = rect_nfa(rec,angles,logNT);
@@ -1919,10 +1917,10 @@ static double rect_improve( struct rect * rec, const image_double angles,
     density of region points or to discard the region if too small.
  */
 static int reduce_region_radius( struct point * reg, int * reg_size,
-                                 const image_double modgrad, const double reg_angle,
-                                 const double prec, const double p, struct rect * rec,
-                                 const image_char used, const image_double angles,
-                                 const double density_th )
+                                 image_double modgrad, double reg_angle,
+                                 double prec, double p, struct rect * rec,
+                                 image_char used, image_double angles,
+                                 double density_th )
 {
   double density,radius1,radius2,rad,xc,yc;
   int i;
@@ -1996,9 +1994,9 @@ static int reduce_region_radius( struct point * reg, int * reg_size,
     produce a rectangle with the right density of region points,
     'reduce_region_radius' is called to try to satisfy this condition.
  */
-static int refine( struct point * reg, int * reg_size, const image_double modgrad,
-                   double reg_angle, const double prec, const double p, struct rect * rec,
-                   const image_char used, const image_double angles, const double density_th )
+static int refine( struct point * reg, int * reg_size, image_double modgrad,
+                   double reg_angle, double prec, double p, struct rect * rec,
+                   image_char used, image_double angles, double density_th )
 {
   double angle,ang_d,mean_angle,tau,density,xc,yc,ang_c,sum,s_sum;
   int i,n;
@@ -2080,14 +2078,14 @@ static int refine( struct point * reg, int * reg_size, const image_double modgra
  */
 static
 double * LineSegmentDetection( int * n_out,
-                               double * img, const int X, const int Y,
-                               const double scale, const double sigma_scale, const double quant,
-                               const double ang_th, const double log_eps, const double density_th,
-                               const int n_bins,
+                               double * img, int X, int Y,
+                               double scale, double sigma_scale, double quant,
+                               double ang_th, double log_eps, double density_th,
+                               int n_bins,
                                int ** reg_img, int * reg_x, int * reg_y )
 {
   image_double image;
-  const ntuple_list out = new_ntuple_list(7);
+  ntuple_list out = new_ntuple_list(7);
   double * return_value;
   image_double scaled_image,angles,modgrad;
   image_char used;
@@ -2115,7 +2113,7 @@ double * LineSegmentDetection( int * n_out,
 
 
   /* angle tolerance */
-  prec = deg2rad(ang_th);
+  prec = M_PI * ang_th / 180.0;
   p = ang_th / 180.0;
   rho = quant / sin(prec); /* gradient magnitude threshold */
 
@@ -2262,7 +2260,53 @@ double * LineSegmentDetection( int * n_out,
 
   return return_value;
 }
+#if 0
+/*----------------------------------------------------------------------------*/
+/** LSD Simple Interface with Scale and Region output.
+ */
+static
+double * lsd_scale_region( int * n_out,
+                           double * img, int X, int Y, double scale,
+                           int ** reg_img, int * reg_x, int * reg_y )
+{
+  /* LSD parameters */
+  double sigma_scale = 0.6; /* Sigma for Gaussian filter is computed as
+                                sigma = sigma_scale/scale.                    */
+  double quant = 2.0;       /* Bound to the quantization error on the
+                                gradient norm.                                */
+  double ang_th = 22.5;     /* Gradient angle tolerance in degrees.           */
+  double log_eps = 0.0;     /* Detection threshold: -log10(NFA) > log_eps     */
+  double density_th = 0.7;  /* Minimal density of region points in rectangle. */
+  int n_bins = 1024;        /* Number of bins in pseudo-ordering of gradient
+                               modulus.                                       */
 
+  return LineSegmentDetection( n_out, img, X, Y, scale, sigma_scale, quant,
+                               ang_th, log_eps, density_th, n_bins,
+                               reg_img, reg_x, reg_y );
+}
+
+/*----------------------------------------------------------------------------*/
+/** LSD Simple Interface with Scale.
+ */
+static
+double * lsd_scale(int * n_out, double * img, int X, int Y, double scale)
+{
+  return lsd_scale_region(n_out,img,X,Y,scale,NULL,NULL,NULL);
+}
+
+/*----------------------------------------------------------------------------*/
+/** LSD Simple Interface.
+ */
+static
+double * lsd(int * n_out, double * img, int X, int Y)
+{
+  /* LSD parameters */
+  double scale = 0.8;       /* Scale the image by Gaussian filter to 'scale'. */
+
+  return lsd_scale(n_out,img,X,Y,scale);
+}
+/*----------------------------------------------------------------------------*/
+#endif
 /*==================================================================================
  * end of LSD code
  *==================================================================================*/
@@ -2275,9 +2319,6 @@ double * LineSegmentDetection( int * n_out,
 #undef RELATIVE_ERROR_FACTOR
 #undef TABSIZE
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

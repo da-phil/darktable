@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2011-2022 darktable developers.
+   Copyright (C) 2011-2020 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -20,13 +20,13 @@
 */
 
 #include "curve_tools.h"
-
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define EPSILON 2 * FLT_MIN
+#define MAX_ITER 10
 
 static const int curvedata_anchors_max = 20;
 
@@ -97,33 +97,36 @@ float *d3_np_fs(int n, float a[], float b[])
 {
   if(n <= 0 || n > curvedata_anchors_max) return NULL;
 
+  int i;
+  float *x;
+  float xmult;
   //
   //  Check.
   //
-  for(int i = 0; i < n; i++)
+  for(i = 0; i < n; i++)
   {
     if(a[1 + i * 3] == 0.0E+00)
     {
       return NULL;
     }
   }
-  float *x = calloc(n, sizeof(float));
+  x = (float *)calloc(n, sizeof(float));
   // nc_merror(x, "d3_np_fs");
 
-  for(int i = 0; i < n; i++)
+  for(i = 0; i < n; i++)
   {
     x[i] = b[i];
   }
 
-  for(int i = 1; i < n; i++)
+  for(i = 1; i < n; i++)
   {
-    const float xmult = a[2 + (i - 1) * 3] / a[1 + (i - 1) * 3];
+    xmult = a[2 + (i - 1) * 3] / a[1 + (i - 1) * 3];
     a[1 + i * 3] = a[1 + i * 3] - xmult * a[0 + i * 3];
     x[i] = x[i] - xmult * x[i - 1];
   }
 
   x[n - 1] = x[n - 1] / a[1 + (n - 1) * 3];
-  for(int i = n - 2; 0 <= i; i--)
+  for(i = n - 2; 0 <= i; i--)
   {
     x[i] = (x[i] - a[0 + (i + 1) * 3] * x[i + 1]) / a[1 + i * 3];
   }
@@ -245,6 +248,10 @@ float *d3_np_fs(int n, float a[], float b[])
 static float *spline_cubic_set_internal(int n, float t[], float y[], int ibcbeg, float ybcbeg, int ibcend,
                                         float ybcend)
 {
+  float *a;
+  float *b;
+  int i;
+  float *ypp;
   //
   //  Check.
   //
@@ -255,7 +262,7 @@ static float *spline_cubic_set_internal(int n, float t[], float y[], int ibcbeg,
     return NULL;
   }
 
-  for(int i = 0; i < n - 1; i++)
+  for(i = 0; i < n - 1; i++)
   {
     if(t[i + 1] <= t[i])
     {
@@ -265,9 +272,9 @@ static float *spline_cubic_set_internal(int n, float t[], float y[], int ibcbeg,
       return NULL;
     }
   }
-  float *a = calloc(3 * n, sizeof(float));
+  a = (float *)calloc(3 * n, sizeof(float));
   // nc_merror(a, "spline_cubic_set");
-  float *b = calloc(n, sizeof(float));
+  b = (float *)calloc(n, sizeof(float));
   // nc_merror(b, "spline_cubic_set");
   //
   //  Set up the first equation.
@@ -301,7 +308,7 @@ static float *spline_cubic_set_internal(int n, float t[], float y[], int ibcbeg,
   //
   //  Set up the intermediate equations.
   //
-  for(int i = 1; i < n - 1; i++)
+  for(i = 1; i < n - 1; i++)
   {
     b[i] = (y[i + 1] - y[i]) / (t[i + 1] - t[i]) - (y[i] - y[i - 1]) / (t[i] - t[i - 1]);
     a[2 + (i - 1) * 3] = (t[i] - t[i - 1]) / 6.0E+00;
@@ -340,8 +347,6 @@ static float *spline_cubic_set_internal(int n, float t[], float y[], int ibcbeg,
   //
   //  Solve the linear system.
   //
-  float *ypp = NULL;
-
   if(n == 2 && ibcbeg == 0 && ibcend == 0)
   {
     ypp = (float *)calloc(2, sizeof(float));
@@ -392,6 +397,9 @@ float *spline_cubic_set(int n, float t[], float y[])
 *************************************************************/
 float *monotone_hermite_set(int n, float x[], float y[])
 {
+  float *delta;
+  float *m;
+  int i;
   if(n <= 1)
   {
     // nc_message(NC_SET_ERROR, "spline_cubic_set() error: "
@@ -399,7 +407,7 @@ float *monotone_hermite_set(int n, float x[], float y[])
     return NULL;
   }
 
-  for(int i = 0; i < n - 1; i++)
+  for(i = 0; i < n - 1; i++)
   {
     if(x[i + 1] <= x[i])
     {
@@ -410,12 +418,12 @@ float *monotone_hermite_set(int n, float x[], float y[])
     }
   }
 
-  float *delta = calloc(n, sizeof(float));
+  delta = (float *)calloc(n, sizeof(float));
   // nc_merror(delta, "spline_cubic_set");
-  float *m = calloc(n + 1, sizeof(float));
+  m = (float *)calloc(n + 1, sizeof(float));
   // nc_merror(m, "spline_cubic_set");
   // calculate the slopes
-  for(int i = 0; i < n - 1; i++)
+  for(i = 0; i < n - 1; i++)
   {
     delta[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i]);
   }
@@ -424,11 +432,11 @@ float *monotone_hermite_set(int n, float x[], float y[])
   m[0] = delta[0];
   m[n - 1] = delta[n - 1];
 
-  for(int i = 1; i < n - 1; i++)
+  for(i = 1; i < n - 1; i++)
   {
     m[i] = (delta[i - 1] + delta[i]) * .5f;
   }
-  for(int i = 0; i < n; i++)
+  for(i = 0; i < n; i++)
   {
     if(fabsf(delta[i]) < EPSILON)
     {
@@ -466,6 +474,8 @@ float *monotone_hermite_set(int n, float x[], float y[])
 *************************************************************/
 float *catmull_rom_set(int n, float x[], float y[])
 {
+  float *m;
+  int i;
   if(n <= 1)
   {
     // nc_message(NC_SET_ERROR, "spline_cubic_set() error: "
@@ -473,7 +483,7 @@ float *catmull_rom_set(int n, float x[], float y[])
     return NULL;
   }
 
-  for(int i = 0; i < n - 1; i++)
+  for(i = 0; i < n - 1; i++)
   {
     if(x[i + 1] <= x[i])
     {
@@ -484,12 +494,12 @@ float *catmull_rom_set(int n, float x[], float y[])
     }
   }
   // nc_merror(delta, "spline_cubic_set");
-  float *m = calloc(n, sizeof(float));
+  m = (float *)calloc(n, sizeof(float));
   // nc_merror(m, "spline_cubic_set");
 
   // calculate the slopes
   m[0] = (y[1] - y[0]) / (x[1] - x[0]);
-  for(int i = 1; i < n - 1; i++)
+  for(i = 1; i < n - 1; i++)
   {
     m[i] = (y[i + 1] - y[i - 1]) / (x[i + 1] - x[i - 1]);
   }
@@ -615,14 +625,18 @@ float catmull_rom_val(int n, float x[], float xval, float y[], float tangents[])
 **********************************************************************/
 float spline_cubic_val(int n, float t[], float tval, float y[], float ypp[])
 {
-  int ival = 0;
+  float dt;
+  float h;
+  int i;
+  int ival;
+  float yval;
   //
   //  Determine the interval [ T(I), T(I+1) ] that contains TVAL.
   //  Values below T[0] or above T[N-1] use extrapolation.
   //
   ival = n - 2;
 
-  for(int i = 0; i < n - 1; i++)
+  for(i = 0; i < n - 1; i++)
   {
     if(tval < t[i + 1])
     {
@@ -634,10 +648,10 @@ float spline_cubic_val(int n, float t[], float tval, float y[], float ypp[])
   //  In the interval I, the polynomial is in terms of a normalized
   //  coordinate between 0 and 1.
   //
-  const float dt = tval - t[ival];
-  const float h = t[ival + 1] - t[ival];
+  dt = tval - t[ival];
+  h = t[ival + 1] - t[ival];
 
-  const float yval = y[ival]
+  yval = y[ival]
          + dt * ((y[ival + 1] - y[ival]) / h - (ypp[ival + 1] / 6.0E+00 + ypp[ival] / 3.0E+00) * h
                  + dt * (0.5E+00 * ypp[ival] + dt * ((ypp[ival + 1] - ypp[ival]) / (6.0E+00 * h))));
 
@@ -663,16 +677,17 @@ CurveDataSample:
 **********************************************/
 int CurveDataSample(CurveData *curve, CurveSample *sample)
 {
-  int n = 0;
+  int i = 0, n;
 
   float x[20] = { 0 };
   float y[20] = { 0 };
+  float *ypp;
 
   // The box points are what the anchor points are relative
   // to so...
 
-  const float box_width = curve->m_max_x - curve->m_min_x;
-  const float box_height = curve->m_max_y - curve->m_min_y;
+  float box_width = curve->m_max_x - curve->m_min_x;
+  float box_height = curve->m_max_y - curve->m_min_y;
 
   // build arrays for processing
   if(curve->m_numAnchors == 0)
@@ -686,28 +701,29 @@ int CurveDataSample(CurveData *curve, CurveSample *sample)
   }
   else
   {
-    for(int i = 0; i < curve->m_numAnchors; i++)
+    for(i = 0; i < curve->m_numAnchors; i++)
     {
       x[i] = curve->m_anchors[i].x * box_width + curve->m_min_x;
       y[i] = curve->m_anchors[i].y * box_height + curve->m_min_y;
     }
     n = curve->m_numAnchors;
   }
-  const float res = 1.0 / (float)(sample->m_samplingRes - 1);
-  const int firstPointX = x[0] * (sample->m_samplingRes - 1);
-  const int firstPointY = y[0] * (sample->m_outputRes - 1);
-  const int lastPointX = x[n - 1] * (sample->m_samplingRes - 1);
-  const int lastPointY = y[n - 1] * (sample->m_outputRes - 1);
-  const int maxY = curve->m_max_y * (sample->m_outputRes - 1);
-  const int minY = curve->m_min_y * (sample->m_outputRes - 1);
+  int val;
+  float res = 1.0 / (float)(sample->m_samplingRes - 1);
+  int firstPointX = x[0] * (sample->m_samplingRes - 1);
+  int firstPointY = y[0] * (sample->m_outputRes - 1);
+  int lastPointX = x[n - 1] * (sample->m_samplingRes - 1);
+  int lastPointY = y[n - 1] * (sample->m_outputRes - 1);
+  int maxY = curve->m_max_y * (sample->m_outputRes - 1);
+  int minY = curve->m_min_y * (sample->m_outputRes - 1);
   // returns an array of second derivatives used to calculate the spline curve.
   // this is a malloc'd array that needs to be freed when done.
   // The settings currently calculate the natural spline, which closely matches
   // camera curve output in raw files.
-  float *ypp = interpolate_set(n, x, y, curve->m_spline_type);
+  ypp = interpolate_set(n, x, y, curve->m_spline_type);
   if(ypp == NULL) return CT_ERROR;
 
-  for(int i = 0; i < (int)sample->m_samplingRes; i++)
+  for(i = 0; i < (int)sample->m_samplingRes; i++)
   {
     // get the value of the curve at a point
     // take into account that curves may not necessarily begin at x = 0.0
@@ -725,7 +741,7 @@ int CurveDataSample(CurveData *curve, CurveSample *sample)
     else
     {
       // within range, we can sample the curve
-      int val = interpolate_val(n, x, i * res, y, ypp, curve->m_spline_type) * (sample->m_outputRes - 1) + 0.5;
+      val = interpolate_val(n, x, i * res, y, ypp, curve->m_spline_type) * (sample->m_outputRes - 1) + 0.5;
       if(val > maxY) val = maxY;
       if(val < minY) val = minY;
       sample->m_Samples[i] = val;
@@ -736,9 +752,6 @@ int CurveDataSample(CurveData *curve, CurveSample *sample)
   return CT_SUCCESS;
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

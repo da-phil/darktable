@@ -19,6 +19,10 @@
 #pragma once
 
 #ifdef HAVE_OPENCL
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <CL/cl.h>          // for cl_mem, _cl_mem
 #include <stddef.h>         // for size_t
 
@@ -31,7 +35,7 @@ typedef struct dt_bilateral_cl_t
 {
   dt_bilateral_cl_global_t *global;
   int devid;
-  int size_x, size_y, size_z;
+  size_t size_x, size_y, size_z;
   int width, height;
   size_t blocksizex, blocksizey;
   float sigma_s, sigma_r;
@@ -61,9 +65,6 @@ void dt_bilateral_free_cl_global(dt_bilateral_cl_global_t *b);
 
 #endif // HAVE_OPENCL
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

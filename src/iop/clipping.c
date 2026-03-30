@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2025 darktable developers.
+    Copyright (C) 2009-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -16,6 +16,9 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bauhaus/bauhaus.h"
 #include "common/debug.h"
 #include "common/imagebuf.h"
@@ -33,6 +36,7 @@
 #include "gui/guides.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "libs/modulegroups.h"
 
 #include <assert.h>
 #include <gdk/gdkkeysyms.h>
@@ -97,39 +101,16 @@ typedef enum _grab_region_t
 } _grab_region_t;
 
 /* calculate the aspect ratios for current image */
-static void keystone_type_populate(dt_iop_module_t *self, gboolean with_applied, int select);
+static void keystone_type_populate(struct dt_iop_module_t *self, gboolean with_applied, int select);
 
-int legacy_params(dt_iop_module_t *self,
-                  const void *const old_params,
-                  const int old_version,
-                  void **new_params,
-                  int32_t *new_params_size,
-                  int *new_version)
+int legacy_params(dt_iop_module_t *self, const void *const old_params, const int old_version,
+                  void *new_params, const int new_version)
 {
-  typedef struct dt_iop_clipping_params_v5_t
-  {
-    float angle;
-    float cx;
-    float cy;
-    float cw;
-    float ch;
-    float k_h, k_v;
-    float kxa;
-    float kya;
-    float kxb;
-    float kyb;
-    float kxc;
-    float kyc;
-    float kxd;
-    float kyd;
-    int k_type, k_sym;
-    int k_apply;
-    gboolean crop_auto;
-    int ratio_n;
-    int ratio_d;
-  } dt_iop_clipping_params_v5_t;
+  if(new_version <= old_version) return 1;
+  if(new_version != 5) return 1;
 
-  if(old_version == 2)
+  dt_iop_clipping_params_t *n = (dt_iop_clipping_params_t *)new_params;
+  if(old_version == 2 && new_version == 5)
   {
     union {
         float f;
@@ -142,7 +123,6 @@ int legacy_params(dt_iop_module_t *self,
     } old_params_t;
 
     const old_params_t *o = (old_params_t *)old_params;
-    dt_iop_clipping_params_v5_t *n = malloc(sizeof(dt_iop_clipping_params_v5_t));
 
     k.f = o->k_h;
     int is_horizontal;
@@ -175,16 +155,11 @@ int legacy_params(dt_iop_module_t *self,
     n->k_apply = 0;
     n->crop_auto = 1;
 
-    // will be computed later, -2 here is used to detect uninitialized
-    // value, -1 is already used for no clipping.
+    // will be computed later, -2 here is used to detect uninitialized value, -1 is already used for no
+    // clipping.
     n->ratio_d = n->ratio_n = -2;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_clipping_params_v5_t);
-    *new_version = 5;
-    return 0;
   }
-  if(old_version == 3)
+  if(old_version == 3 && new_version == 5)
   {
     // old structure def
     typedef struct old_params_t
@@ -193,7 +168,6 @@ int legacy_params(dt_iop_module_t *self,
     } old_params_t;
 
     const old_params_t *o = (old_params_t *)old_params;
-    dt_iop_clipping_params_v5_t *n = malloc(sizeof(dt_iop_clipping_params_v5_t));
 
     n->angle = o->angle, n->cx = o->cx, n->cy = o->cy, n->cw = o->cw, n->ch = o->ch;
     n->k_h = o->k_h, n->k_v = o->k_v;
@@ -209,16 +183,11 @@ int legacy_params(dt_iop_module_t *self,
     n->k_apply = 0;
     n->crop_auto = 1;
 
-    // will be computed later, -2 here is used to detect uninitialized
-    // value, -1 is already used for no clipping.
+    // will be computed later, -2 here is used to detect uninitialized value, -1 is already used for no
+    // clipping.
     n->ratio_d = n->ratio_n = -2;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_clipping_params_v5_t);
-    *new_version = 5;
-    return 0;
   }
-  if(old_version == 4)
+  if(old_version == 4 && new_version == 5)
   {
     typedef struct old_params_t
     {
@@ -229,7 +198,6 @@ int legacy_params(dt_iop_module_t *self,
     } old_params_t;
 
     const old_params_t *o = (old_params_t *)old_params;
-    dt_iop_clipping_params_v5_t *n = malloc(sizeof(dt_iop_clipping_params_v5_t));
 
     n->angle = o->angle, n->cx = o->cx, n->cy = o->cy, n->cw = o->cw, n->ch = o->ch;
     n->k_h = o->k_h, n->k_v = o->k_v;
@@ -240,17 +208,12 @@ int legacy_params(dt_iop_module_t *self,
     n->k_apply = o->k_apply;
     n->crop_auto = o->crop_auto;
 
-    // will be computed later, -2 here is used to detect uninitialized
-    // value, -1 is already used for no clipping.
+    // will be computed later, -2 here is used to detect uninitialized value, -1 is already used for no
+    // clipping.
     n->ratio_d = n->ratio_n = -2;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_clipping_params_v5_t);
-    *new_version = 5;
-    return 0;
   }
 
-  return 1;
+  return 0;
 }
 
 typedef struct dt_iop_clipping_gui_data_t
@@ -267,6 +230,7 @@ typedef struct dt_iop_clipping_gui_data_t
   GtkWidget *keystone_type;
   GtkWidget *crop_auto;
 
+  float button_down_x, button_down_y;
   float button_down_zoom_x, button_down_zoom_y,
       button_down_angle; // position in image where the button has been pressed.
   /* current clip box */
@@ -275,7 +239,7 @@ typedef struct dt_iop_clipping_gui_data_t
   float prev_clip_x, prev_clip_y, prev_clip_w, prev_clip_h;
   /* maximum clip box */
   float clip_max_x, clip_max_y, clip_max_w, clip_max_h;
-  dt_hash_t clip_max_pipe_hash;
+  uint64_t clip_max_pipe_hash;
 
  int k_selected, k_show, k_selected_segment;
   gboolean k_drag;
@@ -350,7 +314,7 @@ const char *aliases()
   return _("reframe|perspective|keystone|distortion");
 }
 
-const char **description(dt_iop_module_t *self)
+const char *description(struct dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("change the framing and correct the perspective"),
                                       _("corrective or creative"),
@@ -372,24 +336,28 @@ int flags()
 
 int operation_tags()
 {
-  return IOP_TAG_DISTORT | IOP_TAG_CROPPING;
+  return IOP_TAG_DISTORT | IOP_TAG_CLIPPING;
 }
 
 int operation_tags_filter()
 {
   // switch off watermark, it gets confused.
-  return IOP_TAG_DECORATION | IOP_TAG_CROPPING;
+  return IOP_TAG_DECORATION | IOP_TAG_CLIPPING;
 }
 
-dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
-                                            dt_dev_pixelpipe_t *pipe,
-                                            dt_dev_pixelpipe_iop_t *piece)
+int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_RGB;
+  return iop_cs_rgb;
 }
 
-static void keystone_get_matrix(const dt_boundingbox_t k_space, float kxa, const float kxb, const float kxc, const float kxd, float kya,
-                                const float kyb, const float kyc, const float kyd, float *a, float *b, float *d, float *e,
+static int gui_has_focus(struct dt_iop_module_t *self)
+{
+  return (self->dev->gui_module == self
+          && dt_dev_modulegroups_get_activated(darktable.develop) != DT_MODULEGROUP_BASICS);
+}
+
+static void keystone_get_matrix(const dt_boundingbox_t k_space, float kxa, float kxb, float kxc, float kxd, float kya,
+                                float kyb, float kyc, float kyd, float *a, float *b, float *d, float *e,
                                 float *g, float *h)
 {
   *a = -((kxb * (kyd * kyd - kyc * kyd) - kxc * kyd * kyd + kyb * (kxc * kyd - kxd * kyd) + kxd * kyc * kyd)
@@ -421,9 +389,11 @@ static void keystone_get_matrix(const dt_boundingbox_t k_space, float kxa, const
           + kyb * kyb * (kxc * kxd * kxd * kyc - kxc * kxc * kxd * kyd));
 }
 
-DT_OMP_DECLARE_SIMD()
-static inline void keystone_backtransform(float *i, const dt_boundingbox_t k_space, const float a, const float b, const float d,
-                                          const float e, const float g, const float h, const float kxa, const float kya)
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
+static inline void keystone_backtransform(float *i, const dt_boundingbox_t k_space, float a, float b, float d,
+                                          float e, float g, float h, float kxa, float kya)
 {
   const float xx = i[0] - k_space[0];
   const float yy = i[1] - k_space[1];
@@ -434,9 +404,11 @@ static inline void keystone_backtransform(float *i, const dt_boundingbox_t k_spa
   i[1] = -(d * xx - a * yy) / div + kya;
 }
 
-DT_OMP_DECLARE_SIMD()
-static inline void keystone_transform(float *i, const dt_boundingbox_t k_space, const float a, const float b, const float d,
-                                      const float e, const float g, const float h, const float kxa, const float kya)
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
+static inline void keystone_transform(float *i, const dt_boundingbox_t k_space, float a, float b, float d,
+                                      float e, float g, float h, float kxa, float kya)
 {
   const float xx = i[0] - kxa;
   const float yy = i[1] - kya;
@@ -446,7 +418,9 @@ static inline void keystone_transform(float *i, const dt_boundingbox_t k_space, 
   i[1] = (d * xx + e * yy) / div + k_space[1];
 }
 
-DT_OMP_DECLARE_SIMD()
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
 static inline void backtransform(float *x, float *o, const float *m, const float t_h, const float t_v)
 {
   x[1] /= (1.0f + x[0] * t_h);
@@ -454,8 +428,10 @@ static inline void backtransform(float *x, float *o, const float *m, const float
   mul_mat_vec_2(m, x, o);
 }
 
-DT_OMP_DECLARE_SIMD()
-static inline void inv_matrix(const float *m, float *inv_m)
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
+static inline void inv_matrix(float *m, float *inv_m)
 {
   const float det = (m[0] * m[3]) - (m[1] * m[2]);
   inv_m[0] =  m[3] / det;
@@ -464,23 +440,22 @@ static inline void inv_matrix(const float *m, float *inv_m)
   inv_m[3] =  m[0] / det;
 }
 
-DT_OMP_DECLARE_SIMD()
-static inline void transform(const float *x, float *o, const float *m, const float t_h, const float t_v)
+#ifdef _OPENMP
+#pragma omp declare simd
+#endif
+static inline void transform(float *x, float *o, const float *m, const float t_h, const float t_v)
 {
   mul_mat_vec_2(m, x, o);
   o[1] *= (1.0f + o[0] * t_h);
   o[0] *= (1.0f + o[1] * t_v);
 }
 
-gboolean distort_transform(dt_iop_module_t *self,
-                           dt_dev_pixelpipe_iop_t *piece,
-                           float *const restrict points,
-                           size_t points_count)
+int distort_transform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, float *const restrict points, size_t points_count)
 {
   // as dt_iop_roi_t contain int values and not floats, we can have some rounding errors
   // as a workaround, we use a factor for preview pipes
   float factor = 1.0f;
-  if(piece->pipe->type & (DT_DEV_PIXELPIPE_PREVIEW | DT_DEV_PIXELPIPE_PREVIEW2)) factor = 100.0f;
+  if((piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW) == DT_DEV_PIXELPIPE_PREVIEW) factor = 100.0f;
   // we first need to be sure that all data values are computed
   // this is done in modify_roi_out fct, so we create tmp roi
   dt_iop_roi_t roi_out, roi_in;
@@ -488,7 +463,7 @@ gboolean distort_transform(dt_iop_module_t *self,
   roi_in.height = piece->buf_in.height * factor;
   self->modify_roi_out(self, piece, &roi_out, &roi_in);
 
-  const dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   const float rx = piece->buf_in.width;
   const float ry = piece->buf_in.height;
@@ -500,7 +475,11 @@ gboolean distort_transform(dt_iop_module_t *self,
   if(d->k_apply == 1)
     keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-  DT_OMP_FOR(if(points_count > 100))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+    dt_omp_firstprivate(points_count, points, d, factor, k_space, ma, mb, md, me, mg, mh, kxa, kya) \
+    schedule(static) if(points_count > 100)
+#endif
   for(size_t i = 0; i < points_count * 2; i += 2)
   {
     float pi[2], po[2];
@@ -538,17 +517,15 @@ gboolean distort_transform(dt_iop_module_t *self,
     self->modify_roi_out(self, piece, &roi_out, &roi_in);
   }
 
-  return TRUE;
+  return 1;
 }
-gboolean distort_backtransform(dt_iop_module_t *self,
-                               dt_dev_pixelpipe_iop_t *piece,
-                               float *const restrict points,
-                               size_t points_count)
+int distort_backtransform(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, float *const restrict points,
+                          size_t points_count)
 {
   // as dt_iop_roi_t contain int values and not floats, we can have some rounding errors
   // as a workaround, we use a factor for preview pipes
   float factor = 1.0f;
-  if(piece->pipe->type & (DT_DEV_PIXELPIPE_PREVIEW | DT_DEV_PIXELPIPE_PREVIEW2)) factor = 100.0f;
+  if((piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW) == DT_DEV_PIXELPIPE_PREVIEW) factor = 100.0f;
   // we first need to be sure that all data values are computed
   // this is done in modify_roi_out fct, so we create tmp roi
   dt_iop_roi_t roi_out, roi_in;
@@ -556,7 +533,7 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   roi_in.height = piece->buf_in.height * factor;
   self->modify_roi_out(self, piece, &roi_out, &roi_in);
 
-  const dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   const float rx = piece->buf_in.width;
   const float ry = piece->buf_in.height;
@@ -568,7 +545,11 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   if(d->k_apply == 1)
     keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-  DT_OMP_FOR_SIMD(if(points_count > 100) aligned(points:64) aligned(k_space:16))
+#ifdef _OPENMP
+#pragma omp parallel for simd default(none) \
+    dt_omp_firstprivate(points_count, points, d, factor, k_space, ma, mb, md, me, mg, mh, kxa, kya) \
+    schedule(static) if(points_count > 100) aligned(points:64) aligned(k_space:16)
+#endif
   for(size_t i = 0; i < points_count * 2; i += 2)
   {
     float pi[2], po[2];
@@ -606,38 +587,38 @@ gboolean distort_backtransform(dt_iop_module_t *self,
     self->modify_roi_out(self, piece, &roi_out, &roi_in);
   }
 
-  return TRUE;
+  return 1;
 }
 
-void distort_mask(dt_iop_module_t *self,
-                  dt_dev_pixelpipe_iop_t *piece,
-                  const float *const in,
-                  float *const out,
-                  const dt_iop_roi_t *const roi_in,
-                  const dt_iop_roi_t *const roi_out)
+void distort_mask(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece, const float *const in,
+                  float *const out, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   // only crop, no rot fast and sharp path:
-  if(!d->flags && d->angle == 0.0 && d->all_off && roi_in->width == roi_out->width &&
-     roi_in->height == roi_out->height)
+  if(!d->flags && d->angle == 0.0 && d->all_off && roi_in->width == roi_out->width && roi_in->height == roi_out->height)
   {
     dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 1);
   }
   else
   {
-    const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
     const float rx = piece->buf_in.width * roi_in->scale;
     const float ry = piece->buf_in.height * roi_in->scale;
-    const dt_boundingbox_t k_space =
-      { d->k_space[0] * rx, d->k_space[1] * ry, d->k_space[2] * rx, d->k_space[3] * ry };
+    const dt_boundingbox_t k_space = { d->k_space[0] * rx, d->k_space[1] * ry, d->k_space[2] * rx, d->k_space[3] * ry };
     const float kxa = d->kxa * rx, kxb = d->kxb * rx, kxc = d->kxc * rx, kxd = d->kxd * rx;
     const float kya = d->kya * ry, kyb = d->kyb * ry, kyc = d->kyc * ry, kyd = d->kyd * ry;
     float ma, mb, md, me, mg, mh;
     if(d->k_apply == 1)
       keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-    DT_OMP_FOR(dt_omp_sharedconst(k_space))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+    dt_omp_firstprivate(in, kxa, kya, out, roi_in, roi_out) \
+    dt_omp_sharedconst(k_space)                             \
+    shared(d, interpolation, ma, mb, md, me, mg, mh) \
+    schedule(static)
+#endif
     // (slow) point-by-point transformation.
     // TODO: optimize with scanlines and linear steps between?
     for(int j = 0; j < roi_out->height; j++)
@@ -672,18 +653,17 @@ void distort_mask(dt_iop_module_t *self,
         po[0] -= roi_in->x + 0.5f;
         po[1] -= roi_in->y + 0.5f;
 
-        _out[i] = CLIP(dt_interpolation_compute_sample(interpolation, in,
-                                                       po[0], po[1],
-                                                       roi_in->width, roi_in->height, 1, roi_in->width));
+        _out[i] = dt_interpolation_compute_sample(interpolation, in, po[0], po[1], roi_in->width, roi_in->height, 1,
+                                                  roi_in->width);
       }
     }
   }
 }
 
-static int _iop_clipping_set_max_clip(dt_iop_module_t *self)
+static int _iop_clipping_set_max_clip(struct dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  const dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   if(g->clip_max_pipe_hash == self->dev->preview_pipe->backbuf_hash) return 1;
 
@@ -691,7 +671,7 @@ static int _iop_clipping_set_max_clip(dt_iop_module_t *self)
   dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
   if(!piece) return 0;
 
-  const float wp = piece->buf_out.width, hp = piece->buf_out.height;
+  float wp = piece->buf_out.width, hp = piece->buf_out.height;
   const float cx = CLAMPF(p->cx, 0.0f, 0.9f);
   const float cy = CLAMPF(p->cy, 0.0f, 0.9f);
   const float cw = CLAMPF(fabsf(p->cw), 0.1f, 1.0f);
@@ -701,31 +681,30 @@ static int _iop_clipping_set_max_clip(dt_iop_module_t *self)
   if(!dt_dev_distort_transform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 4))
     return 0;
 
-  float wd, ht;
-  dt_dev_get_preview_size(self->dev, &wd, &ht);
-
-  g->clip_max_x = fmaxf(points[0] / wd, 0.0f);
-  g->clip_max_y = fmaxf(points[1] / ht, 0.0f);
-  g->clip_max_w = fminf((points[2] - points[0]) / wd, 1.0f);
-  g->clip_max_h = fminf((points[3] - points[1]) / ht, 1.0f);
+  g->clip_max_x = fmaxf(points[0] / self->dev->preview_pipe->backbuf_width, 0.0f);
+  g->clip_max_y = fmaxf(points[1] / self->dev->preview_pipe->backbuf_height, 0.0f);
+  g->clip_max_w = fminf((points[2] - points[0]) / self->dev->preview_pipe->backbuf_width, 1.0f);
+  g->clip_max_h = fminf((points[3] - points[1]) / self->dev->preview_pipe->backbuf_height, 1.0f);
 
   // if clipping values are not null, this is undistorted values...
-  g->clip_x = fmaxf(points[4] / wd, g->clip_max_x);
-  g->clip_y = fmaxf(points[5] / ht, g->clip_max_y);
-  g->clip_w = fminf((points[6] - points[4]) / wd, g->clip_max_w);
-  g->clip_h = fminf((points[7] - points[5]) / ht, g->clip_max_h);
+  g->clip_x = fmaxf(points[4] / self->dev->preview_pipe->backbuf_width, g->clip_max_x);
+  g->clip_y = fmaxf(points[5] / self->dev->preview_pipe->backbuf_height, g->clip_max_y);
+  g->clip_w = fminf((points[6] - points[4]) / self->dev->preview_pipe->backbuf_width, g->clip_max_w);
+  g->clip_h = fminf((points[7] - points[5]) / self->dev->preview_pipe->backbuf_height, g->clip_max_h);
 
   g->clip_max_pipe_hash = self->dev->preview_pipe->backbuf_hash;
   return 1;
 }
 
-void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop_roi_t *roi_out,
+// 1st pass: how large would the output be, given this input roi?
+// this is always called with the full buffer before processing.
+void modify_roi_out(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece, dt_iop_roi_t *roi_out,
                     const dt_iop_roi_t *roi_in_orig)
 {
-  const dt_iop_roi_t roi_in_d = *roi_in_orig;
-  const dt_iop_roi_t *roi_in = &roi_in_d;
+  dt_iop_roi_t roi_in_d = *roi_in_orig;
+  dt_iop_roi_t *roi_in = &roi_in_d;
 
-  dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   // use whole-buffer roi information to create matrix and inverse.
   float rt[] = { cosf(d->angle), sinf(d->angle), -sinf(d->angle), cosf(d->angle) };
@@ -771,8 +750,8 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
       const float roi_in_height = flip ? roi_in->width : roi_in->height;
       float newcropscale = 1.0f;
       // fwd transform rotated points on corners and scale back inside roi_in bounds.
-      float p[2], o[2];
-      const float aabb[4] = { -.5f * roi_in_width, -.5f * roi_in_height, .5f * roi_in_width, .5f * roi_in_height };
+      float p[2], o[2],
+          aabb[4] = { -.5f * roi_in_width, -.5f * roi_in_height, .5f * roi_in_width, .5f * roi_in_height };
       for(int c = 0; c < 4; c++)
       {
         get_corner(oaabb, c, p);
@@ -788,7 +767,7 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
         d->ty = roi_in->height * .5f;
         d->flip = flip;
 
-        const float ach = d->ch - d->cy, acw = d->cw - d->cx;
+        float ach = d->ch - d->cy, acw = d->cw - d->cx;
         // rotate and clip to max extent
         if(flip)
         {
@@ -812,8 +791,8 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
     *roi_out = *roi_in;
     // set roi_out values with rotation and keystone
     // initial corners pos
-    const dt_boundingbox_t corn_x = { 0.0f, roi_in->width, roi_in->width, 0.0f };
-    const dt_boundingbox_t corn_y = { 0.0f, 0.0f, roi_in->height, roi_in->height };
+    dt_boundingbox_t corn_x = { 0.0f, roi_in->width, roi_in->width, 0.0f };
+    dt_boundingbox_t corn_y = { 0.0f, 0.0f, roi_in->height, roi_in->height };
     // destination corner points
     dt_boundingbox_t corn_out_x = { 0.0f };
     dt_boundingbox_t corn_out_y = { 0.0f };
@@ -848,14 +827,14 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
       corn_out_y[c] = o[1];
     }
 
-    float new_x = min4f(corn_out_x);
+    float new_x = fminf(fminf(fminf(corn_out_x[0], corn_out_x[1]), corn_out_x[2]), corn_out_x[3]);
     if(new_x + roi_in->width < 0) new_x = -roi_in->width;
-    float new_y = min4f(corn_out_y);
+    float new_y = fminf(fminf(fminf(corn_out_y[0], corn_out_y[1]), corn_out_y[2]), corn_out_y[3]);
     if(new_y + roi_in->height < 0) new_y = -roi_in->height;
 
-    float new_sc_x = max4f(corn_out_x);
+    float new_sc_x = fmaxf(fmaxf(fmaxf(corn_out_x[0], corn_out_x[1]), corn_out_x[2]), corn_out_x[3]);
     if(new_sc_x > 2.0f * roi_in->width) new_sc_x = 2.0f * roi_in->width;
-    float new_sc_y = max4f(corn_out_y);
+    float new_sc_y = fmaxf(fmaxf(fmaxf(corn_out_y[0], corn_out_y[1]), corn_out_y[2]), corn_out_y[3]);
     if(new_sc_y > 2.0f * roi_in->height) new_sc_y = 2.0f * roi_in->height;
 
     // be careful, we don't want too small area here !
@@ -897,32 +876,19 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
   // sanity check.
   if(roi_out->x < 0) roi_out->x = 0;
   if(roi_out->y < 0) roi_out->y = 0;
-  if(roi_out->width < 4 || roi_out->height < 4)
-  {
-    dt_print_pipe(DT_DEBUG_PIPE,
-      "safety check", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out);
-
-    roi_out->x = roi_in->x;
-    roi_out->y = roi_in->y;
-    roi_out->width = roi_in->width;
-    roi_out->height = roi_in->height;
-    piece->enabled = FALSE;
-
-    if(piece->pipe->type & DT_DEV_PIXELPIPE_FULL)
-      dt_control_log
-        (_("module '%s' has insane data so it is bypassed for now. you should disable it or change parameters\n"),
-         self->name());
-  }
+  if(roi_out->width < 1) roi_out->width = 1;
+  if(roi_out->height < 1) roi_out->height = 1;
 
   // save rotation crop on output buffer in world scale:
   d->cix = roi_out->x;
   d->ciy = roi_out->y;
 }
 
-void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+// 2nd pass: which roi would this operation need as input to fill the given output region?
+void modify_roi_in(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *roi_out, dt_iop_roi_t *roi_in)
 {
-  const dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
   *roi_in = *roi_out;
   // modify_roi_out took care of bounds checking for us. we hopefully do not get requests outside the clipping
   // area.
@@ -933,9 +899,9 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const float kw = piece->buf_in.width * so, kh = piece->buf_in.height * so;
   const float roi_out_x = roi_out->x - d->enlarge_x * so, roi_out_y = roi_out->y - d->enlarge_y * so;
   float p[2], o[2];
-  const dt_boundingbox_t aabb = { roi_out_x + d->cix * so, roi_out_y + d->ciy * so, roi_out_x + d->cix * so + roi_out->width,
+  dt_boundingbox_t aabb = { roi_out_x + d->cix * so, roi_out_y + d->ciy * so, roi_out_x + d->cix * so + roi_out->width,
                   roi_out_y + d->ciy * so + roi_out->height };
-  dt_boundingbox_t aabb_in = { FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX };
+  dt_boundingbox_t aabb_in = { INFINITY, INFINITY, -INFINITY, -INFINITY };
   for(int c = 0; c < 4; c++)
   {
     // get corner points of roi_out
@@ -994,14 +960,14 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
 // 3rd (final) pass: you get this input region (may be different from what was requested above),
 // do your best to fill the output region!
-void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  if(!dt_iop_have_required_input_format(4/*need full-color pixels*/, self, piece->colors,
+  if (!dt_iop_have_required_input_format(4/*need full-color pixels*/, self, piece->colors,
                                          ivoid, ovoid, roi_in, roi_out))
     return; // unsupported format, image has been copied to output and module's trouble flag set
 
-  const dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   const int ch = 4;
   const int ch_width = ch * roi_in->width;
@@ -1014,18 +980,23 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   }
   else
   {
-    const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
     const float rx = piece->buf_in.width * roi_in->scale;
     const float ry = piece->buf_in.height * roi_in->scale;
-    const dt_boundingbox_t k_space =
-      { d->k_space[0] * rx, d->k_space[1] * ry, d->k_space[2] * rx, d->k_space[3] * ry };
+    const dt_boundingbox_t k_space = { d->k_space[0] * rx, d->k_space[1] * ry, d->k_space[2] * rx, d->k_space[3] * ry };
     const float kxa = d->kxa * rx, kxb = d->kxb * rx, kxc = d->kxc * rx, kxd = d->kxd * rx;
     const float kya = d->kya * ry, kyb = d->kyb * ry, kyc = d->kyc * ry, kyd = d->kyd * ry;
     float ma, mb, md, me, mg, mh;
     if(d->k_apply == 1)
       keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-    DT_OMP_FOR(dt_omp_sharedconst(k_space))
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+    dt_omp_firstprivate(ch, ch_width, ivoid, kxa, kya, ovoid, roi_in, roi_out) \
+    dt_omp_sharedconst(k_space) \
+    shared(d, interpolation, ma, mb, md, me, mg, mh) \
+    schedule(static)
+#endif
     // (slow) point-by-point transformation.
     // TODO: optimize with scanlines and linear steps between?
     for(int j = 0; j < roi_out->height; j++)
@@ -1070,13 +1041,13 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 
 
 #ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_clipping_data_t *d = piece->data;
-  const dt_iop_clipping_global_data_t *gd = self->global_data;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
+  dt_iop_clipping_global_data_t *gd = (dt_iop_clipping_global_data_t *)self->global_data;
 
-  cl_int err = DT_OPENCL_DEFAULT_ERROR;
+  cl_int err = -999;
   const int devid = piece->pipe->devid;
 
   const int width = roi_out->width;
@@ -1095,7 +1066,7 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   {
     int crkernel = -1;
 
-    const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
 
     switch(interpolation->id)
     {
@@ -1112,17 +1083,17 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
         crkernel = gd->kernel_clip_rotate_lanczos3;
         break;
       default:
-        return err;
+        return FALSE;
     }
 
-    const int roi[2] = { roi_in->x, roi_in->y };
-    const float roo[2] = { roi_out->x - roi_out->scale * d->enlarge_x + roi_out->scale * d->cix,
+    int roi[2] = { roi_in->x, roi_in->y };
+    float roo[2] = { roi_out->x - roi_out->scale * d->enlarge_x + roi_out->scale * d->cix,
                      roi_out->y - roi_out->scale * d->enlarge_y + roi_out->scale * d->ciy };
-    const float t[2] = { d->tx, d->ty };
-    const float k[2] = { d->k_h, d->k_v };
-    const float m[4] = { d->m[0], d->m[1], d->m[2], d->m[3] };
+    float t[2] = { d->tx, d->ty };
+    float k[2] = { d->k_h, d->k_v };
+    float m[4] = { d->m[0], d->m[1], d->m[2], d->m[3] };
 
-    const float k_sizes[2] = { piece->buf_in.width * roi_in->scale, piece->buf_in.height * roi_in->scale };
+    float k_sizes[2] = { piece->buf_in.width * roi_in->scale, piece->buf_in.height * roi_in->scale };
     const dt_boundingbox_t k_space = { d->k_space[0] * k_sizes[0], d->k_space[1] * k_sizes[1],
                                        d->k_apply ? d->k_space[2] * k_sizes[0] : 0.0f,
                                        d->k_space[3] * k_sizes[1] };
@@ -1134,22 +1105,47 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
     const float maa[4] = { ma, mb, md, me };
     const float mbb[2] = { mg, mh };
 
-    err = dt_opencl_enqueue_kernel_2d_args(devid, crkernel, width, height,
-      CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height),
-      CLARG(roi_in->width), CLARG(roi_in->height), CLARG(roi), CLARG(roo), CLARG(roi_in->scale), CLARG(roi_out->scale),
-      CLARG(d->flip), CLARG(t), CLARG(k), CLARG(m), CLARG(k_space), CLARG(ka), CLARG(maa), CLARG(mbb));
+    size_t sizes[3];
+
+    sizes[0] = ROUNDUPWD(width);
+    sizes[1] = ROUNDUPHT(height);
+    sizes[2] = 1;
+    dt_opencl_set_kernel_arg(devid, crkernel, 0, sizeof(cl_mem), &dev_in);
+    dt_opencl_set_kernel_arg(devid, crkernel, 1, sizeof(cl_mem), &dev_out);
+    dt_opencl_set_kernel_arg(devid, crkernel, 2, sizeof(int), &width);
+    dt_opencl_set_kernel_arg(devid, crkernel, 3, sizeof(int), &height);
+    dt_opencl_set_kernel_arg(devid, crkernel, 4, sizeof(int), &roi_in->width);
+    dt_opencl_set_kernel_arg(devid, crkernel, 5, sizeof(int), &roi_in->height);
+    dt_opencl_set_kernel_arg(devid, crkernel, 6, 2 * sizeof(int), &roi);
+    dt_opencl_set_kernel_arg(devid, crkernel, 7, 2 * sizeof(float), &roo);
+    dt_opencl_set_kernel_arg(devid, crkernel, 8, sizeof(float), &roi_in->scale);
+    dt_opencl_set_kernel_arg(devid, crkernel, 9, sizeof(float), &roi_out->scale);
+    dt_opencl_set_kernel_arg(devid, crkernel, 10, sizeof(int), &d->flip);
+    dt_opencl_set_kernel_arg(devid, crkernel, 11, 2 * sizeof(float), &t);
+    dt_opencl_set_kernel_arg(devid, crkernel, 12, 2 * sizeof(float), &k);
+    dt_opencl_set_kernel_arg(devid, crkernel, 13, 4 * sizeof(float), &m);
+    dt_opencl_set_kernel_arg(devid, crkernel, 14, 4 * sizeof(float), &k_space);
+    dt_opencl_set_kernel_arg(devid, crkernel, 15, 2 * sizeof(float), &ka);
+    dt_opencl_set_kernel_arg(devid, crkernel, 16, 4 * sizeof(float), &maa);
+    dt_opencl_set_kernel_arg(devid, crkernel, 17, 2 * sizeof(float), &mbb);
+    err = dt_opencl_enqueue_kernel_2d(devid, crkernel, sizes);
+    if(err != CL_SUCCESS) goto error;
   }
 
+  return TRUE;
+
 error:
-  return err;
+  dt_print(DT_DEBUG_OPENCL, "[opencl_clipping] couldn't enqueue kernel! %d\n", err);
+  return FALSE;
 }
 #endif
 
-void init_global(dt_iop_module_so_t *self)
+void init_global(dt_iop_module_so_t *module)
 {
   const int program = 2; // basic.cl from programs.conf
-  dt_iop_clipping_global_data_t *gd = malloc(sizeof(dt_iop_clipping_global_data_t));
-  self->data = gd;
+  dt_iop_clipping_global_data_t *gd
+      = (dt_iop_clipping_global_data_t *)malloc(sizeof(dt_iop_clipping_global_data_t));
+  module->data = gd;
   gd->kernel_clip_rotate_bilinear = dt_opencl_create_kernel(program, "clip_rotate_bilinear");
   gd->kernel_clip_rotate_bicubic = dt_opencl_create_kernel(program, "clip_rotate_bicubic");
   gd->kernel_clip_rotate_lanczos2 = dt_opencl_create_kernel(program, "clip_rotate_lanczos2");
@@ -1157,23 +1153,23 @@ void init_global(dt_iop_module_so_t *self)
 }
 
 
-void cleanup_global(dt_iop_module_so_t *self)
+void cleanup_global(dt_iop_module_so_t *module)
 {
-  const dt_iop_clipping_global_data_t *gd = self->data;
+  dt_iop_clipping_global_data_t *gd = (dt_iop_clipping_global_data_t *)module->data;
   dt_opencl_free_kernel(gd->kernel_clip_rotate_bilinear);
   dt_opencl_free_kernel(gd->kernel_clip_rotate_bicubic);
   dt_opencl_free_kernel(gd->kernel_clip_rotate_lanczos2);
   dt_opencl_free_kernel(gd->kernel_clip_rotate_lanczos3);
-  free(self->data);
-  self->data = NULL;
+  free(module->data);
+  module->data = NULL;
 }
 
 
-void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
+void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
-  const dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)p1;
-  dt_iop_clipping_data_t *d = piece->data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)p1;
+  dt_iop_clipping_data_t *d = (dt_iop_clipping_data_t *)piece->data;
 
   // reset all values to be sure everything is initialized
   d->m[0] = d->m[3] = 1.0f;
@@ -1188,7 +1184,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->k_apply = 0;
   d->enlarge_x = d->enlarge_y = 0.0f;
   d->flip = 0;
-  d->angle = deg2radf(p->angle);
+  d->angle = M_PI / 180.0 * p->angle;
 
   // image flip
   d->flags = (p->ch < 0 ? FLAG_FLIP_VERTICAL : 0) | (p->cw < 0 ? FLAG_FLIP_HORIZONTAL : 0);
@@ -1227,10 +1223,10 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     if(p->k_type == 1) // we want horizontal points to be aligned
     {
       // line equations parameters
-      const float a1 = (d->kxd - d->kxa) / (d->kyd - d->kya);
-      const float b1 = d->kxa - a1 * d->kya;
-      const float a2 = (d->kxc - d->kxb) / (d->kyc - d->kyb);
-      const float b2 = d->kxb - a2 * d->kyb;
+      float a1 = (d->kxd - d->kxa) / (d->kyd - d->kya);
+      float b1 = d->kxa - a1 * d->kya;
+      float a2 = (d->kxc - d->kxb) / (d->kyc - d->kyb);
+      float b2 = d->kxb - a2 * d->kyb;
 
       if(d->kya > d->kyb)
       {
@@ -1315,7 +1311,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     d->k_apply = 0;
   }
 
-  if(dt_iop_has_focus(self))
+  if(gui_has_focus(self))
   {
     d->cx = 0.0f;
     d->cy = 0.0f;
@@ -1331,33 +1327,37 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     // we show a error on stderr if we have clamped something
     if(d->cx != p->cx || d->cy != p->cy || d->cw != fabsf(p->cw) || d->ch != fabsf(p->ch))
     {
-      dt_print(DT_DEBUG_ALWAYS,
-               "[crop&rotate] invalid crop data for %d : x=%0.04f y=%0.04f w=%0.04f h=%0.04f",
-               pipe->image.id, p->cx, p->cy, p->cw, p->ch);
+      fprintf(stderr, "[crop&rotate] invalid crop datas for %d : x=%0.04f y=%0.04f w=%0.04f h=%0.04f\n",
+              pipe->image.id, p->cx, p->cy, p->cw, p->ch);
     }
   }
 }
 
 static void _event_preview_updated_callback(gpointer instance, dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
   g->preview_ready = TRUE;
+  if(self->dev->gui_module != self)
+  {
+    dt_image_update_final_size(self->dev->preview_pipe->output_imgid);
+  }
 
-  DT_CONTROL_SIGNAL_DISCONNECT(_event_preview_updated_callback, self);
+  DT_DEBUG_CONTROL_SIGNAL_DISCONNECT(darktable.signals, G_CALLBACK(_event_preview_updated_callback), self);
   // force max size to be recomputed
-  g->clip_max_pipe_hash = DT_INVALID_HASH;
+  g->clip_max_pipe_hash = 0;
 }
 
-void gui_focus(dt_iop_module_t *self, gboolean in)
+void gui_focus(struct dt_iop_module_t *self, gboolean in)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   if(self->enabled)
   {
     if(in)
     {
-      DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _event_preview_updated_callback);
+      DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED,
+                                      G_CALLBACK(_event_preview_updated_callback), self);
 
       // got focus, grab stuff to gui:
       // need to get gui stuff for the first time for this image,
@@ -1368,7 +1368,8 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
     }
     else
     {
-      DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _event_preview_updated_callback);
+      DT_DEBUG_CONTROL_SIGNAL_CONNECT(darktable.signals, DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED,
+                                      G_CALLBACK(_event_preview_updated_callback), self);
 
       // lost focus, commit current params:
       // if the keystone setting is not finished, we discard it
@@ -1383,7 +1384,7 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
       self->dev->gui_module = self;
       commit_box(self, g, p);
       self->dev->gui_module = old_gui;
-      g->clip_max_pipe_hash = DT_INVALID_HASH;
+      g->clip_max_pipe_hash = 0;
     }
   }
   else if(in)
@@ -1391,12 +1392,12 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
 }
 
 
-void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = malloc(sizeof(dt_iop_clipping_data_t));
 }
 
-void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
@@ -1404,14 +1405,14 @@ void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelp
 
 static float _ratio_get_aspect(dt_iop_module_t *self, GtkWidget *combo)
 {
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   //retrieve full image dimensions to calculate aspect ratio if "original image" specified
   const char *text = dt_bauhaus_combobox_get_text(combo);
   if(text && !g_strcmp0(text,_("original image")))
   {
     int proc_iwd = 0, proc_iht = 0;
-    dt_dev_get_processed_size(&darktable.develop->full, &proc_iwd, &proc_iht);
+    dt_dev_get_processed_size(darktable.develop, &proc_iwd, &proc_iht);
 
     if(!(proc_iwd > 0 && proc_iht > 0)) return 0.0f;
 
@@ -1437,7 +1438,7 @@ static float _ratio_get_aspect(dt_iop_module_t *self, GtkWidget *combo)
     }
     else
     {
-      const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+      const struct dt_interpolation *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
       const float whratio = ((float)(iwd - 2 * interpolation->width) * (fabsf(p->cw) - p->cx))
                             / ((float)(iht - 2 * interpolation->width) * (fabsf(p->ch) - p->cy));
       const float ri = (float)iwd / (float)iht;
@@ -1534,12 +1535,12 @@ static float _ratio_get_aspect(dt_iop_module_t *self, GtkWidget *combo)
     return dn / nn;
 }
 
-static void apply_box_aspect(dt_iop_module_t *self, const _grab_region_t grab)
+static void apply_box_aspect(dt_iop_module_t *self, _grab_region_t grab)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
 
   int iwd, iht;
-  dt_dev_get_processed_size(&darktable.develop->full, &iwd, &iht);
+  dt_dev_get_processed_size(darktable.develop, &iwd, &iht);
 
   // enforce aspect ratio.
   float aspect = _ratio_get_aspect(self, g->aspect_presets);
@@ -1606,7 +1607,7 @@ static void apply_box_aspect(dt_iop_module_t *self, const _grab_region_t grab)
     // now fix outside boxes:
     if(clip_x < g->clip_max_x)
     {
-      const double prev_clip_h = clip_h;
+      double prev_clip_h = clip_h;
       clip_h *= (clip_w + clip_x - g->clip_max_x) / clip_w;
       clip_w = clip_w + clip_x - g->clip_max_x;
       clip_x = g->clip_max_x;
@@ -1614,7 +1615,7 @@ static void apply_box_aspect(dt_iop_module_t *self, const _grab_region_t grab)
     }
     if(clip_y < g->clip_max_y)
     {
-      const double prev_clip_w = clip_w;
+      double prev_clip_w = clip_w;
       clip_w *= (clip_h + clip_y - g->clip_max_y) / clip_h;
       clip_h = clip_h + clip_y - g->clip_max_y;
       clip_y = g->clip_max_y;
@@ -1622,14 +1623,14 @@ static void apply_box_aspect(dt_iop_module_t *self, const _grab_region_t grab)
     }
     if(clip_x + clip_w > g->clip_max_x + g->clip_max_w)
     {
-      const double prev_clip_h = clip_h;
+      double prev_clip_h = clip_h;
       clip_h *= (g->clip_max_x + g->clip_max_w - clip_x) / clip_w;
       clip_w = g->clip_max_x + g->clip_max_w - clip_x;
       if(grab & GRAB_TOP) clip_y += prev_clip_h - clip_h;
     }
     if(clip_y + clip_h > g->clip_max_y + g->clip_max_h)
     {
-      const double prev_clip_w = clip_w;
+      double prev_clip_w = clip_w;
       clip_w *= (g->clip_max_y + g->clip_max_h - clip_y) / clip_h;
       clip_h = g->clip_max_y + g->clip_max_h - clip_y;
       if(grab & GRAB_LEFT) clip_x += prev_clip_w - clip_w;
@@ -1645,7 +1646,7 @@ void reload_defaults(dt_iop_module_t *self)
 {
   const dt_image_t *img = &self->dev->image_storage;
 
-  dt_iop_clipping_params_t *d = self->default_params;
+  dt_iop_clipping_params_t *d = (dt_iop_clipping_params_t *)self->default_params;
 
   d->cx = img->usercrop[1];
   d->cy = img->usercrop[0];
@@ -1657,7 +1658,7 @@ static void _float_to_fract(const char *num, int *n, int *d)
 {
   char tnum[100];
   gboolean sep_found = FALSE;
-  const char *p = (char *)num;
+  char *p = (char *)num;
   int k = 0;
 
   *d = 1;
@@ -1671,7 +1672,7 @@ static void _float_to_fract(const char *num, int *n, int *d)
     {
       sep_found = TRUE;
     }
-    else if(*p < '0' || *p > '9')
+    else if (*p < '0' || *p > '9')
     {
       *n = *d = 0;
       return;
@@ -1691,8 +1692,8 @@ static void _float_to_fract(const char *num, int *n, int *d)
 
 static void aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *self)
 {
-  const dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   const int which = dt_bauhaus_combobox_get(combo);
   int d = abs(p->ratio_d), n = p->ratio_n;
   const char *text = dt_bauhaus_combobox_get_text(combo);
@@ -1707,8 +1708,8 @@ static void aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *self)
       {
         // input the exact fraction
         c++;
-        const int dd = atoi(text);
-        const int nn = atoi(c);
+        int dd = atoi(text);
+        int nn = atoi(c);
         // some sanity check
         if(nn == 0 || dd == 0)
         {
@@ -1827,8 +1828,8 @@ static void aspect_presets_changed(GtkWidget *combo, dt_iop_module_t *self)
 
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   ++darktable.gui->reset;
 
@@ -1862,9 +1863,9 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   if(w == g->crop_auto) dt_control_queue_redraw_center();
 }
 
-void gui_reset(dt_iop_module_t *self)
+void gui_reset(struct dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
   /* reset aspect preset to default */
   dt_conf_set_int("plugins/darkroom/clipping/ratio_d", 0);
   dt_conf_set_int("plugins/darkroom/clipping/ratio_n", 0);
@@ -1873,8 +1874,8 @@ void gui_reset(dt_iop_module_t *self)
 
 static void keystone_type_changed(GtkWidget *combo, dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   const int which = dt_bauhaus_combobox_get(combo);
   if((which == 5) || (which == 4 && p->k_h == 0 && p->k_v == 0))
   {
@@ -1909,10 +1910,10 @@ static void keystone_type_changed(GtkWidget *combo, dt_iop_module_t *self)
   dt_control_queue_redraw_center();
 }
 
-static void keystone_type_populate(dt_iop_module_t *self, const gboolean with_applied, const int select)
+static void keystone_type_populate(struct dt_iop_module_t *self, gboolean with_applied, int select)
 {
-  const dt_iop_clipping_gui_data_t *g = self->gui_data;
-  const dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   dt_bauhaus_combobox_clear(g->keystone_type);
   dt_bauhaus_combobox_add(g->keystone_type, _("none"));
   dt_bauhaus_combobox_add(g->keystone_type, _("vertical"));
@@ -1935,11 +1936,17 @@ static void keystone_type_populate(dt_iop_module_t *self, const gboolean with_ap
   keystone_type_changed(g->keystone_type, self);
 }
 
-void gui_update(dt_iop_module_t *self)
+void gui_update(struct dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
+  /* update ui elements */
+  dt_bauhaus_slider_set(g->angle, p->angle);
+  dt_bauhaus_slider_set(g->cx, p->cx);
+  dt_bauhaus_slider_set(g->cy, p->cy);
+  dt_bauhaus_slider_set(g->cw, p->cw);
+  dt_bauhaus_slider_set(g->ch, p->ch);
   int hvflip = 0;
   if(p->cw < 0)
   {
@@ -2017,25 +2024,48 @@ void gui_update(dt_iop_module_t *self)
   g->clip_y = CLAMPF(p->cy, 0.0f, 0.9f);
   g->clip_w = CLAMPF(fabsf(p->cw) - p->cx, 0.1f, 1.0f - g->clip_x);
   g->clip_h = CLAMPF(fabsf(p->ch) - p->cy, 0.1f, 1.0f - g->clip_y);
+
+  dt_bauhaus_combobox_set(g->crop_auto, p->crop_auto);
 }
 
 static void hvflip_callback(GtkWidget *widget, dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   const int flip = dt_bauhaus_combobox_get(widget);
   p->cw = copysignf(p->cw, (flip & 1) ? -1.0 : 1.0);
   p->ch = copysignf(p->ch, (flip & 2) ? -1.0 : 1.0);
   commit_box(self, g, p);
 }
 
-static void aspect_flip(GtkWidget *button, dt_iop_module_t *self)
+static void key_swap_callback(GtkAccelGroup *accel_group, GObject *acceleratable, guint keyval,
+                              GdkModifierType modifier, gpointer d)
 {
-  dt_iop_clipping_params_t *p = self->params;
+  (void)accel_group;
+  (void)acceleratable;
+  (void)keyval;
+  (void)modifier;
+  dt_iop_module_t *self = (dt_iop_module_t *)d;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   p->ratio_d = -p->ratio_d;
   apply_box_aspect(self, GRAB_HORIZONTAL);
   dt_control_queue_redraw_center();
+}
+
+static gboolean key_commit_callback(GtkAccelGroup *accel_group, GObject *acceleratable, guint keyval,
+                                    GdkModifierType modifier, gpointer data)
+{
+  dt_iop_module_t *self = (dt_iop_module_t *)data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
+  commit_box(self, g, p);
+  return TRUE;
+}
+
+static void aspect_flip(GtkWidget *button, dt_iop_module_t *self)
+{
+  key_swap_callback(NULL, NULL, 0, 0, self);
 }
 
 static gint _aspect_ratio_cmp(const dt_iop_clipping_aspect_t *a, const dt_iop_clipping_aspect_t *b)
@@ -2060,7 +2090,7 @@ static gint _aspect_ratio_cmp(const dt_iop_clipping_aspect_t *a, const dt_iop_cl
 }
 
 
-static gchar *format_aspect(gchar *original, const int adim, const int bdim)
+static gchar *format_aspect(gchar *original, int adim, int bdim)
 {
   // Special ratios:  freehand, original image
   if(bdim == 0) return g_strdup(original);
@@ -2068,7 +2098,7 @@ static gchar *format_aspect(gchar *original, const int adim, const int bdim)
   return g_strdup_printf("%s  %4.2f", original, (float)adim / (float)bdim);
 }
 
-void gui_init(dt_iop_module_t *self)
+void gui_init(struct dt_iop_module_t *self)
 {
   dt_iop_clipping_gui_data_t *g = IOP_GUI_ALLOC(clipping);
 
@@ -2077,7 +2107,7 @@ void gui_init(dt_iop_module_t *self)
   g->clip_w = g->clip_h = 1.0;
   g->clip_max_x = g->clip_max_y = 0.0;
   g->clip_max_w = g->clip_max_h = 1.0;
-  g->clip_max_pipe_hash = DT_INVALID_HASH;
+  g->clip_max_pipe_hash = 0;
   g->cropping = 0;
   g->straightening = 0;
   g->applied = 1;
@@ -2102,11 +2132,12 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_combobox_add(g->hvflip, _("both"));
   g_signal_connect(G_OBJECT(g->hvflip), "value-changed", G_CALLBACK(hvflip_callback), self);
   gtk_widget_set_tooltip_text(g->hvflip, _("mirror image horizontally and/or vertically"));
-  dt_gui_box_add(self->widget, g->hvflip);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->hvflip, TRUE, TRUE, 0);
 
   g->angle = dt_bauhaus_slider_from_params(self, N_("angle"));
+  dt_bauhaus_slider_set_step(g->angle, 0.25);
   dt_bauhaus_slider_set_factor(g->angle, -1.0);
-  dt_bauhaus_slider_set_format(g->angle, "°");
+  dt_bauhaus_slider_set_format(g->angle, "%.02f°");
   gtk_widget_set_tooltip_text(g->angle, _("right-click and drag a line on the image to drag a straight line"));
 
   g->keystone_type = dt_bauhaus_combobox_new(self);
@@ -2117,12 +2148,12 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_combobox_add(g->keystone_type, _("full"));
   gtk_widget_set_tooltip_text(g->keystone_type, _("set perspective correction for your image"));
   g_signal_connect(G_OBJECT(g->keystone_type), "value-changed", G_CALLBACK(keystone_type_changed), self);
-  dt_gui_box_add(self->widget, g->keystone_type);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->keystone_type, TRUE, TRUE, 0);
 
   g->crop_auto = dt_bauhaus_combobox_from_params(self, "crop_auto");
   gtk_widget_set_tooltip_text(g->crop_auto, _("automatically crop to avoid black edges"));
 
-  const dt_iop_clipping_aspect_t aspects[] = { { _("freehand"), 0, 0 },
+  dt_iop_clipping_aspect_t aspects[] = { { _("freehand"), 0, 0 },
                                          { _("original image"), 1, 0 },
                                          { _("square"), 1, 1 },
                                          { _("10:8 in print"), 2445, 2032 },
@@ -2159,7 +2190,7 @@ void gui_init(dt_iop_module_t *self)
   GSList *custom_aspects = dt_conf_all_string_entries("plugins/darkroom/clipping/extra_aspect_ratios");
   for(GSList *iter = custom_aspects; iter; iter = g_slist_next(iter))
   {
-    const dt_conf_string_entry_t *nv = iter->data;
+    dt_conf_string_entry_t *nv = (dt_conf_string_entry_t *)iter->data;
 
     const char *c = nv->value;
     const char *end = nv->value + strlen(nv->value);
@@ -2167,12 +2198,12 @@ void gui_init(dt_iop_module_t *self)
     if(c < end - 1)
     {
       c++;
-      const int d = atoi(nv->value);
-      const int n = atoi(c);
+      int d = atoi(nv->value);
+      int n = atoi(c);
       // some sanity check
       if(n == 0 || d == 0)
       {
-        dt_print(DT_DEBUG_ALWAYS, "invalid ratio format for `%s'. it should be \"number:number\"", nv->key);
+        fprintf(stderr, "invalid ratio format for `%s'. it should be \"number:number\"\n", nv->key);
         dt_control_log(_("invalid ratio format for `%s'. it should be \"number:number\""), nv->key);
         continue;
       }
@@ -2184,7 +2215,7 @@ void gui_init(dt_iop_module_t *self)
     }
     else
     {
-      dt_print(DT_DEBUG_ALWAYS, "invalid ratio format for `%s'. it should be \"number:number\"", nv->key);
+      fprintf(stderr, "invalid ratio format for `%s'. it should be \"number:number\"\n", nv->key);
       dt_control_log(_("invalid ratio format for `%s'. it should be \"number:number\""), nv->key);
       continue;
     }
@@ -2200,9 +2231,9 @@ void gui_init(dt_iop_module_t *self)
       n = ((dt_iop_clipping_aspect_t *)g->aspect_list->data)->n + 1;
   for(GList *iter = g->aspect_list; iter; iter = g_list_next(iter))
   {
-    const dt_iop_clipping_aspect_t *aspect = iter->data;
-    const int dd = MIN(aspect->d, aspect->n);
-    const int nn = MAX(aspect->d, aspect->n);
+    dt_iop_clipping_aspect_t *aspect = (dt_iop_clipping_aspect_t *)iter->data;
+    int dd = MIN(aspect->d, aspect->n);
+    int nn = MAX(aspect->d, aspect->n);
     if(dd == d && nn == n)
     {
       // same as the last one, remove this entry
@@ -2237,38 +2268,40 @@ void gui_init(dt_iop_module_t *self)
                                                    "to enter custom aspect ratio open the combobox and type ratio in x:y or decimal format"));
   dt_bauhaus_widget_set_quad_paint(g->aspect_presets, dtgtk_cairo_paint_aspectflip, 0, NULL);
   g_signal_connect(G_OBJECT(g->aspect_presets), "quad-pressed", G_CALLBACK(aspect_flip), self);
-  dt_gui_box_add(self->widget, g->aspect_presets);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->aspect_presets, TRUE, TRUE, 0);
 
   self->widget = dt_ui_notebook_page(g->notebook, _("margins"), NULL);
 
   g->cx = dt_bauhaus_slider_from_params(self, "cx");
   dt_bauhaus_slider_set_digits(g->cx, 4);
-  dt_bauhaus_slider_set_format(g->cx, "%");
+  dt_bauhaus_slider_set_factor(g->cx, 100.0);
+  dt_bauhaus_slider_set_format(g->cx, "%0.2f %%");
   gtk_widget_set_tooltip_text(g->cx, _("the left margin cannot overlap with the right margin"));
 
   g->cw = dt_bauhaus_slider_from_params(self, "cw");
   dt_bauhaus_slider_set_digits(g->cw, 4);
   dt_bauhaus_slider_set_factor(g->cw, -100.0);
   dt_bauhaus_slider_set_offset(g->cw, 100.0);
-  dt_bauhaus_slider_set_format(g->cw, "%");
+  dt_bauhaus_slider_set_format(g->cw, "%0.2f %%");
   gtk_widget_set_tooltip_text(g->cw, _("the right margin cannot overlap with the left margin"));
 
   g->cy = dt_bauhaus_slider_from_params(self, "cy");
   dt_bauhaus_slider_set_digits(g->cy, 4);
-  dt_bauhaus_slider_set_format(g->cy, "%");
+  dt_bauhaus_slider_set_factor(g->cy, 100.0);
+  dt_bauhaus_slider_set_format(g->cy, "%0.2f %%");
   gtk_widget_set_tooltip_text(g->cy, _("the top margin cannot overlap with the bottom margin"));
 
   g->ch = dt_bauhaus_slider_from_params(self, "ch");
   dt_bauhaus_slider_set_digits(g->ch, 4);
   dt_bauhaus_slider_set_factor(g->ch, -100.0);
   dt_bauhaus_slider_set_offset(g->ch, 100.0);
-  dt_bauhaus_slider_set_format(g->ch, "%");
+  dt_bauhaus_slider_set_format(g->ch, "%0.2f %%");
   gtk_widget_set_tooltip_text(g->ch, _("the bottom margin cannot overlap with the top margin"));
 
   self->widget = GTK_WIDGET(g->notebook);
 }
 
-static void free_aspect(const gpointer data)
+static void free_aspect(gpointer data)
 {
   dt_iop_clipping_aspect_t *aspect = (dt_iop_clipping_aspect_t *)data;
   g_free(aspect->name);
@@ -2276,14 +2309,16 @@ static void free_aspect(const gpointer data)
   g_free(aspect);
 }
 
-void gui_cleanup(dt_iop_module_t *self)
+void gui_cleanup(struct dt_iop_module_t *self)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
   g_list_free_full(g->aspect_list, free_aspect);
   g->aspect_list = NULL;
+
+  IOP_GUI_FREE;
 }
 
-static _grab_region_t get_grab(const float pzx, const float pzy, const dt_iop_clipping_gui_data_t *g, const float border,
+static _grab_region_t get_grab(float pzx, float pzy, dt_iop_clipping_gui_data_t *g, const float border,
                                const float wd, const float ht)
 {
   _grab_region_t grab = GRAB_NONE;
@@ -2302,7 +2337,7 @@ static _grab_region_t get_grab(const float pzx, const float pzy, const dt_iop_cl
 }
 
 // draw symmetry signs
-static void gui_draw_sym(cairo_t *cr, const float x, const float y, const float scale, const gboolean active)
+static void gui_draw_sym(cairo_t *cr, float x, float y, float scale, gboolean active)
 {
   PangoLayout *layout;
   PangoRectangle ink;
@@ -2313,7 +2348,7 @@ static void gui_draw_sym(cairo_t *cr, const float x, const float y, const float 
   pango_layout_set_font_description(layout, desc);
   pango_layout_set_text(layout, "ꝏ", -1);
   pango_layout_get_pixel_extents(layout, &ink, NULL);
-  dt_draw_set_color_overlay(cr, TRUE, 0.5);
+  dt_draw_set_color_overlay(cr, 0.5, 0.7);
   dt_gui_draw_rounded_rectangle(
       cr, ink.width + DT_PIXEL_APPLY_DPI(4) * scale, ink.height + DT_PIXEL_APPLY_DPI(8) * scale,
       x - ink.width / 2.0f - DT_PIXEL_APPLY_DPI(2) * scale, y - ink.height / 2.0f - DT_PIXEL_APPLY_DPI(4) * scale);
@@ -2328,17 +2363,12 @@ static void gui_draw_sym(cairo_t *cr, const float x, const float y, const float 
 }
 
 // draw guides and handles over the image
-void gui_post_expose(dt_iop_module_t *self,
-                     cairo_t *cr,
-                     const float wd,
-                     const float ht,
-                     const float pzx,
-                     const float pzy,
-                     const float zoom_scale)
+void gui_post_expose(struct dt_iop_module_t *self, cairo_t *cr, int32_t width, int32_t height,
+                     int32_t pointerx, int32_t pointery)
 {
   dt_develop_t *dev = self->dev;
-  const dt_iop_clipping_gui_data_t *g = self->gui_data;
-  const dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   // we don't do anything if the image is not ready
   if(!g->preview_ready) return;
@@ -2346,16 +2376,32 @@ void gui_post_expose(dt_iop_module_t *self,
   // reapply box aspect to be sure that the ratio has not been modified by the keystone transform
   apply_box_aspect(self, GRAB_HORIZONTAL);
 
-  const double dashes = DT_PIXEL_APPLY_DPI(5.0) / zoom_scale;
+  const float wd = dev->preview_pipe->backbuf_width;
+  const float ht = dev->preview_pipe->backbuf_height;
+  const float zoom_y = dt_control_get_dev_zoom_y();
+  const float zoom_x = dt_control_get_dev_zoom_x();
+  const dt_dev_zoom_t zoom = dt_control_get_dev_zoom();
+  const int closeup = dt_control_get_dev_closeup();
+  const float pr_d = dev->preview_downsampling;
+  const float zoom_scale = dt_dev_get_zoom_scale(dev, zoom, 1<<closeup, 1);
+
+  cairo_translate(cr, width / 2.0, height / 2.0);
+  cairo_scale(cr, zoom_scale, zoom_scale);
+  cairo_translate(cr, -.5f * wd - zoom_x * wd, -.5f * ht - zoom_y * ht);
+
+  double dashes = DT_PIXEL_APPLY_DPI(5.0) / zoom_scale;
 
   // draw cropping window
+  float pzx, pzy;
+  dt_dev_get_pointer_zoom_pos(dev, pointerx, pointery, &pzx, &pzy);
+  pzx += 0.5f;
+  pzy += 0.5f;
   if(_iop_clipping_set_max_clip(self))
   {
     cairo_set_source_rgba(cr, .2, .2, .2, .8);
     cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
-
-    cairo_rectangle(cr, g->clip_max_x * wd - 1.0, g->clip_max_y * ht - 1.0,
-                        g->clip_max_w * wd + 2.0, g->clip_max_h * ht + 2.0);
+    cairo_rectangle(cr, g->clip_max_x * wd - pr_d, g->clip_max_y * ht - pr_d,
+                    g->clip_max_w * wd + 2.0 * pr_d, g->clip_max_h * ht + 2.0 * pr_d);
     cairo_rectangle(cr, g->clip_x * wd, g->clip_y * ht, g->clip_w * wd, g->clip_h * ht);
     cairo_fill(cr);
   }
@@ -2363,7 +2409,7 @@ void gui_post_expose(dt_iop_module_t *self,
   {
     cairo_set_line_width(cr, dashes / 2.0);
     cairo_rectangle(cr, g->clip_x * wd, g->clip_y * ht, g->clip_w * wd, g->clip_h * ht);
-    dt_draw_set_color_overlay(cr, TRUE, 1.0);
+    dt_draw_set_color_overlay(cr, 0.7, 1.0);
     cairo_stroke(cr);
   }
 
@@ -2381,8 +2427,8 @@ void gui_post_expose(dt_iop_module_t *self,
     pango_layout_set_font_description(layout, desc);
 
     int procw, proch;
-    dt_dev_get_processed_size(&dev->full, &procw, &proch);
-    snprintf(dimensions, sizeof(dimensions), "%i x %i", (int)(procw * g->clip_w), (int)(proch * g->clip_h));
+    dt_dev_get_processed_size(dev, &procw, &proch);
+    snprintf(dimensions, sizeof(dimensions), "%.0f x %.0f", (float)procw * g->clip_w, (float)proch * g->clip_h);
 
     pango_layout_set_text(layout, dimensions, -1);
     pango_layout_get_pixel_extents(layout, NULL, &ext);
@@ -2412,7 +2458,7 @@ void gui_post_expose(dt_iop_module_t *self,
   dt_guides_draw(cr, g->clip_x * wd, g->clip_y * ht, g->clip_w * wd, g->clip_h * ht, zoom_scale);
 
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.0) / zoom_scale);
-  dt_draw_set_color_overlay(cr, FALSE, 1.0);
+  dt_draw_set_color_overlay(cr, 0.3, 1.0);
   const int border = DT_PIXEL_APPLY_DPI(30.0) / zoom_scale;
   if(g->straightening)
   {
@@ -2423,10 +2469,10 @@ void gui_post_expose(dt_iop_module_t *self,
     pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(16) * PANGO_SCALE / zoom_scale);
     layout = pango_cairo_create_layout(cr);
     pango_layout_set_font_description(layout, desc);
-    const float bzx = g->button_down_zoom_x, bzy = g->button_down_zoom_y;
-    cairo_arc(cr, bzx * wd, bzy * ht, DT_PIXEL_APPLY_DPI(3), 0, 2.0 * M_PI);
+    const float bzx = g->button_down_zoom_x + .5f, bzy = g->button_down_zoom_y + .5f;
+    cairo_arc(cr, bzx * wd, bzy * ht, DT_PIXEL_APPLY_DPI(3) * pr_d, 0, 2.0 * M_PI);
     cairo_stroke(cr);
-    cairo_arc(cr, pzx * wd, pzy * ht, DT_PIXEL_APPLY_DPI(3), 0, 2.0 * M_PI);
+    cairo_arc(cr, pzx * wd, pzy * ht, DT_PIXEL_APPLY_DPI(3) * pr_d, 0, 2.0 * M_PI);
     cairo_stroke(cr);
     cairo_move_to(cr, bzx * wd, bzy * ht);
     cairo_line_to(cr, pzx * wd, pzy * ht);
@@ -2439,7 +2485,8 @@ void gui_post_expose(dt_iop_module_t *self,
       dx = -dx;
       dy = -dy;
     }
-    float angle = rad2degf(atan2f(dy, dx));
+    float angle = atan2f(dy, dx);
+    angle = angle * 180 / M_PI;
     if(angle > 45.0) angle -= 90;
     if(angle < -45.0) angle += 90;
 
@@ -2661,21 +2708,21 @@ void gui_post_expose(dt_iop_module_t *self,
       PangoRectangle ink;
       PangoFontDescription *desc = pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
       pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
-      pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(16) * PANGO_SCALE);
+      pango_font_description_set_absolute_size(desc, DT_PIXEL_APPLY_DPI(16) * PANGO_SCALE * pr_d);
       layout = pango_cairo_create_layout(cr);
       pango_layout_set_font_description(layout, desc);
       cairo_set_font_size(cr, DT_PIXEL_APPLY_DPI(16));
       pango_layout_set_text(layout, "ok", -1);
       pango_layout_get_pixel_extents(layout, &ink, NULL);
-      const int c[2] = { (MIN(pts[4], pts[2]) + MAX(pts[0], pts[6])) / 2.0f,
+      int c[2] = { (MIN(pts[4], pts[2]) + MAX(pts[0], pts[6])) / 2.0f,
                    (MIN(pts[5], pts[7]) + MAX(pts[1], pts[3])) / 2.0f };
       cairo_set_source_rgba(cr, .5, .5, .5, .9);
-      dt_gui_draw_rounded_rectangle(cr, ink.width + DT_PIXEL_APPLY_DPI(8),
-                                    ink.height + DT_PIXEL_APPLY_DPI(12),
-                                    c[0] - ink.width / 2.0f - DT_PIXEL_APPLY_DPI(4),
-                                    c[1] - ink.height / 2.0f - DT_PIXEL_APPLY_DPI(6));
+      dt_gui_draw_rounded_rectangle(cr, ink.width + DT_PIXEL_APPLY_DPI(8) * pr_d,
+                                    ink.height + DT_PIXEL_APPLY_DPI(12) * pr_d,
+                                    c[0] - ink.width / 2.0f - DT_PIXEL_APPLY_DPI(4) * pr_d,
+                                    c[1] - ink.height / 2.0f - DT_PIXEL_APPLY_DPI(6) * pr_d);
       cairo_move_to(cr, c[0] - ink.width / 2.0, c[1] - 3.0 * ink.height / 4.0);
-      dt_draw_set_color_overlay(cr, FALSE, 0.9);
+      dt_draw_set_color_overlay(cr, 0.2, 0.9);
       pango_cairo_show_layout(cr, layout);
       pango_font_description_free(desc);
       g_object_unref(layout);
@@ -2685,21 +2732,21 @@ void gui_post_expose(dt_iop_module_t *self,
       if(p->k_type == 1 || p->k_type == 3)
       {
         if(p->k_sym == 1 || p->k_sym == 3) sym = TRUE;
-        gui_draw_sym(cr, (pts[0] + pts[6]) / 2.0f, (pts[1] + pts[7]) / 2.0f, 1.0f, sym);
-        gui_draw_sym(cr, (pts[2] + pts[4]) / 2.0f, (pts[3] + pts[5]) / 2.0f, 1.0f, sym);
+        gui_draw_sym(cr, (pts[0] + pts[6]) / 2.0f, (pts[1] + pts[7]) / 2.0f, pr_d, sym);
+        gui_draw_sym(cr, (pts[2] + pts[4]) / 2.0f, (pts[3] + pts[5]) / 2.0f, pr_d, sym);
       }
       if(p->k_type == 2 || p->k_type == 3)
       {
         sym = (p->k_sym >= 2);
-        gui_draw_sym(cr, (pts[0] + pts[2]) / 2.0f, (pts[1] + pts[3]) / 2.0f, 1.0f, sym);
-        gui_draw_sym(cr, (pts[6] + pts[4]) / 2.0f, (pts[7] + pts[5]) / 2.0f, 1.0f, sym);
+        gui_draw_sym(cr, (pts[0] + pts[2]) / 2.0f, (pts[1] + pts[3]) / 2.0f, pr_d, sym);
+        gui_draw_sym(cr, (pts[6] + pts[4]) / 2.0f, (pts[7] + pts[5]) / 2.0f, pr_d, sym);
       }
     }
   }
 }
 
 // determine the distance between the segment [(xa,ya)(xb,yb)] and the point (xc,yc)
-static float dist_seg(const float xa, const float ya, const float xb, const float yb, const float xc, const float yc)
+static float dist_seg(float xa, float ya, float xb, float yb, float xc, float yc)
 {
   if(xa == xb && ya == yb) return (xc - xa) * (xc - xa) + (yc - ya) * (yc - ya);
 
@@ -2720,21 +2767,23 @@ static float dist_seg(const float xa, const float ya, const float xb, const floa
   return un2 - ah2;
 }
 
-int mouse_moved(dt_iop_module_t *self,
-                const float pzx,
-                const float pzy,
-                const double pressure,
-                const int which,
-                const float zoom_scale)
+int mouse_moved(struct dt_iop_module_t *self, double x, double y, double pressure, int which)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
 
   // we don't do anything if the image is not ready
   if(!g->preview_ready) return 0;
 
-  float wd, ht;
-  dt_dev_get_preview_size(self->dev, &wd, &ht);
+  const float wd = self->dev->preview_pipe->backbuf_width;
+  const float ht = self->dev->preview_pipe->backbuf_height;
+  const dt_dev_zoom_t zoom = dt_control_get_dev_zoom();
+  const int closeup = dt_control_get_dev_closeup();
+  const float zoom_scale = dt_dev_get_zoom_scale(self->dev, zoom, 1<<closeup, 1);
+  float pzx, pzy;
+  dt_dev_get_pointer_zoom_pos(self->dev, x, y, &pzx, &pzy);
+  pzx += 0.5f;
+  pzy += 0.5f;
   _iop_clipping_set_max_clip(self);
   _grab_region_t grab = get_grab(pzx, pzy, g, DT_PIXEL_APPLY_DPI(30.0) / zoom_scale, wd, ht);
 
@@ -2742,7 +2791,7 @@ int mouse_moved(dt_iop_module_t *self,
   {
     // second mouse button, straighten activated:
     g->straightening = 1;
-    dt_control_change_cursor("crosshair");
+    dt_control_change_cursor(GDK_CROSSHAIR);
     dt_control_queue_redraw_center();
   }
   else if(darktable.control->button_down && darktable.control->button_down_which == 1)
@@ -2752,7 +2801,7 @@ int mouse_moved(dt_iop_module_t *self,
     {
       float pts[2] = { pzx * wd, pzy * ht };
       dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, 1);
-      const dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
+      dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
       const float xx = pts[0] / (float)piece->buf_out.width, yy = pts[1] / (float)piece->buf_out.height;
       if(g->k_selected == 0)
       {
@@ -2851,7 +2900,7 @@ int mouse_moved(dt_iop_module_t *self,
     // draw a light gray frame, to show it's not stored yet:
     g->applied = 0;
     // first mouse button, adjust cropping frame, but what do we do?
-    const float bzx = g->button_down_zoom_x, bzy = g->button_down_zoom_y;
+    const float bzx = g->button_down_zoom_x + .5f, bzy = g->button_down_zoom_y + .5f;
     if(g->cropping == GRAB_CENTER && !g->straightening && g->k_show != 1)
     {
       g->cropping = grab;
@@ -2867,7 +2916,7 @@ int mouse_moved(dt_iop_module_t *self,
       if(grab & GRAB_BOTTOM) g->handle_y = bzy - (g->clip_h + g->clip_y);
       if(!grab && darktable.control->button_down_which == 3) g->straightening = 1;
     }
-    if(!g->straightening && darktable.control->button_down_which == GDK_BUTTON_PRIMARY && g->k_show != 1)
+    if(!g->straightening && darktable.control->button_down_which == 1 && g->k_show != 1)
     {
       grab = g->cropping;
 
@@ -2907,8 +2956,8 @@ int mouse_moved(dt_iop_module_t *self,
           // now that we are sure that the crop size is correct, we have to adjust top & left
           float nx = g->prev_clip_x - (g->prev_clip_w * ratio - g->prev_clip_w) / 2.0f;
           float ny = g->prev_clip_y - (g->prev_clip_h * ratio - g->prev_clip_h) / 2.0f;
-          const float nw = g->prev_clip_w * ratio;
-          const float nh = g->prev_clip_h * ratio;
+          float nw = g->prev_clip_w * ratio;
+          float nh = g->prev_clip_h * ratio;
 
           // move crop area to the right if needed
           nx = fmaxf(nx, g->clip_max_x);
@@ -2958,7 +3007,7 @@ int mouse_moved(dt_iop_module_t *self,
 
       if(dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 2))
       {
-        const dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
+        dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
         if(piece)
         {
           // only update the sliders, not the dt_iop_clipping_params_t structure, so that the call to
@@ -2989,44 +3038,46 @@ int mouse_moved(dt_iop_module_t *self,
     // hover over active borders, no button pressed
     // change mouse pointer
     if(grab == GRAB_LEFT)
-      dt_control_change_cursor("w-resize");
+      dt_control_change_cursor(GDK_LEFT_SIDE);
     else if(grab == GRAB_TOP)
-      dt_control_change_cursor("n-resize");
+      dt_control_change_cursor(GDK_TOP_SIDE);
     else if(grab == GRAB_RIGHT)
-      dt_control_change_cursor("e-resize");
+      dt_control_change_cursor(GDK_RIGHT_SIDE);
     else if(grab == GRAB_BOTTOM)
-      dt_control_change_cursor("s-resize");
+      dt_control_change_cursor(GDK_BOTTOM_SIDE);
     else if(grab == GRAB_TOP_LEFT)
-      dt_control_change_cursor("nw-resize");
+      dt_control_change_cursor(GDK_TOP_LEFT_CORNER);
     else if(grab == GRAB_TOP_RIGHT)
-      dt_control_change_cursor("ne-resize");
+      dt_control_change_cursor(GDK_TOP_RIGHT_CORNER);
     else if(grab == GRAB_BOTTOM_RIGHT)
-      dt_control_change_cursor("se-resize");
+      dt_control_change_cursor(GDK_BOTTOM_RIGHT_CORNER);
     else if(grab == GRAB_BOTTOM_LEFT)
-      dt_control_change_cursor("sw-resize");
+      dt_control_change_cursor(GDK_BOTTOM_LEFT_CORNER);
     else if(grab == GRAB_NONE)
     {
-      dt_control_hinter_message(_("<b>commit</b>: double-click, <b>straighten</b>: right-drag"));
-      dt_control_change_cursor("default");
+      dt_control_hinter_message(darktable.control, _("<b>commit</b>: double click, <b>straighten</b>: right-drag"));
+      dt_control_change_cursor(GDK_LEFT_PTR);
     }
     if(grab != GRAB_NONE)
-      dt_control_hinter_message(_("<b>resize</b>: drag, <b>keep aspect ratio</b>: shift+drag\n"
+      dt_control_hinter_message(darktable.control, _("<b>resize</b>: drag, <b>keep aspect ratio</b>: shift+drag\n"
                                                      "<b>straighten</b>: right-drag"));
     dt_control_queue_redraw_center();
   }
   else
   {
     // somewhere besides borders. maybe rotate?
-    dt_control_change_cursor("move");
+    dt_control_change_cursor(GDK_FLEUR);
     g->straightening = g->cropping = 0;
     // or maybe keystone
-    const float ext = DT_PIXEL_APPLY_DPI(0.005f) / zoom_scale;
+    const float pr_d = darktable.develop->preview_downsampling;
+    // slightly adjust the size of keystone control area depending on the downsampling
+    const float ext = DT_PIXEL_APPLY_DPI(0.005f + ((1.0f - pr_d) / 100.0f)) / zoom_scale;
     if(g->k_show == 1 && g->k_drag == FALSE)
     {
       float pts[2] = { pzx * wd, pzy * ht };
       dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, 1);
-      const dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
-      const float xx = pts[0] / (float)piece->buf_out.width, yy = pts[1] / (float)piece->buf_out.height;
+      dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
+      float xx = pts[0] / (float)piece->buf_out.width, yy = pts[1] / (float)piece->buf_out.height;
       // are we near a keystone point ?
       g->k_selected = -1;
       g->k_selected_segment = -1;
@@ -3051,25 +3102,25 @@ int mouse_moved(dt_iop_module_t *self,
       }
       if(g->k_selected >= 0)
       {
-        dt_control_hinter_message(_("<b>move control point</b>: drag"));
-        dt_control_change_cursor("crosshair");
+        dt_control_hinter_message(darktable.control, _("<b>move control point</b>: drag"));
+        dt_control_change_cursor(GDK_CROSS);
       }
       else if(g->k_selected_segment >= 0)
       {
-        dt_control_hinter_message(_("<b>move line</b>: drag, <b>toggle symmetry</b>: click ꝏ"));
-        dt_control_change_cursor("crosshair");
+        dt_control_hinter_message(darktable.control, _("<b>move line</b>: drag, <b>toggle symmetry</b>: click <tt>ꝏ</tt>"));
+        dt_control_change_cursor(GDK_CROSS);
       }
       else
       {
-        dt_control_hinter_message(_("<b>apply</b>: click <tt>ok</tt>, <b>toggle symmetry</b>: click ꝏ\n"
+        dt_control_hinter_message(darktable.control, _("<b>apply</b>: click <tt>ok</tt>, <b>toggle symmetry</b>: click <tt>ꝏ</tt>\n"
                                                        "<b>move line/control point</b>: drag"));
-        dt_control_change_cursor("move");
+        dt_control_change_cursor(GDK_FLEUR);
       }
     }
     else
     {
-      dt_control_hinter_message(_("<b>move</b>: drag, <b>move vertically</b>: shift+drag, <b>move horizontally</b>: ctrl+drag\n"
-                                                     "<b>straighten</b>: right-drag, <b>commit</b>: double-click"));
+      dt_control_hinter_message(darktable.control, _("<b>move</b>: drag, <b>move vertically</b>: shift+drag, <b>move horizontally</b>: ctrl+drag\n"
+                                                     "<b>straighten</b>: right-drag, <b>commit</b>: double click"));
     }
     dt_control_queue_redraw_center();
   }
@@ -3080,9 +3131,6 @@ static void commit_box(dt_iop_module_t *self, dt_iop_clipping_gui_data_t *g, dt_
 {
   if(darktable.gui->reset) return;
   g->cropping = 0;
-  const dt_boundingbox_t old = { p->cx, p->cy, p->cw, p->ch };
-  const float eps = 1e-6f; // threshold to avoid rounding errors
-
   if(!self->enabled)
   {
     // first time crop, if any data is stored in p, it's obsolete:
@@ -3090,13 +3138,13 @@ static void commit_box(dt_iop_module_t *self, dt_iop_clipping_gui_data_t *g, dt_
     p->cw = p->ch = 1.0f;
   }
   // we want value in iop space
-  float wd, ht;
-  dt_dev_get_preview_size(self->dev, &wd, &ht);
+  const float wd = self->dev->preview_pipe->backbuf_width;
+  const float ht = self->dev->preview_pipe->backbuf_height;
   float points[4]
       = { g->clip_x * wd, g->clip_y * ht, (g->clip_x + g->clip_w) * wd, (g->clip_y + g->clip_h) * ht };
   if(dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 2))
   {
-    const dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
+    dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
     if(piece)
     {
       p->cx = CLAMPF(points[0] / (float)piece->buf_out.width, 0.0f, 0.9f);
@@ -3106,26 +3154,19 @@ static void commit_box(dt_iop_module_t *self, dt_iop_clipping_gui_data_t *g, dt_
     }
   }
   g->applied = 1;
-  const gboolean changed = fabs(p->cx - old[0]) > eps || fabs(p->cy - old[1]) > eps || fabs(p->cw - old[2]) > eps || fabs(p->ch - old[3]) > eps;
-  // dt_print(DT_DEBUG_ALWAYS, "[crop commit box] %i:  %e %e %e %e", changed, p->cx - old[0], p->cy - old[1], p->cw - old[2], p->ch - old[3]);
-  if(changed) dt_dev_add_history_item(darktable.develop, self, TRUE);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
-int button_released(dt_iop_module_t *self,
-                    const float pzx,
-                    const float pzy,
-                    const int which,
-                    const uint32_t state,
-                    const float zoom_scale)
+int button_released(struct dt_iop_module_t *self, double x, double y, int which, uint32_t state)
 {
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
   // we don't do anything if the image is not ready
   if(!g->preview_ready) return 0;
 
   if(g->straightening)
   {
     // adjust the line with possible current angle and flip on this module
-    dt_boundingbox_t pts = { pzx, pzy, g->button_down_zoom_x, g->button_down_zoom_y };
+    dt_boundingbox_t pts = { x, y, g->button_down_x, g->button_down_y };
     dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_INCL, pts, 2);
 
     float dx = pts[0] - pts[2];
@@ -3137,21 +3178,21 @@ int button_released(dt_iop_module_t *self,
     }
 
     float angle = atan2f(dy, dx);
-    if(!(angle >= -M_PI_F / 2.f && angle <= M_PI_F / 2.f)) angle = 0.0f;
+    if(!(angle >= -M_PI / 2.0 && angle <= M_PI / 2.0)) angle = 0.0f;
     float close = angle;
-    if(close > M_PI_F / 4.f)
-      close = M_PI_F / 2.f - close;
-    else if(close < -M_PI_F / 4.f)
-      close = -M_PI_F / 2.f - close;
+    if(close > M_PI / 4.0)
+      close = M_PI / 2.0 - close;
+    else if(close < -M_PI / 4.0)
+      close = -M_PI / 2.0 - close;
     else
       close = -close;
 
-    float a = rad2degf(close);
-    if(a < -180.f) a += 360.f;
-    if(a > 180.f) a -= 360.f;
+    float a = 180.0 / M_PI * close;
+    if(a < -180.0) a += 360.0;
+    if(a > 180.0) a -= 360.0;
 
     dt_bauhaus_slider_set(g->angle, a);
-    dt_control_change_cursor("default");
+    dt_control_change_cursor(GDK_LEFT_PTR);
   }
   if(g->k_drag) g->k_drag = FALSE;
 
@@ -3162,29 +3203,23 @@ int button_released(dt_iop_module_t *self,
   return 1;
 }
 
-int button_pressed(dt_iop_module_t *self,
-                   const float pzx,
-                   const float pzy,
-                   const double pressure,
-                   const int which,
-                   const int type,
-                   const uint32_t state,
-                   const float zoom_scale)
+int button_pressed(struct dt_iop_module_t *self, double x, double y, double pressure, int which, int type,
+                   uint32_t state)
 {
 
-  dt_iop_clipping_gui_data_t *g = self->gui_data;
-  dt_iop_clipping_params_t *p = self->params;
+  dt_iop_clipping_gui_data_t *g = (dt_iop_clipping_gui_data_t *)self->gui_data;
+  dt_iop_clipping_params_t *p = (dt_iop_clipping_params_t *)self->params;
   // we don't do anything if the image is not ready
   if(!g->preview_ready) return 0;
 
   // avoid unexpected back to lt mode:
-  if(type == GDK_2BUTTON_PRESS && which == GDK_BUTTON_PRIMARY)
+  if(type == GDK_2BUTTON_PRESS && which == 1)
   {
     dt_iop_request_focus(NULL);
     commit_box(self, g, p);
     return 1;
   }
-  if(which == GDK_BUTTON_SECONDARY || which == GDK_BUTTON_PRIMARY)
+  if(which == 3 || which == 1)
   {
     // switch module on already, other code depends in this:
     dt_dev_add_history_item(darktable.develop, self, TRUE);
@@ -3195,16 +3230,22 @@ int button_pressed(dt_iop_module_t *self,
         g->k_drag = TRUE; // if a keystone point is selected then we start to drag it
       else // if we click to the apply button
       {
-        const dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
+        const dt_dev_zoom_t zoom = dt_control_get_dev_zoom();
+        const int closeup = dt_control_get_dev_closeup();
+        const float zoom_scale = dt_dev_get_zoom_scale(self->dev, zoom, 1<<closeup, 1);
+        float pzx, pzy;
+        dt_dev_get_pointer_zoom_pos(self->dev, x, y, &pzx, &pzy);
+        pzx += 0.5f;
+        pzy += 0.5f;
+
+        dt_dev_pixelpipe_iop_t *piece = dt_dev_distort_get_iop_pipe(self->dev, self->dev->preview_pipe, self);
         const float wp = piece->buf_out.width, hp = piece->buf_out.height;
         float pts[8] = { p->kxa * wp, p->kya * hp, p->kxb * wp, p->kyb * hp,
                          p->kxc * wp, p->kyc * hp, p->kxd * wp, p->kyd * hp };
         dt_dev_distort_transform_plus(self->dev, self->dev->preview_pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, 4);
 
-        float wd, ht;
-        dt_dev_get_preview_size(self->dev, &wd, &ht);
-        const float xx = pzx * wd,
-                    yy = pzy * ht;
+        const float xx = pzx * self->dev->preview_pipe->backbuf_width,
+                    yy = pzy * self->dev->preview_pipe->backbuf_height;
         float c[2] = { (MIN(pts[4], pts[2]) + MAX(pts[0], pts[6])) / 2.0f,
                        (MIN(pts[5], pts[7]) + MAX(pts[1], pts[3])) / 2.0f };
         const float ext = DT_PIXEL_APPLY_DPI(10.0) / (zoom_scale);
@@ -3290,8 +3331,10 @@ int button_pressed(dt_iop_module_t *self,
                   // dragging a border ?
                   if(g->k_selected_segment >= 0)
                   {
-                    g->button_down_zoom_x = pzx;
-                    g->button_down_zoom_y = pzy;
+                    dt_dev_get_pointer_zoom_pos(self->dev, x, y, &g->button_down_zoom_x,
+                                                &g->button_down_zoom_y);
+                    g->button_down_zoom_x += 0.5;
+                    g->button_down_zoom_y += 0.5;
                     g->k_drag = TRUE;
                   }
                 }
@@ -3303,8 +3346,9 @@ int button_pressed(dt_iop_module_t *self,
     }
     else
     {
-      g->button_down_zoom_x = pzx;
-      g->button_down_zoom_y = pzy;
+      g->button_down_x = x;
+      g->button_down_y = y;
+      dt_dev_get_pointer_zoom_pos(self->dev, x, y, &g->button_down_zoom_x, &g->button_down_zoom_y);
       g->button_down_angle = p->angle;
 
       /* update prev clip box with current */
@@ -3324,7 +3368,17 @@ int button_pressed(dt_iop_module_t *self,
     return 0;
 }
 
-GSList *mouse_actions(dt_iop_module_t *self)
+void init_key_accels(dt_iop_module_so_t *self)
+{
+  dt_accel_register_iop(self, TRUE, N_("commit"), GDK_KEY_Return, 0);
+}
+
+void connect_key_accels(dt_iop_module_t *self)
+{
+  dt_accel_connect_iop(self, "commit", g_cclosure_new(G_CALLBACK(key_commit_callback), (gpointer)self, NULL));
+}
+
+GSList *mouse_actions(struct dt_iop_module_t *self)
 {
   GSList *lm = NULL;
   lm = dt_mouse_action_create_format(lm, DT_MOUSE_ACTION_LEFT_DRAG, 0, _("[%s on borders] crop"), self->name());
@@ -3337,8 +3391,6 @@ GSList *mouse_actions(dt_iop_module_t *self)
 #undef PHI
 #undef INVPHI
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

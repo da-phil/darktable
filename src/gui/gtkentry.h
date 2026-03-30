@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2012-2024 darktable developers.
+    Copyright (C) 2012-2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -24,21 +24,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "common/metadata.h"
+typedef struct completion_spec
+{
+  gchar *varname;
+  gchar *description;
+} dt_gtkentry_completion_spec;
 
-/** initialize entry with the variables table */
-void dt_gtkentry_setup_variables_completion(GtkEntry *entry);
+typedef enum
+{
+  COMPL_VARNAME = 0,
+  COMPL_DESCRIPTION
+} dtGtkEntryCompletionSpecCol;
 
-/** add a metadata to the variables substitution */
-void dt_gtkentry_variables_add_metadata(dt_metadata_t *metadata);
+void dt_gtkentry_setup_completion(GtkEntry *entry, const dt_gtkentry_completion_spec *compl_list);
 
-/** remove a metadata from the variables substitution */
-void dt_gtkentry_variables_remove_metadata(dt_metadata_t *metadata);
+const dt_gtkentry_completion_spec *dt_gtkentry_get_default_path_compl_list();
 
+gchar *dt_gtkentry_build_completion_tooltip_text(const gchar *header,
+                                                 const dt_gtkentry_completion_spec *compl_list);
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

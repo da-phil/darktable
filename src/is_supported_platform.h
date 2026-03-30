@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2022 darktable developers.
+    Copyright (C) 2016-2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -30,7 +30,7 @@
 #define DT_SUPPORTED_X86 0
 #endif
 
-#if defined(__aarch64__) && (defined(__ARM_64BIT_STATE) && defined(__ARM_ARCH) && (defined(__ARM_ARCH_8A) || __ARM_ARCH_PROFILE == 'A') || defined(__APPLE__) || defined(__MINGW64__))
+#if defined(__aarch64__) && (defined(__ARM_64BIT_STATE) && defined(__ARM_ARCH) && defined(__ARM_ARCH_8A) || defined(__APPLE__))
 #define DT_SUPPORTED_ARMv8A 1
 #else
 #define DT_SUPPORTED_ARMv8A 0
@@ -42,43 +42,28 @@
 #define DT_SUPPORTED_PPC64 0
 #endif
 
-#if (defined(__riscv) || defined(__riscv__)) && (__riscv_xlen==64)
-#define DT_SUPPORTED_RISCV64 1
-#else
-#define DT_SUPPORTED_RISCV64 0
-#endif
-
-#if defined(__loongarch64)
-#define DT_SUPPORTED_LOONGARCH64 1
-#else
-#define DT_SUPPORTED_LOONGARCH64 0
-#endif
-
-#if (DT_SUPPORTED_X86 + DT_SUPPORTED_ARMv8A + DT_SUPPORTED_PPC64 + DT_SUPPORTED_RISCV64 + DT_SUPPORTED_LOONGARCH64) > 1
+#if DT_SUPPORTED_X86 && DT_SUPPORTED_ARMv8A
 #error "Looks like hardware platform detection macros are broken?"
 #endif
 
-#if !DT_SUPPORTED_X86 && !DT_SUPPORTED_ARMv8A && !DT_SUPPORTED_PPC64 && !DT_SUPPORTED_RISCV64 && !DT_SUPPORTED_LOONGARCH64
-#error "Unfortunately we only work on amd64, ARMv8-A, PPC64 (64-bit little-endian only), riscv64 and loongarch64"
+#if !DT_SUPPORTED_X86 && !DT_SUPPORTED_ARMv8A && !DT_SUPPORTED_PPC64
+#error "Unfortunately we only work on amd64, ARMv8-A and PPC64 (64-bit little-endian only)."
 #endif
 
-#undef DT_SUPPORTED_LOONGARCH64
-#undef DT_SUPPORTED_RISCV64
 #undef DT_SUPPORTED_PPC64
 #undef DT_SUPPORTED_ARMv8A
 #undef DT_SUPPORTED_X86
 
 #if !defined(__SSE2__) || !defined(__SSE__)
-#pragma message "Building without SSE2.  Some functionality will be noticeably slower."
+#pragma message "Building without SSE2 is highly experimental."
+#pragma message "Expect a LOT of functionality to be broken. You have been warned."
 #endif
 
 // double check for 32-bit architecture
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ < 8
-#error "Unfortunately we only work on the 64-bit architectures amd64, ARMv8-A, PPC64, riscv64 and loongarch64."
+#error "Unfortunately we only work on the 64-bit architectures amd64, ARMv8-A and PPC64."
 #endif
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

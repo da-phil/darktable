@@ -389,15 +389,15 @@ char *strptime(const char *buf, const char *fmt, struct tm *tm)
         }
         else
         {
-          ep = find_string(bp, &i, (const char *const *)_tzname, NULL, 2);
+          ep = find_string(bp, &i, (const char *const *)tzname, NULL, 2);
           if(ep != NULL)
           {
             tm->tm_isdst = i;
 #ifdef TM_GMTOFF
-            tm->TM_GMTOFF = -(_timezone);
+            tm->TM_GMTOFF = -(timezone);
 #endif
 #ifdef TM_ZONE
-            tm->TM_ZONE = _tzname[i];
+            tm->TM_ZONE = tzname[i];
 #endif
           }
           bp = ep;
@@ -601,9 +601,6 @@ static const u_char *find_string(const u_char *bp, int *tgt, const char *const *
   return NULL;
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

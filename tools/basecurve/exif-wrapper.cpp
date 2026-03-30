@@ -1,7 +1,6 @@
 /*
     This file is part of darktable,
                   2014 Edouard Gomez
-    Copyright (C) 2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -17,13 +16,9 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// avoid error reported when including exiv2.hpp on macOS (XCode 15.2)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
 #include <exiv2/exif.hpp>
 #include <exiv2/error.hpp>
 #include <exiv2/image.hpp>
-#pragma GCC diagnostic pop
 
 #include <cstdio>
 #include <cassert>
@@ -41,13 +36,13 @@ exif_get_ascii_datafield(
 
   try
   {
-    auto image = Exiv2::ImageFactory::open(filename);
+    Exiv2::Image::AutoPtr image = Exiv2::ImageFactory::open(filename);
     assert(image.get() != 0);
     image->readMetadata();
 
     Exiv2::ExifData &exifData = image->exifData();
 
-    auto val = exifData[key].getValue();
+    Exiv2::Value::AutoPtr val = exifData[key].getValue();
 
     if (val->typeId() != Exiv2::asciiString)
     {

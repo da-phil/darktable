@@ -20,11 +20,6 @@
 
 #include <glib.h>
 
-#define DT_READ_ACTION_ONLY (-FLT_MAX)
-#define DT_ACTION_NOT_VALID (-FLT_MAX)
-#define DT_PERFORM_ACTION(move_size) ((move_size) != DT_READ_ACTION_ONLY)
-#define DT_ACTION_IS_INVALID(value) ((value) == DT_ACTION_NOT_VALID)
-
 typedef enum dt_action_type_t
 {
   DT_ACTION_TYPE_CATEGORY,
@@ -32,18 +27,17 @@ typedef enum dt_action_type_t
   DT_ACTION_TYPE_VIEW,
   DT_ACTION_TYPE_LIB,
   DT_ACTION_TYPE_IOP,
-  DT_ACTION_TYPE_BLEND,
   // ==== all below need to be freed and own their strings
   DT_ACTION_TYPE_SECTION,
   // ==== all above split off chains
   DT_ACTION_TYPE_IOP_INSTANCE,
-  DT_ACTION_TYPE_IOP_SECTION,
   DT_ACTION_TYPE_COMMAND,
   DT_ACTION_TYPE_PRESET,
   DT_ACTION_TYPE_FALLBACK,
   DT_ACTION_TYPE_VALUE_FALLBACK,
   // === all widgets below
   DT_ACTION_TYPE_PER_INSTANCE,
+  DT_ACTION_TYPE_CLOSURE,
   DT_ACTION_TYPE_WIDGET,
   // === dynamically assign widget type numbers from here
 } dt_action_type_t;
@@ -59,15 +53,11 @@ typedef struct dt_action_t
   struct dt_action_t *next;
 } dt_action_t;
 
-#define DT_ACTION(p) (p?(dt_action_t*)&p->actions:NULL)
+#define DT_ACTION(p) ((dt_action_t*)&p->actions)
 
 enum
 {
   DT_ACTION_ELEMENT_DEFAULT = 0,
-
-  DT_ACTION_ELEMENT_SHOW = DT_ACTION_ELEMENT_DEFAULT,
-  DT_ACTION_ELEMENT_RESET = 1,
-  DT_ACTION_ELEMENT_PRESETS = 2,
 };
 typedef gint dt_action_element_t;
 
@@ -104,35 +94,14 @@ enum
   DT_ACTION_EFFECT_ON_RIGHT = 6,
 
   DT_ACTION_EFFECT_HOLD = DT_ACTION_EFFECT_DEFAULT_KEY,
-  DT_ACTION_EFFECT_HOLD_TOGGLE = 3,
 
   // Buttons
   DT_ACTION_EFFECT_ACTIVATE = DT_ACTION_EFFECT_DEFAULT_KEY,
   DT_ACTION_EFFECT_ACTIVATE_CTRL = DT_ACTION_EFFECT_DEFAULT_UP,
   DT_ACTION_EFFECT_ACTIVATE_RIGHT = DT_ACTION_EFFECT_DEFAULT_DOWN,
-
-  // Entries
-  DT_ACTION_EFFECT_FOCUS = DT_ACTION_EFFECT_DEFAULT_KEY,
-  DT_ACTION_EFFECT_START = DT_ACTION_EFFECT_DEFAULT_UP,
-  DT_ACTION_EFFECT_END = DT_ACTION_EFFECT_DEFAULT_DOWN,
-  DT_ACTION_EFFECT_CLEAR = 3,
-
-  // Cycle (modules and instances)
-  DT_ACTION_EFFECT_CYCLE_PREVIOUS_INSTANCE = 3,
-  DT_ACTION_EFFECT_CYCLE_NEXT_INSTANCE = 4,
 };
 typedef gint dt_action_effect_t;
 
-#define DT_ACTION_TOGGLE_NEEDED(effect, move_size, value) \
-  DT_PERFORM_ACTION(move_size)                            \
-  && !((effect == DT_ACTION_EFFECT_ON                     \
-     || effect == DT_ACTION_EFFECT_ON_CTRL                \
-     || effect == DT_ACTION_EFFECT_ON_RIGHT) && (value))  \
-  &&   (effect != DT_ACTION_EFFECT_OFF       || (value))
-
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

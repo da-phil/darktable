@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2020-2024 darktable developers.
+    Copyright (C) 2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,18 +19,21 @@
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/exif.h"
+#include "common/imageio.h"
+#include "common/imageio_module.h"
 #include "develop/pixelpipe_hb.h"
 #include "external/libxcf/xcf.h"
-#include "imageio/imageio_common.h"
-#include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
-
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 DT_MODULE(1)
+
+// TODO:
+//   - exif / xmp:
+//        GIMP uses a custom way of serializing the data. see libgimpbase/gimpmetadata.c:gimp_metadata_serialize()
 
 typedef struct dt_imageio_xcf_gui_t
 {
@@ -45,7 +48,7 @@ typedef struct dt_imageio_xcf_t
 
 int write_image(dt_imageio_module_data_t *data, const char *filename, const void *ivoid,
                 dt_colorspaces_color_profile_type_t over_type, const char *over_filename,
-                void *exif, int exif_len, dt_imgid_t imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
+                void *exif, int exif_len, int imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
                 const gboolean export_masks)
 {
   const dt_imageio_xcf_t *const d = (dt_imageio_xcf_t *)data;
@@ -56,37 +59,42 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
   uint32_t profile_len = 0;
   gboolean profile_is_linear = TRUE;
 
-  cmsHPROFILE out_profile = dt_colorspaces_get_output_profile(imgid, over_type, over_filename)->profile;
-  cmsSaveProfileToMem(out_profile, NULL, &profile_len);
-  if(profile_len > 0)
+  if(imgid > 0)
   {
-    profile = malloc(profile_len);
-    if(!profile)
+    cmsHPROFILE out_profile = dt_colorspaces_get_output_profile(imgid, over_type, over_filename)->profile;
+    cmsSaveProfileToMem(out_profile, 0, &profile_len);
+    if(profile_len > 0)
     {
-      dt_print(DT_DEBUG_ALWAYS, "[xcf] error: can't allocate %u bytes of memory", profile_len);
-      return 1;
-    }
-    cmsSaveProfileToMem(out_profile, profile, &profile_len);
-
-    // try to figure out if the profile is linear
-    if(cmsIsMatrixShaper(out_profile))
-    {
-      const cmsToneCurve *red_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigRedTRCTag);
-      const cmsToneCurve *green_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigGreenTRCTag);
-      const cmsToneCurve *blue_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigBlueTRCTag);
-      if(red_curve && green_curve && blue_curve)
+      profile = malloc(profile_len);
+      if(!profile)
       {
-        profile_is_linear = cmsIsToneCurveLinear(red_curve) && cmsIsToneCurveLinear(green_curve)
-                            && cmsIsToneCurveLinear(blue_curve);
+        fprintf(stderr, "[xcf] error: can't allocate %u bytes of memory\n", profile_len);
+        return 1;
+      }
+      cmsSaveProfileToMem(out_profile, profile, &profile_len);
+
+      // try to figure out if the profile is linear
+      if(cmsIsMatrixShaper(out_profile))
+      {
+        const cmsToneCurve *red_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigRedTRCTag);
+        const cmsToneCurve *green_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigGreenTRCTag);
+        const cmsToneCurve *blue_curve = (cmsToneCurve *)cmsReadTag(out_profile, cmsSigBlueTRCTag);
+        if(red_curve && green_curve && blue_curve)
+        {
+          profile_is_linear = cmsIsToneCurveLinear(red_curve)
+                              && cmsIsToneCurveLinear(green_curve)
+                              && cmsIsToneCurveLinear(blue_curve);
+        }
       }
     }
   }
+
 
   XCF *xcf = xcf_open(filename);
 
   if(!xcf)
   {
-    dt_print(DT_DEBUG_ALWAYS, "[xcf] error: can't open `%s'", filename);
+    fprintf(stderr, "[xcf] error: can't open `%s'\n", filename);
     goto exit;
   }
 
@@ -102,7 +110,7 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
     xcf_set(xcf, XCF_PRECISION, profile_is_linear ? XCF_PRECISION_F_32_L : XCF_PRECISION_F_32_G);
   else
   {
-    dt_print(DT_DEBUG_ALWAYS, "[xcf] error: bpp of %d is not supported", d->bpp);
+    fprintf(stderr, "[xcf] error: bpp of %d is not supported\n", d->bpp);
     goto exit;
   }
 
@@ -126,37 +134,14 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
   xcf_set(xcf, XCF_PROP, XCF_PROP_PARASITES, "gimp-comment", XCF_PARASITE_PERSISTENT, strlen(comment) + 1, comment);
   g_free(comment);
 
-  if(exif && exif_len > 0)
-  {
-    // Prepend the libexif expected "Exif\0\0" APP1 prefix (see GIMP parasites.txt)
-    uint8_t *exif_buf = g_try_malloc0(exif_len + 6);
-    if(!exif_buf)
-    {
-      dt_print(DT_DEBUG_ALWAYS, "[xcf] error: can't allocate %d bytes of memory", exif_len + 6);
-      goto exit;
-    }
-    memcpy(exif_buf, "Exif\0\0", 6);
-    memcpy(exif_buf + 6, exif, exif_len);
-    xcf_set(xcf, XCF_PROP, XCF_PROP_PARASITES, "exif-data", XCF_PARASITE_PERSISTENT, exif_len + 6, exif_buf);
-    g_free(exif_buf);
-  }
-
-  // TODO: workaround; uses valid exif as a way to indicate ALL metadata was requested
-  if(exif && exif_len > 0)
-  {
-    char *xmp_string = dt_exif_xmp_read_string(imgid);
-    size_t xmp_len;
-    if(xmp_string && (xmp_len = strlen(xmp_string)) > 0)
-    {
-      // Prepend the expected "GIMP_XMP_1"
-      const char *GIMP_XMP_PREFIX = "GIMP_XMP_1";
-      char *xmp_buf = g_strjoin(NULL, GIMP_XMP_PREFIX, xmp_string, NULL);
-      xcf_set(xcf, XCF_PROP, XCF_PROP_PARASITES, "gimp-metadata", XCF_PARASITE_PERSISTENT,
-              xmp_len + strlen(GIMP_XMP_PREFIX), xmp_buf);
-      g_free(xmp_string);
-      g_free(xmp_buf);
-    }
-  }
+  // TODO: this needs to be serialized, together with the exif data
+//   char *xmp_string = dt_exif_xmp_read_string(imgid);
+//   if(xmp_string)
+//   {
+//     xcf_set(xcf, XCF_PROP, XCF_PROP_PARASITES, "gimp-metadata", XCF_PARASITE_PERSISTENT,
+//             strlen(xmp_string) + 1, xmp_string);
+//     g_free(xmp_string);
+//   }
 
   xcf_add_layer(xcf);
   xcf_set(xcf, XCF_WIDTH, d->global.width);
@@ -168,7 +153,7 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
   if(n_channels > 0)
     for(GList *iter = pipe->nodes; iter; iter = g_list_next(iter))
     {
-      dt_dev_pixelpipe_iop_t *piece = iter->data;
+      dt_dev_pixelpipe_iop_t *piece = (dt_dev_pixelpipe_iop_t *)iter->data;
 
       GHashTableIter rm_iter;
       gpointer key, value;
@@ -176,11 +161,15 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
       g_hash_table_iter_init(&rm_iter, piece->raster_masks);
       while(g_hash_table_iter_next(&rm_iter, &key, &value))
       {
-        gboolean free_mask;
-        float *raster_mask = dt_dev_get_raster_mask(piece, piece->module, GPOINTER_TO_INT(key), NULL, &free_mask);
+        gboolean free_mask = TRUE;
+        float *raster_mask = dt_dev_get_raster_mask(pipe, piece->module, GPOINTER_TO_INT(key), NULL, &free_mask);
 
         if(!raster_mask)
-           goto exit;
+        {
+          // this should never happen
+          fprintf(stderr, "error: can't get raster mask from `%s'\n", piece->module->name());
+          goto exit;
+        }
 
         xcf_add_channel(xcf);
         xcf_set(xcf, XCF_PROP, XCF_PROP_VISIBLE, 0);
@@ -196,24 +185,16 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
         if(d->bpp == 8)
         {
           channel_data = malloc(sizeof(uint8_t) * d->global.width * d->global.height);
-          if(channel_data)
-          {
-            uint8_t *ch = (uint8_t *)channel_data;
-            DT_OMP_FOR_SIMD()
-              for(size_t i = 0; i < (size_t)d->global.width * d->global.height; ++i)
-                ch[i] = (uint8_t)roundf(CLIP(raster_mask[i]) * 255.0f);
-          }
+          uint8_t *ch = (uint8_t *)channel_data;
+          for(size_t i = 0; i < (size_t)d->global.width * d->global.height; i++)
+            ch[i] = CLAMP((int)(raster_mask[i] * 255.0), 0, 255);
         }
         else if(d->bpp == 16)
         {
           channel_data = malloc(sizeof(uint16_t) * d->global.width * d->global.height);
-          if(channel_data)
-          {
-            uint16_t *ch = (uint16_t *)channel_data;
-            DT_OMP_FOR_SIMD()
-              for(size_t i = 0; i < (size_t)d->global.width * d->global.height; ++i)
-                ch[i] = (uint16_t)roundf(CLIP(raster_mask[i]) * 65535.0f);
-          }
+          uint16_t *ch = (uint16_t *)channel_data;
+          for(size_t i = 0; i < (size_t)d->global.width * d->global.height; i++)
+            ch[i] = CLAMP((int)(raster_mask[i] * 65535.0), 0, 65535);
         }
         else if(d->bpp == 32)
         {
@@ -221,10 +202,7 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
           free_channel_data = FALSE;
         }
 
-        if(channel_data)
-          xcf_add_data(xcf, channel_data, 1);
-        else
-          dt_print(DT_DEBUG_ALWAYS, "[xcf] out of memory writing image data to %s", filename);
+        xcf_add_data(xcf, channel_data, 1);
 
         if(free_channel_data)
           free(channel_data);
@@ -240,6 +218,7 @@ exit:
   free(profile);
 
   return res;
+
 }
 
 size_t params_size(dt_imageio_module_format_t *self)
@@ -249,7 +228,7 @@ size_t params_size(dt_imageio_module_format_t *self)
 
 void *get_params(dt_imageio_module_format_t *self)
 {
-  dt_imageio_xcf_t *d = calloc(1, sizeof(dt_imageio_xcf_t));
+  dt_imageio_xcf_t *d = (dt_imageio_xcf_t *)calloc(1, sizeof(dt_imageio_xcf_t));
 
   const char *conf_bpp = dt_conf_get_string_const("plugins/imageio/format/xcf/bpp");
   d->bpp = atoi(conf_bpp);
@@ -268,7 +247,7 @@ int set_params(dt_imageio_module_format_t *self, const void *params, int size)
 {
   if(size != params_size(self)) return 1;
   const dt_imageio_xcf_t *d = (dt_imageio_xcf_t *)params;
-  const dt_imageio_xcf_gui_t *g = self->gui_data;
+  const dt_imageio_xcf_gui_t *g = (dt_imageio_xcf_gui_t *)self->gui_data;
 
   if(d->bpp == 16)
     dt_bauhaus_combobox_set(g->bpp, 1);
@@ -317,7 +296,7 @@ const char *extension(dt_imageio_module_data_t *data)
 
 const char *name()
 {
-  return _("XCF");
+  return _("xcf");
 }
 
 void init(dt_imageio_module_format_t *self)
@@ -344,7 +323,7 @@ static void bpp_combobox_changed(GtkWidget *widget, gpointer user_data)
 
 void gui_init(dt_imageio_module_format_t *self)
 {
-  dt_imageio_xcf_gui_t *gui = malloc(sizeof(dt_imageio_xcf_gui_t));
+  dt_imageio_xcf_gui_t *gui = (dt_imageio_xcf_gui_t *)malloc(sizeof(dt_imageio_xcf_gui_t));
   self->gui_data = (void *)gui;
 
   int bpp = 32;
@@ -354,12 +333,22 @@ void gui_init(dt_imageio_module_format_t *self)
     bpp = atoi(conf_bpp);
   }
 
+  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
   // Bit depth combo box
-  DT_BAUHAUS_COMBOBOX_NEW_FULL(gui->bpp, self, NULL, N_("bit depth"), NULL,
-                               bpp == 16 ? 1 : bpp == 32 ? 2 : 0,
-                               bpp_combobox_changed, NULL,
-                               N_("8 bit"), N_("16 bit"), N_("32 bit (float)"));
-  self->widget = dt_gui_vbox(gui->bpp);
+  gui->bpp = dt_bauhaus_combobox_new(NULL);
+  dt_bauhaus_widget_set_label(gui->bpp, NULL, N_("bit depth"));
+  dt_bauhaus_combobox_add(gui->bpp, _("8 bit"));
+  dt_bauhaus_combobox_add(gui->bpp, _("16 bit"));
+  dt_bauhaus_combobox_add(gui->bpp, _("32 bit (float)"));
+  if(bpp == 16)
+    dt_bauhaus_combobox_set(gui->bpp, 1);
+  else if(bpp == 32)
+    dt_bauhaus_combobox_set(gui->bpp, 2);
+  else // (bpp == 8)
+    dt_bauhaus_combobox_set(gui->bpp, 0);
+  gtk_box_pack_start(GTK_BOX(self->widget), gui->bpp, TRUE, TRUE, 0);
+  g_signal_connect(G_OBJECT(gui->bpp), "value-changed", G_CALLBACK(bpp_combobox_changed), NULL);
 }
 
 void gui_cleanup(dt_imageio_module_format_t *self)
@@ -369,12 +358,10 @@ void gui_cleanup(dt_imageio_module_format_t *self)
 
 void gui_reset(dt_imageio_module_format_t *self)
 {
-  dt_imageio_xcf_gui_t *gui = self->gui_data;
+  dt_imageio_xcf_gui_t *gui = (dt_imageio_xcf_gui_t *)self->gui_data;
   dt_bauhaus_combobox_set(gui->bpp, 2); // bpp = 32
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

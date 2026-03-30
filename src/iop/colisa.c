@@ -1,6 +1,6 @@
 /*
   This file is part of darktable,
-  Copyright (C) 2013-2026 darktable developers.
+  Copyright (C) 2013-2020 darktable developers.
 
   darktable is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -16,6 +16,9 @@
   along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bauhaus/bauhaus.h"
 #include "common/debug.h"
 #include "common/opencl.h"
@@ -71,17 +74,12 @@ typedef struct dt_iop_colisa_global_data_t
 } dt_iop_colisa_global_data_t;
 
 
-const char *deprecated_msg()
-{
-  return _("this module is deprecated. please use colorbalance RGB module instead.");
-}
-
 const char *name()
 {
   return _("contrast brightness saturation");
 }
 
-const char **description(dt_iop_module_t *self)
+const char *description(struct dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("adjust the look of the image"),
                                       _("creative"),
@@ -92,8 +90,7 @@ const char **description(dt_iop_module_t *self)
 
 int flags()
 {
-  return IOP_FLAGS_INCLUDE_IN_STYLES | IOP_FLAGS_SUPPORTS_BLENDING
-    | IOP_FLAGS_ALLOW_TILING | IOP_FLAGS_DEPRECATED;
+  return IOP_FLAGS_INCLUDE_IN_STYLES | IOP_FLAGS_SUPPORTS_BLENDING | IOP_FLAGS_ALLOW_TILING;
 }
 
 int default_group()
@@ -101,21 +98,19 @@ int default_group()
   return IOP_GROUP_BASIC | IOP_GROUP_GRADING;
 }
 
-dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
-                                            dt_dev_pixelpipe_t *pipe,
-                                            dt_dev_pixelpipe_iop_t *piece)
+int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_LAB;
+  return iop_cs_Lab;
 }
 
 #ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_colisa_data_t *d = piece->data;
-  dt_iop_colisa_global_data_t *gd = self->global_data;
+  dt_iop_colisa_data_t *d = (dt_iop_colisa_data_t *)piece->data;
+  dt_iop_colisa_global_data_t *gd = (dt_iop_colisa_global_data_t *)self->global_data;
 
-  cl_int err = DT_OPENCL_DEFAULT_ERROR;
+  cl_int err = -999;
   const int devid = piece->pipe->devid;
 
   const int width = roi_in->width;
@@ -137,23 +132,43 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   dev_lcoeffs = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 3, d->lunbounded_coeffs);
   if(dev_lcoeffs == NULL) goto error;
 
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_colisa, width, height,
-    CLARG(dev_in), CLARG(dev_out), CLARG(width),
-    CLARG(height), CLARG(saturation), CLARG(dev_cm), CLARG(dev_ccoeffs), CLARG(dev_lm), CLARG(dev_lcoeffs));
+  size_t sizes[3];
+  sizes[0] = ROUNDUPWD(width);
+  sizes[1] = ROUNDUPWD(height);
+  sizes[2] = 1;
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 0, sizeof(cl_mem), (void *)&dev_in);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 1, sizeof(cl_mem), (void *)&dev_out);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 2, sizeof(int), (void *)&width);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 3, sizeof(int), (void *)&height);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 4, sizeof(float), (void *)&saturation);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 5, sizeof(cl_mem), (void *)&dev_cm);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 6, sizeof(cl_mem), (void *)&dev_ccoeffs);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 7, sizeof(cl_mem), (void *)&dev_lm);
+  dt_opencl_set_kernel_arg(devid, gd->kernel_colisa, 8, sizeof(cl_mem), (void *)&dev_lcoeffs);
+
+  err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_colisa, sizes);
+  if(err != CL_SUCCESS) goto error;
+
+  dt_opencl_release_mem_object(dev_lcoeffs);
+  dt_opencl_release_mem_object(dev_lm);
+  dt_opencl_release_mem_object(dev_ccoeffs);
+  dt_opencl_release_mem_object(dev_cm);
+  return TRUE;
 
 error:
   dt_opencl_release_mem_object(dev_lcoeffs);
   dt_opencl_release_mem_object(dev_lm);
   dt_opencl_release_mem_object(dev_ccoeffs);
   dt_opencl_release_mem_object(dev_cm);
-  return err;
+  dt_print(DT_DEBUG_OPENCL, "[opencl_colisa] couldn't enqueue kernel! %d\n", err);
+  return FALSE;
 }
 #endif
 
-void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
+void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_colisa_data_t *data = piece->data;
+  dt_iop_colisa_data_t *data = (dt_iop_colisa_data_t *)piece->data;
   float *in = (float *)ivoid;
   float *out = (float *)ovoid;
 
@@ -161,7 +176,12 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const int height = roi_in->height;
   const int ch = piece->colors;
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(ch, height, width) \
+  shared(in, out, data) \
+  schedule(static)
+#endif
   for(size_t k = 0; k < (size_t)width * height; k++)
   {
     float L = (in[k * ch + 0] < 100.0f)
@@ -176,11 +196,11 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 }
 
 
-void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
+void commit_params(struct dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_colisa_params_t *p = (dt_iop_colisa_params_t *)p1;
-  dt_iop_colisa_data_t *d = piece->data;
+  dt_iop_colisa_data_t *d = (dt_iop_colisa_data_t *)piece->data;
 
   d->contrast = p->contrast + 1.0f; // rescale from [-1;+1] to [0;+2] (zero meaning no contrast -> gray plane)
   d->brightness = p->brightness * 2.0f; // rescale from [-1;+1] to [-2;+2]
@@ -190,7 +210,9 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   if(d->contrast <= 1.0f)
   {
 // linear curve for d->contrast below 1
-    DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) shared(d) schedule(static)
+#endif
     for(int k = 0; k < 0x10000; k++) d->ctable[k] = d->contrast * (100.0f * k / 0x10000 - 50.0f) + 50.0f;
   }
   else
@@ -199,7 +221,12 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     const float boost = 20.0f;
     const float contrastm1sq = boost * (d->contrast - 1.0f) * (d->contrast - 1.0f);
     const float contrastscale = sqrtf(1.0f + contrastm1sq);
-    DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+    dt_omp_firstprivate(contrastm1sq, contrastscale) \
+    shared(d) \
+    schedule(static)
+#endif
     for(int k = 0; k < 0x10000; k++)
     {
       float kx2m1 = 2.0f * (float)k / 0x10000 - 1.0f;
@@ -219,7 +246,12 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // generate precomputed brightness curve
   const float gamma = (d->brightness >= 0.0f) ? 1.0f / (1.0f + d->brightness) : (1.0f - d->brightness);
 
-  DT_OMP_FOR()
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+  dt_omp_firstprivate(gamma) \
+  shared(d) \
+  schedule(static)
+#endif
   for(int k = 0; k < 0x10000; k++)
   {
     d->ltable[k] = 100.0f * powf((float)k / 0x10000, gamma);
@@ -234,38 +266,49 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   dt_iop_estimate_exp(xl, yl, 4, d->lunbounded_coeffs);
 }
 
-void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void init_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
-  dt_iop_colisa_data_t *d = calloc(1, sizeof(dt_iop_colisa_data_t));
+  dt_iop_colisa_data_t *d = (dt_iop_colisa_data_t *)calloc(1, sizeof(dt_iop_colisa_data_t));
   piece->data = (void *)d;
   for(int k = 0; k < 0x10000; k++) d->ctable[k] = d->ltable[k] = 100.0f * k / 0x10000; // identity
 }
 
-void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+void cleanup_pipe(struct dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   free(piece->data);
   piece->data = NULL;
 }
 
-void init_global(dt_iop_module_so_t *self)
+void gui_update(struct dt_iop_module_t *self)
+{
+  dt_iop_colisa_gui_data_t *g = (dt_iop_colisa_gui_data_t *)self->gui_data;
+  dt_iop_colisa_params_t *p = (dt_iop_colisa_params_t *)self->params;
+  dt_bauhaus_slider_set(g->contrast, p->contrast);
+  dt_bauhaus_slider_set(g->brightness, p->brightness);
+  dt_bauhaus_slider_set(g->saturation, p->saturation);
+}
+
+
+void init_global(dt_iop_module_so_t *module)
 {
   const int program = 2; // basic.cl, from programs.conf
-  dt_iop_colisa_global_data_t *gd = malloc(sizeof(dt_iop_colisa_global_data_t));
-  self->data = gd;
+  dt_iop_colisa_global_data_t *gd
+      = (dt_iop_colisa_global_data_t *)malloc(sizeof(dt_iop_colisa_global_data_t));
+  module->data = gd;
   gd->kernel_colisa = dt_opencl_create_kernel(program, "colisa");
 }
 
 
-void cleanup_global(dt_iop_module_so_t *self)
+void cleanup_global(dt_iop_module_so_t *module)
 {
-  dt_iop_colisa_global_data_t *gd = self->data;
+  dt_iop_colisa_global_data_t *gd = (dt_iop_colisa_global_data_t *)module->data;
   dt_opencl_free_kernel(gd->kernel_colisa);
-  free(self->data);
-  self->data = NULL;
+  free(module->data);
+  module->data = NULL;
 }
 
 
-void gui_init(dt_iop_module_t *self)
+void gui_init(struct dt_iop_module_t *self)
 {
   dt_iop_colisa_gui_data_t *g = IOP_GUI_ALLOC(colisa);
 
@@ -278,8 +321,6 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->saturation, _("color saturation adjustment"));
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

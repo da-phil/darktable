@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2013-2024 darktable developers.
+    Copyright (C) 2013-2020 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -72,14 +72,9 @@ static void dbus_lua_call_finished(lua_State* L,int result,void* data)
 }
 #endif
 
-static void _handle_method_call(GDBusConnection *connection,
-                                const gchar *sender,
-                                const gchar *object_path,
-                                const gchar *interface_name,
-                                const gchar *method_name,
-                                GVariant *parameters,
-                                GDBusMethodInvocation *invocation,
-                                gpointer user_data)
+static void _handle_method_call(GDBusConnection *connection, const gchar *sender, const gchar *object_path,
+                                const gchar *interface_name, const gchar *method_name, GVariant *parameters,
+                                GDBusMethodInvocation *invocation, gpointer user_data)
 {
   if(!g_strcmp0(method_name, "Quit"))
   {
@@ -90,8 +85,8 @@ static void _handle_method_call(GDBusConnection *connection,
   {
     const gchar *filename;
     g_variant_get(parameters, "(&s)", &filename);
-    const dt_imgid_t imgid = dt_load_from_string(filename, TRUE, NULL);
-    g_dbus_method_invocation_return_value(invocation, g_variant_new("(i)", imgid));
+    int32_t id = dt_load_from_string(filename, TRUE, NULL);
+    g_dbus_method_invocation_return_value(invocation, g_variant_new("(i)", id));
   }
 #ifdef USE_LUA
   else if(!g_strcmp0(method_name, "Lua"))
@@ -106,13 +101,9 @@ static void _handle_method_call(GDBusConnection *connection,
 
 // TODO: expose the conf? partly? completely?
 
-static GVariant *_handle_get_property(GDBusConnection *connection,
-                                      const gchar *sender,
-                                      const gchar *object_path,
-                                      const gchar *interface_name,
-                                      const gchar *property_name,
-                                      GError **error,
-                                      gpointer user_data)
+static GVariant *_handle_get_property(GDBusConnection *connection, const gchar *sender,
+                                      const gchar *object_path, const gchar *interface_name,
+                                      const gchar *property_name, GError **error, gpointer user_data)
 {
   GVariant *ret;
 
@@ -153,12 +144,11 @@ static GVariant *_handle_get_property(GDBusConnection *connection,
 //   return *error == NULL;
 // }
 
-static const GDBusInterfaceVTable interface_vtable =
-        { _handle_method_call, _handle_get_property, NULL };
+static const GDBusInterfaceVTable interface_vtable = { _handle_method_call, _handle_get_property,
+                                                       //   _handle_set_property
+                                                       NULL };
 
-static void _on_bus_acquired(GDBusConnection *connection,
-                             const gchar *name,
-                             gpointer user_data)
+static void _on_bus_acquired(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
   dt_dbus_t *dbus = (dt_dbus_t *)user_data;
 
@@ -169,24 +159,25 @@ static void _on_bus_acquired(GDBusConnection *connection,
                                           NULL);                   /* GError** */
 
   if(dbus->registration_id == 0)
-    dbus->connected = FALSE; // technically we are connected, but we are not exporting anything. or something like that
+    dbus->connected
+        = 0; // technically we are connected, but we are not exporting anything. or something like that
 }
 
 static void _on_name_acquired(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
   dt_dbus_t *dbus = (dt_dbus_t *)user_data;
-  dbus->connected = TRUE;
+  dbus->connected = 1;
 }
 
 static void _on_name_lost(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
   dt_dbus_t *dbus = (dt_dbus_t *)user_data;
-  dbus->connected = FALSE;
+  dbus->connected = 0;
 }
 
 struct dt_dbus_t *dt_dbus_init()
 {
-  dt_dbus_t *dbus = g_malloc0(sizeof(dt_dbus_t));
+  dt_dbus_t *dbus = (dt_dbus_t *)g_malloc0(sizeof(dt_dbus_t));
   if(!dbus) return NULL;
 
   dbus->introspection_data = g_dbus_node_info_new_for_xml(introspection_xml, NULL);
@@ -199,19 +190,15 @@ struct dt_dbus_t *dt_dbus_init()
                                   _on_name_lost, dbus, NULL);
 
   dbus->dbus_connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
-  if(dbus->dbus_connection)
-    g_object_set(G_OBJECT(dbus->dbus_connection), "exit-on-close", FALSE, (gchar *)0);
+  g_object_set(G_OBJECT(dbus->dbus_connection), "exit-on-close", FALSE, (gchar *)0);
 
   return dbus;
 }
 
 void dt_dbus_destroy(const dt_dbus_t *dbus)
 {
-  if(!dbus) return;
-
   g_bus_unown_name(dbus->owner_id);
-  if(dbus->introspection_data)
-    g_dbus_node_info_unref(dbus->introspection_data);
+  g_dbus_node_info_unref(dbus->introspection_data);
   if(dbus->dbus_connection)
     g_object_unref(G_OBJECT(dbus->dbus_connection));
 
@@ -220,12 +207,9 @@ void dt_dbus_destroy(const dt_dbus_t *dbus)
 
 gboolean dt_dbus_connected(const dt_dbus_t *dbus)
 {
-  return dbus && dbus->connected;
+  return dbus->connected;
 }
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

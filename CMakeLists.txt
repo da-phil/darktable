@@ -1,9 +1,8 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.10.0)
 
 cmake_policy(SET CMP0011 NEW)
 cmake_policy(SET CMP0025 NEW)
 cmake_policy(SET CMP0048 NEW)
-cmake_policy(SET CMP0067 NEW)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules/")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/")
@@ -70,9 +69,9 @@ endif()
 # Whether to use relative paths for the build RPATH
 if (APPLE)
     set(CMAKE_MACOSX_RPATH ON)
-    set(RPATH_ORIGIN @loader_path)
+    set(CMAKE_INSTALL_LIBDIR_RPATH @loader_path/../${CMAKE_INSTALL_LIBDIR}/darktable)
 else()
-    set(RPATH_ORIGIN $ORIGIN)
+    set(CMAKE_INSTALL_LIBDIR_RPATH $ORIGIN/../${CMAKE_INSTALL_LIBDIR}/darktable)
 endif()
 
 if (USE_OPENMP)
@@ -81,7 +80,7 @@ if (USE_OPENMP)
 
         # Clang has an option to specify the OpenMP standard to use. Specify it.
         # FIXME: Implement this in FindOpenMP.cmake
-        set(OPENMP_VERSION_SPECIFIER "-fopenmp-version=51")
+        set(OPENMP_VERSION_SPECIFIER "-fopenmp-version=45")
 
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OPENMP_VERSION_SPECIFIER}")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OPENMP_VERSION_SPECIFIER}")
@@ -110,10 +109,6 @@ else()
   set(SOURCE_PACKAGE 0)
 endif()
 
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|amd64)|(X86|x86)|(^i.86$)")
-  set(BUILD_SSE2_CODEPATHS OFF)
-endif()
-
 if(BUILD_SSE2_CODEPATHS)
   CHECK_C_COMPILER_FLAG("-msse2" _MSSE2)
   if(NOT _MSSE2)
@@ -129,32 +124,14 @@ MESSAGE(STATUS "Building SSE2-optimized codepaths: ${BUILD_SSE2_CODEPATHS}")
 #
 if(APPLE)
 	message("-- Mac OS X build detected, setting default features")
-  find_program(HOMEBREW_EXISTS "brew")
-  if(HOMEBREW_EXISTS)
-    execute_process(COMMAND brew --prefix OUTPUT_VARIABLE HOMEBREW_PREFIX)
-    string(STRIP "${HOMEBREW_PREFIX}" HOMEBREW_PREFIX)
-    message("-- Homebrew detected, setting CMAKE_PREFIX_PATH to ${HOMEBREW_PREFIX}")
-    LIST(APPEND CMAKE_PREFIX_PATH ${HOMEBREW_PREFIX})
-    # Explicitly add llvm and icu4c to prefix path
-    LIST(APPEND CMAKE_PREFIX_PATH ${HOMEBREW_PREFIX}/opt/llvm)
-    LIST(APPEND CMAKE_PREFIX_PATH ${HOMEBREW_PREFIX}/opt/icu4c)
-  else()
-    message("-- Setting CMAKE_PREFIX_PATH to prefer MacPorts and/or user-installed libraries over system ones")
-    LIST(APPEND CMAKE_PREFIX_PATH /opt/local /usr/local)
-  endif()
+
+	# prefer macports and/or user-installed libraries over system ones
+	LIST(APPEND CMAKE_PREFIX_PATH /opt/local /usr/local)
 	set(CMAKE_FIND_FRAMEWORK "LAST")
 	# except libstdc++ (only one linked via -l flag, not full path)
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/usr/lib")
 	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L/usr/lib")
 	set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -L/usr/lib")
-
-  if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64" AND CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
-    # request classic linker for Xcode 15 for Apple Silicon Macs
-    message("-- Xcode >= 15 on arm64 detected, requesting classic linker")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -ld_classic")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -ld_classic")
-    set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -ld_classic")
-  endif()
 
 	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_DARWIN_C_SOURCE")
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_DARWIN_C_SOURCE")
@@ -165,6 +142,7 @@ include(compiler-versions)
 
 if(WIN32)
   message("-- Win32 build detected, setting default features")
+  set(CMAKE_FIND_LIBRARY_SUFFIXES .dll ${CMAKE_FIND_LIBRARY_SUFFIXES})
   set(USE_COLORD OFF)
   set(USE_KWALLET OFF)
   set(BUILD_CMSTEST OFF)
@@ -276,19 +254,30 @@ include(windows-macros)
 
 # we need some external programs for building darktable
 message(STATUS "Looking for external programs")
+set(EXTERNAL_PROGRAMS_FOUND 1)
 
 # we need perl for introspection
-find_program(perl_BIN perl REQUIRED)
-message(STATUS "Found perl")
+find_program(perl_BIN perl)
+if(${perl_BIN} STREQUAL "perl_BIN-NOTFOUND")
+  message(STATUS "Missing perl")
+  set(EXTERNAL_PROGRAMS_FOUND 0)
+else(${perl_BIN} STREQUAL "perl_BIN-NOTFOUND")
+  message(STATUS "Found perl")
+endif(${perl_BIN} STREQUAL "perl_BIN-NOTFOUND")
 
-# we need intltool-merge for org.darktable.darktable.desktop
-find_program(intltool_merge_BIN intltool-merge REQUIRED)
-message(STATUS "Found intltool-merge")
+# we need intltool-merge for darktable.desktop
+find_program(intltool_merge_BIN intltool-merge)
+if(${intltool_merge_BIN} STREQUAL "intltool_merge_BIN-NOTFOUND")
+  message(STATUS "Missing intltool-merge")
+  set(EXTERNAL_PROGRAMS_FOUND 0)
+else(${intltool_merge_BIN} STREQUAL "intltool_merge_BIN-NOTFOUND")
+  message(STATUS "Found intltool-merge")
+endif(${intltool_merge_BIN} STREQUAL "intltool_merge_BIN-NOTFOUND")
 
-# we need desktop-file-validate to check org.darktable.darktable.desktop
+# we need desktop-file-validate to check darktable.desktop
 find_program(desktop_file_validate_BIN desktop-file-validate)
 if(${desktop_file_validate_BIN} STREQUAL "desktop_file_validate_BIN-NOTFOUND")
-  message(STATUS "Missing desktop-file-validate, problems in org.darktable.darktable.desktop might go unnoticed")
+  message(STATUS "Missing desktop-file-validate, problems in darktable.desktop might go unnoticed")
   set(VALIDATE_DESKTOP_FILE 0)
 else(${desktop_file_validate_BIN} STREQUAL "desktop_file_validate_BIN-NOTFOUND")
   message(STATUS "Found desktop-file-validate")
@@ -309,13 +298,17 @@ endif(VALIDATE_APPDATA_FILE)
 if(TESTBUILD_OPENCL_PROGRAMS)
   set(TESTBUILD_OPENCL_PROGRAMS OFF)
 
-  find_package(LLVM CONFIG)
+  macro(find_llvm versions)
+    foreach(version ${versions})
+      find_package(LLVM ${version} CONFIG)
+      if(LLVM_FOUND)
+        break()
+      endif()
+    endforeach()
+  endmacro()
 
-  if(LLVM_FOUND)
-    if(${LLVM_VERSION} VERSION_LESS 7)
-      set(LLVM_FOUND FALSE)
-    endif()
-  endif()
+  # 3.9 is the first version with which this works.
+  find_llvm("13;12;11;10;9;8;7;6.0;5.0;4.0;3.9")
 
   if (LLVM_FOUND)
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -329,7 +322,7 @@ if(TESTBUILD_OPENCL_PROGRAMS)
 
       find_path(CLANG_OPENCL_INCLUDE_DIR opencl-c.h
         HINTS ${LLVM_INSTALL_PREFIX}/lib/clang ${LLVM_INSTALL_PREFIX}/lib64/clang
-        PATH_SUFFIXES include ${LLVM_PACKAGE_VERSION}/include ${LLVM_VERSION_MAJOR}/include
+        PATH_SUFFIXES include ${LLVM_PACKAGE_VERSION}/include
         NO_DEFAULT_PATH
       )
 
@@ -345,7 +338,7 @@ if(TESTBUILD_OPENCL_PROGRAMS)
       message(WARNING "Test-compilation of OpenCL programs can not be done.")
     endif()
   else()
-    message(WARNING "Could not find LLVM 7 or above")
+    message(WARNING "Could not find LLVM 3.9+")
     message(WARNING "Test-compilation of OpenCL programs can not be done.")
   endif()
 endif()
@@ -372,10 +365,11 @@ if(${Xsltproc_BIN} STREQUAL "Xsltproc_BIN-NOTFOUND")
   message(STATUS "Missing xsltproc")
   find_program(Saxon_BIN saxon-xslt)
   if(${Saxon_BIN} STREQUAL "Saxon_BIN-NOTFOUND")
-    message(STATUS "Missing saxon-xslt")
-    message(FATAL_ERROR "No XSLT interpreter found")
+    message(STATUS "Missing Saxon-XSLT")
+    message(STATUS "No XSLT interpreter found")
+    set(EXTERNAL_PROGRAMS_FOUND 0)
   else(${Saxon_BIN} STREQUAL "Saxon_BIN-NOTFOUND")
-    message(STATUS "Found saxon-xslt")
+    message(STATUS "Found Saxon-XSLT")
   endif(${Saxon_BIN} STREQUAL "Saxon_BIN-NOTFOUND")
 else(${Xsltproc_BIN} STREQUAL "Xsltproc_BIN-NOTFOUND")
   message(STATUS "Found xsltproc")
@@ -392,16 +386,32 @@ if(USE_XMLLINT)
   endif(${Xmllint_BIN} STREQUAL "Xmllint_BIN-NOTFOUND")
 endif(USE_XMLLINT)
 
+find_program(exiftool_BIN exiftool)
+if(${exiftool_BIN} STREQUAL "exiftool_BIN-NOTFOUND")
+  message(STATUS "Missing exiftool")
+  set(HAVE_EXIFTOOL 0)
+else()
+  message(STATUS "Found exiftool")
+  set(HAVE_EXIFTOOL 1)
+endif()
+
 # done with looking for programs
-message(STATUS "All external programs found")
+if(NOT EXTERNAL_PROGRAMS_FOUND)
+  message(FATAL_ERROR "Some external programs couldn't be found")
+else(NOT EXTERNAL_PROGRAMS_FOUND)
+  message(STATUS "All external programs found")
+endif(NOT EXTERNAL_PROGRAMS_FOUND)
 
 # The path can be modified by setting CMAKE_INSTALL_LOCALEDIR
-find_package(Gettext REQUIRED)
-if(GETTEXT_MSGFMT_EXECUTABLE)
-    add_subdirectory(po)
-else()
-    message(FATAL_ERROR "ERROR: Cannot find msgfmt to convert .po file")
-endif()
+if(USE_NLS)
+    find_package(Gettext)
+    if(GETTEXT_MSGFMT_EXECUTABLE)
+        message(STATUS "Found msgfmt to convert .po file. Translation enabled")
+        add_subdirectory(po)
+    else()
+        message(STATUS "Cannot find msgfmt to convert .po file. Translation won't be enabled")
+    endif()
+endif(USE_NLS)
 
 # needed to generate file "preferences_gen.h" accordingly
 if(USE_OPENCL)
@@ -489,7 +499,7 @@ include(cmake/darktable-packaging.cmake)
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
-    @ONLY)
+    IMMEDIATE @ONLY)
 
 add_custom_target(uninstall
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)

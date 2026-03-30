@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2024 darktable developers.
+    Copyright (C) 2009-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -21,8 +21,6 @@
 #include "common/cache.h"
 #include "common/image.h"
 
-G_BEGIN_DECLS
-
 typedef struct dt_image_cache_t
 {
   dt_cache_t cache;
@@ -40,8 +38,9 @@ typedef enum dt_image_cache_write_mode_t
 }
 dt_image_cache_write_mode_t;
 
-void dt_image_cache_init(void);
-void dt_image_cache_cleanup(void);
+void dt_image_cache_init(dt_image_cache_t *cache);
+void dt_image_cache_cleanup(dt_image_cache_t *cache);
+void dt_image_cache_print(dt_image_cache_t *cache);
 
 // blocks until it gets the image struct with this id for reading.
 // also does the sql query if the image is not in cache atm.
@@ -50,38 +49,30 @@ void dt_image_cache_cleanup(void);
 // cachelines to free up space if necessary.
 // if an entry is swapped out like this in the background, this is the latest
 // point where sql and xmp can be synched (unsafe setting).
-dt_image_t *dt_image_cache_get(const dt_imgid_t imgid, const char mode);
+dt_image_t *dt_image_cache_get(dt_image_cache_t *cache, const int32_t imgid, char mode);
 
 // same as read_get, but doesn't block and returns NULL if the image
 // is currently unavailable.
-dt_image_t *dt_image_cache_testget(const dt_imgid_t imgid, const char mode);
+dt_image_t *dt_image_cache_testget(dt_image_cache_t *cache, const int32_t imgid, char mode);
 
 // drops the read lock on an image struct
-void dt_image_cache_read_release(const dt_image_t *img);
+void dt_image_cache_read_release(dt_image_cache_t *cache, const dt_image_t *img);
 
 // drops the write privileges on an image struct.
 // this triggers a write-through to sql, and if the setting
 // is present, also to xmp sidecar files (safe setting).
-void dt_image_cache_write_release(dt_image_t *img, const dt_image_cache_write_mode_t mode);
-// As above with some additional information
-void dt_image_cache_write_release_info(dt_image_t *img,
-                                       const dt_image_cache_write_mode_t mode,
-                                       const char *info);
+void dt_image_cache_write_release(dt_image_cache_t *cache, dt_image_t *img, dt_image_cache_write_mode_t mode);
 
 // remove the image from the cache
-void dt_image_cache_remove(const dt_imgid_t imgid);
+void dt_image_cache_remove(dt_image_cache_t *cache, const int32_t imgid);
 
 // register timestamps in cache
-void dt_image_cache_set_change_timestamp(const dt_imgid_t imgid);
-void dt_image_cache_set_change_timestamp_from_image(const dt_imgid_t imgid, const dt_imgid_t sourceid);
-void dt_image_cache_unset_change_timestamp(const dt_imgid_t imgid);
-void dt_image_cache_set_export_timestamp(const dt_imgid_t imgid);
-void dt_image_cache_set_print_timestamp(const dt_imgid_t imgid);
+void dt_image_cache_set_change_timestamp(dt_image_cache_t *cache, const int32_t imgid);
+void dt_image_cache_set_change_timestamp_from_image(dt_image_cache_t *cache, const int32_t imgid, const int32_t sourceid);
+void dt_image_cache_unset_change_timestamp(dt_image_cache_t *cache, const int32_t imgid);
+void dt_image_cache_set_export_timestamp(dt_image_cache_t *cache, const int32_t imgid);
+void dt_image_cache_set_print_timestamp(dt_image_cache_t *cache, const int32_t imgid);
 
-G_END_DECLS
-
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

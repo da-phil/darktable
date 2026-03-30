@@ -1,6 +1,6 @@
 /*
  *    This file is part of darktable,
- *    Copyright (C) 2019-2025 darktable developers.
+ *    Copyright (C) 2019-2020 darktable developers.
  *
  *    darktable is free software: you can redistribute it and/or modify
  *    it under the terms of the GNU General Public License as published by
@@ -37,7 +37,7 @@ dt_rgb_norm(const float4 in, const int norm, const int work_profile,
   }
   else if (norm == DT_RGB_NORM_MAX)
   {
-    return fmax(in.x, fmax(in.y, in.z));
+    return max(in.x, max(in.y, in.z));
   }
   else if (norm == DT_RGB_NORM_AVERAGE)
   {
@@ -49,7 +49,7 @@ dt_rgb_norm(const float4 in, const int norm, const int work_profile,
   }
   else if (norm == DT_RGB_NORM_NORM)
   {
-    return dtcl_pow(in.x * in.x + in.y * in.y + in.z * in.z, 0.5f);
+    return native_powr(in.x * in.x + in.y * in.y + in.z * in.z, 0.5f);
   }
   else if (norm == DT_RGB_NORM_POWER)
   {

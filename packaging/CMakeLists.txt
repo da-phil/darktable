@@ -1,27 +1,26 @@
-if(WIN32 AND NOT BUILD_MSYS2_INSTALL)
+
+IF(WIN32 AND NOT BUILD_MSYS2_INSTALL)
 
   set(plugin_dest_dir lib/darktable/plugins)
-  set(APPS "\${CMAKE_INSTALL_PREFIX}/bin/darktable.exe") # paths to executables
-  get_filename_component(MINGW_PATH ${CMAKE_CXX_COMPILER} PATH)
+  set(APPS "\${CMAKE_INSTALL_PREFIX}/bin/darktable.exe")  # paths to executables
+  get_filename_component(MINGW_PATH ${CMAKE_CXX_COMPILER} PATH )
 
   find_program(cygcheck_BIN cygcheck)
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64" OR ${cygcheck_BIN} STREQUAL "cygcheck_BIN-NOTFOUND")
+  if(${cygcheck_BIN} STREQUAL "cygcheck_BIN-NOTFOUND")
 
     # use the slower fixup_bundle
 
     set(DIRS ${MINGW_PATH}) # directories to search for prerequisites
 
     # run Bundle utilities
-    install(
-      CODE "
+    INSTALL(CODE "
       file(GLOB_RECURSE DTPLUGINS
         \"\${CMAKE_INSTALL_PREFIX}/${plugin_dest_dir}/*${CMAKE_SHARED_LIBRARY_SUFFIX}\")
       list(APPEND DTPLUGINS \"\${CMAKE_INSTALL_PREFIX}/bin/libdarktable.dll\")
       include(\"${CMAKE_ROOT}/Modules/BundleUtilities.cmake\")
       set(gp_tool \"objdump\")
       fixup_bundle(\"${APPS}\" \"\${DTPLUGINS}\" \"${DIRS}\")
-      "
-      COMPONENT DTApplication)
+      " COMPONENT DTApplication)
 
   else()
 
@@ -29,8 +28,7 @@ if(WIN32 AND NOT BUILD_MSYS2_INSTALL)
 
     string(REPLACE "/" "\\\\\\\\" DIRS "${MINGW_PATH}") # add lots of escaping
 
-    install(
-      CODE "
+    INSTALL(CODE "
       set(EXTRA_DEPS)
 
       function(process_file filename)
@@ -57,9 +55,8 @@ if(WIN32 AND NOT BUILD_MSYS2_INSTALL)
         execute_process(COMMAND ${CMAKE_COMMAND} -E copy \"\${filename}\" \"\${CMAKE_INSTALL_PREFIX}/bin/\")
       endforeach()
 
-      "
-      COMPONENT DTApplication)
+      " COMPONENT DTApplication)
 
   endif()
 
-endif()
+ENDIF(WIN32 AND NOT BUILD_MSYS2_INSTALL)

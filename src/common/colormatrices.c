@@ -343,9 +343,6 @@ static dt_profiled_colormatrix_t dt_alternate_colormatrices[] =
 };
 
 static const int dt_alternate_colormatrix_cnt = sizeof(dt_alternate_colormatrices)/sizeof(dt_profiled_colormatrix_t);
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

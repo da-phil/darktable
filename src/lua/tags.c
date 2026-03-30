@@ -35,25 +35,6 @@ static int tag_name(lua_State *L)
   return 1;
 }
 
-static int tag_flags(lua_State *L)
-{
-  dt_lua_tag_t tagid1;
-  luaA_to(L, dt_lua_tag_t, &tagid1, -2);
-  gint flags = dt_tag_get_flags(tagid1);
-  lua_pushinteger(L, flags);
-  return 1;
-}
-
-static int tag_synonyms(lua_State *L)
-{
-  dt_lua_tag_t tagid1;
-  luaA_to(L, dt_lua_tag_t, &tagid1, -2);
-  gchar *synonyms = dt_tag_get_synonyms(tagid1);
-  lua_pushstring(L, synonyms);
-  free(synonyms);
-  return 1;
-}
-
 static int tag_tostring(lua_State *L)
 {
   dt_lua_tag_t tagid1;
@@ -92,8 +73,7 @@ static int tag_index(lua_State *L)
   int index = luaL_checkinteger(L, -1);
   if(index < 1)
   {
-    lua_pushnil(L);
-    return 1;
+    return luaL_error(L, "incorrect index in database");
   }
   sqlite3_stmt *stmt = NULL;
   char query[1024];
@@ -103,12 +83,13 @@ static int tag_index(lua_State *L)
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, tagid);
   if(sqlite3_step(stmt) == SQLITE_ROW)
   {
-    dt_imgid_t imgid = sqlite3_column_int(stmt, 0);
+    int imgid = sqlite3_column_int(stmt, 0);
     luaA_push(L, dt_lua_image_t, &imgid);
   }
   else
   {
-    lua_pushnil(L);
+    sqlite3_finalize(stmt);
+    luaL_error(L, "incorrect index in database");
   }
   sqlite3_finalize(stmt);
   return 1;
@@ -181,7 +162,7 @@ static int tag_delete(lua_State *L)
   sqlite3_finalize(stmt);
 
   if(dt_tag_remove(tagid, TRUE))
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
+    DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_TAG_CHANGED);
 
   for(const GList *list_iter = tagged_images; list_iter; list_iter = g_list_next(list_iter))
   {
@@ -195,7 +176,7 @@ static int tag_delete(lua_State *L)
 
 int dt_lua_tag_attach(lua_State *L)
 {
-  dt_lua_image_t imgid = NO_IMGID;
+  dt_lua_image_t imgid = -1;
   dt_lua_tag_t tagid = 0;
   if(luaL_testudata(L, 1, "dt_lua_image_t"))
   {
@@ -209,7 +190,7 @@ int dt_lua_tag_attach(lua_State *L)
   }
   if(dt_tag_attach(tagid, imgid, TRUE, TRUE))
   {
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
+    DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_TAG_CHANGED);
     dt_image_synch_xmp(imgid);
   }
   return 0;
@@ -232,7 +213,7 @@ int dt_lua_tag_detach(lua_State *L)
   if(dt_tag_detach(tagid, imgid, TRUE, TRUE))
   {
     dt_image_synch_xmp(imgid);
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_TAG_CHANGED);
+    DT_DEBUG_CONTROL_SIGNAL_RAISE(darktable.signals, DT_SIGNAL_TAG_CHANGED);
   }
   return 0;
 }
@@ -289,7 +270,7 @@ int dt_lua_tag_get_tagged_images(lua_State *L)
   lua_newtable(L);
   while(rv == SQLITE_ROW)
   {
-    dt_imgid_t imgid = sqlite3_column_int(stmt, 0);
+    int imgid = sqlite3_column_int(stmt, 0);
     luaA_push(L, dt_lua_image_t, &imgid);
     lua_seti(L, -2, table_index);
     table_index++;
@@ -308,10 +289,6 @@ int dt_lua_init_tags(lua_State *L)
   dt_lua_type_register_number_const(L, dt_lua_tag_t);
   lua_pushcfunction(L, tag_name);
   dt_lua_type_register_const(L, dt_lua_tag_t, "name");
-  lua_pushcfunction(L, tag_flags);
-  dt_lua_type_register_const(L, dt_lua_tag_t, "flags");
-  lua_pushcfunction(L, tag_synonyms);
-  dt_lua_type_register_const(L, dt_lua_tag_t, "synonyms");
   lua_pushcfunction(L, tag_delete);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const(L, dt_lua_tag_t, "delete");
@@ -358,9 +335,6 @@ int dt_lua_init_tags(lua_State *L)
 
   return 0;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2025 darktable developers.
+    Copyright (C) 2010-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -25,7 +25,6 @@
 #include "develop/develop.h"
 #include "gradientslider.h"
 #include "gui/gtk.h"
-#include "gui/accelerators.h"
 
 #define DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MAX 50
 #define DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MIN 10
@@ -36,28 +35,18 @@ G_DEFINE_TYPE(GtkDarktableGradientSlider, _gradient_slider, GTK_TYPE_DRAWING_ARE
 #define parent_class _gradient_slider_parent_class
 
 // Class overrides
-static void _gradient_slider_get_preferred_height(GtkWidget *widget,
-                                                  gint *min_height,
-                                                  gint *nat_height);
-static void _gradient_slider_get_preferred_width(GtkWidget *widget,
-                                                 gint *min_width,
-                                                 gint *nat_width);
+static void _gradient_slider_get_preferred_height(GtkWidget *widget, gint *min_height, gint *nat_height);
+static void _gradient_slider_get_preferred_width(GtkWidget *widget, gint *min_width, gint *nat_width);
 static gboolean _gradient_slider_draw(GtkWidget *widget, cairo_t *cr);
 static void _gradient_slider_destroy(GtkWidget *widget);
 
 // Events
-static gboolean _gradient_slider_enter_notify_event(GtkWidget *widget,
-                                                    GdkEventCrossing *event);
-static gboolean _gradient_slider_button_press(GtkWidget *widget,
-                                              GdkEventButton *event);
-static gboolean _gradient_slider_button_release(GtkWidget *widget,
-                                                GdkEventButton *event);
-static gboolean _gradient_slider_motion_notify(GtkWidget *widget,
-                                               GdkEventMotion *event);
-static gboolean _gradient_slider_scroll_event(GtkWidget *widget,
-                                              GdkEventScroll *event);
-static gboolean _gradient_slider_key_press_event(GtkWidget *widget,
-                                                 GdkEventKey *event);
+static gboolean _gradient_slider_enter_notify_event(GtkWidget *widget, GdkEventCrossing *event);
+static gboolean _gradient_slider_button_press(GtkWidget *widget, GdkEventButton *event);
+static gboolean _gradient_slider_button_release(GtkWidget *widget, GdkEventButton *event);
+static gboolean _gradient_slider_motion_notify(GtkWidget *widget, GdkEventMotion *event);
+static gboolean _gradient_slider_scroll_event(GtkWidget *widget, GdkEventScroll *event);
+static gboolean _gradient_slider_key_press_event(GtkWidget *widget, GdkEventKey *event);
 
 enum
 {
@@ -81,7 +70,7 @@ static gboolean _gradient_slider_postponed_value_change(gpointer data)
   if(!DTGTK_GRADIENT_SLIDER(data)->is_dragging) DTGTK_GRADIENT_SLIDER(data)->timeout_handle = 0;
   else
   {
-    const int delay = CLAMP(darktable.develop->full.pipe->average_delay * 3 / 2,
+    const int delay = CLAMP(darktable.develop->average_delay * 3 / 2,
                             DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MIN,
                             DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MAX);
     DTGTK_GRADIENT_SLIDER(data)->timeout_handle = g_timeout_add(delay, _gradient_slider_postponed_value_change, data);
@@ -90,8 +79,7 @@ static gboolean _gradient_slider_postponed_value_change(gpointer data)
   return FALSE; // This is called by the gtk mainloop and is threadsafe
 }
 
-static inline gboolean _test_if_marker_is_upper_or_down(const gint marker,
-                                                        const gboolean up)
+static inline gboolean _test_if_marker_is_upper_or_down(const gint marker, const gboolean up)
 {
   if(up && (marker == GRADIENT_SLIDER_MARKER_LOWER_OPEN ||
                   marker == GRADIENT_SLIDER_MARKER_LOWER_FILLED ||
@@ -107,8 +95,7 @@ static inline gboolean _test_if_marker_is_upper_or_down(const gint marker,
     return TRUE; // must be a DOUBLE
 }
 
-static inline gdouble _screen_to_scale(GtkWidget *widget,
-                                       const gint screen)
+static inline gdouble _screen_to_scale(GtkWidget *widget, gint screen)
 {
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
 
@@ -117,8 +104,7 @@ static inline gdouble _screen_to_scale(GtkWidget *widget,
   return ((gdouble)screen - gslider->margin_left) / ((gdouble)allocation.width - gslider->margin_left - gslider->margin_right);
 }
 
-static inline gint _scale_to_screen(GtkWidget *widget,
-                                    const gdouble scale)
+static inline gint _scale_to_screen(GtkWidget *widget, gdouble scale)
 {
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
 
@@ -127,8 +113,7 @@ static inline gint _scale_to_screen(GtkWidget *widget,
   return (gint)(scale * (allocation.width - gslider->margin_left - gslider->margin_right) + gslider->margin_left);
 }
 
-static inline gdouble _get_position_from_screen(GtkWidget *widget,
-                                                const gdouble x)
+static inline gdouble _get_position_from_screen(GtkWidget *widget, const gdouble x)
 {
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
   gdouble position = roundf(_screen_to_scale(widget, x) / gslider->increment) * gslider->increment;
@@ -140,8 +125,7 @@ static inline gint _get_active_marker(GtkDarktableGradientSlider *gslider)
   return (gslider->selected >= 0) ? gslider->selected : gslider->active;
 }
 
-static inline void _clamp_marker(GtkDarktableGradientSlider *gslider,
-                                 const gint selected)
+static inline void _clamp_marker(GtkDarktableGradientSlider *gslider, const gint selected)
 {
   g_return_if_fail(gslider != NULL);
 
@@ -150,9 +134,7 @@ static inline void _clamp_marker(GtkDarktableGradientSlider *gslider,
   gslider->position[selected] = CLAMP(gslider->position[selected], min, max);
 }
 
-static gint _get_active_marker_internal(GtkWidget *widget,
-                                        const gdouble x,
-                                        const gboolean up)
+static gint _get_active_marker_internal(GtkWidget *widget, const gdouble x, const gboolean up)
 {
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
   gint lselected = -1;
@@ -171,9 +153,7 @@ static gint _get_active_marker_internal(GtkWidget *widget,
   return lselected;
 }
 
-static gint _get_active_marker_from_screen(GtkWidget *widget,
-                                           const gdouble x,
-                                           const gdouble y)
+static gint _get_active_marker_from_screen(GtkWidget *widget, const gdouble x, const gdouble y)
 {
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
@@ -187,10 +167,7 @@ static gint _get_active_marker_from_screen(GtkWidget *widget,
   return lselected;
 }
 
-static gdouble _slider_move(GtkWidget *widget,
-                            const gint k,
-                            const gdouble value,
-                            const gint direction)
+static gdouble _slider_move(GtkWidget *widget, gint k, gdouble value, gint direction)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), value);
 
@@ -243,10 +220,7 @@ static gdouble _slider_move(GtkWidget *widget,
   return newvalue;
 }
 
-static gboolean _gradient_slider_add_delta_internal(GtkWidget *widget,
-                                                    gdouble delta,
-                                                    const guint state,
-                                                    const gint selected)
+static gboolean _gradient_slider_add_delta_internal(GtkWidget *widget, gdouble delta, guint state, const gint selected)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), TRUE);
 
@@ -254,7 +228,22 @@ static gboolean _gradient_slider_add_delta_internal(GtkWidget *widget,
 
   if(selected == -1) return TRUE;
 
-  delta *= dt_accel_get_speed_multiplier(widget, state);
+  float multiplier;
+
+  if(dt_modifier_is(state, GDK_SHIFT_MASK))
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_rough_step_multiplier");
+  }
+  else if(dt_modifier_is(state, GDK_CONTROL_MASK))
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_precise_step_multiplier");
+  }
+  else
+  {
+    multiplier = dt_conf_get_float("darkroom/ui/scale_step_multiplier");
+  }
+
+  delta *= multiplier;
 
   gslider->position[selected] = gslider->position[selected] + delta;
   _clamp_marker(gslider, selected);
@@ -265,16 +254,13 @@ static gboolean _gradient_slider_add_delta_internal(GtkWidget *widget,
   return TRUE;
 }
 
-static float _default_linear_scale_callback(GtkWidget *self,
-                                            const float value,
-                                            const int dir)
+static float _default_linear_scale_callback(GtkWidget *self, float value, int dir)
 {
   // regardless of dir: input <-> output
   return value;
 }
 
-static gboolean _gradient_slider_enter_notify_event(GtkWidget *widget,
-                                                    GdkEventCrossing *event)
+static gboolean _gradient_slider_enter_notify_event(GtkWidget *widget, GdkEventCrossing *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
 
@@ -285,8 +271,7 @@ static gboolean _gradient_slider_enter_notify_event(GtkWidget *widget,
   return FALSE;
 }
 
-static gboolean _gradient_slider_leave_notify_event(GtkWidget *widget,
-                                                    GdkEventCrossing *event)
+static gboolean _gradient_slider_leave_notify_event(GtkWidget *widget, GdkEventCrossing *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
 
@@ -301,15 +286,14 @@ static gboolean _gradient_slider_leave_notify_event(GtkWidget *widget,
   return FALSE;
 }
 
-static gboolean _gradient_slider_button_press(GtkWidget *widget,
-                                              GdkEventButton *event)
+static gboolean _gradient_slider_button_press(GtkWidget *widget, GdkEventButton *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
 
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
 
   // reset slider
-  if(event->button == GDK_BUTTON_PRIMARY && event->type == GDK_2BUTTON_PRESS && gslider->is_resettable)
+  if(event->button == 1 && event->type == GDK_2BUTTON_PRESS && gslider->is_resettable)
   {
     gslider->is_dragging = FALSE;
     gslider->do_reset = TRUE;
@@ -319,14 +303,14 @@ static gboolean _gradient_slider_button_press(GtkWidget *widget,
     g_signal_emit_by_name(G_OBJECT(widget), "value-changed");
     g_signal_emit_by_name(G_OBJECT(widget), "value-reset");
   }
-  else if((event->button == GDK_BUTTON_PRIMARY || event->button == GDK_BUTTON_SECONDARY) && event->type == GDK_BUTTON_PRESS)
+  else if((event->button == 1 || event->button == 3) && event->type == GDK_BUTTON_PRESS)
   {
     const gint lselected = _get_active_marker_from_screen(widget, event->x, event->y);
 
     assert(lselected >= 0);
     assert(lselected <= gslider->positions - 1);
 
-    if(event->button == GDK_BUTTON_PRIMARY) // left mouse button : select and start dragging
+    if(event->button == 1) // left mouse button : select and start dragging
     {
       gslider->selected = lselected;
       gslider->do_reset = FALSE;
@@ -339,7 +323,7 @@ static gboolean _gradient_slider_button_press(GtkWidget *widget,
       gslider->is_changed = TRUE;
       gslider->is_dragging = TRUE;
       // timeout_handle should always be zero here, but check just in case
-      const int delay = CLAMP(darktable.develop->full.pipe->average_delay * 3 / 2,
+      const int delay = CLAMP(darktable.develop->average_delay * 3 / 2,
                               DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MIN,
                               DTGTK_GRADIENT_SLIDER_VALUE_CHANGED_DELAY_MAX);
       if(!gslider->timeout_handle)
@@ -362,8 +346,7 @@ static gboolean _gradient_slider_button_press(GtkWidget *widget,
   return TRUE;
 }
 
-static gboolean _gradient_slider_motion_notify(GtkWidget *widget,
-                                               GdkEventMotion *event)
+static gboolean _gradient_slider_motion_notify(GtkWidget *widget, GdkEventMotion *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
 
@@ -392,15 +375,14 @@ static gboolean _gradient_slider_motion_notify(GtkWidget *widget,
   return TRUE;
 }
 
-static gboolean _gradient_slider_button_release(GtkWidget *widget,
-                                                GdkEventButton *event)
+static gboolean _gradient_slider_button_release(GtkWidget *widget, GdkEventButton *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
 
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
   const gint selected = _get_active_marker(gslider);
 
-  if(event->button == GDK_BUTTON_PRIMARY && selected != -1 && gslider->do_reset == FALSE)
+  if(event->button == 1 && selected != -1 && gslider->do_reset == FALSE)
   {
     // First get some dimension info
     gslider->is_changed = TRUE;
@@ -419,8 +401,7 @@ static gboolean _gradient_slider_button_release(GtkWidget *widget,
   return TRUE;
 }
 
-static gboolean _gradient_slider_scroll_event(GtkWidget *widget,
-                                              GdkEventScroll *event)
+static gboolean _gradient_slider_scroll_event(GtkWidget *widget, GdkEventScroll *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), TRUE);
 
@@ -436,43 +417,40 @@ static gboolean _gradient_slider_scroll_event(GtkWidget *widget,
   if(dt_gui_get_scroll_unit_delta(event, &delta_y))
   {
     gdouble delta = delta_y * -gslider->increment;
-    return _gradient_slider_add_delta_internal(widget, delta,
-                                               event->state, selected);
+    return _gradient_slider_add_delta_internal(widget, delta, event->state, selected);
   }
 
   return TRUE;
 }
 
-static gboolean _gradient_slider_key_press_event(GtkWidget *widget,
-                                                 GdkEventKey *event)
+static gboolean _gradient_slider_key_press_event(GtkWidget *widget, GdkEventKey *event)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), TRUE);
 
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
 
-  int handled = FALSE;
-  float delta = -gslider->increment;
-  switch(event->keyval)
-  {
-    case GDK_KEY_Up:
-    case GDK_KEY_KP_Up:
-    case GDK_KEY_Right:
-    case GDK_KEY_KP_Right:
-      delta = gslider->increment;
-    case GDK_KEY_Down:
-    case GDK_KEY_KP_Down:
-    case GDK_KEY_Left:
-    case GDK_KEY_KP_Left:
-      handled = TRUE;
-  }
-
-  if(!handled) return FALSE;
-
   const gint selected = _get_active_marker(gslider);
   if(selected == -1) return TRUE;
 
-  return _gradient_slider_add_delta_internal(widget, delta,
-                                             event->state, selected);
+  int handled = 0;
+  float delta = 0.0f;
+
+  if(event->keyval == GDK_KEY_Up || event->keyval == GDK_KEY_KP_Up || event->keyval == GDK_KEY_Right
+     || event->keyval == GDK_KEY_KP_Right)
+  {
+    handled = 1;
+    delta = gslider->increment;
+  }
+  else if(event->keyval == GDK_KEY_Down || event->keyval == GDK_KEY_KP_Down || event->keyval == GDK_KEY_Left
+          || event->keyval == GDK_KEY_KP_Left)
+  {
+    handled = 1;
+    delta = -gslider->increment;
+  }
+
+  if(!handled) return TRUE;
+
+  return _gradient_slider_add_delta_internal(widget, delta, event->state, selected);
 }
 
 static void _gradient_slider_class_init(GtkDarktableGradientSliderClass *klass)
@@ -492,18 +470,10 @@ static void _gradient_slider_class_init(GtkDarktableGradientSliderClass *klass)
   widget_class->scroll_event = _gradient_slider_scroll_event;
   widget_class->key_press_event = _gradient_slider_key_press_event;
 
-  _signals[VALUE_CHANGED] = g_signal_new("value-changed",
-                                         G_TYPE_FROM_CLASS(klass),
-                                         G_SIGNAL_RUN_LAST, 0,
-                                         NULL, NULL,
-                                         g_cclosure_marshal_VOID__VOID,
-                                         G_TYPE_NONE, 0);
-  _signals[VALUE_RESET] = g_signal_new("value-reset",
-                                       G_TYPE_FROM_CLASS(klass),
-                                       G_SIGNAL_RUN_LAST, 0,
-                                       NULL, NULL,
-                                       g_cclosure_marshal_VOID__VOID,
-                                       G_TYPE_NONE, 0);
+  _signals[VALUE_CHANGED] = g_signal_new("value-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
+                                         NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
+  _signals[VALUE_RESET] = g_signal_new("value-reset", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0,
+                                       NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
 }
 
 static void _gradient_slider_init(GtkDarktableGradientSlider *gslider)
@@ -526,9 +496,7 @@ static void _gradient_slider_init(GtkDarktableGradientSlider *gslider)
   gtk_widget_set_can_focus(widget, TRUE);
 }
 
-static void _gradient_slider_get_preferred_height(GtkWidget *widget,
-                                                  gint *min_height,
-                                                  gint *nat_height)
+static void _gradient_slider_get_preferred_height(GtkWidget *widget, gint *min_height, gint *nat_height)
 {
   g_return_if_fail(widget != NULL);
 
@@ -537,16 +505,14 @@ static void _gradient_slider_get_preferred_height(GtkWidget *widget,
 
   GtkBorder margin, border, padding;
   int css_min_height;
-  gtk_style_context_get(context, state, "min-height", &css_min_height, NULL);
+  gtk_style_context_get (context, state, "min-height", &css_min_height, NULL);
   gtk_style_context_get_margin(context, state, &margin);
   gtk_style_context_get_border(context, state, &border);
   gtk_style_context_get_padding(context, state, &padding);
   *min_height = *nat_height = css_min_height + padding.top + padding.bottom + border.top + border.bottom + margin.top + margin.bottom;
 }
 
-static void _gradient_slider_get_preferred_width(GtkWidget *widget,
-                                                 gint *min_width,
-                                                 gint *nat_width)
+static void _gradient_slider_get_preferred_width(GtkWidget *widget, gint *min_width, gint *nat_width)
 {
   g_return_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget));
 
@@ -584,8 +550,7 @@ static void _gradient_slider_destroy(GtkWidget *widget)
   GTK_WIDGET_CLASS(parent_class)->destroy(widget);
 }
 
-static gboolean _gradient_slider_draw(GtkWidget *widget,
-                                      cairo_t *cr)
+static gboolean _gradient_slider_draw(GtkWidget *widget, cairo_t *cr)
 {
   g_return_val_if_fail(DTGTK_IS_GRADIENT_SLIDER(widget), FALSE);
   GtkDarktableGradientSlider *gslider = DTGTK_GRADIENT_SLIDER(widget);
@@ -649,7 +614,7 @@ static gboolean _gradient_slider_draw(GtkWidget *widget,
   cairo_set_source_rgba(cr, color.red, color.green, color.blue, 1.0);
 
   // do we have a picker value to draw?
-  if(!dt_isnan(gslider->picker[0]))
+  if(!isnan(gslider->picker[0]))
   {
     int vx_min = _scale_to_screen(widget, CLAMP(gslider->picker[1], 0.0, 1.0));
     int vx_max = _scale_to_screen(widget, CLAMP(gslider->picker[2], 0.0, 1.0));
@@ -713,8 +678,7 @@ static void _gradient_slider_set_defaults(GtkDarktableGradientSlider *gslider)
 {
   g_return_if_fail(gslider != NULL);
 
-  gslider->is_dragging = gslider->is_changed =
-    gslider->do_reset = gslider->is_entered = 0;
+  gslider->is_dragging = gslider->is_changed = gslider->do_reset = gslider->is_entered = 0;
   gslider->timeout_handle = 0;
   gslider->selected = gslider->positions == 1 ? 0 : -1;
   gslider->active = -1;
@@ -723,8 +687,7 @@ static void _gradient_slider_set_defaults(GtkDarktableGradientSlider *gslider)
   gslider->is_entered = FALSE;
   gslider->picker[0] = gslider->picker[1] = gslider->picker[2] = NAN;
   gslider->increment = DTGTK_GRADIENT_SLIDER_DEFAULT_INCREMENT;
-  gslider->margin_left = gslider->margin_right =
-    GRADIENT_SLIDER_MARGINS_DEFAULT;
+  gslider->margin_left = gslider->margin_right = GRADIENT_SLIDER_MARGINS_DEFAULT;
   gslider->markers_type = FREE_MARKERS;
   gslider->colors = NULL;
   gslider->min_spacing = 0;
@@ -738,7 +701,7 @@ static void _gradient_slider_set_defaults(GtkDarktableGradientSlider *gslider)
 
 
 // Public functions for multivalue type
-GtkWidget *dtgtk_gradient_slider_multivalue_new(const gint positions)
+GtkWidget *dtgtk_gradient_slider_multivalue_new(gint positions)
 {
   assert(positions <= GRADIENT_SLIDER_MAX_POSITIONS);
 
@@ -746,24 +709,22 @@ GtkWidget *dtgtk_gradient_slider_multivalue_new(const gint positions)
   gslider = g_object_new(_gradient_slider_get_type(), NULL);
   gslider->positions = positions;
   _gradient_slider_set_defaults(gslider);
-  dt_gui_add_class(GTK_WIDGET(gslider), "dt_gslider_multivalue");
+
+  GtkStyleContext *context = gtk_widget_get_style_context(GTK_WIDGET(gslider));
+  gtk_style_context_add_class(context, "dt_gslider_multivalue");
+
   return (GtkWidget *)gslider;
 }
 
-GtkWidget *dtgtk_gradient_slider_multivalue_new_with_name
-  (const gint positions,
-   gchar *name)
+GtkWidget *dtgtk_gradient_slider_multivalue_new_with_name(gint positions, gchar *name)
 {
   GtkWidget *widget = GTK_WIDGET(dtgtk_gradient_slider_multivalue_new(positions));
-  if(name) gtk_widget_set_name(widget, name);
+  if (name) gtk_widget_set_name(widget, name);
 
   return widget;
 }
 
-GtkWidget *dtgtk_gradient_slider_multivalue_new_with_color
-  (const GdkRGBA start,
-   const GdkRGBA end,
-   const gint positions)
+GtkWidget *dtgtk_gradient_slider_multivalue_new_with_color(GdkRGBA start, GdkRGBA end, gint positions)
 {
   assert(positions <= GRADIENT_SLIDER_MAX_POSITIONS);
 
@@ -773,61 +734,53 @@ GtkWidget *dtgtk_gradient_slider_multivalue_new_with_color
   _gradient_slider_set_defaults(gslider);
 
   // Construct gradient start color
-  _gradient_slider_stop_t *gc = g_malloc(sizeof(_gradient_slider_stop_t));
+  _gradient_slider_stop_t *gc = (_gradient_slider_stop_t *)g_malloc(sizeof(_gradient_slider_stop_t));
   gc->position = 0.0;
   memcpy(&gc->color, &start, sizeof(GdkRGBA));
   gslider->colors = g_list_append(gslider->colors, gc);
 
   // Construct gradient stop color
-  gc = g_malloc(sizeof(_gradient_slider_stop_t));
+  gc = (_gradient_slider_stop_t *)g_malloc(sizeof(_gradient_slider_stop_t));
   gc->position = 1.0;
   memcpy(&gc->color, &end, sizeof(GdkRGBA));
   gslider->colors = g_list_append(gslider->colors, gc);
-  dt_gui_add_class(GTK_WIDGET(gslider), "dt_gslider_multivalue");
+
+  GtkStyleContext *context = gtk_widget_get_style_context(GTK_WIDGET(gslider));
+  gtk_style_context_add_class(context, "dt_gslider_multivalue");
+
   return (GtkWidget *)gslider;
 }
 
-GtkWidget *dtgtk_gradient_slider_multivalue_new_with_color_and_name
-  (const GdkRGBA start,
-   const GdkRGBA end,
-   const gint positions,
-   gchar *name)
+GtkWidget *dtgtk_gradient_slider_multivalue_new_with_color_and_name(GdkRGBA start, GdkRGBA end, gint positions, gchar *name)
 {
   GtkWidget *widget = GTK_WIDGET(dtgtk_gradient_slider_multivalue_new_with_color(start, end, positions));
-  if(name) gtk_widget_set_name(widget, name);
+  if (name) gtk_widget_set_name(widget, name);
 
   return widget;
 }
 
-void dtgtk_gradient_slider_multivalue_set_stop
-  (GtkDarktableGradientSlider *gslider,
-   const gfloat position,
-   const GdkRGBA color)
+void dtgtk_gradient_slider_multivalue_set_stop(GtkDarktableGradientSlider *gslider, gfloat position,
+                                               GdkRGBA color)
 {
   g_return_if_fail(gslider != NULL);
-  const gfloat rawposition = gslider->scale_callback((GtkWidget *)gslider,
-                                                     position, GRADIENT_SLIDER_SET);
-  // First find color at position, if exists update color, otherwise
-  // create a new stop at position.
-  GList *current = g_list_find_custom(gslider->colors, (gpointer)&rawposition,
-                                      _list_find_by_position);
+  const gfloat rawposition = gslider->scale_callback((GtkWidget *)gslider, position, GRADIENT_SLIDER_SET);
+  // First find color at position, if exists update color, otherwise create a new stop at position.
+  GList *current = g_list_find_custom(gslider->colors, (gpointer)&rawposition, _list_find_by_position);
   if(current != NULL)
   {
-    memcpy(&((_gradient_slider_stop_t *)current->data)->color,
-           &color, sizeof(GdkRGBA));
+    memcpy(&((_gradient_slider_stop_t *)current->data)->color, &color, sizeof(GdkRGBA));
   }
   else
   {
     // stop didn't exist lets add it
-    _gradient_slider_stop_t *gc = g_malloc(sizeof(_gradient_slider_stop_t));
+    _gradient_slider_stop_t *gc = (_gradient_slider_stop_t *)g_malloc(sizeof(_gradient_slider_stop_t));
     gc->position = rawposition;
     memcpy(&gc->color, &color, sizeof(GdkRGBA));
     gslider->colors = g_list_append(gslider->colors, gc);
   }
 }
 
-void dtgtk_gradient_slider_multivalue_clear_stops
-  (GtkDarktableGradientSlider *gslider)
+void dtgtk_gradient_slider_multivalue_clear_stops(GtkDarktableGradientSlider *gslider)
 {
   g_return_if_fail(gslider != NULL);
   g_list_free_full(gslider->colors, g_free);
@@ -839,67 +792,43 @@ GType dtgtk_gradient_slider_multivalue_get_type()
   return _gradient_slider_get_type();
 }
 
-gdouble dtgtk_gradient_slider_multivalue_get_value
-  (GtkDarktableGradientSlider *gslider,
-   const gint pos)
+gdouble dtgtk_gradient_slider_multivalue_get_value(GtkDarktableGradientSlider *gslider, gint pos)
 {
   assert(pos <= gslider->positions);
 
-  return gslider->scale_callback((GtkWidget *)gslider,
-                                 gslider->position[pos],
-                                 GRADIENT_SLIDER_GET);
+  return gslider->scale_callback((GtkWidget *)gslider, gslider->position[pos], GRADIENT_SLIDER_GET);
 }
 
-void dtgtk_gradient_slider_multivalue_get_values
-  (GtkDarktableGradientSlider *gslider,
-   gdouble *values)
+void dtgtk_gradient_slider_multivalue_get_values(GtkDarktableGradientSlider *gslider, gdouble *values)
 {
   g_return_if_fail(gslider != NULL);
   for(int k = 0; k < gslider->positions; k++)
-    values[k] = gslider->scale_callback((GtkWidget *)gslider,
-                                        gslider->position[k],
-                                        GRADIENT_SLIDER_GET);
+    values[k] = gslider->scale_callback((GtkWidget *)gslider, gslider->position[k], GRADIENT_SLIDER_GET);
 }
 
-void dtgtk_gradient_slider_multivalue_set_value
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble value,
-   const gint pos)
+void dtgtk_gradient_slider_multivalue_set_value(GtkDarktableGradientSlider *gslider, gdouble value, gint pos)
 {
   g_return_if_fail(gslider != NULL);
   assert(pos <= gslider->positions);
 
-  gslider->position[pos] = CLAMP(gslider->scale_callback((GtkWidget *)gslider,
-                                                         value,
-                                                         GRADIENT_SLIDER_SET),
-                                 0.0, 1.0);
+  gslider->position[pos] = CLAMP(gslider->scale_callback((GtkWidget *)gslider, value, GRADIENT_SLIDER_SET), 0.0, 1.0);
   gslider->selected = gslider->positions == 1 ? 0 : -1;
-  if(!darktable.gui->reset) g_signal_emit_by_name(G_OBJECT(gslider),
-                                                  "value-changed");
+  if(!darktable.gui->reset) g_signal_emit_by_name(G_OBJECT(gslider), "value-changed");
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_multivalue_set_values
-  (GtkDarktableGradientSlider *gslider,
-   gdouble *values)
+void dtgtk_gradient_slider_multivalue_set_values(GtkDarktableGradientSlider *gslider, gdouble *values)
 {
   g_return_if_fail(gslider != NULL);
   g_return_if_fail(values != NULL);
   for(int k = 0; k < gslider->positions; k++)
-    gslider->position[k] = CLAMP(gslider->scale_callback((GtkWidget *)gslider,
-                                                         values[k],
-                                                         GRADIENT_SLIDER_SET),
-                                 0.0, 1.0);
+    gslider->position[k] = CLAMP(gslider->scale_callback((GtkWidget *)gslider, values[k], GRADIENT_SLIDER_SET), 0.0, 1.0);
   gslider->selected = gslider->positions == 1 ? 0 : -1;
-  if(!darktable.gui->reset) g_signal_emit_by_name(G_OBJECT(gslider),
-                                                  "value-changed");
+  if(!darktable.gui->reset) g_signal_emit_by_name(G_OBJECT(gslider), "value-changed");
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_multivalue_set_marker
-  (GtkDarktableGradientSlider *gslider,
-   const gint mark,
-   const gint pos)
+void dtgtk_gradient_slider_multivalue_set_marker(GtkDarktableGradientSlider *gslider, gint mark, gint pos)
 {
   g_return_if_fail(gslider != NULL);
   assert(pos <= gslider->positions);
@@ -908,53 +837,39 @@ void dtgtk_gradient_slider_multivalue_set_marker
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_multivalue_set_markers
-  (GtkDarktableGradientSlider *gslider,
-   gint *markers)
+void dtgtk_gradient_slider_multivalue_set_markers(GtkDarktableGradientSlider *gslider, gint *markers)
 {
   g_return_if_fail(gslider != NULL);
   for(int k = 0; k < gslider->positions; k++) gslider->marker[k] = markers[k];
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_multivalue_set_resetvalue
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble value,
-   const gint pos)
+void dtgtk_gradient_slider_multivalue_set_resetvalue(GtkDarktableGradientSlider *gslider, gdouble value,
+                                                     gint pos)
 {
   g_return_if_fail(gslider != NULL);
   assert(pos <= gslider->positions);
 
-  gslider->resetvalue[pos] = gslider->scale_callback((GtkWidget *)gslider,
-                                                     value, GRADIENT_SLIDER_SET);
+  gslider->resetvalue[pos] = gslider->scale_callback((GtkWidget *)gslider, value, GRADIENT_SLIDER_SET);
   gslider->is_resettable = TRUE;
 }
 
-gdouble dtgtk_gradient_slider_multivalue_get_resetvalue
-  (GtkDarktableGradientSlider *gslider,
-   const gint pos)
+gdouble dtgtk_gradient_slider_multivalue_get_resetvalue(GtkDarktableGradientSlider *gslider, gint pos)
 {
   assert(pos <= gslider->positions);
 
-  return gslider->scale_callback((GtkWidget *)gslider,
-                                 gslider->resetvalue[pos], GRADIENT_SLIDER_GET);
+  return gslider->scale_callback((GtkWidget *)gslider, gslider->resetvalue[pos], GRADIENT_SLIDER_GET);
 }
 
-void dtgtk_gradient_slider_multivalue_set_resetvalues
-  (GtkDarktableGradientSlider *gslider,
-   gdouble *values)
+void dtgtk_gradient_slider_multivalue_set_resetvalues(GtkDarktableGradientSlider *gslider, gdouble *values)
 {
   g_return_if_fail(gslider != NULL);
   for(int k = 0; k < gslider->positions; k++)
-    gslider->resetvalue[k] = gslider->scale_callback((GtkWidget *)gslider,
-                                                     values[k],
-                                                     GRADIENT_SLIDER_SET);
+    gslider->resetvalue[k] = gslider->scale_callback((GtkWidget *)gslider, values[k], GRADIENT_SLIDER_SET);
   gslider->is_resettable = TRUE;
 }
 
-void dtgtk_gradient_slider_multivalue_set_picker
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble value)
+void dtgtk_gradient_slider_multivalue_set_picker(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   g_return_if_fail(gslider != NULL);
   gslider->picker[0] = gslider->picker[1] = gslider->picker[2]
@@ -962,40 +877,29 @@ void dtgtk_gradient_slider_multivalue_set_picker
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_multivalue_set_picker_meanminmax
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble mean,
-   const gdouble min,
-   const gdouble max)
+void dtgtk_gradient_slider_multivalue_set_picker_meanminmax(GtkDarktableGradientSlider *gslider, gdouble mean,
+                                                            gdouble min, gdouble max)
 {
   g_return_if_fail(gslider != NULL);
-  gslider->picker[0] = gslider->scale_callback((GtkWidget *)gslider,
-                                               mean, GRADIENT_SLIDER_SET);
-  gslider->picker[1] = gslider->scale_callback((GtkWidget *)gslider,
-                                               min, GRADIENT_SLIDER_SET);
-  gslider->picker[2] = gslider->scale_callback((GtkWidget *)gslider,
-                                               max, GRADIENT_SLIDER_SET);
+  gslider->picker[0] = gslider->scale_callback((GtkWidget *)gslider, mean, GRADIENT_SLIDER_SET);
+  gslider->picker[1] = gslider->scale_callback((GtkWidget *)gslider, min, GRADIENT_SLIDER_SET);
+  gslider->picker[2] = gslider->scale_callback((GtkWidget *)gslider, max, GRADIENT_SLIDER_SET);
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-gboolean dtgtk_gradient_slider_multivalue_is_dragging
-  (GtkDarktableGradientSlider *gslider)
+gboolean dtgtk_gradient_slider_multivalue_is_dragging(GtkDarktableGradientSlider *gslider)
 {
   g_return_val_if_fail(gslider != NULL, FALSE);
   return gslider->is_dragging;
 }
 
-void dtgtk_gradient_slider_multivalue_set_increment
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble value)
+void dtgtk_gradient_slider_multivalue_set_increment(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   g_return_if_fail(gslider != NULL);
   gslider->increment = value;
 }
 
-void dtgtk_gradient_slider_multivalue_set_scale_callback
-  (GtkDarktableGradientSlider *gslider,
-   float (*callback)(GtkWidget *self, float value, int dir))
+void dtgtk_gradient_slider_multivalue_set_scale_callback(GtkDarktableGradientSlider *gslider, float (*callback)(GtkWidget *self, float value, int dir))
 {
   float (*old_callback)(GtkWidget*, float, int) = gslider->scale_callback;
   float (*new_callback)(GtkWidget*, float, int) = (callback == NULL ? _default_linear_scale_callback : callback);
@@ -1029,40 +933,40 @@ void dtgtk_gradient_slider_multivalue_set_scale_callback
 GtkWidget *dtgtk_gradient_slider_new()
 {
   GtkWidget *gslider = dtgtk_gradient_slider_multivalue_new(1);
-  dt_gui_add_class(gslider, "dt_gslider");
+
+  GtkStyleContext *context = gtk_widget_get_style_context(gslider);
+  gtk_style_context_add_class(context, "dt_gslider");
+
   return gslider;
 }
 
 GtkWidget *dtgtk_gradient_slider_new_with_name(gchar *name)
 {
   GtkWidget *widget = GTK_WIDGET(dtgtk_gradient_slider_new());
-  if(name) gtk_widget_set_name(widget, name);
+  if (name) gtk_widget_set_name(widget, name);
 
   return widget;
 }
 
-GtkWidget *dtgtk_gradient_slider_new_with_color(const GdkRGBA start,
-                                                const GdkRGBA end)
+GtkWidget *dtgtk_gradient_slider_new_with_color(GdkRGBA start, GdkRGBA end)
 {
-  GtkWidget *gslider = dtgtk_gradient_slider_multivalue_new_with_color
-    (start, end, 1);
-  dt_gui_add_class(gslider, "dt_gslider");
+  GtkWidget *gslider = dtgtk_gradient_slider_multivalue_new_with_color(start, end, 1);
+
+  GtkStyleContext *context = gtk_widget_get_style_context(gslider);
+  gtk_style_context_add_class(context, "dt_gslider");
+
   return gslider;
 }
 
-GtkWidget *dtgtk_gradient_slider_new_with_color_and_name(const GdkRGBA start,
-                                                         const GdkRGBA end,
-                                                         gchar *name)
+GtkWidget *dtgtk_gradient_slider_new_with_color_and_name(GdkRGBA start, GdkRGBA end, gchar *name)
 {
   GtkWidget *widget = GTK_WIDGET(dtgtk_gradient_slider_new_with_color(start, end));
-  if(name) gtk_widget_set_name(widget, name);
+  if (name) gtk_widget_set_name(widget, name);
 
   return widget;
 }
 
-void dtgtk_gradient_slider_set_stop(GtkDarktableGradientSlider *gslider,
-                                    const gfloat position,
-                                    const GdkRGBA color)
+void dtgtk_gradient_slider_set_stop(GtkDarktableGradientSlider *gslider, gfloat position, GdkRGBA color)
 {
   dtgtk_gradient_slider_multivalue_set_stop(gslider, position, color);
 }
@@ -1077,20 +981,17 @@ gdouble dtgtk_gradient_slider_get_value(GtkDarktableGradientSlider *gslider)
   return dtgtk_gradient_slider_multivalue_get_value(gslider, 0);
 }
 
-void dtgtk_gradient_slider_set_value(GtkDarktableGradientSlider *gslider,
-                                     const gdouble value)
+void dtgtk_gradient_slider_set_value(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   dtgtk_gradient_slider_multivalue_set_value(gslider, value, 0);
 }
 
-void dtgtk_gradient_slider_set_marker(GtkDarktableGradientSlider *gslider,
-                                      const gint mark)
+void dtgtk_gradient_slider_set_marker(GtkDarktableGradientSlider *gslider, gint mark)
 {
   dtgtk_gradient_slider_multivalue_set_marker(gslider, mark, 0);
 }
 
-void dtgtk_gradient_slider_set_resetvalue(GtkDarktableGradientSlider *gslider,
-                                          const gdouble value)
+void dtgtk_gradient_slider_set_resetvalue(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   dtgtk_gradient_slider_multivalue_set_resetvalue(gslider, value, 0);
 }
@@ -1100,8 +1001,7 @@ gdouble dtgtk_gradient_slider_get_resetvalue(GtkDarktableGradientSlider *gslider
   return dtgtk_gradient_slider_multivalue_get_resetvalue(gslider, 0);
 }
 
-void dtgtk_gradient_slider_set_picker(GtkDarktableGradientSlider *gslider,
-                                      const gdouble value)
+void dtgtk_gradient_slider_set_picker(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   g_return_if_fail(gslider != NULL);
   gslider->picker[0] = gslider->picker[1] = gslider->picker[2]
@@ -1109,19 +1009,13 @@ void dtgtk_gradient_slider_set_picker(GtkDarktableGradientSlider *gslider,
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
-void dtgtk_gradient_slider_set_picker_meanminmax
-  (GtkDarktableGradientSlider *gslider,
-   const gdouble mean,
-   const gdouble min,
-   const gdouble max)
+void dtgtk_gradient_slider_set_picker_meanminmax(GtkDarktableGradientSlider *gslider, gdouble mean,
+                                                 gdouble min, gdouble max)
 {
   g_return_if_fail(gslider != NULL);
-  gslider->picker[0] = gslider->scale_callback((GtkWidget *)gslider,
-                                               mean, GRADIENT_SLIDER_SET);
-  gslider->picker[1] = gslider->scale_callback((GtkWidget *)gslider,
-                                               min, GRADIENT_SLIDER_SET);
-  gslider->picker[2] = gslider->scale_callback((GtkWidget *)gslider,
-                                               max, GRADIENT_SLIDER_SET);
+  gslider->picker[0] = gslider->scale_callback((GtkWidget *)gslider, mean, GRADIENT_SLIDER_SET);
+  gslider->picker[1] = gslider->scale_callback((GtkWidget *)gslider, min, GRADIENT_SLIDER_SET);
+  gslider->picker[2] = gslider->scale_callback((GtkWidget *)gslider, max, GRADIENT_SLIDER_SET);
   gtk_widget_queue_draw(GTK_WIDGET(gslider));
 }
 
@@ -1131,16 +1025,13 @@ gboolean dtgtk_gradient_slider_is_dragging(GtkDarktableGradientSlider *gslider)
   return gslider->is_dragging;
 }
 
-void dtgtk_gradient_slider_set_increment(GtkDarktableGradientSlider *gslider,
-                                         const gdouble value)
+void dtgtk_gradient_slider_set_increment(GtkDarktableGradientSlider *gslider, gdouble value)
 {
   g_return_if_fail(gslider != NULL);
   gslider->increment = value;
 }
 
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

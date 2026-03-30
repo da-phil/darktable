@@ -47,8 +47,6 @@ static int visible_member(lua_State *L)
   else
   {
     dt_lib_set_visible(module, lua_toboolean(L, 3));
-    // force a reload of visible modules
-    dt_view_manager_switch_by_view(darktable.view_manager, dt_view_manager_get_current_view(darktable.view_manager));
     return 0;
   }
 }
@@ -88,14 +86,14 @@ static int on_screen_member(lua_State *L)
   return 1;
 }
 
-static int position_member(lua_State*L)
+static int position_member(lua_State*L) 
 {
   dt_lib_module_t * module = *(dt_lib_module_t**)lua_touserdata(L, 1);
   lua_pushinteger(L, module->position(module));
   return 1;
 }
 
-static int container_member(lua_State*L)
+static int container_member(lua_State*L) 
 {
   dt_lib_module_t * module = *(dt_lib_module_t**)lua_touserdata(L, 1);
   dt_ui_container_t container;
@@ -105,7 +103,7 @@ static int container_member(lua_State*L)
 }
 
 
-static int views_member(lua_State*L)
+static int views_member(lua_State*L) 
 {
   dt_lib_module_t * module = *(dt_lib_module_t**)lua_touserdata(L, 1);
   lua_newtable(L);
@@ -120,32 +118,6 @@ static int views_member(lua_State*L)
       table_index++;
     }
   }
-  return 1;
-}
-
-static int active_preset_member(lua_State *L)
-{
-  dt_lib_module_t * module = *(dt_lib_module_t**)lua_touserdata(L, 1);
-  lua_newtable(L);
-  gchar *preset_name;
-
-  dt_lib_module_info_t *mi = calloc(1, sizeof(dt_lib_module_info_t));
-
-  mi->plugin_name = g_strdup(module->plugin_name);
-  mi->version = module->version();
-  mi->module = module;
-  mi->params = module->get_params ? module->get_params(module, &mi->params_size) : NULL;
-  if(!mi->params)
-  {
-    // this is a valid case, for example in location.c when nothing got selected
-    // fprintf(stderr, "something went wrong: &params=%p, size=%i\n",
-    //         mi->params, mi->params_size);
-    mi->params_size = 0;
-  }
-
-  preset_name = dt_lib_get_active_preset_name(mi);
-  lua_pushstring(L, preset_name);
-  free(mi);
   return 1;
 }
 
@@ -217,8 +189,6 @@ int dt_lua_init_early_lib(lua_State *L)
   dt_lua_type_register_const(L, dt_lua_lib_t, "container");
   lua_pushcfunction(L, views_member);
   dt_lua_type_register_const(L, dt_lua_lib_t, "views");
-  lua_pushcfunction(L, active_preset_member);
-  dt_lua_type_register_const(L, dt_lua_lib_t, "active_preset");
   lua_pushcfunction(L, visible_member);
   dt_lua_gtk_wrap(L);
   dt_lua_type_register(L, dt_lua_lib_t, "visible");
@@ -228,9 +198,6 @@ int dt_lua_init_early_lib(lua_State *L)
   dt_lua_module_new(L, "lib"); // special case : will be attached to dt.gui in lua/gui.c:dt_lua_init_gui
   return 0;
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

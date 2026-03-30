@@ -33,7 +33,7 @@ static int lua_print(lua_State *L)
 
 static int lua_print_toast(lua_State *L)
 {
-
+  
   const int init_gui = (darktable.gui != NULL);
   if(init_gui)
     dt_toast_log("%s", luaL_checkstring(L, -1));
@@ -45,7 +45,7 @@ static int lua_print_toast(lua_State *L)
 
 static int lua_print_hinter(lua_State *L)
 {
-
+  
   const int init_gui = (darktable.gui != NULL);
   if(init_gui)
   {
@@ -53,7 +53,7 @@ static int lua_print_hinter(lua_State *L)
     char msg[256];
     if(snprintf(msg, sizeof(msg), "%s", luaL_checkstring(L, -1)) > 0)
     {
-      dt_control_hinter_message(msg);
+      dt_control_hinter_message(darktable.control, msg);
     }
   }
   else
@@ -65,13 +65,13 @@ static int lua_print_hinter(lua_State *L)
 
 static int lua_print_log(lua_State *L)
 {
-  dt_print(DT_DEBUG_LUA, "LUA %s", luaL_checkstring(L, -1));
+  dt_print(DT_DEBUG_LUA, "LUA %s\n", luaL_checkstring(L, -1));
   return 0;
 }
 
 static int lua_print_error(lua_State *L)
 {
-  dt_print(DT_DEBUG_LUA, "LUA ERROR %s", luaL_checkstring(L, -1));
+  dt_print(DT_DEBUG_LUA, "LUA ERROR %s\n", luaL_checkstring(L, -1));
   return 0;
 }
 
@@ -105,9 +105,6 @@ int dt_lua_init_print(lua_State *L)
 
 
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

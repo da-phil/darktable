@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2025 darktable developers.
+    Copyright (C) 2011-2021 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,8 +19,6 @@
 #include "common/geo.h"
 #include "common/darktable.h"
 #include "common/math.h"
-#include "control/jobs/control_jobs.h"
-
 #include <glib.h>
 #include <inttypes.h>
 
@@ -61,14 +59,14 @@ static GMarkupParser _gpx_parser
     = { _gpx_parser_start_element, _gpx_parser_end_element, _gpx_parser_text, NULL, NULL };
 
 
-static gint _sort_track(const gconstpointer a, const gconstpointer b)
+static gint _sort_track(gconstpointer a, gconstpointer b)
 {
   const dt_gpx_track_point_t *pa = (const dt_gpx_track_point_t *)a;
   const dt_gpx_track_point_t *pb = (const dt_gpx_track_point_t *)b;
   return g_date_time_compare(pa->time, pb->time);
 }
 
-static gint _sort_segment(const gconstpointer a, const gconstpointer b)
+static gint _sort_segment(gconstpointer a, gconstpointer b)
 {
   const dt_gpx_track_segment_t *pa = (const dt_gpx_track_segment_t *)a;
   const dt_gpx_track_segment_t *pb = (const dt_gpx_track_segment_t *)b;
@@ -77,30 +75,35 @@ static gint _sort_segment(const gconstpointer a, const gconstpointer b)
 
 dt_gpx_t *dt_gpx_new(const gchar *filename)
 {
-  GError *err = NULL;
-  gint bom_offset = 0;
-  GMarkupParseContext *ctx = NULL;
   dt_gpx_t *gpx = NULL;
+  GMarkupParseContext *ctx = NULL;
+  GError *err = NULL;
+  GMappedFile *gpxmf = NULL;
+  gchar *gpxmf_content = NULL;
+  gint gpxmf_size = 0;
+  gint bom_offset = 0;
+
 
   /* map gpx file to parse into memory */
-  GMappedFile *gpxmf = g_mapped_file_new(filename, FALSE, &err);
+  gpxmf = g_mapped_file_new(filename, FALSE, &err);
   if(err) goto error;
 
-  gchar *gpxmf_content = g_mapped_file_get_contents(gpxmf);
-  const gint gpxmf_size = g_mapped_file_get_length(gpxmf);
+  gpxmf_content = g_mapped_file_get_contents(gpxmf);
+  gpxmf_size = g_mapped_file_get_length(gpxmf);
   if(!gpxmf_content || gpxmf_size < 10) goto error;
 
   /* allocate new dt_gpx_t context */
   gpx = g_malloc0(sizeof(dt_gpx_t));
 
   /* skip UTF-8 BOM */
-  if(gpxmf_content[0] == '\xef' && gpxmf_content[1] == '\xbb' && gpxmf_content[2] == '\xbf')
+  if(gpxmf_size > 3 && gpxmf_content[0] == '\xef' && gpxmf_content[1] == '\xbb' && gpxmf_content[2] == '\xbf')
     bom_offset = 3;
 
   /* initialize the parser and start parse gpx xml data */
   ctx = g_markup_parse_context_new(&_gpx_parser, 0, gpx, NULL);
   g_markup_parse_context_parse(ctx, gpxmf_content + bom_offset, gpxmf_size - bom_offset, &err);
   if(err) goto error;
+
 
   /* cleanup and return gpx context */
   g_markup_parse_context_free(ctx);
@@ -114,8 +117,7 @@ dt_gpx_t *dt_gpx_new(const gchar *filename)
 error:
   if(err)
   {
-    dt_print(DT_DEBUG_ALWAYS, "dt_gpx_new: %s", err->message);
-    dt_control_log("%s", err->message);
+    fprintf(stderr, "dt_gpx_new: %s\n", err->message);
     g_error_free(err);
   }
 
@@ -140,7 +142,7 @@ void _track_pts_free(dt_gpx_track_point_t *trkpt)
   g_free(trkpt);
 }
 
-void dt_gpx_destroy(dt_gpx_t *gpx)
+void dt_gpx_destroy(struct dt_gpx_t *gpx)
 {
   g_assert(gpx != NULL);
 
@@ -150,7 +152,7 @@ void dt_gpx_destroy(dt_gpx_t *gpx)
   g_free(gpx);
 }
 
-gboolean dt_gpx_get_location(const dt_gpx_t *gpx, GDateTime *timestamp, dt_image_geoloc_t *geoloc)
+gboolean dt_gpx_get_location(struct dt_gpx_t *gpx, GDateTime *timestamp, dt_image_geoloc_t *geoloc)
 {
   g_assert(gpx != NULL);
 
@@ -159,7 +161,7 @@ gboolean dt_gpx_get_location(const dt_gpx_t *gpx, GDateTime *timestamp, dt_image
 
   for(GList *item = gpx->trkpts; item; item = g_list_next(item))
   {
-    const dt_gpx_track_point_t *tp = item->data;
+    dt_gpx_track_point_t *tp = (dt_gpx_track_point_t *)item->data;
 
     /* if timestamp is out of time range return false but fill
        closest location value start or end point */
@@ -172,13 +174,13 @@ gboolean dt_gpx_get_location(const dt_gpx_t *gpx, GDateTime *timestamp, dt_image
       return FALSE;
     }
 
-    const dt_gpx_track_point_t *tp_next = item->next->data;
+    dt_gpx_track_point_t *tp_next = (dt_gpx_track_point_t *)item->next->data;
     /* check if timestamp is within current and next trackpoint */
     const gint cmp_n = g_date_time_compare(timestamp, tp_next->time);
-    if(item->next && cmp_n <= 0)
+    if((cmp >= 0) && (item->next && cmp_n <= 0))
     {
-      const GTimeSpan seg_diff = g_date_time_difference(tp_next->time, tp->time);
-      const GTimeSpan diff = g_date_time_difference(timestamp, tp->time);
+      GTimeSpan seg_diff = g_date_time_difference(tp_next->time, tp->time);
+      GTimeSpan diff = g_date_time_difference(timestamp, tp->time);
       if(seg_diff == 0 || diff == 0)
       {
         geoloc->longitude = tp->longitude;
@@ -251,23 +253,13 @@ gboolean dt_gpx_get_location(const dt_gpx_t *gpx, GDateTime *timestamp, dt_image
   return FALSE;
 }
 
-static void _gpx_parse_error(GError **error)
-{
-    g_set_error(error,
-                G_MARKUP_ERROR,
-                G_MARKUP_ERROR_PARSE,
-               _("failed to parse GPX file"));
-}
-
 /*
  * GPX XML parser code
  */
 void _gpx_parser_start_element(GMarkupParseContext *ctx, const gchar *element_name,
                                const gchar **attribute_names, const gchar **attribute_values,
-                               const gpointer user_data, GError **error)
+                               gpointer user_data, GError **error)
 {
-  g_return_if_fail(*error == NULL);
-
   dt_gpx_t *gpx = (dt_gpx_t *)user_data;
 
   if(gpx->parsing_trk == FALSE)
@@ -285,11 +277,8 @@ void _gpx_parser_start_element(GMarkupParseContext *ctx, const gchar *element_na
   {
     if(gpx->current_track_point)
     {
-      dt_print(DT_DEBUG_ALWAYS,
-               "broken GPX file, new trkpt element before the previous ended.");
+      fprintf(stderr, "broken gpx file, new trkpt element before the previous ended.\n");
       g_free(gpx->current_track_point);
-      _gpx_parse_error(error);
-      return;
     }
 
     const gchar **attribute_name = attribute_names;
@@ -310,9 +299,9 @@ void _gpx_parser_start_element(GMarkupParseContext *ctx, const gchar *element_na
       /* go thru the attributes to find and get values of lon / lat*/
       while(*attribute_name)
       {
-        if(strcmp(*attribute_name, "lon") == 0 && **attribute_value)
+        if(strcmp(*attribute_name, "lon") == 0)
           gpx->current_track_point->longitude = g_ascii_strtod(*attribute_value, NULL);
-        else if(strcmp(*attribute_name, "lat") == 0 && **attribute_value)
+        else if(strcmp(*attribute_name, "lat") == 0)
           gpx->current_track_point->latitude = g_ascii_strtod(*attribute_value, NULL);
 
         attribute_name++;
@@ -322,20 +311,12 @@ void _gpx_parser_start_element(GMarkupParseContext *ctx, const gchar *element_na
       /* validate that we actually got lon / lat attribute values */
       if(isnan(gpx->current_track_point->longitude) || isnan(gpx->current_track_point->latitude))
       {
-        dt_print(DT_DEBUG_ALWAYS,
-                 "broken GPX file, failed to get lon/lat attribute values for trkpt");
+        fprintf(stderr, "broken gpx file, failed to get lon/lat attribute values for trkpt\n");
         gpx->invalid_track_point = TRUE;
-        _gpx_parse_error(error);
-        return;
       }
     }
     else
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "broken GPX file, trkpt element doesn't have lon/lat attributes");
-      _gpx_parse_error(error);
-      return;
-    }
+      fprintf(stderr, "broken gpx file, trkpt element doesn't have lon/lat attributes\n");
 
     gpx->current_parser_element = GPX_PARSER_ELEMENT_TRKPT;
   }
@@ -369,16 +350,12 @@ end:
   return;
 
 element_error:
-  dt_print(DT_DEBUG_ALWAYS,
-           "broken GPX file, element '%s' found outside of trkpt", element_name);
-  _gpx_parse_error(error);
+  fprintf(stderr, "broken gpx file, element '%s' found outside of trkpt.\n", element_name);
 }
 
-void _gpx_parser_end_element(GMarkupParseContext *context, const gchar *element_name, const gpointer user_data,
+void _gpx_parser_end_element(GMarkupParseContext *context, const gchar *element_name, gpointer user_data,
                              GError **error)
 {
-  g_return_if_fail(*error == NULL);
-
   dt_gpx_t *gpx = (dt_gpx_t *)user_data;
 
   /* closing trackpoint lets take care of data parsed */
@@ -407,11 +384,9 @@ void _gpx_parser_end_element(GMarkupParseContext *context, const gchar *element_
   }
 }
 
-void _gpx_parser_text(GMarkupParseContext *context, const gchar *text, gsize text_len, const gpointer user_data,
+void _gpx_parser_text(GMarkupParseContext *context, const gchar *text, gsize text_len, gpointer user_data,
                       GError **error)
 {
-  g_return_if_fail(*error == NULL);
-
   dt_gpx_t *gpx = (dt_gpx_t *)user_data;
 
   if(gpx->current_parser_element == GPX_PARSER_ELEMENT_NAME)
@@ -428,21 +403,9 @@ void _gpx_parser_text(GMarkupParseContext *context, const gchar *text, gsize tex
     if(!gpx->current_track_point->time)
     {
       gpx->invalid_track_point = TRUE;
-      dt_print(DT_DEBUG_ALWAYS,
-               "broken GPX file, failed to parse iso8601 time '%s' for trackpoint", text);
-      _gpx_parse_error(error);
-      return;
+      fprintf(stderr, "broken gpx file, failed to pars is8601 time '%s' for trackpoint\n", text);
     }
-
-    if(!gpx->trksegs)
-    {
-      dt_print(DT_DEBUG_ALWAYS,
-               "broken GPX file, no <trkseg> found");
-      _gpx_parse_error(error);
-      return;
-    }
-
-    dt_gpx_track_segment_t *ts = gpx->trksegs->data;
+    dt_gpx_track_segment_t *ts = (dt_gpx_track_segment_t *)gpx->trksegs->data;
     if(ts)
     {
       ts->nb_trkpt++;
@@ -458,26 +421,22 @@ void _gpx_parser_text(GMarkupParseContext *context, const gchar *text, gsize tex
     gpx->current_track_point->elevation = g_ascii_strtod(text, NULL);
 }
 
-GList *dt_gpx_get_trkseg(const struct dt_gpx_t *gpx)
+GList *dt_gpx_get_trkseg(struct dt_gpx_t *gpx)
 {
-  return (gpx != NULL)? gpx->trksegs
-                      : NULL;
+  return gpx->trksegs;
 }
 
-GList *dt_gpx_get_trkpts(const dt_gpx_t *gpx, const guint segid)
+GList *dt_gpx_get_trkpts(struct dt_gpx_t *gpx, const guint segid)
 {
-  if(gpx == NULL)
-    return NULL;
-
   GList *pts = NULL;
   GList *ts = g_list_nth(gpx->trksegs, segid);
   if(!ts) return pts;
-  const dt_gpx_track_segment_t *tsd = ts->data;
+  dt_gpx_track_segment_t *tsd = (dt_gpx_track_segment_t *)ts->data;
   GList *tps = g_list_find(gpx->trkpts, tsd->trkpt);
   if(!tps) return pts;
   for(GList *tp = tps; tp; tp = g_list_next(tp))
   {
-    const dt_gpx_track_point_t *tpd = tp->data;
+    dt_gpx_track_point_t *tpd = (dt_gpx_track_point_t *)tp->data;
     if(tpd->segid != segid) return pts;
     dt_geo_map_display_point_t *p = g_malloc0(sizeof(dt_geo_map_display_point_t));
     p->lat = tpd->latitude;
@@ -491,17 +450,14 @@ GList *dt_gpx_get_trkpts(const dt_gpx_t *gpx, const guint segid)
  * Geodesic interpolation functions
  * ------------------------------------------------------------------------*/
 
-void dt_gpx_geodesic_distance(const double lat1,
-                              const double lon1,
-                              const double lat2,
-                              const double lon2,
-                              double *d,
-                              double *delta)
+void dt_gpx_geodesic_distance(double lat1, double lon1,
+                              double lat2, double lon2,
+                              double *d, double *delta)
 {
-  const double lat_rad_1 = deg2rad(lat1);
-  const double lat_rad_2 = deg2rad(lat2);
-  const double lon_rad_1 = deg2rad(lon1);
-  const double lon_rad_2 = deg2rad(lon2);
+  const double lat_rad_1 = lat1 * M_PI / 180;
+  const double lat_rad_2 = lat2 * M_PI / 180;
+  const double lon_rad_1 = lon1 * M_PI / 180;
+  const double lon_rad_2 = lon2 * M_PI / 180;
   const double delta_lat_rad = lat_rad_2 - lat_rad_1;
   const double delta_lon_rad = lon_rad_2 - lon_rad_1;
   const double sin_delta_lat_rad = sin(delta_lat_rad / 2);
@@ -519,7 +475,7 @@ void dt_gpx_geodesic_intermediate_point(const double lat1, const double lon1,
                                         const double lat2, const double lon2,
                                         const double delta,
                                         const gboolean first_time,
-                                        const double f,
+                                        double f,
                                         double *lat, double *lon)
 {
   static double lat_rad_1;
@@ -538,16 +494,16 @@ void dt_gpx_geodesic_intermediate_point(const double lat1, const double lon1,
 
   if(first_time)
   {
-    lat_rad_1 = deg2rad(lat1);
+    lat_rad_1 = lat1 * M_PI / 180;
     sin_lat_rad_1 = sin(lat_rad_1);
     cos_lat_rad_1 = cos(lat_rad_1);
-    lat_rad_2 = deg2rad(lat2);
+    lat_rad_2 = lat2 * M_PI / 180;
     sin_lat_rad_2 = sin(lat_rad_2);
     cos_lat_rad_2 = cos(lat_rad_2);
-    lon_rad_1 = deg2rad(lon1);
+    lon_rad_1 = lon1 * M_PI / 180;
     sin_lon_rad_1 = sin(lon_rad_1);
     cos_lon_rad_1 = cos(lon_rad_1);
-    lon_rad_2 = deg2rad(lon2);
+    lon_rad_2 = lon2 * M_PI / 180;
     sin_lon_rad_2 = sin(lon_rad_2);
     cos_lon_rad_2 = cos(lon_rad_2);
     sin_delta = sin(delta);
@@ -561,14 +517,12 @@ void dt_gpx_geodesic_intermediate_point(const double lat1, const double lon1,
   const double lat_rad = atan2(z, sqrt(x * x + y * y)); /* latitude of intermediate point in radians */
   const double lon_rad = atan2(y, x);                   /* longitude of intermediate point in radians */
 
-  *lat = rad2deg(lat_rad);
-  *lon = rad2deg(lon_rad);
+  *lat = lat_rad / M_PI * 180;
+  *lon = lon_rad / M_PI * 180;
 }
 /* -------- end of Geodesic interpolation functions -----------------------*/
 
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

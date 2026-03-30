@@ -23,10 +23,16 @@
 
 G_BEGIN_DECLS
 
-#define DTGTK_TYPE_EXPANDER dtgtk_expander_get_type()
-G_DECLARE_FINAL_TYPE(GtkDarktableExpander, dtgtk_expander, DTGTK, EXPANDER, GtkBox)
+#define DTGTK_TYPE_EXPANDER (dtgtk_expander_get_type())
+#define DTGTK_EXPANDER(obj) (G_TYPE_CHECK_INSTANCE_CAST((obj), DTGTK_TYPE_EXPANDER, GtkDarktableExpander))
+#define DTGTK_IS_EXPANDER(obj) (G_TYPE_CHECK_INSTANCE_TYPE((obj), DTGTK_TYPE_EXPANDER))
+#define DTGTK_EXPANDER_CLASS(klass)                                                                          \
+  (G_TYPE_CHECK_CLASS_CAST((klass), DTGTK_TYPE_EXPANDER, GtkDarktableExpanderClass))
+#define DTGTK_IS_EXPANDER_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE((klass), DTGTK_TYPE_EXPANDER))
+#define DTGTK_EXPANDER_GET_CLASS(obj)                                                                        \
+  (G_TYPE_INSTANCE_GET_CLASS((obj), DTGTK_TYPE_EXPANDER, GtkDarktableExpanderClass))
 
-struct _GtkDarktableExpander
+typedef struct _GtkDarktableExpander
 {
   GtkBox box;
   gboolean expanded;
@@ -35,7 +41,14 @@ struct _GtkDarktableExpander
   GtkWidget *header_evb;
   GtkWidget *body;
   GtkWidget *body_evb;
-};
+} GtkDarktableExpander;
+
+typedef struct _GtkDarktableExpanderClass
+{
+  GtkBoxClass parent_class;
+} GtkDarktableExpanderClass;
+
+GType dtgtk_expander_get_type(void);
 
 GtkWidget *dtgtk_expander_get_frame(GtkDarktableExpander *expander);
 GtkWidget *dtgtk_expander_get_header(GtkDarktableExpander *expander);
@@ -45,15 +58,11 @@ GtkWidget *dtgtk_expander_get_body_event_box(GtkDarktableExpander *expander);
 
 void dtgtk_expander_set_expanded(GtkDarktableExpander *expander, gboolean expanded);
 gboolean dtgtk_expander_get_expanded(GtkDarktableExpander *expander);
-void dtgtk_expander_set_drag_hover(GtkDarktableExpander *expander, gboolean allow, gboolean below, guint time);
 
 GtkWidget *dtgtk_expander_new(GtkWidget *header, GtkWidget *body);
 
 G_END_DECLS
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

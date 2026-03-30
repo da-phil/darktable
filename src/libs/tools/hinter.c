@@ -42,9 +42,10 @@ const char *name(dt_lib_module_t *self)
   return _("hinter");
 }
 
-dt_view_type_flags_t views(dt_lib_module_t *self)
+const char **views(dt_lib_module_t *self)
 {
-  return DT_VIEW_LIGHTTABLE | DT_VIEW_DARKROOM | DT_VIEW_MAP | DT_VIEW_TETHERING;
+  static const char *v[] = {"lighttable", "darkroom", "map", "tethering", NULL};
+  return v;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -57,7 +58,7 @@ int expandable(dt_lib_module_t *self)
   return 0;
 }
 
-int position(const dt_lib_module_t *self)
+int position()
 {
   return 1;
 }
@@ -66,7 +67,7 @@ int position(const dt_lib_module_t *self)
 void gui_init(dt_lib_module_t *self)
 {
   /* initialize ui widgets */
-  dt_lib_hinter_t *d = g_malloc0(sizeof(dt_lib_hinter_t));
+  dt_lib_hinter_t *d = (dt_lib_hinter_t *)g_malloc0(sizeof(dt_lib_hinter_t));
   self->data = (void *)d;
 
   self->widget = gtk_event_box_new();
@@ -88,24 +89,9 @@ void gui_cleanup(dt_lib_module_t *self)
 
 void _lib_hinter_set_message(dt_lib_module_t *self, const char *message)
 {
-  dt_lib_hinter_t *d = self->data;
-
-  if(message && !*message && !dt_ui_panel_visible(darktable.gui->ui, DT_UI_PANEL_CENTER_TOP))
-  {
-    GtkWidget *count = dt_view_filter_get_count(darktable.view_manager);
-    if(count)
-    {
-      gchar *count_message = g_strdup_printf(_("%s in current collection"),
-                                            gtk_label_get_text(GTK_LABEL(count)));
-      gtk_label_set_markup(GTK_LABEL(d->label), count_message);
-      g_free(count_message);
-    }
-  }
-  else
-    gtk_label_set_markup(GTK_LABEL(d->label), message);
+  dt_lib_hinter_t *d = (dt_lib_hinter_t *)self->data;
+  gtk_label_set_markup(GTK_LABEL(d->label), message);
 }
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on

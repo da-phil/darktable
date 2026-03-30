@@ -19,8 +19,6 @@
     Copyright 2004-2008 by Shawn Freeman, Udi Fuchs
 */
 
-#include <inttypes.h>
-
 #pragma once
 
 // Curve Types
@@ -57,7 +55,7 @@ typedef struct
 typedef struct
 {
   // Type for this curve
-  uint32_t m_spline_type;
+  unsigned int m_spline_type;
 
   // Box data
   float m_min_x;
@@ -66,7 +64,7 @@ typedef struct
   float m_max_y;
 
   // Number of anchor points
-  uint8_t m_numAnchors;
+  unsigned char m_numAnchors;
 
   // contains a list of anchors, 2 floats per each point, x-y format
   // max is 20 points
@@ -77,11 +75,11 @@ typedef struct
 typedef struct
 {
   // Number of samples to use for the curve.
-  uint32_t m_samplingRes;
-  uint32_t m_outputRes;
+  unsigned int m_samplingRes;
+  unsigned int m_outputRes;
 
   // Sampling array
-  uint16_t *m_Samples; // jo: changed to short int to save memory
+  unsigned short int *m_Samples; // jo: changed to short int to save memory
 
 } CurveSample;
 
@@ -128,9 +126,6 @@ float *interpolate_set(int n, float x[], float y[], unsigned int type);
  *******************************************************************/
 float interpolate_val(int n, float x[], float xval, float y[], float tangents[], unsigned int type);
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-

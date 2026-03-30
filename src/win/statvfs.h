@@ -37,7 +37,9 @@
 
 #pragma once
 
-G_BEGIN_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef unsigned long long fsblkcnt_t;
 typedef unsigned long long fsfilcnt_t;
@@ -59,11 +61,10 @@ struct statvfs
 
 int statvfs(const char *path, struct statvfs *buf);
 
-G_END_DECLS
+#ifdef __cplusplus
+}
+#endif
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
-
