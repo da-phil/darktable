@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2013-2020 darktable developers.
+   Copyright (C) 2013-2025 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -27,7 +27,12 @@
 #include "common/dtpthread.h"
 #include <glib.h>
 
+// while it's poor practice to have includes inside an "extern C" block, we need to
+// do this here because the Lua headers don't supply it when compiling under C++....
+G_BEGIN_DECLS
+
 #ifdef USE_LUA
+
 #include <lautoc.h>
 #include <lauxlib.h>
 #include <lua.h>
@@ -69,7 +74,7 @@ typedef struct
 
   dt_pthread_mutex_t mutex;          // mutex protecting the lua condition variable
   pthread_cond_t cond;               // condition variable to wait for the lua lock
-  bool exec_lock;                    // true if some lua code is running. this is logically a mutex
+  volatile bool exec_lock;           // true if some lua code is running. this is logically a mutex
 
   bool ending;                       // true if we are in the process of terminating DT
 
@@ -97,6 +102,11 @@ typedef struct
 } dt_lua_state_t;
 #endif
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+G_END_DECLS
+
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

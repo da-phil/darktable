@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2010-2021 darktable developers.
+   Copyright (C) 2010-2026 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -15,9 +15,7 @@
    You should have received a copy of the GNU General Public License
    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/darktable.h"
@@ -95,7 +93,7 @@ const char *name()
   return _("unbreak input profile");
 }
 
-const char *description(struct dt_iop_module_t *self)
+const char **description(dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("correct input color profiles meant to be applied on non-linear RGB"),
                                       _("corrective"),
@@ -115,9 +113,11 @@ int flags()
          | IOP_FLAGS_SUPPORTS_BLENDING;
 }
 
-int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
+                                            dt_dev_pixelpipe_t *pipe,
+                                            dt_dev_pixelpipe_iop_t *piece)
 {
-  return iop_cs_rgb;
+  return IOP_CS_RGB;
 }
 
 void init_presets(dt_iop_module_so_t *self)
@@ -133,38 +133,53 @@ void init_presets(dt_iop_module_so_t *self)
   p.dynamic_range = 16.0f;
   p.shadows_range = -12.0f;
   dt_gui_presets_add_generic(_("16 EV dynamic range (generic)"), self->op,
-                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   // 14 EV preset
   p.dynamic_range = 14.0f;
   p.shadows_range = -10.50f;
   dt_gui_presets_add_generic(_("14 EV dynamic range (generic)"), self->op,
-                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   // 12 EV preset
   p.dynamic_range = 12.0f;
   p.shadows_range = -9.0f;
   dt_gui_presets_add_generic(_("12 EV dynamic range (generic)"), self->op,
-                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   // 10 EV preset
   p.dynamic_range = 10.0f;
   p.shadows_range = -7.50f;
   dt_gui_presets_add_generic(_("10 EV dynamic range (generic)"), self->op,
-                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
 
   // 08 EV preset
   p.dynamic_range = 8.0f;
   p.shadows_range = -6.0f;
   dt_gui_presets_add_generic(_("08 EV dynamic range (generic)"), self->op,
-                             self->version(), &p, sizeof(p), 1, DEVELOP_BLEND_CS_RGB_DISPLAY);
+                             self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_DISPLAY);
 }
 
 
-int legacy_params(dt_iop_module_t *self, const void *const old_params, const int old_version, void *new_params,
-                  const int new_version)
+int legacy_params(dt_iop_module_t *self,
+                  const void *const old_params,
+                  const int old_version,
+                  void **new_params,
+                  int32_t *new_params_size,
+                  int *new_version)
 {
-  if(old_version == 1 && new_version == 2)
+  typedef struct dt_iop_profilegamma_params_v2_t
+  {
+    dt_iop_profilegamma_mode_t mode;
+    float linear;
+    float gamma;
+    float dynamic_range;
+    float grey_point;
+    float shadows_range;
+    float security_factor;
+  } dt_iop_profilegamma_params_v2_t;
+
+  if(old_version == 1)
   {
     typedef struct dt_iop_profilegamma_params_v1_t
     {
@@ -172,15 +187,20 @@ int legacy_params(dt_iop_module_t *self, const void *const old_params, const int
       float gamma;
     } dt_iop_profilegamma_params_v1_t;
 
-    dt_iop_profilegamma_params_v1_t *o = (dt_iop_profilegamma_params_v1_t *)old_params;
-    dt_iop_profilegamma_params_t *n = (dt_iop_profilegamma_params_t *)new_params;
-    dt_iop_profilegamma_params_t *d = (dt_iop_profilegamma_params_t *)self->default_params;
-
-    *n = *d; // start with a fresh copy of default parameters
+    const dt_iop_profilegamma_params_v1_t *o = old_params;
+    dt_iop_profilegamma_params_v2_t *n = malloc(sizeof(dt_iop_profilegamma_params_v2_t));
 
     n->linear = o->linear;
     n->gamma = o->gamma;
     n->mode = PROFILEGAMMA_GAMMA;
+    n->dynamic_range = 10.0f;
+    n->grey_point = 18.0f;
+    n->shadows_range = -5.0f;
+    n->security_factor = 0.0f;
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_profilegamma_params_v2_t);
+    *new_version = 2;
     return 0;
   }
   return 1;
@@ -188,38 +208,27 @@ int legacy_params(dt_iop_module_t *self, const void *const old_params, const int
 
 
 #ifdef HAVE_OPENCL
-int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_profilegamma_data_t *d = (dt_iop_profilegamma_data_t *)piece->data;
-  dt_iop_profilegamma_global_data_t *gd = (dt_iop_profilegamma_global_data_t *)self->global_data;
+  dt_iop_profilegamma_data_t *d = piece->data;
+  dt_iop_profilegamma_global_data_t *gd = self->global_data;
 
-  cl_int err = -999;
+  cl_int err = DT_OPENCL_DEFAULT_ERROR;
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
   const int height = roi_in->height;
   cl_mem dev_table = NULL;
   cl_mem dev_coeffs = NULL;
 
-
-  size_t sizes[3] = { ROUNDUPWD(width), ROUNDUPHT(height), 1 };
-
   if(d->mode == PROFILEGAMMA_LOG)
   {
     const float dynamic_range = d->dynamic_range;
     const float shadows_range = d->shadows_range;
     const float grey = d->grey_point / 100.0f;
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 0, sizeof(cl_mem), (void *)&dev_in);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 1, sizeof(cl_mem), (void *)&dev_out);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 2, sizeof(int), (void *)&width);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 3, sizeof(int), (void *)&height);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 4, sizeof(float), (void *)&dynamic_range);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 5, sizeof(float), (void *)&shadows_range);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma_log, 6, sizeof(float), (void *)&grey);
-
-    err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_profilegamma_log, sizes);
-    if(err != CL_SUCCESS) goto error;
-    return TRUE;
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_profilegamma_log, width, height,
+      CLARG(dev_in), CLARG(dev_out),
+      CLARG(width), CLARG(height), CLARG(dynamic_range), CLARG(shadows_range), CLARG(grey));
   }
   else if(d->mode == PROFILEGAMMA_GAMMA)
   {
@@ -229,36 +238,22 @@ int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_m
     dev_coeffs = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 3, d->unbounded_coeffs);
     if(dev_coeffs == NULL) goto error;
 
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 0, sizeof(cl_mem), (void *)&dev_in);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 1, sizeof(cl_mem), (void *)&dev_out);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 2, sizeof(int), (void *)&width);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 3, sizeof(int), (void *)&height);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 4, sizeof(cl_mem), (void *)&dev_table);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_profilegamma, 5, sizeof(cl_mem), (void *)&dev_coeffs);
-
-    err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_profilegamma, sizes);
-    if(err != CL_SUCCESS)
-    {
-      dt_opencl_release_mem_object(dev_table);
-      dt_opencl_release_mem_object(dev_coeffs);
-      goto error;
-    }
-
-    dt_opencl_release_mem_object(dev_table);
-    dt_opencl_release_mem_object(dev_coeffs);
-    return TRUE;
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_profilegamma, width, height,
+      CLARG(dev_in), CLARG(dev_out), CLARG(width),
+      CLARG(height), CLARG(dev_table), CLARG(dev_coeffs));
   }
 
 error:
-  dt_print(DT_DEBUG_OPENCL, "[opencl_profilegamma] couldn't enqueue kernel! %d\n", err);
-  return FALSE;
+  dt_opencl_release_mem_object(dev_table);
+  dt_opencl_release_mem_object(dev_coeffs);
+  return err;
 }
 #endif
 
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid, void *const ovoid,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_profilegamma_data_t *data = (dt_iop_profilegamma_data_t *)piece->data;
+  dt_iop_profilegamma_data_t *data = piece->data;
 
   const int ch = piece->colors;
 
@@ -277,19 +272,14 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
       */
       const float noise = powf(2.0f, -16.0f);
 
-#ifdef _OPENMP
-#pragma omp parallel for SIMD() default(none) \
-      dt_omp_firstprivate(ch, grey, ivoid, ovoid, roi_out, noise) \
-      shared(data) \
-      schedule(static)
-#endif
+      DT_OMP_FOR()
       for(size_t k = 0; k < (size_t)ch * roi_out->width * roi_out->height; k++)
       {
         float tmp = ((const float *)ivoid)[k] / grey;
-        if (tmp < noise) tmp = noise;
+        if(tmp < noise) tmp = noise;
         tmp = (fastlog2(tmp) - data->shadows_range) / (data->dynamic_range);
 
-        if (tmp < noise)
+        if(tmp < noise)
         {
           ((float *)ovoid)[k] = noise;
         }
@@ -303,12 +293,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 
     case PROFILEGAMMA_GAMMA:
     {
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-      dt_omp_firstprivate(ch, ivoid, ovoid, roi_out) \
-      shared(data) \
-      schedule(static)
-#endif
+      DT_OMP_FOR()
       for(int k = 0; k < roi_out->height; k++)
       {
         const float *in = ((float *)ivoid) + (size_t)ch * k * roi_out->width;
@@ -337,10 +322,10 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 static void apply_auto_grey(dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
+  dt_iop_profilegamma_params_t *p = self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
 
-  float grey = fmax(fmax(self->picked_color[0], self->picked_color[1]), self->picked_color[2]);
+  const float grey = max3f(self->picked_color);
   p->grey_point = 100.f * grey;
 
   ++darktable.gui->reset;
@@ -353,13 +338,13 @@ static void apply_auto_grey(dt_iop_module_t *self)
 static void apply_auto_black(dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
+  dt_iop_profilegamma_params_t *p = self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
 
-  float noise = powf(2.0f, -16.0f);
+  const float noise = powf(2.0f, -16.0f);
 
   // Black
-  float black = fmax(fmax(self->picked_color_min[0], self->picked_color_min[1]), self->picked_color_min[2]);
+  const float black = max3f(self->picked_color_min);
   float EVmin = Log2Thres(black / (p->grey_point / 100.0f), noise);
   EVmin *= (1.0f + p->security_factor / 100.0f);
 
@@ -375,16 +360,16 @@ static void apply_auto_black(dt_iop_module_t *self)
 static void apply_auto_dynamic_range(dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
+  dt_iop_profilegamma_params_t *p = self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
 
-  float noise = powf(2.0f, -16.0f);
+  const float noise = powf(2.0f, -16.0f);
 
   // Black
   float EVmin = p->shadows_range;
 
   // White
-  float white = fmax(fmax(self->picked_color_max[0], self->picked_color_max[1]), self->picked_color_max[2]);
+  const float white = max3f(self->picked_color_max);
   float EVmax = Log2Thres(white / (p->grey_point / 100.0f), noise);
   EVmax *= (1.0f + p->security_factor / 100.0f);
 
@@ -399,22 +384,22 @@ static void apply_auto_dynamic_range(dt_iop_module_t *self)
 
 static void apply_autotune(dt_iop_module_t *self)
 {
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
+  dt_iop_profilegamma_params_t *p = self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
 
-  float noise = powf(2.0f, -16.0f);
+  const float noise = powf(2.0f, -16.0f);
 
   // Grey
-  float grey = fmax(fmax(self->picked_color[0], self->picked_color[1]), self->picked_color[2]);
+  const float grey = max3f(self->picked_color);
   p->grey_point = 100.f * grey;
 
   // Black
-  float black = fmax(fmax(self->picked_color_min[0], self->picked_color_min[1]), self->picked_color_min[2]);
+  const float black = max3f(self->picked_color_min);
   float EVmin = Log2Thres(black / (p->grey_point / 100.0f), noise);
   EVmin *= (1.0f + p->security_factor / 100.0f);
 
   // White
-  float white = fmax(fmax(self->picked_color_max[0], self->picked_color_max[1]), self->picked_color_max[2]);
+  const float white = max3f(self->picked_color_max);
   float EVmax = Log2Thres(white / (p->grey_point / 100.0f), noise);
   EVmax *= (1.0f + p->security_factor / 100.0f);
 
@@ -433,8 +418,8 @@ static void apply_autotune(dt_iop_module_t *self)
 
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
+  dt_iop_profilegamma_params_t *p = self->params;
 
   if(w == g->mode)
   {
@@ -449,8 +434,8 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   }
   else if(w == g->security_factor)
   {
-    float prev = *(float *)previous;
-    float ratio = (p->security_factor - prev) / (prev + 100.0f);
+    const float prev = *(float *)previous;
+    const float ratio = (p->security_factor - prev) / (prev + 100.0f);
 
     float EVmin = p->shadows_range;
     EVmin = EVmin + ratio * EVmin;
@@ -462,15 +447,16 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
     p->shadows_range = EVmin;
 
     ++darktable.gui->reset;
-    dt_bauhaus_slider_set_soft(g->dynamic_range, p->dynamic_range);
-    dt_bauhaus_slider_set_soft(g->shadows_range, p->shadows_range);
+    dt_bauhaus_slider_set(g->dynamic_range, p->dynamic_range);
+    dt_bauhaus_slider_set(g->shadows_range, p->shadows_range);
     --darktable.gui->reset;
   }
 }
 
-void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_iop_t *piece)
+void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker,
+                        dt_dev_pixelpipe_t *pipe)
 {
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
   if     (picker == g->grey_point)
     apply_auto_grey(self);
   else if(picker == g->shadows_range)
@@ -480,14 +466,14 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
   else if(picker == g->auto_button)
     apply_autotune(self);
   else
-    fprintf(stderr, "[profile_gamma] unknown color picker\n");
+    dt_print(DT_DEBUG_ALWAYS, "[profile_gamma] unknown color picker");
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)p1;
-  dt_iop_profilegamma_data_t *d = (dt_iop_profilegamma_data_t *)piece->data;
+  dt_iop_profilegamma_data_t *d = piece->data;
 
   const float linear = p->linear;
   const float gamma = p->gamma;
@@ -498,21 +484,14 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   float a, b, c, g;
   if(gamma == 1.0)
   {
-#ifdef _OPENMP
-#pragma omp parallel for default(none) shared(d) schedule(static)
-#endif
+    DT_OMP_FOR()
     for(int k = 0; k < 0x10000; k++) d->table[k] = 1.0 * k / 0x10000;
   }
   else
   {
     if(linear == 0.0)
     {
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-      dt_omp_firstprivate(gamma) \
-      shared(d) \
-      schedule(static)
-#endif
+      DT_OMP_FOR()
       for(int k = 0; k < 0x10000; k++) d->table[k] = powf(1.00 * k / 0x10000, gamma);
     }
     else
@@ -529,12 +508,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
         a = b = g = 0.0;
         c = 1.0;
       }
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-      dt_omp_firstprivate(linear) \
-      shared(d, a, b, c, g) \
-      schedule(static)
-#endif
+      DT_OMP_FOR()
       for(int k = 0; k < 0x10000; k++)
       {
         float tmp;
@@ -586,40 +560,30 @@ void gui_reset(dt_iop_module_t *self)
 
 void gui_update(dt_iop_module_t *self)
 {
-  dt_iop_profilegamma_gui_data_t *g = (dt_iop_profilegamma_gui_data_t *)self->gui_data;
-  dt_iop_profilegamma_params_t *p = (dt_iop_profilegamma_params_t *)self->params;
+  dt_iop_profilegamma_gui_data_t *g = self->gui_data;
 
   dt_iop_color_picker_reset(self, TRUE);
-
-  dt_bauhaus_combobox_set(g->mode, p->mode);
-  dt_bauhaus_slider_set_soft(g->linear, p->linear);
-  dt_bauhaus_slider_set_soft(g->gamma, p->gamma);
-  dt_bauhaus_slider_set_soft(g->dynamic_range, p->dynamic_range);
-  dt_bauhaus_slider_set_soft(g->grey_point, p->grey_point);
-  dt_bauhaus_slider_set_soft(g->shadows_range, p->shadows_range);
-  dt_bauhaus_slider_set_soft(g->security_factor, p->security_factor);
 
   gui_changed(self, g->mode, 0);
 }
 
-void init_global(dt_iop_module_so_t *module)
+void init_global(dt_iop_module_so_t *self)
 {
   const int program = 2; // basic.cl, from programs.conf
-  dt_iop_profilegamma_global_data_t *gd
-      = (dt_iop_profilegamma_global_data_t *)malloc(sizeof(dt_iop_profilegamma_global_data_t));
+  dt_iop_profilegamma_global_data_t *gd = malloc(sizeof(dt_iop_profilegamma_global_data_t));
 
-  module->data = gd;
+  self->data = gd;
   gd->kernel_profilegamma = dt_opencl_create_kernel(program, "profilegamma");
   gd->kernel_profilegamma_log = dt_opencl_create_kernel(program, "profilegamma_log");
 }
 
-void cleanup_global(dt_iop_module_so_t *module)
+void cleanup_global(dt_iop_module_so_t *self)
 {
-  dt_iop_profilegamma_global_data_t *gd = (dt_iop_profilegamma_global_data_t *)module->data;
+  dt_iop_profilegamma_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_profilegamma);
   dt_opencl_free_kernel(gd->kernel_profilegamma_log);
-  free(module->data);
-  module->data = NULL;
+  free(self->data);
+  self->data = NULL;
 }
 
 
@@ -633,7 +597,7 @@ void gui_init(dt_iop_module_t *self)
 
   /**** GAMMA MODE ***/
 
-  GtkWidget *vbox_gamma = self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE));
+  GtkWidget *vbox_gamma = self->widget = dt_gui_vbox();
 
   g->linear = dt_bauhaus_slider_from_params(self, N_("linear"));
   dt_bauhaus_slider_set_digits(g->linear, 4);
@@ -647,50 +611,50 @@ void gui_init(dt_iop_module_t *self)
 
   /**** LOG MODE ****/
 
-  GtkWidget *vbox_log = self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE));
+  GtkWidget *vbox_log = self->widget = dt_gui_vbox();
 
   g->grey_point
       = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, dt_bauhaus_slider_from_params(self, "grey_point"));
-  dt_bauhaus_slider_set_step(g->grey_point, 0.5);
-  dt_bauhaus_slider_set_format(g->grey_point, "%.2f %%");
+  dt_bauhaus_slider_set_format(g->grey_point, "%");
   gtk_widget_set_tooltip_text(g->grey_point, _("adjust to match the average luma of the subject"));
 
   g->shadows_range
       = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, dt_bauhaus_slider_from_params(self, "shadows_range"));
   dt_bauhaus_slider_set_soft_max(g->shadows_range, 0.0);
-  dt_bauhaus_slider_set_format(g->shadows_range, "%.2f EV");
-  gtk_widget_set_tooltip_text(g->shadows_range, _("number of stops between middle gray and pure black\nthis is a reading a posemeter would give you on the scene"));
+  dt_bauhaus_slider_set_format(g->shadows_range, _(" EV"));
+  gtk_widget_set_tooltip_text(g->shadows_range, _("number of stops between middle gray and pure black\nthis is a reading a light meter would give you on the scene"));
 
   g->dynamic_range
       = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, dt_bauhaus_slider_from_params(self, "dynamic_range"));
   dt_bauhaus_slider_set_soft_range(g->dynamic_range, 0.5, 16.0);
-  dt_bauhaus_slider_set_format(g->dynamic_range, "%.2f EV");
-  gtk_widget_set_tooltip_text(g->dynamic_range, _("number of stops between pure black and pure white\nthis is a reading a posemeter would give you on the scene"));
+  dt_bauhaus_slider_set_format(g->dynamic_range, _(" EV"));
+  gtk_widget_set_tooltip_text(g->dynamic_range, _("number of stops between pure black and pure white\nthis is a reading a light meter would give you on the scene"));
 
-  gtk_box_pack_start(GTK_BOX(vbox_log), dt_ui_section_label_new(_("optimize automatically")), FALSE, FALSE, 0);
+  dt_gui_box_add(vbox_log, dt_ui_section_label_new(C_("section", "optimize automatically")));
 
   g->security_factor = dt_bauhaus_slider_from_params(self, "security_factor");
-  dt_bauhaus_slider_set_step(g->security_factor, 0.1);
-  dt_bauhaus_slider_set_format(g->security_factor, "%.2f %%");
-  gtk_widget_set_tooltip_text(g->security_factor, _("enlarge or shrink the computed dynamic range\nthis is useful when noise perturbates the measurements"));
+  dt_bauhaus_slider_set_format(g->security_factor, "%");
+  gtk_widget_set_tooltip_text(g->security_factor, _("increase or decrease the computed dynamic range\nthis is useful when noise distorts the measurement"));
 
   g->auto_button = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, dt_bauhaus_combobox_new(self));
   dt_bauhaus_widget_set_label(g->auto_button, NULL, N_("auto tune levels"));
   gtk_widget_set_tooltip_text(g->auto_button, _("make an optimization with some guessing"));
-  gtk_box_pack_start(GTK_BOX(vbox_log), g->auto_button, TRUE, TRUE, 0);
+  dt_gui_box_add(vbox_log, g->auto_button);
 
   gtk_stack_add_named(GTK_STACK(g->mode_stack), vbox_log, "log");
 
   // start building top level widget
-  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE);
+  self->widget = dt_gui_vbox();
 
   g->mode = dt_bauhaus_combobox_from_params(self, N_("mode"));
   gtk_widget_set_tooltip_text(g->mode, _("tone mapping method"));
 
-  gtk_box_pack_start(GTK_BOX(self->widget), g->mode_stack, TRUE, TRUE, 0);
+  dt_gui_box_add(self->widget, g->mode_stack);
 }
 
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

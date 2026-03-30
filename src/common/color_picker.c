@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2016-2021 darktable developers.
+    Copyright (C) 2016-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -17,6 +17,7 @@
 */
 
 #include "common/color_picker.h"
+#include "common/bspline.h"
 #include "common/darktable.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/iop_profile.h"
@@ -24,15 +25,40 @@
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 
+typedef DT_ALIGNED_PIXEL uint32_t dt_aligned_weights_t[4];
+
 static inline size_t _box_size(const int *const box)
 {
   return (size_t)((box[3] - box[1]) * (box[2] - box[0]));
 }
 
-#ifdef _OPENMP
-#pragma omp declare simd aligned(rgb, JzCzhz: 16) uniform(profile)
-#endif
-static inline void rgb_to_JzCzhz(const dt_aligned_pixel_t rgb, dt_aligned_pixel_t JzCzhz,
+static inline void _update_stats_by_ch(dt_aligned_pixel_t acc,
+                                       dt_aligned_pixel_t low,
+                                       dt_aligned_pixel_t high,
+                                       const int ch,
+                                       const float pick)
+{
+  acc[ch] += pick;
+  low[ch] = MIN(low[ch], pick);
+  high[ch] = MAX(high[ch], pick);
+}
+
+static inline void _update_stats_4ch(dt_aligned_pixel_t acc,
+                                     dt_aligned_pixel_t low,
+                                     dt_aligned_pixel_t high,
+                                     dt_aligned_pixel_t pick)
+{
+  // allow for determining sensible max/min values
+  // FIXME: the mean calculation of hue isn't always right, use circular mean calc instead?
+  pick[3] = pick[2] < 0.5f ? pick[2] + 0.5f : pick[2] - 0.5f;
+  // need all channels as blend pickers may use 4th to reverse hues
+  for_four_channels(k,aligned(acc,low,high,pick:16))
+    _update_stats_by_ch(acc, low, high, k, pick[k]);
+}
+
+DT_OMP_DECLARE_SIMD(aligned(rgb, JzCzhz: 16) uniform(profile))
+static inline void rgb_to_JzCzhz(const dt_aligned_pixel_t rgb,
+                                 dt_aligned_pixel_t JzCzhz,
                                  const dt_iop_order_iccprofile_info_t *const profile)
 {
   dt_aligned_pixel_t XYZ_D65 = { 0.0f, 0.0f, 0.0f };
@@ -55,561 +81,491 @@ static inline void rgb_to_JzCzhz(const dt_aligned_pixel_t rgb, dt_aligned_pixel_
   dt_JzAzBz_2_JzCzhz(JzAzBz, JzCzhz);
 }
 
-#ifdef _OPENMP
-#pragma omp declare simd aligned(avg, min, max, pixels: 16) uniform(width, w)
-#endif
-static inline void _color_picker_rgb_or_lab(dt_aligned_pixel_t avg, dt_aligned_pixel_t min, dt_aligned_pixel_t max,
-                                            const float *const pixels, const float w, const size_t width)
+typedef void((*picker_worker_4ch)(dt_aligned_pixel_t acc,
+                                  dt_aligned_pixel_t low,
+                                  dt_aligned_pixel_t high,
+                                  const float *const pixels,
+                                  const size_t width,
+                                  const dt_iop_order_iccprofile_info_t *const profile));
+
+typedef void((*picker_worker_1ch)(dt_aligned_pixel_t acc,
+                                  dt_aligned_pixel_t low,
+                                  dt_aligned_pixel_t high,
+                                  dt_aligned_weights_t weights,
+                                  const float *const pixels,
+                                  const size_t j,
+                                  const dt_iop_roi_t *const roi,
+                                  const int *const box,
+                                  const void *const data));
+
+static inline void _color_picker_rgb_or_lab(dt_aligned_pixel_t acc,
+                                            dt_aligned_pixel_t low,
+                                            dt_aligned_pixel_t high,
+                                            const float *const pixels,
+                                            const size_t width,
+                                            const dt_iop_order_iccprofile_info_t *const profile)
 {
   for(size_t i = 0; i < width; i += 4)
-  {
-    dt_aligned_pixel_t pick = { pixels[i], pixels[i + 1], pixels[i + 2], 0.0f };
-    for(size_t k = 0; k < 4; k++)
-    {
-      avg[k] += w * pick[k];
-      min[k] = fminf(min[k], pick[k]);
-      max[k] = fmaxf(max[k], pick[k]);
-    }
-  }
+    for_each_channel(k, aligned(acc,low,high,pixels:16))
+      _update_stats_by_ch(acc, low, high, k, pixels[i + k]);
 }
 
-#ifdef _OPENMP
-#pragma omp declare simd aligned(avg, min, max, pixels: 16) uniform(width, w)
-#endif
-static inline void _color_picker_lch(dt_aligned_pixel_t avg, dt_aligned_pixel_t min, dt_aligned_pixel_t max,
-                                     const float *const pixels, const float w, const size_t width)
+static inline void _color_picker_lch(dt_aligned_pixel_t acc,
+                                     dt_aligned_pixel_t low,
+                                     dt_aligned_pixel_t high,
+                                     const float *const pixels,
+                                     const size_t width,
+                                     const dt_iop_order_iccprofile_info_t *const profile)
 {
   for(size_t i = 0; i < width; i += 4)
   {
     dt_aligned_pixel_t pick;
     dt_Lab_2_LCH(pixels + i, pick);
-    pick[3] = pick[2] < 0.5f ? pick[2] + 0.5f : pick[2] - 0.5f;
-    for(size_t k = 0; k < 4; k++)
-    {
-      avg[k] += w * pick[k];
-      min[k] = fminf(min[k], pick[k]);
-      max[k] = fmaxf(max[k], pick[k]);
-    }
+    _update_stats_4ch(acc, low, high, pick);
   }
 }
 
-#ifdef _OPENMP
-#pragma omp declare simd aligned(avg, min, max, pixels: 16) uniform(width, w)
-#endif
-static inline void _color_picker_hsl(dt_aligned_pixel_t avg, dt_aligned_pixel_t min, dt_aligned_pixel_t max,
-                                     const float *const pixels, const float w, const size_t width)
+static inline void _color_picker_hsl(dt_aligned_pixel_t acc,
+                                     dt_aligned_pixel_t low,
+                                     dt_aligned_pixel_t high,
+                                     const float *const pixels,
+                                     const size_t width,
+                                     const dt_iop_order_iccprofile_info_t *const profile)
 {
   for(size_t i = 0; i < width; i += 4)
   {
     dt_aligned_pixel_t pick;
     dt_RGB_2_HSL(pixels + i, pick);
-    pick[3] = pick[0] < 0.5f ? pick[0] + 0.5f : pick[0] - 0.5f;
-    for(size_t k = 0; k < 4; k++)
-    {
-      avg[k] += w * pick[k];
-      min[k] = fminf(min[k], pick[k]);
-      max[k] = fmaxf(max[k], pick[k]);
-    }
+    _update_stats_4ch(acc, low, high, pick);
   }
 }
 
-#ifdef _OPENMP
-#pragma omp declare simd aligned(avg, min, max, pixels: 16) uniform(width, w, profile)
-#endif
-static inline void _color_picker_jzczhz(dt_aligned_pixel_t avg, dt_aligned_pixel_t min, dt_aligned_pixel_t max,
-                                        const float *const pixels, const float w, const size_t width,
+static inline void _color_picker_jzczhz(dt_aligned_pixel_t acc,
+                                        dt_aligned_pixel_t low,
+                                        dt_aligned_pixel_t high,
+                                        const float *const pixels,
+                                        const size_t width,
                                         const dt_iop_order_iccprofile_info_t *const profile)
 {
   for(size_t i = 0; i < width; i += 4)
   {
     dt_aligned_pixel_t pick;
     rgb_to_JzCzhz(pixels + i, pick, profile);
-    pick[3] = pick[2] < 0.5f ? pick[2] + 0.5f : pick[2] - 0.5f;
-    for(size_t k = 0; k < 4; k++)
-    {
-      avg[k] += w * pick[k];
-      min[k] = fminf(min[k], pick[k]);
-      max[k] = fmaxf(max[k], pick[k]);
-    }
+    _update_stats_4ch(acc, low, high, pick);
   }
 }
 
-static void color_picker_helper_4ch_seq(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                        const dt_iop_roi_t *const roi, const int *const box,
-                                        dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                        dt_aligned_pixel_t picked_color_max, const dt_iop_colorspace_type_t cst_to,
-                                        const dt_iop_order_iccprofile_info_t *const profile)
+static inline void _color_picker_bayer(dt_aligned_pixel_t acc,
+                                       dt_aligned_pixel_t low,
+                                       dt_aligned_pixel_t high,
+                                       dt_aligned_weights_t weights,
+                                       const float *const pixels,
+                                       const size_t j,
+                                       const dt_iop_roi_t *const roi,
+                                       const int *const box,
+                                       const void *const data)
+{
+  const uint32_t filters = GPOINTER_TO_UINT(data);
+  for(size_t i = box[0]; i < box[2]; i++)
+  {
+    const int c = FC(j + roi->y, i + roi->x, filters);
+    _update_stats_by_ch(acc, low, high, c, pixels[i]);
+    weights[c]++;
+  }
+}
+
+static inline void _color_picker_xtrans(dt_aligned_pixel_t acc,
+                                        dt_aligned_pixel_t low,
+                                        dt_aligned_pixel_t high,
+                                        dt_aligned_weights_t weights,
+                                        const float *const pixels,
+                                        const size_t j,
+                                        const dt_iop_roi_t *const roi,
+                                        const int *const box,
+                                        const void *const data)
+{
+  const uint8_t(*const xtrans)[6] = (const uint8_t(*const)[6])data;
+  for(size_t i = box[0]; i < box[2]; i++)
+  {
+    const int c = FCxtrans(j, i, roi, xtrans);
+    _update_stats_by_ch(acc, low, high, c, pixels[i]);
+    weights[c]++;
+  }
+}
+
+static void _color_picker_work_4ch(const float *const source,
+                                   const dt_iop_roi_t *const roi,
+                                   const int *const box,
+                                   lib_colorpicker_stats pick,
+                                   const dt_iop_order_iccprofile_info_t *const profile,
+                                   const picker_worker_4ch worker,
+                                   const size_t min_for_threads)
 {
   const int width = roi->width;
-
   const size_t size = _box_size(box);
   const size_t stride = 4 * (size_t)(box[2] - box[0]);
   const size_t off_mul = 4 * width;
   const size_t off_add = 4 * box[0];
 
-  const float w = 1.0f / (float)size;
+  dt_aligned_pixel_t acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+  dt_aligned_pixel_t low = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  dt_aligned_pixel_t high = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
 
-  // code path for small region, especially for color picker point mode
-  if(cst_to == iop_cs_LCh)
-  {
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      const size_t offset = j * off_mul + off_add;
-      _color_picker_lch(picked_color, picked_color_min, picked_color_max, pixel + offset, w, stride);
-    }
-  }
-  else if(cst_to == iop_cs_HSL)
-  {
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      const size_t offset = j * off_mul + off_add;
-      _color_picker_hsl(picked_color, picked_color_min, picked_color_max, pixel + offset, w, stride);
-    }
-  }
-  else if(cst_to == iop_cs_JzCzhz)
-  {
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      const size_t offset = j * off_mul + off_add;
-      _color_picker_jzczhz(picked_color, picked_color_min, picked_color_max, pixel + offset, w, stride, profile);
-    }
-  }
-  else
-  {
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      const size_t offset = j * off_mul + off_add;
-      _color_picker_rgb_or_lab(picked_color, picked_color_min, picked_color_max, pixel + offset, w, stride);
-    }
-  }
-}
-
-static void color_picker_helper_4ch_parallel(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                             const dt_iop_roi_t *const roi, const int *const box,
-                                             dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                             dt_aligned_pixel_t picked_color_max, const dt_iop_colorspace_type_t cst_to,
-                                             const dt_iop_order_iccprofile_info_t *const profile)
-{
-  const int width = roi->width;
-
-  const size_t size = _box_size(box);
-  const size_t stride = 4 * (size_t)(box[2] - box[0]);
-  const size_t off_mul = 4 * width;
-  const size_t off_add = 4 * box[0];
-
-  const float w = 1.0f / (float)size;
-
-  const size_t numthreads = dt_get_num_threads();
-
-  size_t allocsize;
-  float *const restrict mean = dt_alloc_perthread_float(4, &allocsize);
-  float *const restrict mmin = dt_alloc_perthread_float(4, &allocsize);
-  float *const restrict mmax = dt_alloc_perthread_float(4, &allocsize);
-
-  for(int n = 0; n < allocsize * numthreads; n++)
-  {
-    mean[n] = 0.0f;
-    mmin[n] = INFINITY;
-    mmax[n] = -INFINITY;
-  }
-
-  if(cst_to == iop_cs_LCh)
-  {
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(w, pixel, width, stride, off_mul, off_add, box, mean, mmin, mmax, allocsize)
-#endif
-    {
-      float *const restrict tmean = dt_get_perthread(mean,allocsize);
-      float *const restrict tmmin = dt_get_perthread(mmin,allocsize);
-      float *const restrict tmmax = dt_get_perthread(mmax,allocsize);
-
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-      for(size_t j = box[1]; j < box[3]; j++)
-      {
-        const size_t offset = j * off_mul + off_add;
-        _color_picker_lch(tmean, tmmin, tmmax, pixel + offset, w, stride);
-      }
-    }
-  }
-  else if(cst_to == iop_cs_HSL)
-  {
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(w, pixel, width, stride, off_mul, off_add, box, mean, mmin, mmax, allocsize)
-#endif
-    {
-      float *const restrict tmean = dt_get_perthread(mean,allocsize);
-      float *const restrict tmmin = dt_get_perthread(mmin,allocsize);
-      float *const restrict tmmax = dt_get_perthread(mmax,allocsize);
-
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-      for(size_t j = box[1]; j < box[3]; j++)
-      {
-        const size_t offset = j * off_mul + off_add;
-        _color_picker_hsl(tmean, tmmin, tmmax, pixel + offset, w, stride);
-      }
-    }
-  }
-  else if(cst_to == iop_cs_JzCzhz)
-  {
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(w, pixel, width, stride, off_mul, off_add, box, mean, mmin, mmax, profile, allocsize)
-#endif
-    {
-      float *const restrict tmean = dt_get_perthread(mean,allocsize);
-      float *const restrict tmmin = dt_get_perthread(mmin,allocsize);
-      float *const restrict tmmax = dt_get_perthread(mmax,allocsize);
-
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-      for(size_t j = box[1]; j < box[3]; j++)
-      {
-        const size_t offset = j * off_mul + off_add;
-        _color_picker_jzczhz(tmean, tmmin, tmmax, pixel + offset, w, stride, profile);
-      }
-    }
-  }
-  else
-  {
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(w, pixel, width, stride, off_mul, off_add, box, mean, mmin, mmax, allocsize)
-#endif
-    {
-      float *const restrict tmean = dt_get_perthread(mean,allocsize);
-      float *const restrict tmmin = dt_get_perthread(mmin,allocsize);
-      float *const restrict tmmax = dt_get_perthread(mmax,allocsize);
-
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-      for(size_t j = box[1]; j < box[3]; j++)
-      {
-        const size_t offset = j * off_mul + off_add;
-        _color_picker_rgb_or_lab(tmean, tmmin, tmmax, pixel + offset, w, stride);
-      }
-    }
-  }
-
-  for(int n = 0; n < numthreads; n++)
-  {
-    for(int k = 0; k < 4; k++)
-    {
-      picked_color[k] += mean[allocsize * n + k];
-      picked_color_min[k] = fminf(picked_color_min[k], mmin[allocsize * n + k]);
-      picked_color_max[k] = fmaxf(picked_color_max[k], mmax[allocsize * n + k]);
-    }
-  }
-
-  dt_free_align(mmax);
-  dt_free_align(mmin);
-  dt_free_align(mean);
-}
-
-static void color_picker_helper_4ch(const dt_iop_buffer_dsc_t *dsc, const float *const pixel,
-                                    const dt_iop_roi_t *roi, const int *const box, dt_aligned_pixel_t picked_color,
-                                    dt_aligned_pixel_t picked_color_min, dt_aligned_pixel_t picked_color_max,
-                                    const dt_iop_colorspace_type_t cst_to,
-                                    const dt_iop_order_iccprofile_info_t *const profile)
-{
-  const size_t size = _box_size(box);
-
-  if(size > 100) // avoid inefficient multi-threading in case of small region size (arbitrary limit)
-    return color_picker_helper_4ch_parallel(dsc, pixel, roi, box, picked_color, picked_color_min,
-                                            picked_color_max, cst_to, profile);
-  else
-    return color_picker_helper_4ch_seq(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max,
-                                       cst_to, profile);
-}
-
-static void color_picker_helper_bayer_seq(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                          const dt_iop_roi_t *const roi, const int *const box,
-                                          dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                          dt_aligned_pixel_t picked_color_max)
-{
-  const int width = roi->width;
-  const uint32_t filters = dsc->filters;
-
-  uint32_t weights[4] = { 0u, 0u, 0u, 0u };
-
-  // code path for small region, especially for color picker point mode
+  // min_for_threads depends on # of samples and complexity of the
+  // colorspace conversion
+  DT_OMP_FOR(if (size > min_for_threads) reduction(+ : acc[:4]) reduction(min : low[:4]) reduction(max : high[:4]))
   for(size_t j = box[1]; j < box[3]; j++)
   {
-    for(size_t i = box[0]; i < box[2]; i++)
-    {
-      const int c = FC(j + roi->y, i + roi->x, filters);
-      const size_t k = width * j + i;
-
-      const float v = pixel[k];
-
-      picked_color[c] += v;
-      picked_color_min[c] = fminf(picked_color_min[c], v);
-      picked_color_max[c] = fmaxf(picked_color_max[c], v);
-      weights[c]++;
-    }
+    const size_t offset = j * off_mul + off_add;
+    worker(acc, low, high, source + offset, stride, profile);
   }
 
-  // and finally normalize data. For bayer, there is twice as much green.
-  for(int c = 0; c < 4; c++)
+  // copy all four channels, as four some colorspaces there may be
+  // meaningful data in the fourth channel
+  for_four_channels(c)
   {
-    picked_color[c] = weights[c] ? (picked_color[c] / (float)weights[c]) : 0.0f;
+    pick[DT_PICK_MEAN][c] = acc[c] / (float)size;
+    pick[DT_PICK_MIN][c] = low[c];
+    pick[DT_PICK_MAX][c] = high[c];
   }
 }
 
-static void color_picker_helper_bayer_parallel(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                               const dt_iop_roi_t *const roi, const int *const box,
-                                               dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                               dt_aligned_pixel_t picked_color_max)
+static void _color_picker_nomat(const float *const source,
+                                const dt_iop_roi_t *const roi,
+                                const int *const box,
+                                lib_colorpicker_stats pick,
+                                const dt_iop_order_iccprofile_info_t *const profile)
+{
+  cmsHPROFILE *input = dt_colorspaces_get_profile(profile->type, profile->filename, DT_PROFILE_DIRECTION_IN)->profile;
+  cmsHPROFILE *Lab = dt_colorspaces_get_profile(DT_COLORSPACE_LAB, "", DT_PROFILE_DIRECTION_ANY)->profile;
+  cmsHTRANSFORM *xform = cmsCreateTransform(input, TYPE_RGBA_FLT, Lab, TYPE_LabA_FLT, profile->intent, 0);
+ 
+  dt_aligned_pixel_t acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+  dt_aligned_pixel_t low = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  dt_aligned_pixel_t high = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+  const size_t bsize = _box_size(box);
+  DT_OMP_FOR(if (bsize > 10) reduction(+ : acc[:4]) reduction(min : low[:4]) reduction(max : high[:4]))
+  for(size_t y = box[1]; y < box[3]; y++)
+  {
+    for(size_t x = box[0]; x < box[2]; x++)
+    {
+      dt_aligned_pixel_t JzAzBz = { 0.0f, 0.0f, 0.0f, 0.0f };
+      dt_aligned_pixel_t JzCzhz = { 0.0f, 0.0f, 0.0f, 0.0f };
+      dt_aligned_pixel_t pLAB = { 0.0f, 0.0f, 0.0f, 0.0f };
+      dt_aligned_pixel_t XYZ_D50 = { 0.0f, 0.0f, 0.0f, 0.0f };
+      dt_aligned_pixel_t XYZ_D65 = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+      cmsDoTransform(xform, source + (y * roi->width + x) * 4, pLAB, 1);
+      dt_Lab_to_XYZ(pLAB, XYZ_D50);
+      dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
+      dt_XYZ_2_JzAzBz(XYZ_D65, JzAzBz);
+      dt_JzAzBz_2_JzCzhz(JzAzBz, JzCzhz);
+      _update_stats_4ch(acc, low, high, JzCzhz);
+    }
+  }
+
+  cmsDeleteTransform(xform);
+  for_four_channels(c)
+  {
+    pick[DT_PICK_MEAN][c] = acc[c] / (float)bsize;
+    pick[DT_PICK_MIN][c] = low[c];
+    pick[DT_PICK_MAX][c] = high[c];
+  }
+}
+
+static void _color_picker_work_1ch(const float *const pixel,
+                                   const dt_iop_roi_t *const roi,
+                                   const int *const box,
+                                   lib_colorpicker_stats pick,
+                                   const void *const data,
+                                   const picker_worker_1ch worker,
+                                   const size_t min_for_threads)
 {
   const int width = roi->width;
-  const uint32_t filters = dsc->filters;
+  dt_aligned_pixel_t acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+  dt_aligned_pixel_t low = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  dt_aligned_pixel_t high = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+  dt_aligned_weights_t weights = { 0u, 0u, 0u, 0u };
 
-  uint32_t weights[4] = { 0u, 0u, 0u, 0u };
-
-  const size_t numthreads = dt_get_num_threads();
-
-  //TODO: convert to use dt_alloc_perthread
-  float *const msum = malloc(sizeof(float) * numthreads * 4);
-  float *const mmin = malloc(sizeof(float) * numthreads * 4);
-  float *const mmax = malloc(sizeof(float) * numthreads * 4);
-  uint32_t *const cnt = malloc(sizeof(uint32_t) * numthreads * 4);
-
-  for(int n = 0; n < 4 * numthreads; n++)
-  {
-    msum[n] = 0.0f;
-    mmin[n] = INFINITY;
-    mmax[n] = -INFINITY;
-    cnt[n] = 0u;
-  }
-
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(pixel, width, roi, filters, box, msum, mmin, mmax, cnt)
-#endif
-  {
-    const int tnum = dt_get_thread_num();
-
-    float *const tsum = msum + 4 * tnum;
-    float *const tmmin = mmin + 4 * tnum;
-    float *const tmmax = mmax + 4 * tnum;
-    uint32_t *const tcnt = cnt + 4 * tnum;
-
-#ifdef _OPENMP
-#pragma omp for schedule(static) collapse(2)
-#endif
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      for(size_t i = box[0]; i < box[2]; i++)
-      {
-        const int c = FC(j + roi->y, i + roi->x, filters);
-        const size_t k = width * j + i;
-
-        const float v = pixel[k];
-
-        tsum[c] += v;
-        tmmin[c] = fminf(tmmin[c], v);
-        tmmax[c] = fmaxf(tmmax[c], v);
-        tcnt[c]++;
-      }
-    }
-  }
-
-  for(int n = 0; n < numthreads; n++)
-  {
-    for(int c = 0; c < 4; c++)
-    {
-      picked_color[c] += msum[4 * n + c];
-      picked_color_min[c] = fminf(picked_color_min[c], mmin[4 * n + c]);
-      picked_color_max[c] = fmaxf(picked_color_max[c], mmax[4 * n + c]);
-      weights[c] += cnt[4 * n + c];
-    }
-  }
-
-  free(cnt);
-  free(mmax);
-  free(mmin);
-  free(msum);
-
-  // and finally normalize data. For bayer, there is twice as much green.
-  for(int c = 0; c < 4; c++)
-  {
-    picked_color[c] = weights[c] ? (picked_color[c] / (float)weights[c]) : 0.0f;
-  }
-}
-
-static void color_picker_helper_bayer(const dt_iop_buffer_dsc_t *dsc, const float *const pixel,
-                                      const dt_iop_roi_t *roi, const int *const box, dt_aligned_pixel_t picked_color,
-                                      dt_aligned_pixel_t picked_color_min, dt_aligned_pixel_t picked_color_max)
-{
-  const size_t size = _box_size(box);
-
-  if(size > 100) // avoid inefficient multi-threading in case of small region size (arbitrary limit)
-    return color_picker_helper_bayer_parallel(dsc, pixel, roi, box, picked_color, picked_color_min,
-                                              picked_color_max);
-  else
-    return color_picker_helper_bayer_seq(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max);
-}
-
-static void color_picker_helper_xtrans_seq(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                           const dt_iop_roi_t *const roi, const int *const box,
-                                           dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                           dt_aligned_pixel_t picked_color_max)
-{
-  const int width = roi->width;
-  const uint8_t(*const xtrans)[6] = (const uint8_t(*const)[6])dsc->xtrans;
-
-  uint32_t weights[3] = { 0u, 0u, 0u };
-
-  // code path for small region, especially for color picker point mode
+  // worker logic is slightly different from 4-channel as we need to
+  // keep track of position in the mosiac
+  DT_OMP_FOR(if (_box_size(box) > min_for_threads) reduction(+ : acc[:4], weights[:4]) reduction(min : low[:4]) reduction(max : high[:4]))
   for(size_t j = box[1]; j < box[3]; j++)
   {
-    for(size_t i = box[0]; i < box[2]; i++)
-    {
-      const int c = FCxtrans(j, i, roi, xtrans);
-      const size_t k = width * j + i;
-
-      const float v = pixel[k];
-
-      picked_color[c] += v;
-      picked_color_min[c] = fminf(picked_color_min[c], v);
-      picked_color_max[c] = fmaxf(picked_color_max[c], v);
-      weights[c]++;
-    }
+    worker(acc, low, high, weights, pixel + width * j, j, roi, box, data);
   }
 
-  // and finally normalize data.
+  copy_pixel(pick[DT_PICK_MIN], low);
+  copy_pixel(pick[DT_PICK_MAX], high);
+  // and finally normalize data. For bayer, there is twice as much green.
   // X-Trans RGB weighting averages to 2:5:2 for each 3x3 cell
-  for(int c = 0; c < 3; c++)
+  for_each_channel(c)
+    pick[DT_PICK_MEAN][c] = weights[c] ? (acc[c] / (float)weights[c]) : 0.0f;
+}
+
+void dt_color_picker_backtransform_box(dt_develop_t *dev,
+                                       const int num,
+                                       const float *in,
+                                       float *out)
+{
+  const float wd  = MAX(1, dev->preview_pipe->iwidth);
+  const float ht  = MAX(1, dev->preview_pipe->iheight);
+  const float wdp = MAX(1, dev->preview_pipe->processed_width);
+  const float htp = MAX(1, dev->preview_pipe->processed_height);
+
+  const int out_num = num == 2 ? 4 : 1;
+
+  for(int i = 0; i < out_num; i++)
   {
-    picked_color[c] /= (float)weights[c];
+    out[i * 2    ] = wdp * in[(i % 3 > 0) * 2];
+    out[i * 2 + 1] = htp * in[(i % 2) * 2 + 1];
+  }
+  dt_dev_distort_backtransform(dev, out, out_num);
+  for(int i = 0; i < out_num; i++)
+  {
+    out[i * 2    ] = CLIP(out[i * 2    ] / wd);
+    out[i * 2 + 1] = CLIP(out[i * 2 + 1] / ht);
   }
 }
 
-static void color_picker_helper_xtrans_parallel(const dt_iop_buffer_dsc_t *const dsc, const float *const pixel,
-                                                const dt_iop_roi_t *const roi, const int *const box,
-                                                dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                                                dt_aligned_pixel_t picked_color_max)
+static void _sort_coordinates(float *fbox)
 {
-  const int width = roi->width;
-  const uint8_t(*const xtrans)[6] = (const uint8_t(*const)[6])dsc->xtrans;
-
-  uint32_t weights[3] = { 0u, 0u, 0u };
-
-  const size_t numthreads = dt_get_num_threads();
-
-  //TODO: convert to use dt_alloc_perthread
-  float *const mmin = malloc(sizeof(float) * numthreads * 3);
-  float *const msum = malloc(sizeof(float) * numthreads * 3);
-  float *const mmax = malloc(sizeof(float) * numthreads * 3);
-  uint32_t *const cnt = malloc(sizeof(uint32_t) * numthreads * 3);
-
-  for(int n = 0; n < 3 * numthreads; n++)
-  {
-    msum[n] = 0.0f;
-    mmin[n] = INFINITY;
-    mmax[n] = -INFINITY;
-    cnt[n] = 0u;
-  }
-
-#ifdef _OPENMP
-#pragma omp parallel default(none) \
-  dt_omp_firstprivate(pixel, width, roi, xtrans, box, cnt, msum, mmin, mmax)
-#endif
-  {
-    const int tnum = dt_get_thread_num();
-
-    float *const tsum = msum + 3 * tnum;
-    float *const tmmin = mmin + 3 * tnum;
-    float *const tmmax = mmax + 3 * tnum;
-    uint32_t *const tcnt = cnt + 3 * tnum;
-
-#ifdef _OPENMP
-#pragma omp for schedule(static) collapse(2)
-#endif
-    for(size_t j = box[1]; j < box[3]; j++)
-    {
-      for(size_t i = box[0]; i < box[2]; i++)
-      {
-        const int c = FCxtrans(j, i, roi, xtrans);
-        const size_t k = width * j + i;
-
-        const float v = pixel[k];
-
-        tsum[c] += v;
-        tmmin[c] = fminf(tmmin[c], v);
-        tmmax[c] = fmaxf(tmmax[c], v);
-        tcnt[c]++;
-      }
-    }
-  }
-
-  for(int n = 0; n < numthreads; n++)
-  {
-    for(int c = 0; c < 3; c++)
-    {
-      picked_color[c] += msum[3 * n + c];
-      picked_color_min[c] = fminf(picked_color_min[c], mmin[3 * n + c]);
-      picked_color_max[c] = fmaxf(picked_color_max[c], mmax[3 * n + c]);
-      weights[c] += cnt[3 * n + c];
-    }
-  }
-
-  free(cnt);
-  free(mmax);
-  free(mmin);
-  free(msum);
-
-  // and finally normalize data.
-  // X-Trans RGB weighting averages to 2:5:2 for each 3x3 cell
-  for(int c = 0; c < 3; c++)
-  {
-    picked_color[c] /= (float)weights[c];
-  }
+  float tmp;
+  #define SWAP(a, b) { tmp = (a); (a) = (b); (b) = tmp; }
+  if(fbox[0] > fbox[2]) SWAP(fbox[0], fbox[2]);
+  if(fbox[1] > fbox[3]) SWAP(fbox[1], fbox[3]);
+  if(fbox[4] > fbox[6]) SWAP(fbox[4], fbox[6]);
+  if(fbox[5] > fbox[7]) SWAP(fbox[5], fbox[7]);
+  if(fbox[0] > fbox[4]) SWAP(fbox[0], fbox[4]);
+  if(fbox[1] > fbox[5]) SWAP(fbox[1], fbox[5]);
+  if(fbox[2] > fbox[6]) SWAP(fbox[2], fbox[6]);
+  if(fbox[3] > fbox[7]) SWAP(fbox[3], fbox[7]);
+  if(fbox[2] > fbox[4]) SWAP(fbox[2], fbox[4]);
+  if(fbox[3] > fbox[5]) SWAP(fbox[3], fbox[5]);
+  #undef SWAP
 }
 
-static void color_picker_helper_xtrans(const dt_iop_buffer_dsc_t *dsc, const float *const pixel,
-                                       const dt_iop_roi_t *roi, const int *const box, dt_aligned_pixel_t picked_color,
-                                       dt_aligned_pixel_t picked_color_min, dt_aligned_pixel_t picked_color_max)
+// Use by darkroom visualizing
+void dt_color_picker_transform_box(dt_develop_t *dev,
+                                   const int num,
+                                   const float *in,
+                                   float *out,
+                                   const gboolean scale)
 {
-  const size_t size = _box_size(box);
+  const float wd = dev->preview_pipe->iwidth;
+  const float ht = dev->preview_pipe->iheight;
+  const float wdp = scale ? dev->preview_pipe->processed_width : 1.0f;
+  const float htp = scale ? dev->preview_pipe->processed_height : 1.0f;
 
-  if(size > 100) // avoid inefficient multi-threading in case of small region size (arbitrary limit)
-    return color_picker_helper_xtrans_parallel(dsc, pixel, roi, box, picked_color, picked_color_min,
-                                               picked_color_max);
+  const gboolean box = num == 2;
+  if(wd < 1.0f || ht < 1.0f)
+  {
+    for(int i = 0; i < num; i++)
+      out[i] = in[i];
+    return;
+  }
+
+  dt_pickerbox_t fbox;
+  for(int i = 0; i < 8; i += 2)
+  {
+    fbox[i    ] = wd * in[i    ];
+    fbox[i + 1] = ht * in[i + 1];
+  }
+
+  dt_dev_distort_transform(dev, fbox, box ? 4 : 1);
+
+  if(box) // sort the 4 point coordinates
+  {
+    _sort_coordinates(fbox);
+    out[0] = 0.5f * (fbox[0] + fbox[2]) / wdp;
+    out[1] = 0.5f * (fbox[1] + fbox[3]) / htp;
+    out[2] = 0.5f * (fbox[4] + fbox[6]) / wdp;
+    out[3] = 0.5f * (fbox[5] + fbox[7]) / htp;
+  }
   else
-    return color_picker_helper_xtrans_seq(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max);
+  {
+    out[0] = fbox[0] / wdp;
+    out[1] = fbox[1] / htp;
+  }
 }
 
-// picked_color, picked_color_min and picked_color_max should be aligned
-void dt_color_picker_helper(const dt_iop_buffer_dsc_t *dsc, const float *const pixel, const dt_iop_roi_t *roi,
-                            const int *const box, dt_aligned_pixel_t picked_color, dt_aligned_pixel_t picked_color_min,
-                            dt_aligned_pixel_t picked_color_max, const dt_iop_colorspace_type_t image_cst,
+// calculate box in current module's coordinates for the color picker
+gboolean dt_color_picker_box(dt_iop_module_t *module,
+                             const dt_iop_roi_t *roi,
+                             const dt_colorpicker_sample_t *const sample,
+                             dt_pixelpipe_picker_source_t picker_source,
+                             int *box)
+{
+  if(picker_source == PIXELPIPE_PICKER_OUTPUT
+     && !sample->pick_output)
+    return TRUE;
+
+  dt_develop_t *dev = darktable.develop;
+  const float wd = dev->preview_pipe->iwidth;
+  const float ht = dev->preview_pipe->iheight;
+
+  const int width = roi->width;
+  const int height = roi->height;
+  const gboolean isbox = sample->size == DT_LIB_COLORPICKER_SIZE_BOX;
+
+  /* get absolute pixel coordinates in final preview image.
+     we transform back all 4 corner locations to current module coordinates,
+     sort the coordinates, and use average of 2 highest and 2 lowest for the
+     resulting rectangle.
+  */
+  dt_pickerbox_t fbox;
+  for(int i = 0; i < 8; i += 2)
+  {
+    fbox[i    ] = wd * (isbox ? sample->box[i    ] : sample->point[0]);
+    fbox[i + 1] = ht * (isbox ? sample->box[i + 1] : sample->point[1]);
+  }
+
+  const gboolean expanded = module->flags() & IOP_FLAGS_EXPAND_ROI_IN;
+  const gboolean input = picker_source == PIXELPIPE_PICKER_INPUT;
+  dt_dev_distort_transform_plus(dev, dev->preview_pipe,
+                                module->iop_order - (expanded && input ? 1 : 0),
+                                input ? DT_DEV_TRANSFORM_DIR_BACK_INCL : DT_DEV_TRANSFORM_DIR_BACK_EXCL,
+                                fbox, 4);
+
+  _sort_coordinates(fbox);
+  box[0] = 0.5f * (fbox[0] + fbox[2]) - roi->x;
+  box[1] = 0.5f * (fbox[1] + fbox[3]) - roi->y;
+  box[2] = 0.5f * (fbox[4] + fbox[6]) - roi->x;
+  box[3] = 0.5f * (fbox[5] + fbox[7]) - roi->y;
+
+  // make sure we sample at least one point
+  box[2] = MAX(box[2], box[0] + 1);
+  box[3] = MAX(box[3], box[1] + 1);
+
+  // FIXME: on invalid box, caller should set sample to something like
+  // NaN to flag it as invalid
+  if(box[0] >= width || box[1] >= height || box[2] < 0 || box[3] < 0)
+    return TRUE;
+
+  // clamp bounding box to roi
+  box[0] = CLAMP(box[0], 0, width - 1);
+  box[1] = CLAMP(box[1], 0, height - 1);
+  box[2] = CLAMP(box[2], 1, width);
+  box[3] = CLAMP(box[3], 1, height);
+
+  // return an error condition if area has not at least 1 pixel width and height
+  return (box[2] - box[0] < 1) || (box[3] - box[1] < 1);
+}
+
+void dt_color_picker_helper(const dt_iop_buffer_dsc_t *dsc,
+                            const float *const pixel,
+                            const dt_iop_roi_t *roi,
+                            const int *const box,
+                            const gboolean denoise,
+                            lib_colorpicker_stats pick,
+                            const dt_iop_colorspace_type_t image_cst,
                             const dt_iop_colorspace_type_t picker_cst,
                             const dt_iop_order_iccprofile_info_t *const profile)
 {
-  if((dsc->channels == 4u) && ((image_cst == picker_cst) || (picker_cst == iop_cs_NONE)))
-    color_picker_helper_4ch(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max, picker_cst, profile);
-  else if(dsc->channels == 4u && image_cst == iop_cs_Lab && picker_cst == iop_cs_LCh)
-    color_picker_helper_4ch(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max, picker_cst, profile);
-  else if(dsc->channels == 4u && image_cst == iop_cs_rgb && (picker_cst == iop_cs_HSL || picker_cst == iop_cs_JzCzhz))
-    color_picker_helper_4ch(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max, picker_cst, profile);
-  else if(dsc->channels == 4u) // This is a fallback, better than crashing as happens with monochromes
-    color_picker_helper_4ch(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max, picker_cst, profile);
+  dt_times_t start_time = { 0 };
+  dt_get_perf_times(&start_time);
+
+  for_four_channels(k)
+  {
+    pick[DT_PICK_MEAN][k] = 0.0f;
+    pick[DT_PICK_MIN][k] = FLT_MAX;
+    pick[DT_PICK_MAX][k] = -FLT_MAX;
+  }
+
+  if(dsc->channels == 4u)
+  {
+    float *restrict denoised = NULL;
+    const float *source = pixel;
+    if(denoise)
+    {
+      // Denoise the image
+      size_t padded_size;
+      denoised = dt_alloc_align_float(4 * roi->width * roi->height);
+      if(denoised)
+      {
+        float *const tempbuf =
+          dt_alloc_perthread_float(4 * roi->width, &padded_size); //TODO: alloc in caller
+
+        // blur without clipping negatives because Lab a and b channels can be
+        // legitimately negative
+        // FIXME: this blurs whole image even when just a bit is sampled in the
+        // case of CPU path
+        blur_2D_Bspline(pixel, denoised, tempbuf, padded_size,
+                        roi->width, roi->height, 1, FALSE);
+        dt_free_align(tempbuf);
+        source = denoised;
+      }
+      else
+        dt_print(DT_DEBUG_ALWAYS,
+                 "[color picker] unable to alloc working memory, denoising skipped");
+    }
+
+    // 4-channel raw images are monochrome, can be read as RGB
+    const dt_iop_colorspace_type_t effective_cst =
+      image_cst == IOP_CS_RAW ? IOP_CS_RGB : image_cst;
+
+    if(effective_cst == IOP_CS_LAB && picker_cst == IOP_CS_LCH)
+    {
+      // blending for Lab modules (e.g. color zones and tone curve)
+      _color_picker_work_4ch(source, roi, box, pick, NULL, _color_picker_lch, 10);
+    }
+    else if(effective_cst == IOP_CS_RGB && picker_cst == IOP_CS_HSL)
+    {
+      // display-referred blending for RGB modules
+      _color_picker_work_4ch(source, roi, box, pick, NULL, _color_picker_hsl, 10);
+    }
+    else if(effective_cst == IOP_CS_RGB && picker_cst == IOP_CS_JZCZHZ)
+    {
+      // scene-referred blending for RGB modules
+      if(profile && !dt_is_valid_colormatrix(profile->matrix_in[0][0]))
+        _color_picker_nomat(source, roi, box, pick, profile);
+      else
+        _color_picker_work_4ch(source, roi, box, pick, profile, _color_picker_jzczhz, 10);
+    }
+    else if(effective_cst == picker_cst)
+    {
+      // most iop pickers and the global picker
+      _color_picker_work_4ch(source, roi, box, pick, NULL, _color_picker_rgb_or_lab, 100);
+    }
+    else if(picker_cst == IOP_CS_NONE)
+    {
+      // temperature IOP when correcting non-RAW
+      _color_picker_work_4ch(source, roi, box, pick, NULL, _color_picker_rgb_or_lab, 100);
+    }
+    else
+    {
+      // fallback, but this shouldn't happen
+      dt_print(DT_DEBUG_ALWAYS,
+               "[colorpicker] unknown colorspace conversion from %s to %s",
+               dt_iop_colorspace_to_name(image_cst), dt_iop_colorspace_to_name(picker_cst));
+      _color_picker_work_4ch(source, roi, box, pick, NULL, _color_picker_rgb_or_lab, 100);
+    }
+
+    dt_free_align(denoised);
+  }
   else if(dsc->channels == 1u && dsc->filters != 0u && dsc->filters != 9u)
-    color_picker_helper_bayer(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max);
+  {
+    _color_picker_work_1ch(pixel, roi, box, pick, GUINT_TO_POINTER(dsc->filters),
+                           _color_picker_bayer, 100);
+  }
   else if(dsc->channels == 1u && dsc->filters == 9u)
-    color_picker_helper_xtrans(dsc, pixel, roi, box, picked_color, picked_color_min, picked_color_max);
+  {
+    _color_picker_work_1ch(pixel, roi, box, pick, dsc->xtrans,
+                           _color_picker_xtrans, 100);
+  }
   else
     dt_unreachable_codepath();
+
+  dt_print(DT_DEBUG_PERF,
+           "dt_color_picker_helper stats reading %u channels (filters %u) cst %d -> %d "
+           "size %zu denoised %d took %.3f secs (%.3f CPU)",
+           dsc->channels, dsc->filters, image_cst, picker_cst, _box_size(box), denoise,
+           dt_get_lap_time(&start_time.clock), dt_get_lap_utime(&start_time.user));
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

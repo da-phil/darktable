@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2012-2021 darktable developers.
+    Copyright (C) 2012-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -53,9 +53,9 @@
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/exif.h"
-#include "common/imageio.h"
-#include "common/imageio_module.h"
 #include "control/conf.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,12 +69,11 @@ typedef enum
 } dt_imageio_j2k_format_t;
 
 // borrowed from blender
-#define DOWNSAMPLE_FLOAT_TO_8BIT(_val) (_val) <= 0.0f ? 0 : ((_val) >= 1.0f ? 255 : (int)roundf(255.0f * (_val)))
+// #define DOWNSAMPLE_FLOAT_TO_8BIT(_val) (_val) <= 0.0f ? 0 : ((_val) >= 1.0f ? 255 : (int)roundf(255.0f * (_val)))
 #define DOWNSAMPLE_FLOAT_TO_12BIT(_val) (_val) <= 0.0f ? 0 : ((_val) >= 1.0f ? 4095 : (int)roundf(4095.0f * (_val)))
-#define DOWNSAMPLE_FLOAT_TO_16BIT(_val)                                                                      \
-  (_val) <= 0.0f ? 0 : ((_val) >= 1.0f ? 65535 : (int)roundf(65535.0f * (_val)))
+// #define DOWNSAMPLE_FLOAT_TO_16BIT(_val) (_val) <= 0.0f ? 0 : ((_val) >= 1.0f ? 65535 : (int)roundf(65535.0f * (_val)))
 
-DT_MODULE(2)
+DT_MODULE(3)
 
 typedef enum
 {
@@ -88,14 +87,12 @@ typedef struct dt_imageio_j2k_t
 {
   dt_imageio_module_data_t global;
   int bpp;
-  dt_imageio_j2k_format_t format;
   dt_imageio_j2k_preset_t preset;
   int quality;
 } dt_imageio_j2k_t;
 
 typedef struct dt_imageio_j2k_gui_t
 {
-  GtkWidget *format;
   GtkWidget *preset;
   GtkWidget *quality;
 } dt_imageio_j2k_gui_t;
@@ -104,11 +101,6 @@ void init(dt_imageio_module_format_t *self)
 {
 #ifdef USE_LUA
   dt_lua_register_module_member(darktable.lua_state.state, self, dt_imageio_j2k_t, bpp, int);
-  luaA_enum(darktable.lua_state.state, dt_imageio_j2k_format_t);
-  luaA_enum_value_name(darktable.lua_state.state, dt_imageio_j2k_format_t, J2K_CFMT, "j2k");
-  luaA_enum_value_name(darktable.lua_state.state, dt_imageio_j2k_format_t, JP2_CFMT, "jp2");
-  dt_lua_register_module_member(darktable.lua_state.state, self, dt_imageio_j2k_t, format,
-                                dt_imageio_j2k_format_t);
   dt_lua_register_module_member(darktable.lua_state.state, self, dt_imageio_j2k_t, quality, int);
   luaA_enum(darktable.lua_state.state, dt_imageio_j2k_preset_t);
   luaA_enum_value_name(darktable.lua_state.state, dt_imageio_j2k_preset_t, DT_J2K_PRESET_OFF, "off");
@@ -220,10 +212,10 @@ static void cinema_setup_encoder(opj_cparameters_t *parameters, opj_image_t *ima
       }
       if(!((image->comps[0].w == 2048) | (image->comps[0].h == 1080)))
       {
-        fprintf(stdout,
-                "Image coordinates %d x %d is not 2K compliant.\nJPEG Digital Cinema Profile-3 "
-                "(2K profile) compliance requires that at least one of coordinates match 2048 x 1080\n",
-                image->comps[0].w, image->comps[0].h);
+        dt_print(DT_DEBUG_ALWAYS,
+                 "Image coordinates %d x %d is not 2K compliant.\nJPEG Digital Cinema Profile-3 "
+                 "(2K profile) compliance requires that at least one of coordinates match 2048 x 1080",
+                 image->comps[0].w, image->comps[0].h);
         parameters->cp_rsiz = OPJ_STD_RSIZ;
       }
       break;
@@ -240,10 +232,10 @@ static void cinema_setup_encoder(opj_cparameters_t *parameters, opj_image_t *ima
       }
       if(!((image->comps[0].w == 4096) | (image->comps[0].h == 2160)))
       {
-        fprintf(stdout,
-                "Image coordinates %d x %d is not 4K compliant.\nJPEG Digital Cinema Profile-4"
-                "(4K profile) compliance requires that at least one of coordinates match 4096 x 2160\n",
-                image->comps[0].w, image->comps[0].h);
+        dt_print(DT_DEBUG_ALWAYS,
+                 "Image coordinates %d x %d is not 4K compliant.\nJPEG Digital Cinema Profile-4 "
+                 "(4K profile) compliance requires that at least one of coordinates match 4096 x 2160",
+                 image->comps[0].w, image->comps[0].h);
         parameters->cp_rsiz = OPJ_STD_RSIZ;
       }
       parameters->numpocs = initialise_4K_poc(parameters->POC, parameters->numresolution);
@@ -320,9 +312,10 @@ static void cinema_setup_encoder(opj_cparameters_t *parameters, opj_image_t *ima
 
 int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const void *in_tmp,
                 dt_colorspaces_color_profile_type_t over_type, const char *over_filename,
-                void *exif, int exif_len, int imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
+                void *exif, int exif_len, dt_imgid_t imgid, int num, int total, struct dt_dev_pixelpipe_t *pipe,
                 const gboolean export_masks)
 {
+  int rc = 1;
   const float *in = (const float *)in_tmp;
   dt_imageio_j2k_t *j2k = (dt_imageio_j2k_t *)j2k_tmp;
   opj_cparameters_t parameters; /* compression parameters */
@@ -342,7 +335,7 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
   parameters.cp_disto_alloc = 1;
   parameters.cp_rsiz = OPJ_STD_RSIZ;
 
-  parameters.cod_format = j2k->format;
+  parameters.cod_format = 1; /* JP2 container */
   parameters.cp_cinema = (OPJ_CINEMA_MODE)j2k->preset;
 
   if(parameters.cp_cinema)
@@ -356,7 +349,7 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
   }
 
   /* Create comment for codestream */
-  parameters.cp_comment = g_strdup_printf("Created by %s", darktable_package_string);
+  parameters.cp_comment = g_strdup_printf("Created with %s", darktable_package_string);
 
   /*Converting the image to a format suitable for encoding*/
   {
@@ -372,7 +365,6 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
     for(int i = 0; i < numcomps; i++)
     {
       cmptparm[i].prec = prec;
-      cmptparm[i].bpp = prec;
       cmptparm[i].sgnd = 0;
       cmptparm[i].dx = subsampling_dx;
       cmptparm[i].dy = subsampling_dy;
@@ -382,9 +374,10 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
     image = opj_image_create(numcomps, &cmptparm[0], OPJ_CLRSPC_SRGB);
     if(!image)
     {
-      fprintf(stderr, "Error: opj_image_create() failed\n");
+      dt_print(DT_DEBUG_ALWAYS, "Error: opj_image_create() failed");
       free(rates);
-      return 1;
+      rc = 0;
+      goto exit;
     }
 
     /* set image offset and reference grid */
@@ -402,9 +395,10 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
 //        }
 //        break;
       case 12:
-        for(int i = 0; i < w * h; i++)
+        DT_OMP_FOR_SIMD(collapse(2))
+        for(int i = 0; i < w * h; ++i)
         {
-          for(int k = 0; k < numcomps; k++)
+          for(int k = 0; k < numcomps; ++k)
             image->comps[k].data[i] = DOWNSAMPLE_FLOAT_TO_12BIT(in[i * 4 + k]);
         }
         break;
@@ -416,11 +410,45 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
 //        }
 //        break;
 //      default:
-//        fprintf(stderr, "Error: this shouldn't happen, there is no bit depth of %d for jpeg 2000 images.\n",
+//        dt_print(DT_DEBUG_ALWAYS, "Error: this shouldn't happen, there is no bit depth of %d for jpeg 2000 images.",
 //                prec);
 //        free(rates);
 //        opj_image_destroy(image);
 //        return 1;
+    }
+  }
+
+  /* Determine the actual (export vs colorout) color profile used */
+  const dt_colorspaces_color_profile_t *cp = dt_colorspaces_get_output_profile(imgid, over_type, over_filename);
+  /* ICC writing doesn't work w/ OpenJPEG 2.5.3 and earlier (prefer runtime detection) */
+  const char *opj_ver = opj_version();
+  if(opj_ver[0] > '2' || (opj_ver[0] == '2' && (opj_ver[2] > '5' || (opj_ver[2] == '5' && opj_ver[4] > '3'))))
+  {
+    uint32_t icc_profile_len;
+    cmsSaveProfileToMem(cp->profile, NULL, &icc_profile_len);
+    if(icc_profile_len > 0)
+    {
+      uint8_t *icc_profile_buf = malloc(sizeof(uint8_t) * icc_profile_len);
+      if(icc_profile_buf == NULL)
+      {
+        dt_print(DT_DEBUG_ALWAYS, "failed to allocate ICC profile");
+        opj_image_destroy(image);
+        rc = 0;
+        goto exit;
+      }
+      cmsSaveProfileToMem(cp->profile, icc_profile_buf, &icc_profile_len);
+      image->icc_profile_buf = icc_profile_buf; /* freed later by opj_image_destroy() */
+      image->icc_profile_len = icc_profile_len;
+    }
+  }
+  else
+  {
+    if(cp->type != DT_COLORSPACE_SRGB)
+    {
+      dt_control_log("%s", _("unable to attach output profile to JP2"));
+      dt_print(
+          DT_DEBUG_ALWAYS,
+          "Warning: exporting with anything but sRGB profile might lead to wrong results when opening the image");
     }
   }
 
@@ -437,17 +465,10 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
 
   /* encode the destination image */
   /* ---------------------------- */
-  int rc = 1;
-  OPJ_CODEC_FORMAT codec;
-  if(parameters.cod_format == J2K_CFMT) /* J2K format output */
-    codec = OPJ_CODEC_J2K;
-  else
-    codec = OPJ_CODEC_JP2;
-
   opj_stream_t *cstream = NULL;
 
   /* get a J2K/JP2 compressor handle */
-  opj_codec_t *ccodec = opj_create_compress(codec);
+  opj_codec_t *ccodec = opj_create_compress(OPJ_CODEC_JP2);
 
   opj_set_error_handler(ccodec, error_callback, stderr);
   opj_set_warning_handler(ccodec, warning_callback, stderr);
@@ -465,8 +486,9 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
   {
     opj_destroy_codec(ccodec);
     opj_image_destroy(image);
-    fprintf(stderr, "failed to create output stream\n");
-    return 1;
+    dt_print(DT_DEBUG_ALWAYS, "failed to create output stream");
+    rc = 0;
+    goto exit;
   }
 
   if(!opj_start_compress(ccodec, image, cstream))
@@ -474,8 +496,9 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
     opj_stream_destroy(cstream);
     opj_destroy_codec(ccodec);
     opj_image_destroy(image);
-    fprintf(stderr, "failed to encode image: opj_start_compress\n");
-    return 1;
+    dt_print(DT_DEBUG_ALWAYS, "failed to encode image: opj_start_compress");
+    rc = 0;
+    goto exit;
   }
 
   /* encode the image */
@@ -484,8 +507,9 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
     opj_stream_destroy(cstream);
     opj_destroy_codec(ccodec);
     opj_image_destroy(image);
-    fprintf(stderr, "failed to encode image: opj_encode\n");
-    return 1;
+    dt_print(DT_DEBUG_ALWAYS, "failed to encode image: opj_encode");
+    rc = 0;
+    goto exit;
   }
 
   /* encode the image */
@@ -494,22 +518,25 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
     opj_stream_destroy(cstream);
     opj_destroy_codec(ccodec);
     opj_image_destroy(image);
-    fprintf(stderr, "failed to encode image: opj_end_compress\n");
-    return 1;
+    dt_print(DT_DEBUG_ALWAYS, "failed to encode image: opj_end_compress");
+    rc = 0;
+    goto exit;
   }
 
   opj_stream_destroy(cstream);
   opj_destroy_codec(ccodec);
 
   /* add exif data blob. seems to not work for j2k files :( */
-  if(exif && j2k->format == JP2_CFMT) rc = dt_exif_write_blob(exif, exif_len, filename, 1);
+  if(exif) rc = dt_exif_write_blob(exif, exif_len, filename, 1);
 
   /* free image data */
   opj_image_destroy(image);
 
+exit:
   /* free user parameters structure */
   g_free(parameters.cp_comment);
   free(parameters.cp_matrice);
+  free(parameters.mct_data);
 
   return ((rc == 1) ? 0 : 1);
 }
@@ -519,13 +546,25 @@ size_t params_size(dt_imageio_module_format_t *self)
   return sizeof(dt_imageio_j2k_t);
 }
 
-void *legacy_params(dt_imageio_module_format_t *self, const void *const old_params,
-                    const size_t old_params_size, const int old_version, const int new_version,
+void *legacy_params(dt_imageio_module_format_t *self,
+                    const void *const old_params,
+                    const size_t old_params_size,
+                    const int old_version,
+                    int *new_version,
                     size_t *new_size)
 {
-  if(old_version == 1 && new_version == 2)
+  typedef struct _imageio_j2k_v2_t
   {
-    typedef struct dt_imageio_j2k_v1_t
+    dt_imageio_module_data_t global;
+    int bpp;
+    dt_imageio_j2k_format_t format;
+    dt_imageio_j2k_preset_t preset;
+    int quality;
+  } dt_imageio_j2k_v2_t;
+
+  if(old_version == 1)
+  {
+    typedef struct _imageio_j2k_v1_t
     {
       int max_width, max_height;
       int width, height;
@@ -536,8 +575,8 @@ void *legacy_params(dt_imageio_module_format_t *self, const void *const old_para
       int quality;
     } dt_imageio_j2k_v1_t;
 
-    dt_imageio_j2k_v1_t *o = (dt_imageio_j2k_v1_t *)old_params;
-    dt_imageio_j2k_t *n = (dt_imageio_j2k_t *)malloc(sizeof(dt_imageio_j2k_t));
+    const dt_imageio_j2k_v1_t *o = (dt_imageio_j2k_v1_t *)old_params;
+    dt_imageio_j2k_v2_t *n = malloc(sizeof(dt_imageio_j2k_v2_t));
 
     n->global.max_width = o->max_width;
     n->global.max_height = o->max_height;
@@ -549,7 +588,40 @@ void *legacy_params(dt_imageio_module_format_t *self, const void *const old_para
     n->format = o->format;
     n->preset = o->preset;
     n->quality = o->quality;
-    *new_size = self->params_size(self);
+
+    *new_version = 2;
+    *new_size = sizeof(dt_imageio_j2k_v2_t);
+    return n;
+  }
+
+  // incremental update supported:
+
+  typedef struct dt_imageio_j2k_v3_t
+  {
+    dt_imageio_module_data_t global;
+    int bpp;
+    dt_imageio_j2k_preset_t preset;
+    int quality;
+  } dt_imageio_j2k_v3_t;
+
+  if(old_version == 2)
+  {
+    // let's update from 2 to 3
+    const dt_imageio_j2k_v2_t *o = (dt_imageio_j2k_v2_t *)old_params;
+    dt_imageio_j2k_v3_t *n = malloc(sizeof(dt_imageio_j2k_v3_t));
+
+    n->global.max_width = o->global.max_width;
+    n->global.max_height = o->global.max_height;
+    n->global.width = o->global.width;
+    n->global.height = o->global.height;
+    g_strlcpy(n->global.style, o->global.style, sizeof(o->global.style));
+    n->global.style_append = o->global.style_append;
+    n->bpp = o->bpp;
+    n->preset = o->preset;
+    n->quality = o->quality;
+
+    *new_size = sizeof(dt_imageio_j2k_v3_t);
+    *new_version = 3;
     return n;
   }
   return NULL;
@@ -557,12 +629,10 @@ void *legacy_params(dt_imageio_module_format_t *self, const void *const old_para
 
 void *get_params(dt_imageio_module_format_t *self)
 {
-  dt_imageio_j2k_t *d = (dt_imageio_j2k_t *)calloc(1, sizeof(dt_imageio_j2k_t));
-  d->bpp = 16; // can be 8, 12 or 16
-  d->format = dt_conf_get_int("plugins/imageio/format/j2k/format");
+  dt_imageio_j2k_t *d = calloc(1, sizeof(dt_imageio_j2k_t));
+  d->bpp = 12; // can be 8, 12 or 16
   d->preset = dt_conf_get_int("plugins/imageio/format/j2k/preset");
   d->quality = dt_conf_get_int("plugins/imageio/format/j2k/quality");
-  if(d->quality <= 0 || d->quality > 100) d->quality = 100;
   return d;
 }
 
@@ -575,8 +645,7 @@ int set_params(dt_imageio_module_format_t *self, const void *params, const int s
 {
   if(size != self->params_size(self)) return 1;
   dt_imageio_j2k_t *d = (dt_imageio_j2k_t *)params;
-  dt_imageio_j2k_gui_t *g = (dt_imageio_j2k_gui_t *)self->gui_data;
-  dt_bauhaus_combobox_set(g->format, d->format);
+  dt_imageio_j2k_gui_t *g = self->gui_data;
   dt_bauhaus_combobox_set(g->preset, d->preset);
   dt_bauhaus_slider_set(g->quality, d->quality);
   return 0;
@@ -598,13 +667,9 @@ const char *mime(dt_imageio_module_data_t *data)
   return "image/jp2";
 }
 
-const char *extension(dt_imageio_module_data_t *data_tmp)
+const char *extension(dt_imageio_module_data_t *data)
 {
-  const dt_imageio_j2k_t *data = (dt_imageio_j2k_t *)data_tmp;
-  if(data->format == J2K_CFMT)
-    return "j2k";
-  else
-    return "jp2";
+  return "jp2";
 }
 
 const char *name()
@@ -618,12 +683,6 @@ static void preset_changed(GtkWidget *widget, gpointer user_data)
   dt_conf_set_int("plugins/imageio/format/j2k/preset", preset);
 }
 
-static void format_changed(GtkWidget *widget, gpointer user_data)
-{
-  const int format = dt_bauhaus_combobox_get(widget);
-  dt_conf_set_int("plugins/imageio/format/j2k/format", format);
-}
-
 static void quality_changed(GtkWidget *slider, gpointer user_data)
 {
   int quality = (int)dt_bauhaus_slider_get(slider);
@@ -633,43 +692,30 @@ static void quality_changed(GtkWidget *slider, gpointer user_data)
 // TODO: some quality/compression stuff in case "off" is selected
 void gui_init(dt_imageio_module_format_t *self)
 {
-  dt_imageio_j2k_gui_t *gui = (dt_imageio_j2k_gui_t *)malloc(sizeof(dt_imageio_j2k_gui_t));
+  dt_imageio_j2k_gui_t *gui = malloc(sizeof(dt_imageio_j2k_gui_t));
   self->gui_data = (void *)gui;
-  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-  const int format_last = dt_conf_get_int("plugins/imageio/format/j2k/format");
   const int preset_last = dt_conf_get_int("plugins/imageio/format/j2k/preset");
   const int quality_last = dt_conf_get_int("plugins/imageio/format/j2k/quality");
 
-  gui->format = dt_bauhaus_combobox_new(NULL);
-  dt_bauhaus_widget_set_label(gui->format, NULL, N_("format"));
-  dt_bauhaus_combobox_add(gui->format, _("J2K"));
-  dt_bauhaus_combobox_add(gui->format, _("jp2"));
-  dt_bauhaus_combobox_set(gui->format, format_last);
-  gtk_box_pack_start(GTK_BOX(self->widget), gui->format, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(gui->format), "value-changed", G_CALLBACK(format_changed), NULL);
-
-  gui->quality = dt_bauhaus_slider_new_with_range(NULL,
+  gui->quality = dt_bauhaus_slider_new_with_range((dt_iop_module_t*)self,
                                                   dt_confgen_get_int("plugins/imageio/format/j2k/quality", DT_MIN),
                                                   dt_confgen_get_int("plugins/imageio/format/j2k/quality", DT_MAX),
                                                   1,
                                                   dt_confgen_get_int("plugins/imageio/format/j2k/quality", DT_DEFAULT),
                                                   0);
   dt_bauhaus_widget_set_label(gui->quality, NULL, N_("quality"));
-  dt_bauhaus_slider_set_default(gui->quality, dt_confgen_get_int("plugins/imageio/format/j2k/quality", DT_DEFAULT));
-  if(quality_last > 0 && quality_last <= 100) dt_bauhaus_slider_set(gui->quality, quality_last);
-  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(gui->quality), TRUE, TRUE, 0);
+  dt_bauhaus_slider_set(gui->quality, quality_last);
   g_signal_connect(G_OBJECT(gui->quality), "value-changed", G_CALLBACK(quality_changed), NULL);
 
-  gui->preset = dt_bauhaus_combobox_new(NULL);
-  dt_bauhaus_widget_set_label(gui->preset, NULL, N_("DCP mode"));
-  dt_bauhaus_combobox_add(gui->preset, _("off"));
-  dt_bauhaus_combobox_add(gui->preset, _("Cinema2K, 24FPS"));
-  dt_bauhaus_combobox_add(gui->preset, _("Cinema2K, 48FPS"));
-  dt_bauhaus_combobox_add(gui->preset, _("Cinema4K, 24FPS"));
-  dt_bauhaus_combobox_set(gui->preset, preset_last);
-  gtk_box_pack_start(GTK_BOX(self->widget), gui->preset, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(gui->preset), "value-changed", G_CALLBACK(preset_changed), NULL);
+  DT_BAUHAUS_COMBOBOX_NEW_FULL(gui->preset, self, NULL, N_("DCP mode"), NULL,
+                               preset_last, preset_changed, self,
+                               N_("off"),
+                               N_("Cinema2K, 24FPS"),
+                               N_("Cinema2K, 48FPS"),
+                               N_("Cinema4K, 24FPS"));
+
+  self->widget = dt_gui_vbox(gui->quality, gui->preset);
 
   // TODO: options for "off"
 }
@@ -681,21 +727,20 @@ void gui_cleanup(dt_imageio_module_format_t *self)
 
 void gui_reset(dt_imageio_module_format_t *self)
 {
-  const int format_def = dt_confgen_get_int("plugins/imageio/format/j2k/format", DT_DEFAULT);
   const int preset_def = dt_confgen_get_int("plugins/imageio/format/j2k/preset", DT_DEFAULT);
   const int quality_def = dt_confgen_get_int("plugins/imageio/format/j2k/quality", DT_DEFAULT);
-  dt_imageio_j2k_gui_t *gui = (dt_imageio_j2k_gui_t *)self->gui_data;
-  dt_bauhaus_combobox_set(gui->format, format_def);
+  dt_imageio_j2k_gui_t *gui = self->gui_data;
   dt_bauhaus_combobox_set(gui->preset, preset_def);
   dt_bauhaus_combobox_set(gui->quality, quality_def);
 }
 
 int flags(dt_imageio_module_data_t *data)
 {
-  dt_imageio_j2k_t *j = (dt_imageio_j2k_t *)data;
-  return ((j && j->format == JP2_CFMT) ? FORMAT_FLAGS_SUPPORT_XMP : 0);
+  return FORMAT_FLAGS_SUPPORT_XMP;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

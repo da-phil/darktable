@@ -31,10 +31,11 @@ DO_CONFIG=1
 DO_BUILD=1
 DO_INSTALL=0
 SUDO=""
+CMAKE_OPTIONS_FROM_CMDLINE=""
 
 PRINT_HELP=0
 
-FEATURES="CAMERA COLORD FLICKR GRAPHICSMAGICK IMAGEMAGICK KWALLET LIBSECRET LUA MAP MAC_INTEGRATION NLS OPENCL OPENEXR OPENMP UNITY WEBP GAME"
+FEATURES="AI CAMERA COLORD GRAPHICSMAGICK IMAGEMAGICK JXL KWALLET LIBSECRET LUA MAC_INTEGRATION MAP OPENCL OPENEXR OPENMP UNITY WEBP"
 
 # prepare a lowercase version with a space before and after
 # it's very important for parse_feature, has no impact in for loop expansions
@@ -120,6 +121,11 @@ parse_args()
 		-h|--help)
 			PRINT_HELP=1
 			;;
+		--)
+			shift
+			CMAKE_OPTIONS_FROM_CMDLINE="$@"
+			break
+			;;
 		*)
 			echo "warning: ignoring unknown option $option"
 			;;
@@ -135,7 +141,7 @@ parse_args()
 print_help()
 {
 	cat <<EOF
-$(basename $0) [OPTIONS]
+$(basename $0) [OPTIONS] [-- [additional cmake configuration options...]]
 
 Options:
 Installation:
@@ -169,6 +175,9 @@ Cleanup actions:
    --clean-all                Clean both build and install directories
 -f --force                    Force clean-build to perform removal
                               ignoring any errors
+
+Additional cmake configuration options:
+Options passed as is to the cmake configure command
 
 Features:
 By default cmake will enable the features it autodetects on the build machine.
@@ -311,21 +320,6 @@ done
 CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}
 CMAKE_MORE_OPTIONS="${CMAKE_MORE_OPTIONS} ${CMAKE_PREFIX_PATH}"
 
-
-# ---------------------------------------------------------------------------
-# Determine CPU architecture
-# ---------------------------------------------------------------------------
-
-CPU_ARCHITECTURE=""
-if [[ `uname -a` =~ ^Darwin.* ]] && [[ `uname -a` =~ .*arm64$ ]]
-then
-    CPU_ARCHITECTURE="ARM64"
-    CMAKE_MORE_OPTIONS="${CMAKE_MORE_OPTIONS} -DBUILD_SSE2_CODEPATHS=OFF"
-else
-	CPU_ARCHITECTURE="Intel"
-fi
-
-
 # ---------------------------------------------------------------------------
 # Let's go
 # ---------------------------------------------------------------------------
@@ -338,7 +332,6 @@ Installation prefix: $INSTALL_PREFIX
 Build type:          $BUILD_TYPE
 Build generator:     $BUILD_GENERATOR
 Build tasks:         $MAKE_TASKS
-CPU Architecture:    $CPU_ARCHITECTURE
 
 EOF
 
@@ -378,8 +371,8 @@ if [ $ADDRESS_SANITIZER -ne 0 ] ; then
 fi
 
 
-cmd_config="${ASAN_FLAGS}cmake -G \"$BUILD_GENERATOR\" -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} ${CMAKE_MORE_OPTIONS} \"$DT_SRC_DIR\""
-cmd_build="cmake --build "$BUILD_DIR" -- -j$MAKE_TASKS"
+cmd_config="${ASAN_FLAGS}cmake -G \"$BUILD_GENERATOR\" -DCMAKE_INSTALL_PREFIX=\"${INSTALL_PREFIX}\" -DCMAKE_BUILD_TYPE=${BUILD_TYPE} ${CMAKE_MORE_OPTIONS} ${CMAKE_OPTIONS_FROM_CMDLINE} \"$DT_SRC_DIR\""
+cmd_build="cmake --build \"$BUILD_DIR\" -- -j$MAKE_TASKS"
 cmd_install="${SUDO}cmake --build \"$BUILD_DIR\" --target install -- -j$MAKE_TASKS"
 
 

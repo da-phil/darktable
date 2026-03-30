@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2012-2020 darktable developers.
+    Copyright (C) 2012-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -29,21 +29,32 @@ typedef struct heap_t
   float *vals;
 } heap_t;
 
-heap_t *heap_init(uint32_t size)
-{
-  heap_t *h = (heap_t *)malloc(sizeof(heap_t));
-  h->keys = (uint64_t *)malloc(sizeof(uint64_t) * size);
-  h->vals = (float *)malloc(sizeof(float) * size);
-  h->size = size;
-  h->end = 0;
-  return h;
-}
-
 void heap_cleanup(heap_t *h)
 {
-  free(h->keys);
-  free(h->vals);
-  free(h);
+  if(h)
+  {
+    free(h->keys);
+    free(h->vals);
+    free(h);
+  }
+}
+
+heap_t *heap_init(uint32_t size)
+{
+  heap_t *h = malloc(sizeof(heap_t));
+  if(h)
+  {
+    h->keys = (uint64_t *)malloc(sizeof(uint64_t) * size);
+    h->vals = (float *)malloc(sizeof(float) * size);
+    h->size = size;
+    h->end = 0;
+    if(!h->keys || !h->vals)
+    {
+      heap_cleanup(h);
+      return NULL;
+    }
+  }
+  return h;
 }
 
 int heap_empty(heap_t *h)
@@ -125,6 +136,9 @@ void heap_remove(heap_t *h, uint64_t *key, float *val)
   }
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

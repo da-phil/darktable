@@ -30,10 +30,7 @@
 int dt_lua_check_print_error(lua_State* L, int result)
 {
   if(result == LUA_OK) return result;
-  if(darktable.unmuted & DT_DEBUG_LUA)
-  {
-    dt_print(DT_DEBUG_LUA, "LUA ERROR : %s\n", lua_tostring(L, -1));
-  }
+  dt_print(DT_DEBUG_LUA, "LUA ERROR : %s", lua_tostring(L, -1));
   lua_pop(L,1); // remove the error message, it has been handled
   return result;
 }
@@ -128,7 +125,7 @@ static void run_async_thread_main(gpointer data,gpointer user_data)
   lua_State*L = darktable.lua_state.state;
   lua_State* thread = get_thread(L,thread_num);
   if(!thread) {
-    dt_print(DT_DEBUG_LUA, "LUA ERROR : no thread found, this should never happen\n");
+    dt_print(DT_DEBUG_LUA, "LUA ERROR : no thread found, this should never happen");
     return;
   }
   dt_lua_finish_callback  cb = lua_touserdata(thread,1);
@@ -204,7 +201,7 @@ static gboolean stacked_job_dispatch (GSource* source, GSourceFunc callback, gpo
 {
   gpointer message;
   message = g_async_queue_try_pop (darktable.lua_state.stacked_job_queue);
-  if (message == NULL)
+  if(message == NULL)
   {
     return TRUE;
   }
@@ -301,7 +298,7 @@ static gboolean alien_job_dispatch (GSource* source, GSourceFunc callback, gpoin
 {
   gpointer message;
   message = g_async_queue_try_pop (darktable.lua_state.alien_job_queue);
-  if (message == NULL)
+  if(message == NULL)
   {
     return TRUE;
   }
@@ -381,7 +378,7 @@ static void alien_job_init()
 
 /*
    STRING JOB
-   This is a source that deals with lua jobs that are gien as lua strings
+   This is a source that deals with lua jobs that are given as lua strings
    */
 
 typedef struct {
@@ -408,7 +405,7 @@ static gboolean string_job_dispatch (GSource* source, GSourceFunc callback, gpoi
 {
   gpointer message;
   message = g_async_queue_try_pop (darktable.lua_state.string_job_queue);
-  if (message == NULL)
+  if(message == NULL)
   {
     return TRUE;
   }
@@ -472,7 +469,7 @@ static void string_job_init()
 void dt_lua_async_call_internal(const char* function, int line,lua_State *L, int nargs,int nresults,dt_lua_finish_callback cb, void*data)
 {
 #ifdef _DEBUG
-  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d, nargs : %d\n",__FUNCTION__,function,line,nargs);
+  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d, nargs : %d",__FUNCTION__,function,line,nargs);
 #endif
 
   lua_State *new_thread = lua_newthread(L);
@@ -490,12 +487,12 @@ void dt_lua_async_call_alien_internal(const char * call_function, int line,lua_C
   if(!darktable.lua_state.alien_job_queue) {
     // early call before lua has properly been initialized, ignore
 #ifdef _DEBUG
-  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called early. probably ok.\n",__FUNCTION__);
+  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called early. probably ok",__FUNCTION__);
 #endif
     return;
   }
 #ifdef _DEBUG
-  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d\n",__FUNCTION__,call_function,line);
+  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d",__FUNCTION__,call_function,line);
 #endif
   async_call_data*data = malloc(sizeof(async_call_data));
   data->pusher = pusher;
@@ -557,7 +554,7 @@ void dt_lua_async_call_alien_internal(const char * call_function, int line,lua_C
 void dt_lua_async_call_string_internal(const char* function, int line,const char* lua_string,int nresults,dt_lua_finish_callback cb, void*cb_data)
 {
 #ifdef _DEBUG
-  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d, string %s\n",__FUNCTION__,function,line,lua_string);
+  dt_print(DT_DEBUG_LUA,"LUA DEBUG : %s called from %s %d, string %s",__FUNCTION__,function,line,lua_string);
 #endif
   string_call_data*data = malloc(sizeof(string_call_data));
   data->function = strdup(lua_string);
@@ -657,22 +654,24 @@ static int gtk_wrap(lua_State*L)
     return lua_gettop(L);
   } else {
 #ifdef _DEBUG
-    dt_print(DT_DEBUG_LUA, "LUA DEBUG : %s called from %s %llu\n", __FUNCTION__,
+    dt_print(DT_DEBUG_LUA, "LUA DEBUG : %s called from %s %llu", __FUNCTION__,
              lua_tostring(L, lua_upvalueindex(2)), lua_tointeger(L, lua_upvalueindex(3)));
 #endif
     dt_lua_unlock();
-    gtk_wrap_communication communication;
+    gtk_wrap_communication communication = {};
     g_mutex_init(&communication.end_mutex);
     g_cond_init(&communication.end_cond);
     communication.L = L;
+    communication.retval = -1;
+    g_main_context_invoke_full(NULL,G_PRIORITY_HIGH_IDLE, dt_lua_gtk_wrap_callback,&communication, NULL);
     g_mutex_lock(&communication.end_mutex);
-    g_main_context_invoke(NULL,dt_lua_gtk_wrap_callback,&communication);
-    g_cond_wait(&communication.end_cond,&communication.end_mutex);
+    while(communication.retval == -1)
+      g_cond_wait(&communication.end_cond,&communication.end_mutex);
     g_mutex_unlock(&communication.end_mutex);
     g_mutex_clear(&communication.end_mutex);
     dt_lua_lock();
 #ifdef _DEBUG
-    dt_print(DT_DEBUG_LUA, "LUA DEBUG : %s return for call from from %s %llu\n", __FUNCTION__,
+    dt_print(DT_DEBUG_LUA, "LUA DEBUG : %s return for call from from %s %llu", __FUNCTION__,
              lua_tostring(L, lua_upvalueindex(2)), lua_tointeger(L, lua_upvalueindex(3)));
 #endif
     if(communication.retval == LUA_OK) {
@@ -728,6 +727,9 @@ int dt_lua_init_call(lua_State *L)
   return 0;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

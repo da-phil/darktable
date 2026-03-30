@@ -25,7 +25,7 @@ void _clear_pos(dt_image_pos *pos)
 
 void dt_printing_clear_box(dt_image_box *img)
 {
-  img->imgid = -1;
+  img->imgid = NO_IMGID;
   img->max_width = img->max_height = 0;
   img->exp_width = img->exp_height = 0;
   img->dis_width = img->dis_height = 0;
@@ -53,12 +53,9 @@ void dt_printing_clear_boxes(dt_images_box *imgs)
   imgs->imgid_to_load = -1;
 }
 
-static inline float sqrf(float a)
-{
-  return a * a;
-}
-
-int32_t dt_printing_get_image_box(const dt_images_box *imgs, const int x, const int y)
+int32_t dt_printing_get_image_box(const dt_images_box *imgs,
+                                  const int x,
+                                  const int y)
 {
   int box = -1;
   float dist = FLT_MAX;
@@ -92,7 +89,9 @@ int32_t dt_printing_get_image_box(const dt_images_box *imgs, const int x, const 
   return box;
 }
 
-void _compute_rel_pos(const dt_images_box *imgs, const dt_image_pos *ref, dt_image_pos *pos)
+void _compute_rel_pos(const dt_images_box *imgs,
+                      const dt_image_pos *ref,
+                      dt_image_pos *pos)
 {
   // compute the printing position & width as % of the page
 
@@ -108,9 +107,15 @@ void _compute_rel_pos(const dt_images_box *imgs, const dt_image_pos *ref, dt_ima
 }
 
 void dt_printing_setup_display(dt_images_box *imgs,
-                               const float px, const float py, const float pwidth, const float pheight,
-                               const float ax, const float ay, const float awidth, const float aheight,
-                               gboolean borderless)
+                               const float px,
+                               const float py,
+                               const float pwidth,
+                               const float pheight,
+                               const float ax,
+                               const float ay,
+                               const float awidth,
+                               const float aheight,
+                               const gboolean borderless)
 {
   imgs->screen.page.x      = px;
   imgs->screen.page.y      = py;
@@ -122,9 +127,9 @@ void dt_printing_setup_display(dt_images_box *imgs,
   imgs->screen.print_area.width  = awidth;
   imgs->screen.print_area.height = aheight;
 
-  dt_print(DT_DEBUG_PRINT, "[printing] screen/page  (%3.1f, %3.1f) -> (%3.1f, %3.1f)\n",
+  dt_print(DT_DEBUG_PRINT, "[printing] screen/page  (%3.1f, %3.1f) -> (%3.1f, %3.1f)",
            px, py, pwidth, pheight);
-  dt_print(DT_DEBUG_PRINT, "[printing] screen/parea (%3.1f, %3.1f) -> (%3.1f, %3.1f)\n",
+  dt_print(DT_DEBUG_PRINT, "[printing] screen/parea (%3.1f, %3.1f) -> (%3.1f, %3.1f)",
            ax, ay, awidth, aheight);
 
   imgs->screen.borderless = borderless;
@@ -144,9 +149,12 @@ void dt_printing_setup_display(dt_images_box *imgs,
   }
 }
 
-void dt_printing_setup_box(dt_images_box *imgs, const int idx,
-                           const float x, const float y,
-                           const float width, const float height)
+void dt_printing_setup_box(dt_images_box *imgs,
+                           const int idx,
+                           const float x,
+                           const float y,
+                           const float width,
+                           const float height)
 {
   const float dx = fminf(imgs->screen.print_area.width,
                          fmaxf(100.0f, width));
@@ -164,12 +172,14 @@ void dt_printing_setup_box(dt_images_box *imgs, const int idx,
 
   if(box->screen.x + dx > imgs->screen.print_area.x + imgs->screen.print_area.width)
   {
-    const float off = (box->screen.x + dx - imgs->screen.print_area.x - imgs->screen.print_area.width);
+    const float off =
+      (box->screen.x + dx - imgs->screen.print_area.x - imgs->screen.print_area.width);
     box->screen.x = fmaxf(imgs->screen.print_area.x, box->screen.x - off);
   }
   if(box->screen.y + dy > imgs->screen.print_area.y + imgs->screen.print_area.height)
   {
-    const float off = (box->screen.y + dy - imgs->screen.print_area.y - imgs->screen.print_area.height);
+    const float off =
+      (box->screen.y + dy - imgs->screen.print_area.y - imgs->screen.print_area.height);
     box->screen.y = fmaxf(imgs->screen.print_area.y, box->screen.y - off);
   }
 
@@ -179,7 +189,8 @@ void dt_printing_setup_box(dt_images_box *imgs, const int idx,
 }
 
 void dt_printing_setup_page(dt_images_box *imgs,
-                            const float page_width, const float page_height,
+                            const float page_width,
+                            const float page_height,
                             const int resolution)
 {
   imgs->page_width_mm = page_width;
@@ -196,8 +207,11 @@ void dt_printing_setup_page(dt_images_box *imgs,
   }
 }
 
-void _align_pos(const dt_image_pos *ref, const dt_alignment_t alignment,
-                const int32_t width, const int32_t height, dt_image_pos *pos)
+void _align_pos(const dt_image_pos *ref,
+                const dt_alignment_t alignment,
+                const int32_t width,
+                const int32_t height,
+                dt_image_pos *pos)
 {
   pos->width  = width;
   pos->height = height;
@@ -243,14 +257,18 @@ void _align_pos(const dt_image_pos *ref, const dt_alignment_t alignment,
   }
 }
 
-void dt_printing_get_screen_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos)
+void dt_printing_get_screen_pos(const dt_images_box *imgs,
+                                const dt_image_box *img,
+                                dt_image_pos *pos)
 {
   _clear_pos(pos);
 
   _align_pos(&img->screen, img->alignment, img->dis_width, img->dis_height, pos);
 }
 
-void dt_printing_get_screen_rel_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos)
+void dt_printing_get_screen_rel_pos(const dt_images_box *imgs,
+                                    const dt_image_box *img,
+                                    dt_image_pos *pos)
 {
   dt_image_pos screen_pos;
 
@@ -259,7 +277,9 @@ void dt_printing_get_screen_rel_pos(const dt_images_box *imgs, const dt_image_bo
   _compute_rel_pos(imgs, &screen_pos, pos);
 }
 
-void dt_printing_get_image_pos_mm(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos)
+void dt_printing_get_image_pos_mm(const dt_images_box *imgs,
+                                  const dt_image_box *img,
+                                  dt_image_pos *pos)
 {
   dt_image_pos rpos;
 
@@ -271,7 +291,9 @@ void dt_printing_get_image_pos_mm(const dt_images_box *imgs, const dt_image_box 
   pos->height = rpos.height * imgs->page_height_mm;
 }
 
-void dt_printing_get_image_pos(const dt_images_box *imgs, const dt_image_box *img, dt_image_pos *pos)
+void dt_printing_get_image_pos(const dt_images_box *imgs,
+                               const dt_image_box *img,
+                               dt_image_pos *pos)
 {
   dt_image_pos rpos;
 
@@ -283,8 +305,11 @@ void dt_printing_get_image_pos(const dt_images_box *imgs, const dt_image_box *im
   pos->height = rpos.height * imgs->page_height;
 }
 
-void dt_printing_setup_image(dt_images_box *imgs, const int idx,
-                             const int32_t imgid, const int32_t width, const int32_t height,
+void dt_printing_setup_image(dt_images_box *imgs,
+                             const int idx,
+                             const dt_imgid_t imgid,
+                             const int32_t width,
+                             const int32_t height,
                              const dt_alignment_t alignment)
 {
   dt_image_box *box = &imgs->box[idx];
@@ -332,6 +357,8 @@ void dt_printing_setup_image(dt_images_box *imgs, const int idx,
   }
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

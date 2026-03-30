@@ -1,12 +1,24 @@
-<!ELEMENT dtconfiglist (dtconfig)*>
-<!ELEMENT dtconfig (name,type,default,capability?,shortdescription?,longdescription?)>
+<!ELEMENT dtconfiglist (dttab*, dtconfig*)>
+
+<!ELEMENT dttab (section)+>
+<!ATTLIST dttab
+	name ID #REQUIRED
+        title CDATA #REQUIRED
+>
+<!ELEMENT section EMPTY>
+<!ATTLIST section
+	name ID #IMPLIED
+        title CDATA #REQUIRED
+>
+
+<!ELEMENT dtconfig (name,type,default,capability?,shortdescription?,longdescription?,welcomescreen?)>
 <!ATTLIST dtconfig
-	prefs (import|lighttable|darkroom|otherviews|processing|security|cpugpu|storage|misc) #IMPLIED
-        section
-        (import|session|interface|other|tags|geoloc|slideshow|cpugpu|database|xmp|accel|general|modules|thumbs) #IMPLIED
-        dialog (collect|recentcollect|import) #IMPLIED
+	prefs IDREF #IMPLIED
+        section IDREF #IMPLIED
+        dialog (collect|recentcollect|import|tagging) #IMPLIED
         ui (yes|no) #IMPLIED
         restart (true|false) #IMPLIED
+        common (yes|no) #IMPLIED
         capability CDATA #IMPLIED
 >
 <!ELEMENT name (#PCDATA)>
@@ -24,3 +36,10 @@
 <!ELEMENT default (#PCDATA)>
 <!ELEMENT shortdescription (#PCDATA)>
 <!ELEMENT longdescription (#PCDATA)>
+
+<!ELEMENT welcomescreen EMPTY>
+<!ATTLIST welcomescreen
+        pagenum CDATA #IMPLIED
+        questionnum CDATA #IMPLIED
+        dirchooser (yes|no) #IMPLIED
+>

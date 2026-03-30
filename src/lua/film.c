@@ -119,7 +119,8 @@ static int film_getnum(lua_State *L)
   int index = luaL_checkinteger(L, -1);
   if(index < 1)
   {
-    return luaL_error(L, "incorrect index in database");
+    lua_pushnil(L);
+    return 1;
   }
   dt_lua_film_t film_id;
   luaA_to(L, dt_lua_film_t, &film_id, -2);
@@ -133,13 +134,12 @@ static int film_getnum(lua_State *L)
   {
     dt_lua_image_t imgid = sqlite3_column_int(stmt, 0);
     luaA_push(L, dt_lua_image_t, &imgid);
-    sqlite3_finalize(stmt);
   }
   else
   {
-    sqlite3_finalize(stmt);
-    return luaL_error(L, "incorrect index in database");
+    lua_pushnil(L);
   }
+  sqlite3_finalize(stmt);
   return 1;
 }
 static int films_len(lua_State *L)
@@ -164,7 +164,8 @@ static int films_index(lua_State *L)
   int index = luaL_checkinteger(L, -1);
   if(index < 1)
   {
-    return luaL_error(L, "incorrect index in database");
+    lua_pushnil(L);
+    return 1;
   }
   sqlite3_stmt *stmt = NULL;
   char query[1024];
@@ -196,9 +197,9 @@ static int films_new(lua_State *L)
 
   dt_film_t my_film;
   dt_film_init(&my_film);
-  int film_id = dt_film_new(&my_film, final_path);
+  dt_filmid_t film_id = dt_film_new(&my_film, final_path);
   g_free(final_path);
-  if(film_id)
+  if(dt_is_valid_filmid(film_id))
   {
     luaA_push(L, dt_lua_film_t, &film_id);
     return 1;
@@ -255,6 +256,9 @@ int dt_lua_init_film(lua_State *L)
   return 0;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

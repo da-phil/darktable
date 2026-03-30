@@ -1,7 +1,6 @@
 /*
     This file is part of darktable,
-    copyright (c) 2016 johannes hanika.
-    copyright (c) 2016 Ulrich Pegelow.
+    copyright (c) 2016-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,26 +18,6 @@
 
 #include "color_conversion.h"
 #include "rgb_norms.h"
-
-/* we use this exp approximation to maintain full identity with cpu path */
-float
-fast_expf(const float x)
-{
-  // meant for the range [-100.0f, 0.0f]. largest error ~ -0.06 at 0.0f.
-  // will get _a_lot_ worse for x > 0.0f (9000 at 10.0f)..
-  const int i1 = 0x3f800000u;
-  // e^x, the comment would be 2^x
-  const int i2 = 0x402DF854u;//0x40000000u;
-  // const int k = CLAMPS(i1 + x * (i2 - i1), 0x0u, 0x7fffffffu);
-  // without max clamping (doesn't work for large x, but is faster):
-  const int k0 = i1 + x * (i2 - i1);
-  union {
-      float f;
-      int k;
-  } u;
-  u.k = k0 > 0 ? k0 : 0;
-  return u.f;
-}
 
 /*
   Primary LUT lookup.  Measures the luminance of a given pixel using a selectable function, looks up that
@@ -124,20 +103,20 @@ basecurve_compute_features(read_only image2d_t in, write_only image2d_t out, con
 
   float4 value = read_imagef(in, sampleri, (int2)(x, y));
 
-  const float ma = max(value.x, max(value.y, value.z));
-  const float mi = min(value.x, min(value.y, value.z));
+  const float ma = fmax(value.x, fmax(value.y, value.z));
+  const float mi = fmin(value.x, fmin(value.y, value.z));
 
-  const float sat = 0.1f + 0.1f * (ma - mi) / max(1.0e-4f, ma);
+  const float sat = 0.1f + 0.1f * (ma - mi) / fmax(1.0e-4f, ma);
   value.w = sat;
 
   const float c = 0.54f;
 
   float v = fabs(value.x - c);
-  v = max(fabs(value.y - c), v);
-  v = max(fabs(value.z - c), v);
+  v = fmax(fabs(value.y - c), v);
+  v = fmax(fabs(value.z - c), v);
 
   const float var = 0.5f;
-  const float e = 0.2f + fast_expf(-v * v / (var * var));
+  const float e = 0.2f + dt_fast_expf(-v * v / (var * var));
 
   value.w *= e;
 

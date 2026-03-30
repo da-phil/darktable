@@ -24,7 +24,7 @@
 
 typedef struct position_description_t
 {
-  const char *view;
+  dt_view_type_flags_t view;
   uint32_t container;
   int position;
 } position_description_t;
@@ -35,7 +35,7 @@ typedef struct
   lua_widget widget;
   gboolean expandable;
   GList *position_descriptions;
-  const char **views;
+  dt_view_type_flags_t views;
 } lua_lib_data_t;
 
 static int expandable_wrapper(struct dt_lib_module_t *self)
@@ -74,14 +74,13 @@ static void gui_cleanup_wrapper(struct dt_lib_module_t *self)
 {
   lua_lib_data_t *gui_data =self->data;
   free(gui_data->name);
-  free(gui_data->views);
   g_list_free(gui_data->position_descriptions);
   free(self->data);
   self->widget = NULL;
 }
 
 
-static const char **view_wrapper(struct dt_lib_module_t *self)
+static dt_view_type_flags_t view_wrapper(struct dt_lib_module_t *self)
 {
   lua_lib_data_t *gui_data = self->data;
   return (gui_data->views);
@@ -92,7 +91,7 @@ static position_description_t *get_position_description(lua_lib_data_t *gui_data
   for(GList *iter = gui_data->position_descriptions; iter; iter = g_list_next(iter))
   {
     position_description_t *position_description = (position_description_t *)iter->data;
-    if(!strcmp(position_description->view, cur_view->module_name)) return position_description;
+    if(position_description->view == cur_view->view(cur_view)) return position_description;
   }
   return NULL;
 }
@@ -112,13 +111,8 @@ int position_wrapper(const struct dt_lib_module_t *self)
   const dt_view_t *cur_view = dt_view_manager_get_current_view(darktable.view_manager);
   lua_lib_data_t *gui_data = self->data;
   position_description_t *position_description = get_position_description(gui_data, cur_view);
-  if(position_description) return position_description->position;
-  printf("ERROR in lualib, couldn't find a position for `%s', this should never happen\n", gui_data->name);
-  /*
-     No position found. This can happen if we are called while current view is not one
-     of our views. just return 0
-     */
-  return 0;
+  // If current view is not one of our views, just return 0
+  return position_description ? position_description->position : 0;
 }
 
 static int async_lib_call(lua_State * L)
@@ -183,14 +177,11 @@ static dt_lib_module_t ref_lib = {
   .button_released = NULL,
   .button_pressed = NULL,
   .scrolled = NULL,
-  .configure = NULL,
   .position = position_wrapper,
   .legacy_params = NULL,
   .get_params = NULL,
   .set_params = NULL,
   .init_presets = NULL,
-  .init_key_accels = NULL,
-  .connect_key_accels = NULL,
   .reset_button = NULL,
   .presets_button = NULL,
   .view_enter = view_enter_wrapper,
@@ -237,7 +228,7 @@ static int register_lib(lua_State *L)
     position_description_t *position_description = malloc(sizeof(position_description_t));
     data->position_descriptions = g_list_append(data->position_descriptions, position_description);
 
-    position_description->view = tmp_view->module_name;
+    position_description->view = tmp_view->view(tmp_view);
 
     // get the container
     lua_pushinteger(L,1);
@@ -255,12 +246,11 @@ static int register_lib(lua_State *L)
 
     lua_pop(L, 1);
   }
-  data->views = calloc(g_list_length(data->position_descriptions) + 1, sizeof(char *));
-  int i = 0;
+  data->views = DT_VIEW_NONE;
   for(GList *iter = data->position_descriptions; iter; iter = g_list_next(iter))
   {
     position_description_t *position_description = (position_description_t *)iter->data;
-    data->views[i++] = position_description->view;
+    data->views |= position_description->view;
   }
 
   lua_widget widget;
@@ -284,14 +274,6 @@ static int register_lib(lua_State *L)
 
   lua_pop(L,2);
 
-
-
-
-
-  if(lib->gui_reset)
-  {
-    dt_accel_register_lib(lib, NC_("accel", "reset lib parameters"), 0, 0);
-  }
   if(lib->init) lib->init(lib);
 
   lib->gui_init(lib);
@@ -299,7 +281,6 @@ static int register_lib(lua_State *L)
 
   darktable.lib->plugins = g_list_insert_sorted(darktable.lib->plugins, lib, dt_lib_sort_plugins);
   dt_lib_init_presets(lib);
-  if(darktable.gui && lib->init_key_accels) lib->init_key_accels(lib);
 
   dt_view_manager_switch_by_view(darktable.view_manager, dt_view_manager_get_current_view(darktable.view_manager));
   return 0;
@@ -319,6 +300,9 @@ int dt_lua_init_lualib(lua_State *L)
   return 0;
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

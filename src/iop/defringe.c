@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2013-2021 darktable developers.
+    Copyright (C) 2013-2024 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,9 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/gaussian.h"
@@ -26,6 +24,7 @@
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
+#include "develop/tiling.h"
 #include "gui/gtk.h"
 #include "gui/accelerators.h"
 #include "iop/iop_api.h"
@@ -75,7 +74,7 @@ const char *aliases()
   return _("chromatic aberrations");
 }
 
-const char *description(struct dt_iop_module_t *self)
+const char **description(dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("attenuate chromatic aberration by desaturating edges"),
                                       _("corrective"),
@@ -100,22 +99,25 @@ const char *deprecated_msg()
   return _("this module is deprecated. please use the chromatic aberration module instead.");
 }
 
-int default_colorspace(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
+dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
+                                            dt_dev_pixelpipe_t *pipe,
+                                            dt_dev_pixelpipe_iop_t *piece)
 {
-  return iop_cs_Lab;
+  return IOP_CS_LAB;
 }
 
-// Verify before actually using this
-/*
-void tiling_callback  (dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, const dt_iop_roi_t *roi_in,
-const dt_iop_roi_t *roi_out, dt_develop_tiling_t *tiling)
+void tiling_callback(dt_iop_module_t *self,
+                     dt_dev_pixelpipe_iop_t *piece,
+                     const dt_iop_roi_t *roi_in,
+                     const dt_iop_roi_t *roi_out,
+                     dt_develop_tiling_t *tiling)
 {
-  dt_iop_defringe_data_t *p = (dt_iop_defringe_data_t *)piece->data;
+  dt_iop_defringe_data_t *p = piece->data;
 
   const int width = roi_in->width;
   const int height = roi_in->height;
   const int channels = piece->colors;
-  const size_t basebuffer = width*height*channels*sizeof(float);
+  const size_t basebuffer = width * height * channels * sizeof(float);
 
   tiling->factor = 2.0f + (float)dt_gaussian_memory_use(width, height, channels)/basebuffer;
 #ifdef HAVE_OPENCL
@@ -123,25 +125,22 @@ const dt_iop_roi_t *roi_out, dt_develop_tiling_t *tiling)
 #endif
   tiling->maxbuf = fmax(1.0f, (float)dt_gaussian_singlebuffer_size(width, height, channels)/basebuffer);
   tiling->overhead = 0;
-  tiling->overlap = p->window;
-  tiling->xalign = 1;
-  tiling->yalign = 1;
-  return;
+  tiling->overlap = 2 * p->radius;
+  tiling->align = 1;
 }
-*/
 
 // fibonacci lattice to select surrounding pixels for different cases
 static const float fib[] = { 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233 };
 // 0,1,2,3,4,5,6, 7, 8, 9,10,11, 12, 13
 
-static inline void fib_latt(int *const x, int *const y, float radius, int step, int idx)
+static inline void _fib_latt(int *const x, int *const y, float radius, int step, int idx)
 {
   // idx < 1 because division by zero is also a problem in the following line
   if(idx >= sizeof(fib) / sizeof(float) - 1 || idx < 1)
   {
     *x = 0;
     *y = 0;
-    fprintf(stderr, "Fibonacci lattice index wrong/out of bounds in: defringe module\n");
+    dt_print(DT_DEBUG_ALWAYS, "Fibonacci lattice index wrong/out of bounds in defringe module");
     return;
   }
   float px = step / fib[idx], py = step * (fib[idx + 1] / fib[idx]);
@@ -165,11 +164,15 @@ static inline void fib_latt(int *const x, int *const y, float radius, int step, 
 // most are chosen arbitrarily and/or by experiment/trial+error ... I am sorry ;-)
 // and having everything user-defineable would be just too much
 // -----------------------------------------------------------------------------------------
-void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, const void *const i,
-             void *const o, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+void process(dt_iop_module_t *self,
+             dt_dev_pixelpipe_iop_t *piece,
+             const void *const i,
+             void *const o,
+             const dt_iop_roi_t *const roi_in,
+             const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_defringe_data_t *const d = (dt_iop_defringe_data_t *)piece->data;
-  if (!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, module, piece->colors,
+  const dt_iop_defringe_data_t *const d = piece->data;
+  if(!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, self, piece->colors,
                                          i, o, roi_in, roi_out))
     return; // image has been copied through to output and module's trouble flag has been updated
 
@@ -186,7 +189,7 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
 
   if(roi_out->width < 2 * radius + 1 || roi_out->height < 2 * radius + 1) goto ERROR_EXIT;
 
-  float avg_edge_chroma = 0.0;
+  float avg_edge_chroma = 0.0f;
 
   const float *const restrict in = (float *const)i;
   float *const restrict out = (float *const)o;
@@ -197,7 +200,7 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
   gauss = dt_gaussian_init(width, height, 4, Labmax, Labmin, sigma, order);
   if(!gauss)
   {
-    fprintf(stderr, "Error allocating memory for gaussian blur in: defringe module\n");
+    dt_print(DT_DEBUG_ALWAYS, "Error allocating memory for gaussian blur in defringe module");
     goto ERROR_EXIT;
   }
   dt_gaussian_blur_4c(gauss, in, out);
@@ -244,7 +247,7 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
   xy_small = malloc(sizeof(int) * 2 * samples_small);
   if(!xy_avg || !xy_small)
   {
-    fprintf(stderr, "Error allocating memory for fibonacci lattice in: defringe module\n");
+    dt_print(DT_DEBUG_ALWAYS, "Error allocating memory for fibonacci lattice in defringe module");
     goto ERROR_EXIT;
   }
 
@@ -252,26 +255,20 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
   for(int u = 0; u < samples_avg; u++)
   {
     int dx, dy;
-    fib_latt(&dx, &dy, avg_radius, u, sampleidx_avg);
+    _fib_latt(&dx, &dy, avg_radius, u, sampleidx_avg);
     xy_avg[2*u] = dx;
     xy_avg[2*u+1] = dy;
   }
   for(int u = 0; u < samples_small; u++)
   {
     int dx, dy;
-    fib_latt(&dx, &dy, small_radius, u, sampleidx_small);
+    _fib_latt(&dx, &dy, small_radius, u, sampleidx_small);
     xy_small[2*u] = dx;
     xy_small[2*u+1] = dy;
   }
 
   const float use_global_average = MODE_GLOBAL_AVERAGE == d->op_mode;
-#ifdef _OPENMP
-#pragma omp parallel for simd default(none) \
-  dt_omp_firstprivate(in, out, use_global_average) \
-  dt_omp_sharedconst(width, height) \
-  reduction(+ : avg_edge_chroma) \
-  schedule(simd:static)
-#endif
+  DT_OMP_FOR_SIMD(reduction(+ : avg_edge_chroma))
   for(size_t j = 0; j < (size_t)height * width * 4; j += 4)
   {
     // edge-detect on color channels
@@ -299,16 +296,9 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
     thresh = fmax(0.1f, d->thresh);
   }
 
-#ifdef _OPENMP
-// dynamically/guided scheduled due to possible uneven edge-chroma distribution (thanks to rawtherapee code
-// for this hint!)
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(ch, in, out, samples_avg, samples_small) \
-  dt_omp_sharedconst(d, width, height) \
-  shared(xy_small, xy_avg) \
-  firstprivate(thresh, avg_edge_chroma) \
-  schedule(dynamic,3)
-#endif
+  // dynamically/guided scheduled due to possible uneven edge-chroma
+  // distribution (thanks to rawtherapee code for this hint!)
+  DT_OMP_PRAGMA(parallel for default(firstprivate) schedule(dynamic,3))
   for(int v = 0; v < height; v++)
   {
     const size_t row_above = (size_t)MAX(0, (v-1)) * width * ch;
@@ -383,9 +373,7 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
       }
       else
       {
-        #ifdef _OPENMP
-        #pragma omp simd aligned(in, out)
-        #endif
+        DT_OMP_SIMD(aligned(in, out))
         // we can't copy the alpha channel here because it contains info needed by neighboring pixels!
         for(int c = 0; c < 3; c++)
         {
@@ -394,9 +382,6 @@ void process(struct dt_iop_module_t *module, dt_dev_pixelpipe_iop_t *piece, cons
       }
     }
   }
-
-  if(piece->pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
-    dt_iop_alpha_copy(i, o, roi_out->width, roi_out->height);
 
   goto FINISH_PROCESS;
 
@@ -427,15 +412,18 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->thresh_scale, _("threshold for defringe, higher values mean less defringing"));
 }
 
-void gui_update(dt_iop_module_t *module)
+void gui_update(dt_iop_module_t *self)
 {
-  dt_iop_defringe_gui_data_t *g = (dt_iop_defringe_gui_data_t *)module->gui_data;
-  dt_iop_defringe_params_t *p = (dt_iop_defringe_params_t *)module->params;
+  dt_iop_defringe_gui_data_t *g = self->gui_data;
+  dt_iop_defringe_params_t *p = self->params;
   dt_bauhaus_combobox_set(g->mode_select, p->op_mode);
   dt_bauhaus_slider_set(g->radius_scale, p->radius);
   dt_bauhaus_slider_set(g->thresh_scale, p->thresh);
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

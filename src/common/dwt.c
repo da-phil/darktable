@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2017-2020 darktable developers.
+    Copyright (C) 2017-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -21,9 +21,6 @@
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "dwt.h"
-#if defined(__SSE__)
-#include <xmmintrin.h>
-#endif
 
 /* Based on the original source code of GIMP's Wavelet Decompose plugin, by Marco Rossini
  *
@@ -33,9 +30,9 @@
 
 dwt_params_t *dt_dwt_init(float *image, const int width, const int height, const int ch, const int scales,
                           const int return_layer, const int merge_from_scale, void *user_data,
-                          const float preview_scale, const int use_sse)
+                          const float preview_scale)
 {
-  dwt_params_t *p = (dwt_params_t *)malloc(sizeof(dwt_params_t));
+  dwt_params_t *p = malloc(sizeof(dwt_params_t));
   if(!p) return NULL;
 
   p->image = image;
@@ -47,7 +44,6 @@ dwt_params_t *dt_dwt_init(float *image, const int width, const int height, const
   p->merge_from_scale = merge_from_scale;
   p->user_data = user_data;
   p->preview_scale = preview_scale;
-  p->use_sse = use_sse;
 
   return p;
 }
@@ -109,7 +105,8 @@ int dt_dwt_first_scale_visible(dwt_params_t *p)
 
 static void dwt_get_image_layer(float *const layer, dwt_params_t *const p)
 {
-  if(p->image != layer) memcpy(p->image, layer, sizeof(float) * p->width * p->height * p->ch);
+  if(p->image != layer)
+    dt_iop_image_copy_by_size(p->image, layer, p->width, p->height, p->ch);
 }
 
 // first, "vertical" pass of wavelet decomposition
@@ -117,12 +114,7 @@ static void dwt_decompose_vert(float *const restrict out, const float *const res
                                const size_t height, const size_t width, const size_t lev)
 {
   const size_t vscale = MIN(1 << lev, height-1);
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, width, vscale) \
-  dt_omp_sharedconst(in, out) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int rowid = 0; rowid < height ; rowid++)
   {
     const size_t row = dwt_interleave_rows(rowid,height,vscale);
@@ -138,7 +130,7 @@ static void dwt_decompose_vert(float *const restrict out, const float *const res
     const float* const restrict above = in + 4 * above_row * width;
     const float* const restrict below = in + 4 * below_row * width;
     float* const restrict temprow = out + rowstart;
-    for (size_t col = 0; col < 4*width; col += 4)
+    for(size_t col = 0; col < 4*width; col += 4)
     {
       for_each_channel(c,aligned(center, above, below, temprow : 16))
       {
@@ -150,16 +142,17 @@ static void dwt_decompose_vert(float *const restrict out, const float *const res
 
 // second, horizontal pass of wavelet decomposition; generates 'coarse' into the output buffer and overwrites
 //   the input buffer with 'details'
-static void dwt_decompose_horiz(float *const restrict out, float *const restrict in, float *const temp,
-                                const size_t height, const size_t width, const size_t lev)
+static void dwt_decompose_horiz(
+    float *const restrict out,
+    float *const restrict in,
+    float *const temp,
+    size_t padded_size,
+    const size_t height,
+    const size_t width,
+    const size_t lev)
 {
   const int hscale = MIN(1 << lev, width);  //(int because we need a signed difference below)
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, width, hscale) \
-  dt_omp_sharedconst(in, out, temp) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int row = 0; row < height ; row++)
   {
     // perform a weighted sum of the current pixel with the ones 'scale' pixels to the left and right, using
@@ -168,11 +161,11 @@ static void dwt_decompose_horiz(float *const restrict out, float *const restrict
     // final sum and split the original input into 'coarse' and 'details' by subtracting the scaled sum from
     // the original input.
     const size_t rowindex = (size_t)4 * (row * width);
-    float* const restrict temprow = temp + width * dt_get_thread_num() * 4;
+    float* const restrict temprow = dt_get_perthread(temp,padded_size);
     float* const restrict details = in + rowindex;
     float* const restrict coarse = out + rowindex;
 
-    for (int col = 0; col < width - hscale; col++)
+    for(int col = 0; col < width - hscale; col++)
     {
       const size_t leftpos = (size_t)4*abs(col-hscale);	// the abs() handles reflection at the left edge
       const size_t rightpos = (size_t)4*(col+hscale);
@@ -188,7 +181,7 @@ static void dwt_decompose_horiz(float *const restrict out, float *const restrict
       }
     }
     // handle reflection at right edge
-    for (int col = width - hscale; col < width; col++)
+    for(int col = width - hscale; col < width; col++)
     {
       const size_t leftpos = (size_t)4 * abs(col-hscale); // still need to handle reflection, if hscale>=width/2
       const size_t rightpos = (size_t)4 * (2*width - 2 - (col+hscale));
@@ -210,64 +203,63 @@ static void dwt_decompose_horiz(float *const restrict out, float *const restrict
 }
 
 // split input into 'coarse' and 'details'; put 'details' back into the input buffer
-static void dwt_decompose_layer(float *const restrict out, float *const restrict in, float *const temp, const int lev,
-                                const dwt_params_t *const p)
+static void dwt_decompose_layer(
+    float *const restrict out,
+    float *const restrict in,
+    float *const temp,
+    size_t padded_size,
+    const int lev,
+    const dwt_params_t *const p)
 {
   dwt_decompose_vert(out, in, p->height, p->width, lev);
-  dwt_decompose_horiz(out, in, temp, p->height, p->width, lev);
+  dwt_decompose_horiz(out, in, temp, padded_size, p->height, p->width, lev);
   return;
 }
 
 /* actual decomposing algorithm */
-static void dwt_wavelet_decompose(float *img, dwt_params_t *const p, _dwt_layer_func layer_func)
+static void dwt_wavelet_decompose(float *img,
+                                  dwt_params_t *const p,
+                                  _dwt_layer_func layer_func)
 {
-  float *temp = NULL;
-  float *layers = NULL;
+  assert(p->ch == 4);
+
+  float *temp = NULL;		// scratch buffer for decomposition
+  float *layers = NULL;		// buffer to reconstruct the image
   float *merged_layers = NULL;
   float *buffer[2] = { 0, 0 };
-  int bcontinue = 1;
-  const size_t size = (size_t)p->width * p->height * p->ch;
-
-  assert(p->ch == 4);
 
   if(layer_func) layer_func(img, p, 0);
 
-  if(p->scales <= 0) goto cleanup;
+  if(p->scales <= 0)
+    return;
 
   /* image buffers */
   buffer[0] = img;
-  /* temporary storage */
-  buffer[1] = dt_alloc_align_float(size);
-  // buffer to reconstruct the image
-  layers = dt_alloc_align_float((size_t)4 * p->width * p->height);
-  // scratch buffer for decomposition
-  temp = dt_alloc_align_float(dt_get_num_threads() * 4 * p->width);
 
-  if(buffer[1] == NULL || layers == NULL || temp == NULL)
+  /* allocate temporary storage */
+  dt_iop_roi_t roi = { .x = 0, .y = 0, .height = p->height, .width = p->width };
+  size_t padded_size;
+  const int do_merge = p->merge_from_scale > 0;
+  if(!dt_iop_alloc_image_buffers(NULL, &roi, &roi,
+                                 4 | DT_IMGSZ_INPUT, &buffer[1],
+                                 4 | DT_IMGSZ_INPUT | DT_IMGSZ_CLEARBUF, &layers,
+                                 4 | DT_IMGSZ_WIDTH | DT_IMGSZ_PERTHREAD, &temp, &padded_size,
+                                 (do_merge ? 4 | DT_IMGSZ_INPUT | DT_IMGSZ_CLEARBUF : 0), &merged_layers,
+                                 0, NULL))
   {
-    printf("not enough memory for wavelet decomposition");
-    goto cleanup;
-  }
-  dt_iop_image_fill(layers,0.0f,p->width,p->height,p->ch);
-
-  if(p->merge_from_scale > 0)
-  {
-    merged_layers = dt_alloc_align_float((size_t)p->width * p->height * p->ch);
-    if(merged_layers == NULL)
-    {
-      printf("not enough memory for wavelet decomposition");
-      goto cleanup;
-    }
-    dt_iop_image_fill(merged_layers,0.0f,p->width,p->height,p->ch);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[dwt] unable to alloc working memory, skipping wavelet decomposition");
+    return;
   }
 
   // iterate over wavelet scales
   unsigned int hpass = 0;
+  int bcontinue = 1;
   for(unsigned int lev = 0; lev < p->scales && bcontinue; lev++)
   {
     unsigned int lpass = (1 - (lev & 1));
 
-    dwt_decompose_layer(buffer[lpass], buffer[hpass], temp, lev, p);
+    dwt_decompose_layer(buffer[lpass], buffer[hpass], temp, padded_size, lev, p);
 
     // no merge scales or we didn't reach the merge scale from yet
     if(p->merge_from_scale == 0 || p->merge_from_scale > lev + 1)
@@ -345,11 +337,11 @@ static void dwt_wavelet_decompose(float *img, dwt_params_t *const p, _dwt_layer_
     }
   }
 
-cleanup:
-  if(temp) dt_free_align(temp);
-  if(layers) dt_free_align(layers);
-  if(merged_layers) dt_free_align(merged_layers);
-  if(buffer[1]) dt_free_align(buffer[1]);
+  dt_free_align(temp);
+  dt_free_align(layers);
+  dt_free_align(buffer[1]);
+  if(merged_layers)
+    dt_free_align(merged_layers);
 }
 
 /* this function prepares for decomposing, which is done in the function dwt_wavelet_decompose() */
@@ -383,16 +375,15 @@ void dwt_decompose(dwt_params_t *p, _dwt_layer_func layer_func)
 }
 
 // first, "vertical" pass of wavelet decomposition
-static void dwt_denoise_vert_1ch(float *const restrict out, const float *const restrict in,
-                                 const size_t height, const size_t width, const size_t lev)
+static void dwt_denoise_vert_1ch(
+    float *const restrict out,
+    const float *const restrict in,
+    const size_t height,
+    const size_t width,
+    const size_t lev)
 {
   const int vscale = MIN(1 << lev, height);
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, width, vscale) \
-  dt_omp_sharedconst(in, out) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int rowid = 0; rowid < height ; rowid++)
   {
     const int row = dwt_interleave_rows(rowid,height,vscale);
@@ -407,10 +398,8 @@ static void dwt_denoise_vert_1ch(float *const restrict out, const float *const r
     const float *const restrict above =  in + abs(row - vscale) * width;
     const float *const restrict below = in + below_row * width;
     float* const restrict outrow = out + rowstart;
-#ifdef _OPENMP
-#pragma omp simd
-#endif
-    for (int col= 0; col < width; col++)
+    DT_OMP_SIMD()
+    for(int col= 0; col < width; col++)
     {
       outrow[col] = 2.f * center[col] + above[col] + below[col];
     }
@@ -419,17 +408,18 @@ static void dwt_denoise_vert_1ch(float *const restrict out, const float *const r
 
 // second, horizontal pass of wavelet decomposition; generates 'coarse' into the output buffer and overwrites
 //   the input buffer with 'details'
-static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restrict in,
-                                  float *const restrict accum, const size_t height, const size_t width,
-                                  const size_t lev, const float thold, const int last)
+static void dwt_denoise_horiz_1ch(
+    float *const restrict out,
+    float *const restrict in,
+    float *const restrict accum,
+    const size_t height,
+    const size_t width,
+    const size_t lev,
+    const float thold,
+    const int last)
 {
   const int hscale = MIN(1 << lev, width);
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, width, hscale, thold, last) \
-  dt_omp_sharedconst(in, out, accum) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int row = 0; row < height ; row++)
   {
     // perform a weighted sum of the current pixel with the ones 'scale' pixels to the left and right, using
@@ -442,10 +432,8 @@ static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restri
     float *const restrict coarse = out + rowindex;
     float *const restrict accum_row = accum + rowindex;
     // handle reflection at left edge
-#ifdef _OPENMP
-#pragma omp simd
-#endif
-    for (int col = 0; col < hscale; col++)
+    DT_OMP_SIMD()
+    for(int col = 0; col < hscale; col++)
     {
       // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
       const float hat = (2.f * coarse[col] + coarse[hscale-col] + coarse[col+hscale]) / 16.f;
@@ -458,10 +446,8 @@ static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restri
       //const float excess = diff < 0.0 ? MIN(diff + thold, 0.0f) : MAX(diff - thold, 0.0f);
       accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
     }
-#ifdef _OPENMP
-#pragma omp simd
-#endif
-    for (int col = hscale; col < width - hscale; col++)
+    DT_OMP_SIMD()
+    for(int col = hscale; col < width - hscale; col++)
     {
       // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
       const float hat = (2.f * coarse[col] + coarse[col-hscale] + coarse[col+hscale]) / 16.f;
@@ -475,10 +461,8 @@ static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restri
       accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
     }
     // handle reflection at right edge
-#ifdef _OPENMP
-#pragma omp simd
-#endif
-    for (int col = width - hscale; col < width; col++)
+    DT_OMP_SIMD()
+    for(int col = width - hscale; col < width; col++)
     {
       const float right = coarse[2*width - 2 - (col+hscale)];
       // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
@@ -489,10 +473,10 @@ static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restri
       details[col] = hat;		// done with original input, so we can overwrite it with 'coarse'
       accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
     }
-    if (last)
+    if(last)
     {
       // add the details to the residue to create the final denoised result
-      for (int col = 0; col < width; col++)
+      for(int col = 0; col < width; col++)
       {
         details[col] += accum_row[col];
       }
@@ -504,9 +488,18 @@ static void dwt_denoise_horiz_1ch(float *const restrict out, float *const restri
  * recomposing the result from just the portion of each scale which exceeds the magnitude of the given
  * threshold for that scale.
  */
-void dwt_denoise(float *const img, const int width, const int height, const int bands, const float *const noise)
+void dwt_denoise(float *const img,
+                 const int width,
+                 const int height,
+                 const int bands,
+                 const float *const noise)
 {
   float *const details = dt_alloc_align_float((size_t)2 * width * height);
+  if(!details)
+  {
+    dt_print(DT_DEBUG_ALWAYS,"[dwt_denoise] unable to alloc working memory, skipping denoise");
+    return;
+  }
   float *const interm = details + width * height;	// temporary storage for use during each pass
 
   // zero the accumulator
@@ -516,11 +509,14 @@ void dwt_denoise(float *const img, const int width, const int height, const int 
   {
     const int last = (lev+1) == bands;
 
-    // "vertical" pass, averages pixels with those 'scale' rows above and below and puts result in 'interm'
+    // "vertical" pass, averages pixels with those 'scale' rows above
+    // and below and puts result in 'interm'
     dwt_denoise_vert_1ch(interm, img, height, width, lev);
-    // horizontal filtering pass, averages pixels in 'interm' with those 'scale' rows to the left and right
-    // accumulates the portion of the detail scale that is above the noise threshold into 'details'; this
-    // will be added to the residue left in 'img' on the last iteration
+    // horizontal filtering pass, averages pixels in 'interm' with
+    // those 'scale' rows to the left and right
+    // accumulates the portion of the detail scale that is above the
+    // noise threshold into 'details'; this will be added to the
+    // residue left in 'img' on the last iteration
     dwt_denoise_horiz_1ch(interm, img, details, height, width, lev, noise[lev], last);
   }
   dt_free_align(details);
@@ -529,7 +525,7 @@ void dwt_denoise(float *const img, const int width, const int height, const int 
 #ifdef HAVE_OPENCL
 dt_dwt_cl_global_t *dt_dwt_init_cl_global()
 {
-  dt_dwt_cl_global_t *g = (dt_dwt_cl_global_t *)malloc(sizeof(dt_dwt_cl_global_t));
+  dt_dwt_cl_global_t *g = malloc(sizeof(dt_dwt_cl_global_t));
 
   const int program = 20; // dwt.cl, from programs.conf
   g->kernel_dwt_add_img_to_layer = dt_opencl_create_kernel(program, "dwt_add_img_to_layer");
@@ -558,7 +554,7 @@ dwt_params_cl_t *dt_dwt_init_cl(const int devid, cl_mem image, const int width, 
                                 const int return_layer, const int merge_from_scale, void *user_data,
                                 const float preview_scale)
 {
-  dwt_params_cl_t *p = (dwt_params_cl_t *)malloc(sizeof(dwt_params_cl_t));
+  dwt_params_cl_t *p = malloc(sizeof(dwt_params_cl_t));
   if(!p) return NULL;
 
   p->global = darktable.opencl->dwt;
@@ -598,46 +594,21 @@ int dt_dwt_first_scale_visible_cl(dwt_params_cl_t *p)
 
 static cl_int dwt_subtract_layer_cl(cl_mem bl, cl_mem bh, dwt_params_cl_t *const p)
 {
-  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-
   const int devid = p->devid;
   const int kernel = p->global->kernel_dwt_subtract_layer;
 
-  size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-
   const float lpass_mult = (1.f / 16.f);
-  const int width = p->width;
-  const int height = p->height;
-
-  dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&bl);
-  dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(cl_mem), (void *)&bh);
-  dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(width));
-  dt_opencl_set_kernel_arg(devid, kernel, 3, sizeof(int), (void *)&(height));
-  dt_opencl_set_kernel_arg(devid, kernel, 4, sizeof(float), (void *)&lpass_mult);
-  err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
-
-  return err;
+  return dt_opencl_enqueue_kernel_2d_args(devid, kernel, p->width, p->height,
+    CLARG(bl), CLARG(bh), CLARG(p->width), CLARG(p->height), CLARG(lpass_mult));
 }
 
 static cl_int dwt_add_layer_cl(cl_mem img, cl_mem layers, dwt_params_cl_t *const p, const int n_scale)
 {
-  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-
   const int devid = p->devid;
   const int kernel = p->global->kernel_dwt_add_img_to_layer;
 
-  size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-
-  const int width = p->width;
-  const int height = p->height;
-
-  dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&img);
-  dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(cl_mem), (void *)&layers);
-  dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(width));
-  dt_opencl_set_kernel_arg(devid, kernel, 3, sizeof(int), (void *)&(height));
-  err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
-
-  return err;
+  return dt_opencl_enqueue_kernel_2d_args(devid, kernel, p->width, p->height,
+    CLARG(img), CLARG(layers), CLARG(p->width), CLARG(p->height));
 }
 
 static cl_int dwt_get_image_layer_cl(cl_mem layer, dwt_params_cl_t *const p)
@@ -672,63 +643,31 @@ static cl_int dwt_wavelet_decompose_cl(cl_mem img, dwt_params_cl_t *const p, _dw
 
   if(p->scales <= 0) goto cleanup;
 
+  err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
   /* image buffers */
   buffer[0] = img;
   /* temporary storage */
   buffer[1] = dt_opencl_alloc_device_buffer(devid, sizeof(float) * p->ch * p->width * p->height);
-  if(buffer[1] == NULL)
-  {
-    printf("not enough memory for wavelet decomposition");
-    err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-    goto cleanup;
-  }
+  if(buffer[1] == NULL) goto cleanup;
 
   // buffer to reconstruct the image
   layers = dt_opencl_alloc_device_buffer(devid, sizeof(float) * p->ch * p->width * p->height);
-  if(layers == NULL)
-  {
-    printf("not enough memory for wavelet decomposition");
-    err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-    goto cleanup;
-  }
+  if(layers == NULL) goto cleanup;
+
   // init layer buffer
-  {
-    const int kernel = p->global->kernel_dwt_init_buffer;
-
-    size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-    const int width = p->width;
-    const int height = p->height;
-
-    dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&layers);
-    dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(int), (void *)&(width));
-    dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(height));
-    err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
-    if(err != CL_SUCCESS) goto cleanup;
-  }
+  err = dt_opencl_enqueue_kernel_2d_args(devid, p->global->kernel_dwt_init_buffer, p->width, p->height,
+      CLARG(layers), CLARG(p->width), CLARG(p->height));
+  if(err != CL_SUCCESS) goto cleanup;
 
   if(p->merge_from_scale > 0)
   {
     merged_layers = dt_opencl_alloc_device_buffer(devid, sizeof(float) * p->ch * p->width * p->height);
-    if(merged_layers == NULL)
-    {
-      printf("not enough memory for wavelet decomposition");
-      err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-      goto cleanup;
-    }
+    if(merged_layers == NULL) goto cleanup;
+
     // init reconstruct buffer
-    {
-      const int kernel = p->global->kernel_dwt_init_buffer;
-
-      size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-      const int width = p->width;
-      const int height = p->height;
-
-      dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&merged_layers);
-      dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(int), (void *)&(width));
-      dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(height));
-      err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
-      if(err != CL_SUCCESS) goto cleanup;
-    }
+    err = dt_opencl_enqueue_kernel_2d_args(devid, p->global->kernel_dwt_init_buffer, p->width, p->height,
+        CLARG(merged_layers), CLARG(p->width), CLARG(p->height));
+    if(err != CL_SUCCESS) goto cleanup;
   }
 
   // iterate over wavelet scales
@@ -741,58 +680,33 @@ static cl_int dwt_wavelet_decompose_cl(cl_mem img, dwt_params_cl_t *const p, _dw
     // when (*layer_func) uses too much memory I get a -4 error, so alloc and free for each scale
     // setup a temp buffer
     temp = dt_opencl_alloc_device_buffer(devid, sizeof(float) * p->ch * p->width * p->height);
-    if(temp == NULL)
-    {
-      printf("not enough memory for wavelet decomposition");
-      err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-      goto cleanup;
-    }
+    if(temp == NULL) goto cleanup;
 
     // hat transform by row
     {
-      const int kernel = p->global->kernel_dwt_hat_transform_row;
-
       int sc = 1 << lev;
       sc = (int)(sc * p->preview_scale);
       if(sc > p->width) sc = p->width;
 
-      size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-
-      dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&temp);
-      dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(cl_mem), (void *)&(buffer[hpass]));
-      dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(p->width));
-      dt_opencl_set_kernel_arg(devid, kernel, 3, sizeof(int), (void *)&(p->height));
-      dt_opencl_set_kernel_arg(devid, kernel, 4, sizeof(int), (void *)&sc);
-      err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
+      err = dt_opencl_enqueue_kernel_2d_args(devid, p->global->kernel_dwt_hat_transform_row, p->width, p->height,
+        CLARG(temp), CLARG((buffer[hpass])), CLARG(p->width), CLARG(p->height), CLARG(sc));
       if(err != CL_SUCCESS) goto cleanup;
     }
 
     // hat transform by col
     {
-      const int kernel = p->global->kernel_dwt_hat_transform_col;
-
       int sc = 1 << lev;
       sc = (int)(sc * p->preview_scale);
       if(sc > p->height) sc = p->height;
       const float lpass_mult = (1.f / 16.f);
 
-      size_t sizes[] = { ROUNDUPWD(p->width), ROUNDUPHT(p->height), 1 };
-
-      dt_opencl_set_kernel_arg(devid, kernel, 0, sizeof(cl_mem), (void *)&temp);
-      dt_opencl_set_kernel_arg(devid, kernel, 1, sizeof(int), (void *)&(p->width));
-      dt_opencl_set_kernel_arg(devid, kernel, 2, sizeof(int), (void *)&(p->height));
-      dt_opencl_set_kernel_arg(devid, kernel, 3, sizeof(int), (void *)&sc);
-      dt_opencl_set_kernel_arg(devid, kernel, 4, sizeof(cl_mem), (void *)&(buffer[lpass]));
-      dt_opencl_set_kernel_arg(devid, kernel, 5, sizeof(float), (void *)&lpass_mult);
-      err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
+      err = dt_opencl_enqueue_kernel_2d_args(devid, p->global->kernel_dwt_hat_transform_col, p->width, p->height,
+        CLARG(temp), CLARG(p->width), CLARG(p->height), CLARG(sc), CLARG((buffer[lpass])), CLARG(lpass_mult));
       if(err != CL_SUCCESS) goto cleanup;
     }
 
-    if(temp)
-    {
-      dt_opencl_release_mem_object(temp);
-      temp = NULL;
-    }
+    dt_opencl_release_mem_object(temp);
+    temp = NULL;
 
     err = dwt_subtract_layer_cl(buffer[lpass], buffer[hpass], p);
     if(err != CL_SUCCESS) goto cleanup;
@@ -898,18 +812,16 @@ static cl_int dwt_wavelet_decompose_cl(cl_mem img, dwt_params_cl_t *const p, _dw
   }
 
 cleanup:
-  if(layers) dt_opencl_release_mem_object(layers);
-  if(merged_layers) dt_opencl_release_mem_object(merged_layers);
-  if(temp) dt_opencl_release_mem_object(temp);
-  if(buffer[1]) dt_opencl_release_mem_object(buffer[1]);
+  dt_opencl_release_mem_object(layers);
+  dt_opencl_release_mem_object(merged_layers);
+  dt_opencl_release_mem_object(temp);
+  dt_opencl_release_mem_object(buffer[1]);
 
   return err;
 }
 
 cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func)
 {
-  cl_int err = CL_SUCCESS;
-
   // this is a zoom scale, not a wavelet scale
   if(p->preview_scale <= 0.f) p->preview_scale = 1.f;
 
@@ -934,9 +846,12 @@ cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func)
   }
 
   // call the actual decompose
-  err = dwt_wavelet_decompose_cl(p->image, p, layer_func);
-
-  return err;
+  return dwt_wavelet_decompose_cl(p->image, p, layer_func);
 }
 
 #endif
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// vim: shiftwidth=2 expandtab tabstop=2 cindent
+// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

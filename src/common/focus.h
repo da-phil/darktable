@@ -1,6 +1,7 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2013-2020 darktable developers.
+    Copyright (C) 2013-2024 darktable developers.
+
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
@@ -45,12 +46,7 @@ static inline void _dt_focus_cdf22_wtf(uint8_t *buf, const int l, const int widt
   const int step = 1 << l;
   const int st = step / 2;
 
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, st, step, width, ch) \
-  shared(buf) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int j = 0; j < height; j++)
   {
     // rows
@@ -68,12 +64,7 @@ static inline void _dt_focus_cdf22_wtf(uint8_t *buf, const int l, const int widt
     if(i < width) /*for(ch=0; ch<3; ch++)*/
       gbuf(buf, i, j) += _from_uint8(gbuf(buf, i - st, j)) / 2;
   }
-#ifdef _OPENMP
-#pragma omp parallel for default(none) \
-  dt_omp_firstprivate(height, st, step, width, ch) \
-  shared(buf) \
-  schedule(static)
-#endif
+  DT_OMP_FOR()
   for(int i = 0; i < width; i++)
   {
     // cols
@@ -102,29 +93,17 @@ static void _dt_focus_update(dt_focus_cluster_t *f, int frows, int fcols, int i,
     int fx = i / (float)wd * fcols;
     int fy = j / (float)ht * frows;
     int fi = fcols * fy + fx;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].x += i;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].y += j;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].x2 += (float)i * i;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].y2 += (float)j * j;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].n++;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
+    DT_OMP_PRAGMA(atomic)
     f[fi].thrs += diff;
   }
 }
@@ -144,9 +123,7 @@ static void dt_focus_create_clusters(dt_focus_cluster_t *focus, int frows, int f
   _dt_focus_cdf22_wtf(buffer, 2, wd, ht);
   // go through HH1 and detect sharp clusters:
   memset(focus, 0, sizeof(dt_focus_cluster_t) * fcols * frows);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) default(shared)
-#endif
+  DT_OMP_FOR()
   for(int j = 0; j < ht - 1; j += 4)
     for(int i = 0; i < wd - 1; i += 4)
     {
@@ -164,9 +141,7 @@ static void dt_focus_create_clusters(dt_focus_cluster_t *focus, int frows, int f
   {
     memset(focus, 0, sizeof(dt_focus_cluster_t) * fs);
     _dt_focus_cdf22_wtf(buffer, 3, wd, ht);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) default(shared)
-#endif
+    DT_OMP_FOR()
     for(int j = 0; j < ht - 1; j += 8)
     {
       for(int i = 0; i < wd - 1; i += 8)
@@ -192,9 +167,7 @@ static void dt_focus_create_clusters(dt_focus_cluster_t *focus, int frows, int f
 
 #if 0 // simple high pass filter, doesn't work on slightly unsharp/high iso images
   memset(focus, 0, sizeof(dt_focus_cluster_t)*fs);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) default(shared)
-#endif
+  DT_OMP_FOR()
   for(int j=1;j<ht-1;j++)
   {
     int index = 4*j*wd+4;
@@ -221,24 +194,27 @@ static void dt_focus_create_clusters(dt_focus_cluster_t *focus, int frows, int f
   }
 }
 
-static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, int imgid, int buffer_width,
+static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, dt_imgid_t imgid, int buffer_width,
                                    int buffer_height, dt_focus_cluster_t *focus, int frows, int fcols,
                                    float full_zoom, float full_x, float full_y)
 {
   const int fs = frows * fcols;
+  // array with cluster positions
+  float *pos = malloc(fs * 6 * sizeof(float));
+  if(!pos)
+    return;
+
   cairo_save(cr);
   cairo_translate(cr, width / 2.0, height / 2.0f);
 
-  const dt_image_t *img = dt_image_cache_get(darktable.image_cache, imgid, 'r');
+  const dt_image_t *img = dt_image_cache_get(imgid, 'r');
   dt_image_t image = *img;
-  dt_image_cache_read_release(darktable.image_cache, img);
+  dt_image_cache_read_release(img);
 
   // FIXME: get those from rawprepare IOP somehow !!!
   int wd = buffer_width + image.crop_x;
   int ht = buffer_height + image.crop_y;
 
-  // array with cluster positions
-  float *pos = malloc(fs * 6 * sizeof(float));
   float *offx = pos + fs * 2, *offy = pos + fs * 4;
 
   for(int k = 0; k < fs; k++)
@@ -261,10 +237,10 @@ static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, int imgid
   // could use dt_image_altered() here, but it ignores flip module
   {
     dt_develop_t dev;
-    dt_dev_init(&dev, 0);
+    dt_dev_init(&dev, FALSE);
     dt_dev_load_image(&dev, imgid);
     dt_dev_pixelpipe_t pipe;
-    const int res = dt_dev_pixelpipe_init_dummy(&pipe, wd, ht);
+    const gboolean res = dt_dev_pixelpipe_init_dummy(&pipe, wd, ht);
     if(res)
     {
       // set mem pointer to 0, won't be used.
@@ -281,9 +257,8 @@ static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, int imgid
     dt_dev_cleanup(&dev);
   }
 
-  const int32_t tb = darktable.develop->border_size;
-  const float prev_scale = darktable.develop->preview_downsampling;
-  const float scale = fminf((width - 2 * tb) / (float)wd, (height - 2 * tb) / (float)ht) * full_zoom / prev_scale;
+  const int32_t tb = darktable.develop->full.border_size;
+  const float scale = fminf((width - 2 * tb) / (float)wd, (height - 2 * tb) / (float)ht) * full_zoom;
   cairo_scale(cr, scale, scale);
   float fx = 0.0f;
   float fy = 0.0f;
@@ -298,7 +273,7 @@ static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, int imgid
     if(ht * scale <= height) fy = 0;
   }
 
-  cairo_translate(cr, -wd / 2.0f * prev_scale + fx / scale * darktable.gui->ppd_thb, -ht / 2.0f * prev_scale + fy / scale * darktable.gui->ppd_thb);
+  cairo_translate(cr, -wd / 2.0f + fx / scale * darktable.gui->ppd_thb, -ht / 2.0f + fy / scale * darktable.gui->ppd_thb);
 
   cairo_rectangle(cr, 0, 0, wd, ht);
   cairo_clip(cr);
@@ -370,6 +345,8 @@ static void dt_focus_draw_clusters(cairo_t *cr, int width, int height, int imgid
 #undef gbuf
 #undef FOCUS_THRS
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

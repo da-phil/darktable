@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2021 darktable developers.
+    Copyright (C) 2010-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -18,11 +18,11 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
+#include "common/datetime.h"
 #include "common/exif.h"
 #include "common/image.h"
 #include "common/image_cache.h"
-#include "common/imageio.h"
-#include "common/imageio_module.h"
+#include "common/metadata.h"
 #include "common/utility.h"
 #include "common/variables.h"
 #include "control/conf.h"
@@ -31,7 +31,11 @@
 #include "dtgtk/paint.h"
 #include "gui/gtk.h"
 #include "gui/gtkentry.h"
+#include "gui/accelerators.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_module.h"
 #include "imageio/storage/imageio_storage_api.h"
+#include <glib-2.0/gio/gio.h>
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
@@ -40,13 +44,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-DT_MODULE(3)
+DT_MODULE(4)
 
+extern darktable_t darktable;
+
+// options for conflict handling
 typedef enum dt_disk_onconflict_actions_t
 {
   DT_EXPORT_ONCONFLICT_UNIQUEFILENAME = 0,
   DT_EXPORT_ONCONFLICT_OVERWRITE = 1,
-  DT_EXPORT_ONCONFLICT_SKIP = 2
+  DT_EXPORT_ONCONFLICT_OVERWRITE_IF_CHANGED = 2,
+  DT_EXPORT_ONCONFLICT_SKIP = 3
 } dt_disk_onconflict_actions_t;
 
 // gui data
@@ -64,17 +72,33 @@ typedef struct dt_imageio_disk_t
   dt_variables_params_t *vp;
 } dt_imageio_disk_t;
 
-
 const char *name(const struct dt_imageio_module_storage_t *self)
 {
   return _("file on disk");
 }
 
-void *legacy_params(dt_imageio_module_storage_t *self, const void *const old_params,
-                    const size_t old_params_size, const int old_version, const int new_version,
+void *legacy_params(dt_imageio_module_storage_t *self,
+                    const void *const old_params,
+                    const size_t old_params_size,
+                    const int old_version,
+                    int *new_version,
                     size_t *new_size)
 {
-  if(old_version == 1 && new_version == 3)
+  typedef enum dt_disk_onconflict_actions_v3_t
+  {
+    DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V3 = 0,
+    DT_EXPORT_ONCONFLICT_OVERWRITE_V3 = 1,
+    DT_EXPORT_ONCONFLICT_SKIP_V3 = 2,
+  } dt_disk_onconflict_actions_v3_t;
+
+  typedef struct dt_imageio_disk_v3_t
+  {
+    char filename[DT_MAX_PATH_FOR_PARAMS];
+    dt_disk_onconflict_actions_v3_t onsave_action;
+    dt_variables_params_t *vp;
+  } dt_imageio_disk_v3_t;
+
+  if(old_version == 1)
   {
     typedef struct dt_imageio_disk_v1_t
     {
@@ -83,16 +107,19 @@ void *legacy_params(dt_imageio_module_storage_t *self, const void *const old_par
       gboolean overwrite;
     } dt_imageio_disk_v1_t;
 
-    dt_imageio_disk_t *n = (dt_imageio_disk_t *)malloc(sizeof(dt_imageio_disk_t));
-    dt_imageio_disk_v1_t *o = (dt_imageio_disk_v1_t *)old_params;
+    const dt_imageio_disk_v1_t *o = (dt_imageio_disk_v1_t *)old_params;
+    dt_imageio_disk_v3_t *n = malloc(sizeof(dt_imageio_disk_v3_t));
 
     g_strlcpy(n->filename, o->filename, sizeof(n->filename));
-    n->onsave_action = (o->overwrite) ? DT_EXPORT_ONCONFLICT_OVERWRITE: DT_EXPORT_ONCONFLICT_UNIQUEFILENAME;
+    n->onsave_action = (o->overwrite)
+      ? DT_EXPORT_ONCONFLICT_OVERWRITE_V3
+      : DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V3;
 
-    *new_size = self->params_size(self);
+    *new_version = 3;
+    *new_size = sizeof(dt_imageio_disk_v3_t) - sizeof(void *);
     return n;
   }
-  if(old_version == 2 && new_version == 3)
+  if(old_version == 2)
   {
     typedef struct dt_imageio_disk_v2_t
     {
@@ -101,107 +128,172 @@ void *legacy_params(dt_imageio_module_storage_t *self, const void *const old_par
       dt_variables_params_t *vp;
     } dt_imageio_disk_v2_t;
 
-    dt_imageio_disk_t *n = (dt_imageio_disk_t *)malloc(sizeof(dt_imageio_disk_t));
-    dt_imageio_disk_v2_t *o = (dt_imageio_disk_v2_t *)old_params;
+    const dt_imageio_disk_v2_t *o = (dt_imageio_disk_v2_t *)old_params;
+    dt_imageio_disk_v3_t *n = malloc(sizeof(dt_imageio_disk_v3_t));
 
     g_strlcpy(n->filename, o->filename, sizeof(n->filename));
-    n->onsave_action = (o->overwrite) ? DT_EXPORT_ONCONFLICT_OVERWRITE: DT_EXPORT_ONCONFLICT_UNIQUEFILENAME;
+    n->onsave_action = (o->overwrite)
+      ? DT_EXPORT_ONCONFLICT_OVERWRITE_V3
+      : DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V3;
 
-    *new_size = self->params_size(self);
+    *new_version = 3;
+    *new_size = sizeof(dt_imageio_disk_v3_t) - sizeof(void *);
     return n;
   }
+
+  // incremental converts
+
+  typedef enum dt_disk_onconflict_actions_v4_t
+  {
+    DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V4 = 0,
+    DT_EXPORT_ONCONFLICT_OVERWRITE_V4 = 1,
+    DT_EXPORT_ONCONFLICT_OVERWRITE_IF_CHANGED_V4 = 2,
+    DT_EXPORT_ONCONFLICT_SKIP_V4 = 3
+  } dt_disk_onconflict_actions_v4_t;
+
+  typedef struct dt_imageio_disk_v4_t
+  {
+    char filename[DT_MAX_PATH_FOR_PARAMS];
+    dt_disk_onconflict_actions_v4_t onsave_action;
+    dt_variables_params_t *vp;
+  } dt_imageio_disk_v4_t;
+
+  // from 3 to 4 only
+  if(old_version == 3)
+  {
+    const dt_imageio_disk_v3_t *o = (dt_imageio_disk_v3_t *)old_params;
+    dt_imageio_disk_v4_t *n = malloc(sizeof(dt_imageio_disk_v4_t));
+
+    g_strlcpy(n->filename, o->filename, sizeof(n->filename));
+    switch(o->onsave_action)
+    {
+      case DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V3:
+        n->onsave_action = DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V4;
+        break;
+      case DT_EXPORT_ONCONFLICT_OVERWRITE_V3:
+        n->onsave_action = DT_EXPORT_ONCONFLICT_OVERWRITE_V4;
+        break;
+      case DT_EXPORT_ONCONFLICT_SKIP_V3:
+        n->onsave_action = DT_EXPORT_ONCONFLICT_SKIP_V4;
+        break;
+      default:
+        n->onsave_action = DT_EXPORT_ONCONFLICT_UNIQUEFILENAME_V4;
+    }
+
+    // size of v4 did not change
+    *new_size = sizeof(dt_imageio_disk_v4_t) - sizeof(void *);
+    *new_version = 4;
+
+    return n;
+  }
+
   return NULL;
 }
 
-static void button_clicked(GtkWidget *widget, dt_imageio_module_storage_t *self)
+static void button_clicked(GtkWidget *widget,
+                           dt_imageio_module_storage_t *self)
 {
-  disk_t *d = (disk_t *)self->gui_data;
+  disk_t *d = self->gui_data;
   GtkWidget *win = dt_ui_main_window(darktable.gui->ui);
   GtkFileChooserNative *filechooser = gtk_file_chooser_native_new(
         _("select directory"), GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
         _("_select as output destination"), _("_cancel"));
 
   gchar *old = g_strdup(gtk_entry_get_text(d->entry));
-  char *c = g_strstr_len(old, -1, "$");
-  if(c) *c = '\0';
-  gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), old);
+  gchar *dirname;
+  gchar *filename;
+  if(g_file_test(old, G_FILE_TEST_IS_DIR))
+  {
+    // only a directory was specified, no filename
+    // so we use the default $(FILE.NAME) for filename.
+    dirname = g_strdup(old);
+    filename = g_strdup("$(FILE.NAME)");
+  }
+  else
+  {
+    dirname = g_path_get_dirname(old);
+    filename = g_path_get_basename(old);
+  }
+
+  gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(filechooser), dirname);
   g_free(old);
+  g_free(dirname);
+
   if(gtk_native_dialog_run(GTK_NATIVE_DIALOG(filechooser)) == GTK_RESPONSE_ACCEPT)
   {
     gchar *dir = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(filechooser));
-    char *composed = g_build_filename(dir, "$(FILE_NAME)", NULL);
+    char *composed = g_build_filename(dir, filename, NULL);
 
-    // composed can now contain '\': on Windows it's the path separator,
-    // on other platforms it can be part of a regular folder name.
-    // This would later clash with variable substitution, so we have to escape them
+#ifdef _WIN32
+    // Windows does not support forward slashes in filename,
+    // but they can also be used as path separators.
+    // To keep it consistent with Unix, we can just replace backslashes
+    // with forward slashes.
+    // This also means that we do not have problems with variable substitution.
+    // TODO: Of course it would be better if we supported "natural"
+    // Windows style path names.
+    gchar *escaped = dt_util_str_replace(composed, "\\", "/");
+#else
+    // On Unix, the backslash _can_ be part of a regular folder name.
+    // So it has to be escaped, because it would clash with variable
+    // substitution.
     gchar *escaped = dt_util_str_replace(composed, "\\", "\\\\");
+#endif
 
-    gtk_entry_set_text(GTK_ENTRY(d->entry), escaped); // the signal handler will write this to conf
+    gtk_entry_set_text(GTK_ENTRY(d->entry), escaped);
+    // the signal handler will write this to conf
     gtk_editable_set_position(GTK_EDITABLE(d->entry), strlen(escaped));
     g_free(dir);
     g_free(composed);
     g_free(escaped);
   }
+  g_free(filename);
   g_object_unref(filechooser);
 }
 
-static void entry_changed_callback(GtkEntry *entry, gpointer user_data)
+static void entry_changed_callback(GtkEntry *entry,
+                                   gpointer user_data)
 {
-  dt_conf_set_string("plugins/imageio/storage/disk/file_directory", gtk_entry_get_text(entry));
+  dt_conf_set_string("plugins/imageio/storage/disk/file_directory",
+                     gtk_entry_get_text(entry));
 }
 
-static void onsave_action_toggle_callback(GtkWidget *widget, gpointer user_data)
+static void onsave_action_toggle_callback(GtkWidget *widget,
+                                          gpointer user_data)
 {
-  dt_conf_set_int("plugins/imageio/storage/disk/overwrite", dt_bauhaus_combobox_get(widget));
+  dt_conf_set_int("plugins/imageio/storage/disk/overwrite",
+                  dt_bauhaus_combobox_get(widget));
 }
 
 void gui_init(dt_imageio_module_storage_t *self)
 {
-  disk_t *d = (disk_t *)malloc(sizeof(disk_t));
+  disk_t *d = malloc(sizeof(disk_t));
   self->gui_data = (void *)d;
-  self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  GtkWidget *widget;
 
-  GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(hbox), TRUE, FALSE, 0);
+  d->entry =
+    GTK_ENTRY(dt_action_entry_new
+              (DT_ACTION(self), N_("path"), G_CALLBACK(entry_changed_callback), self,
+               _("enter the path where to put exported images\nvariables support bash"
+                 " like string manipulation\n"
+                 "type '$(' to activate the completion and see the list of variables"),
+               dt_conf_get_string_const("plugins/imageio/storage/disk/file_directory")));
+  dt_gtkentry_setup_variables_completion(d->entry);
+  gtk_editable_set_position(GTK_EDITABLE(d->entry), -1);
 
-  widget = gtk_entry_new();
-  gtk_box_pack_start(GTK_BOX(hbox), widget, TRUE, TRUE, 0);
-  const char *dir = dt_conf_get_string_const("plugins/imageio/storage/disk/file_directory");
-  if(dir)
-  {
-    gtk_entry_set_text(GTK_ENTRY(widget), dir);
-    gtk_editable_set_position(GTK_EDITABLE(widget), strlen(dir));
-  }
-
-  dt_gtkentry_setup_completion(GTK_ENTRY(widget), dt_gtkentry_get_default_path_compl_list());
-
-  char *tooltip_text = dt_gtkentry_build_completion_tooltip_text(
-      _("enter the path where to put exported images\nvariables support bash like string manipulation\n"
-        "recognized variables:"),
-      dt_gtkentry_get_default_path_compl_list());
-
-  d->entry = GTK_ENTRY(widget);
-  gtk_entry_set_width_chars(GTK_ENTRY(widget), 0);
-  gtk_widget_set_tooltip_text(widget, tooltip_text);
-  g_signal_connect(G_OBJECT(widget), "changed", G_CALLBACK(entry_changed_callback), self);
-
-  widget = dtgtk_button_new(dtgtk_cairo_paint_directory, CPF_NONE, NULL);
+  GtkWidget *widget = dtgtk_button_new(dtgtk_cairo_paint_directory, CPF_NONE, NULL);
   gtk_widget_set_name(widget, "non-flat");
   gtk_widget_set_tooltip_text(widget, _("select directory"));
-  gtk_box_pack_start(GTK_BOX(hbox), widget, FALSE, FALSE, 0);
   g_signal_connect(G_OBJECT(widget), "clicked", G_CALLBACK(button_clicked), self);
 
-  d->onsave_action = dt_bauhaus_combobox_new(NULL);
-  dt_bauhaus_widget_set_label(d->onsave_action, NULL, N_("on conflict"));
-  dt_bauhaus_combobox_add(d->onsave_action, _("create unique filename"));
-  dt_bauhaus_combobox_add(d->onsave_action, _("overwrite"));
-  dt_bauhaus_combobox_add(d->onsave_action, _("skip"));
-  gtk_box_pack_start(GTK_BOX(self->widget), d->onsave_action, TRUE, TRUE, 0);
-  g_signal_connect(G_OBJECT(d->onsave_action), "value-changed", G_CALLBACK(onsave_action_toggle_callback), self);
-  dt_bauhaus_combobox_set(d->onsave_action, dt_conf_get_int("plugins/imageio/storage/disk/overwrite"));
+  DT_BAUHAUS_COMBOBOX_NEW_FULL(d->onsave_action, self, NULL, N_("on conflict"), NULL,
+                               dt_conf_get_int("plugins/imageio/storage/disk/overwrite"),
+                               onsave_action_toggle_callback, self,
+                               N_("create unique filename"),
+                               N_("overwrite"),
+                               N_("overwrite if changed"),
+                               N_("skip"));
 
-  g_free(tooltip_text);
+  self->widget = dt_gui_vbox(dt_gui_hbox(d->entry, widget), d->onsave_action);
 }
 
 void gui_cleanup(dt_imageio_module_storage_t *self)
@@ -211,19 +303,34 @@ void gui_cleanup(dt_imageio_module_storage_t *self)
 
 void gui_reset(dt_imageio_module_storage_t *self)
 {
-  disk_t *d = (disk_t *)self->gui_data;
-  // global default can be annoying:
-  // gtk_entry_set_text(GTK_ENTRY(d->entry), "$(FILE_FOLDER)/darktable_exported/$(FILE_NAME)");
-  gtk_entry_set_text(d->entry, dt_confgen_get("plugins/imageio/storage/disk/file_directory", DT_DEFAULT));
-  dt_bauhaus_combobox_set(d->onsave_action, dt_confgen_get_int("plugins/imageio/storage/disk/overwrite", DT_DEFAULT));
-  dt_conf_set_string("plugins/imageio/storage/disk/file_directory", gtk_entry_get_text(d->entry));
-  dt_conf_set_int("plugins/imageio/storage/disk/overwrite", dt_bauhaus_combobox_get(d->onsave_action));
+  disk_t *d = self->gui_data;
+  gtk_entry_set_text(d->entry,
+                     dt_confgen_get("plugins/imageio/storage/disk/file_directory",
+                                    DT_DEFAULT));
+  dt_bauhaus_combobox_set(d->onsave_action,
+                          dt_confgen_get_int("plugins/imageio/storage/disk/overwrite",
+                                             DT_DEFAULT));
+  dt_conf_set_string("plugins/imageio/storage/disk/file_directory",
+                     gtk_entry_get_text(d->entry));
+  dt_conf_set_int("plugins/imageio/storage/disk/overwrite",
+                  dt_bauhaus_combobox_get(d->onsave_action));
 }
 
-int store(dt_imageio_module_storage_t *self, dt_imageio_module_data_t *sdata, const int imgid,
-          dt_imageio_module_format_t *format, dt_imageio_module_data_t *fdata, const int num, const int total,
-          const gboolean high_quality, const gboolean upscale, const gboolean export_masks,
-          dt_colorspaces_color_profile_type_t icc_type, const gchar *icc_filename, dt_iop_color_intent_t icc_intent,
+int store(dt_imageio_module_storage_t *self,
+          dt_imageio_module_data_t *sdata,
+          const dt_imgid_t imgid,
+          dt_imageio_module_format_t *format,
+          dt_imageio_module_data_t *fdata,
+          const int num,
+          const int total,
+          const gboolean high_quality,
+          const gboolean upscale,
+          const gboolean is_scaling,
+          const double scale_factor,
+          const gboolean export_masks,
+          dt_colorspaces_color_profile_type_t icc_type,
+          const gchar *icc_filename,
+          dt_iop_color_intent_t icc_intent,
           dt_export_metadata_t *metadata)
 {
   dt_imageio_disk_t *d = (dt_imageio_disk_t *)sdata;
@@ -232,8 +339,20 @@ int store(dt_imageio_module_storage_t *self, dt_imageio_module_data_t *sdata, co
   char input_dir[PATH_MAX] = { 0 };
   char pattern[DT_MAX_PATH_FOR_PARAMS];
   g_strlcpy(pattern, d->filename, sizeof(pattern));
-  gboolean from_cache = FALSE;
-  dt_image_full_path(imgid, input_dir, sizeof(input_dir), &from_cache);
+
+  /* If we are in gimp plugin mode we can either export on purpose by using the
+     export interface or we do the final export - when quitting the plugin -
+     to the file that is later presented to GIMP as defined in the --gimp API
+     We have to test for this as we don't want the variable expand stepping in.
+  */
+  const gboolean variable_expand = dt_gimpmode()
+                                      ? (g_strrstr(pattern, "XDT2GIMP") == NULL)
+                                      : TRUE;
+  dt_print(DT_DEBUG_IMAGEIO, "disk store :%s: `%s'",
+    variable_expand ? "expand variables" : "FINAL GIMP EXPORT",
+    pattern);
+
+  dt_image_full_path(imgid, input_dir, sizeof(input_dir), NULL);
   // set variable values to expand them afterwards in darktable variables
   dt_variables_set_max_width_height(d->vp, fdata->max_width, fdata->max_height);
   dt_variables_set_upscale(d->vp, upscale);
@@ -244,47 +363,72 @@ int store(dt_imageio_module_storage_t *self, dt_imageio_module_data_t *sdata, co
   {
 try_again:
     // avoid braindead export which is bound to overwrite at random:
-    if(total > 1 && !g_strrstr(pattern, "$"))
+    if(variable_expand && total > 1 && !g_strrstr(pattern, "$"))
     {
-      snprintf(pattern + strlen(pattern), sizeof(pattern) - strlen(pattern), "_$(SEQUENCE)");
+      snprintf(pattern + strlen(pattern),
+               sizeof(pattern) - strlen(pattern), "_$(SEQUENCE)");
     }
 
-    gchar *fixed_path = dt_util_fix_path(pattern);
-    g_strlcpy(pattern, fixed_path, sizeof(pattern));
-    g_free(fixed_path);
+    if(variable_expand)
+    {
+      gchar *fixed_path = dt_util_fix_path(pattern);
+      g_strlcpy(pattern, fixed_path, sizeof(pattern));
+      g_free(fixed_path);
+    }
 
     d->vp->filename = input_dir;
     d->vp->jobcode = "export";
     d->vp->imgid = imgid;
     d->vp->sequence = num;
 
-    gchar *result_filename = dt_variables_expand(d->vp, pattern, TRUE);
-    g_strlcpy(filename, result_filename, sizeof(filename));
-    g_free(result_filename);
-
-    // if filenamepattern is a directory just add ${FILE_NAME} as default..
-    // this can happen if the filename component of the pattern is an empty variable
-    char last_char = *(filename + strlen(filename) - 1);
-    if(last_char == '/' || last_char == '\\')
+    if(variable_expand)
     {
-      // add to the end of the original pattern without caring about a
-      // potentially added "_$(SEQUENCE)"
-      if (snprintf(pattern, sizeof(pattern), "%s" G_DIR_SEPARATOR_S "$(FILE_NAME)", d->filename) < sizeof(pattern))
-        goto try_again;
+      gchar *result_filename = dt_variables_expand(d->vp, pattern, TRUE);
+      g_strlcpy(filename, result_filename, sizeof(filename));
+      g_free(result_filename);
+
+      // if filenamepattern is a directory just add ${FILE_NAME} as
+      // default..  this can happen if the filename component of the
+      // pattern is an empty variable
+      const char last_char = *(filename + strlen(filename) - 1);
+      if(last_char == '/' || last_char == '\\')
+      {
+        // add to the end of the original pattern without caring about a
+        // potentially added "_$(SEQUENCE)"
+        if(snprintf(pattern, sizeof(pattern), "%s"
+                G_DIR_SEPARATOR_S "$(FILE_NAME)", d->filename) < sizeof(pattern))
+          goto try_again;
+      }
+    }
+    else
+    {
+      // we don't expand via variables but take what we got as pattern
+      g_strlcpy(filename, pattern, sizeof(filename));
     }
 
+
+    // get the directory path of the output file
     char *output_dir = g_path_get_dirname(filename);
 
+    // try to create the output directory (including parent
+    // directories, if necessary)
     if(g_mkdir_with_parents(output_dir, 0755))
     {
-      fprintf(stderr, "[imageio_storage_disk] could not create directory: `%s'!\n", output_dir);
+      // output directory could not be created
+      dt_print(DT_DEBUG_ALWAYS,
+               "[imageio_storage_disk] could not create directory: `%s'!",
+               output_dir);
       dt_control_log(_("could not create directory `%s'!"), output_dir);
       fail = TRUE;
       goto failed;
     }
+    // make sure the outpur directory is writeable
     if(g_access(output_dir, W_OK | X_OK) != 0)
     {
-      fprintf(stderr, "[imageio_storage_disk] could not write to directory: `%s'!\n", output_dir);
+      // output directory is not writeable
+      dt_print(DT_DEBUG_ALWAYS,
+               "[imageio_storage_disk] could not write to directory: `%s'!",
+               output_dir);
       dt_control_log(_("could not write to directory `%s'!"), output_dir);
       fail = TRUE;
       goto failed;
@@ -299,9 +443,13 @@ try_again:
   failed:
     g_free(output_dir);
 
+    // conflict handling option: unique filename is generated if the
+    // file already exists
     if(!fail && d->onsave_action == DT_EXPORT_ONCONFLICT_UNIQUEFILENAME)
     {
       int seq = 1;
+
+      // increase filename suffix until a filename is generated that is unique
       while(g_file_test(filename, G_FILE_TEST_EXISTS))
       {
         snprintf(c, filename_free_space, "_%.2d.%s", seq, ext);
@@ -309,15 +457,68 @@ try_again:
       }
     }
 
+    // conflict handling option: skip
     if(!fail && d->onsave_action == DT_EXPORT_ONCONFLICT_SKIP)
     {
+      // check if the file exists
       if(g_file_test(filename, G_FILE_TEST_EXISTS))
       {
+        // file exists, skip
         dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
-        fprintf(stderr, "[export_job] skipping `%s'\n", filename);
+        dt_print(DT_DEBUG_ALWAYS, "[export_job] skipping `%s'", filename);
         dt_control_log(ngettext("%d/%d skipping `%s'", "%d/%d skipping `%s'", num),
                        num, total, filename);
         return 0;
+      }
+    }
+
+    // conflict handling option: overwrite if newer
+    if(!fail && d->onsave_action == DT_EXPORT_ONCONFLICT_OVERWRITE_IF_CHANGED)
+    {
+      // check if the file exists. If not, it will be exported again, regardless
+      // of the changes.
+      if(g_file_test(filename, G_FILE_TEST_EXISTS))
+      {
+        GFile *gfile = g_file_new_for_path(filename);
+
+        GFileInfo *info = g_file_query_info
+          (gfile,
+           G_FILE_ATTRIBUTE_TIME_MODIFIED,
+           G_FILE_QUERY_INFO_NONE,
+           NULL,
+           NULL);
+
+        GTimeSpan export_file_timestamp = 0;
+
+        if(info)
+        {
+          if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_MODIFIED))
+          {
+            time_t mtime = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
+            GDateTime *gdt = g_date_time_new_from_unix_local(mtime);
+            export_file_timestamp = dt_datetime_gdatetime_to_gtimespan(gdt);
+            g_date_time_unref(gdt);
+          }
+          g_object_unref(info);
+        }
+        g_object_unref(gfile);
+
+        // get the image data
+        const dt_image_t *img = dt_image_cache_get(imgid, 'r');
+        const GTimeSpan change_timestamp = img ? img->change_timestamp : 0;
+        dt_image_cache_read_release(img);
+
+        // check if the exported file is more recent than the change date.
+        // if yes skip the image
+        if(export_file_timestamp > change_timestamp)
+        {
+          dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+          dt_print(DT_DEBUG_ALWAYS, "[export_job] skipping (not modified since export) `%s'", filename);
+          dt_control_log(ngettext("%d/%d skipping (not modified since export) `%s'",
+                                  "%d/%d skipping (not modified since export) `%s'", num),
+                         num, total, filename);
+          return 0;
+        }
       }
     }
   } // end of critical block
@@ -325,15 +526,20 @@ try_again:
   if(fail) return 1;
 
   /* export image to file */
-  if(dt_imageio_export(imgid, filename, format, fdata, high_quality, upscale, TRUE, export_masks, icc_type,
-                       icc_filename, icc_intent, self, sdata, num, total, metadata) != 0)
+  if(dt_imageio_export(imgid, filename, format, fdata, high_quality,
+                       upscale, is_scaling, scale_factor,
+                       TRUE, export_masks, icc_type,
+                       icc_filename, icc_intent, self, sdata,
+                       num, total, metadata) != 0)
   {
-    fprintf(stderr, "[imageio_storage_disk] could not export to file: `%s'!\n", filename);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[imageio_storage_disk] could not export to file: `%s'!",
+             filename);
     dt_control_log(_("could not export to file `%s'!"), filename);
     return 1;
   }
 
-  fprintf(stderr, "[export_job] exported to `%s'\n", filename);
+  dt_print(DT_DEBUG_ALWAYS, "[export_job] exported to `%s'", filename);
   dt_control_log(ngettext("%d/%d exported to `%s'", "%d/%d exported to `%s'", num),
                  num, total, filename);
   return 0;
@@ -347,16 +553,18 @@ size_t params_size(dt_imageio_module_storage_t *self)
 void init(dt_imageio_module_storage_t *self)
 {
 #ifdef USE_LUA
-  dt_lua_register_module_member(darktable.lua_state.state, self, dt_imageio_disk_t, filename,
+  dt_lua_register_module_member(darktable.lua_state.state, self,
+                                dt_imageio_disk_t, filename,
                                 char_path_length);
 #endif
 }
 
 void *get_params(dt_imageio_module_storage_t *self)
 {
-  dt_imageio_disk_t *d = (dt_imageio_disk_t *)calloc(1, sizeof(dt_imageio_disk_t));
+  dt_imageio_disk_t *d = calloc(1, sizeof(dt_imageio_disk_t));
 
-  const char *text = dt_conf_get_string_const("plugins/imageio/storage/disk/file_directory");
+  const char *text =
+    dt_conf_get_string_const("plugins/imageio/storage/disk/file_directory");
   g_strlcpy(d->filename, text, sizeof(d->filename));
 
   d->onsave_action = dt_conf_get_int("plugins/imageio/storage/disk/overwrite");
@@ -367,7 +575,8 @@ void *get_params(dt_imageio_module_storage_t *self)
   return d;
 }
 
-void free_params(dt_imageio_module_storage_t *self, dt_imageio_module_data_t *params)
+void free_params(dt_imageio_module_storage_t *self,
+                 dt_imageio_module_data_t *params)
 {
   if(!params) return;
   dt_imageio_disk_t *d = (dt_imageio_disk_t *)params;
@@ -375,10 +584,12 @@ void free_params(dt_imageio_module_storage_t *self, dt_imageio_module_data_t *pa
   free(params);
 }
 
-int set_params(dt_imageio_module_storage_t *self, const void *params, const int size)
+int set_params(dt_imageio_module_storage_t *self,
+               const void *params,
+               const int size)
 {
   dt_imageio_disk_t *d = (dt_imageio_disk_t *)params;
-  disk_t *g = (disk_t *)self->gui_data;
+  disk_t *g = self->gui_data;
 
   if(size != self->params_size(self)) return 1;
 
@@ -390,11 +601,13 @@ int set_params(dt_imageio_module_storage_t *self, const void *params, const int 
 
 char *ask_user_confirmation(dt_imageio_module_storage_t *self)
 {
-  disk_t *g = (disk_t *)self->gui_data;
-  if(dt_bauhaus_combobox_get(g->onsave_action) == DT_EXPORT_ONCONFLICT_OVERWRITE && dt_conf_get_bool("plugins/lighttable/export/ask_before_export_overwrite"))
+  disk_t *g = self->gui_data;
+  if(dt_bauhaus_combobox_get(g->onsave_action) == DT_EXPORT_ONCONFLICT_OVERWRITE
+     && dt_conf_get_bool("plugins/lighttable/export/ask_before_export_overwrite"))
   {
-    return g_strdup(_("you are going to export on overwrite mode, this will overwrite any existing images\n\n"
-        "do you really want to continue?"));
+    return g_strdup(_("you are going to export in overwrite mode,"
+                      " this will overwrite any existing images\n\n"
+                      "do you really want to continue?"));
   }
   else
   {
@@ -402,6 +615,8 @@ char *ask_user_confirmation(dt_imageio_module_storage_t *self)
   }
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

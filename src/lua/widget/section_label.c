@@ -43,6 +43,7 @@ static int section_label_member(lua_State *L)
   if(lua_gettop(L) > 2) {
     const char * text = luaL_checkstring(L,3);
     gtk_label_set_text(GTK_LABEL(label->widget),text);
+    gtk_label_set_ellipsize(GTK_LABEL(label->widget), PANGO_ELLIPSIZE_END);
     return 0;
   }
   lua_pushstring(L,gtk_label_get_text(GTK_LABEL(label->widget)));
@@ -73,6 +74,9 @@ int dt_lua_init_widget_section_label(lua_State* L)
   dt_lua_type_register(L, lua_section_label, "label");
   return 0;
 }
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

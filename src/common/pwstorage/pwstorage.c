@@ -1,5 +1,6 @@
 // This file is part of darktable
 // Copyright (c) 2010-2016 Tobias Ellinghaus <me@houz.org>.
+// Copyright (C) 2023 darktable developers.
 
 // darktable is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -14,10 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include "pwstorage.h"
 
 #ifdef HAVE_LIBSECRET
@@ -28,8 +25,17 @@
 #include "backend_kwallet.h"
 #endif
 
+#ifdef HAVE_APPLE_KEYCHAIN
+#include "backend_apple_keychain.h"
+#endif
+
+#ifdef HAVE_WINDOWS_CREDENTIALS
+#include "backend_windows_credentials.h"
+#endif
+
 #include "control/conf.h"
 #include "control/control.h"
+#include "common/darktable.h"
 
 #include <glib.h>
 #include <string.h>
@@ -44,9 +50,15 @@ const dt_pwstorage_t *dt_pwstorage_new()
 #ifdef HAVE_KWALLET
   dt_capabilities_add("kwallet");
 #endif
+#ifdef HAVE_APPLE_KEYCHAIN
+  dt_capabilities_add("apple_keychain");
+#endif
+#ifdef HAVE_WINDOWS_CREDENTIALS
+  dt_capabilities_add("windows_credentials");
+#endif
 
   dt_pwstorage_t *pwstorage = g_malloc(sizeof(dt_pwstorage_t));
-  dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] Creating new context %p\n", pwstorage);
+  dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] Creating new context %p", pwstorage);
 
   if(pwstorage == NULL) return NULL;
 
@@ -55,17 +67,23 @@ const dt_pwstorage_t *dt_pwstorage_new()
 
   if(strcmp(_backend_str, "auto") == 0)
   {
-    const gchar *desktop = getenv("XDG_CURRENT_DESKTOP");
-    if(g_strcmp0(desktop, "KDE") == 0)
-      _backend = PW_STORAGE_BACKEND_KWALLET;
-    else if(g_strcmp0(desktop, "GNOME") == 0)
-      _backend = PW_STORAGE_BACKEND_LIBSECRET;
-    else if(g_strcmp0(desktop, "Unity") == 0)
-      _backend = PW_STORAGE_BACKEND_LIBSECRET;
-    else if(g_strcmp0(desktop, "XFCE") == 0)
-      _backend = PW_STORAGE_BACKEND_LIBSECRET;
+    #ifdef HAVE_APPLE_KEYCHAIN
+      _backend = PW_STORAGE_BACKEND_APPLE_KEYCHAIN;
+    #elif defined HAVE_WINDOWS_CREDENTIALS
+      _backend = PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS;
+    #else
+      const gchar *desktop = getenv("XDG_CURRENT_DESKTOP");
+      if(g_strcmp0(desktop, "KDE") == 0)
+        _backend = PW_STORAGE_BACKEND_KWALLET;
+      else if(g_strcmp0(desktop, "GNOME") == 0)
+        _backend = PW_STORAGE_BACKEND_LIBSECRET;
+      else if(g_strcmp0(desktop, "Unity") == 0)
+        _backend = PW_STORAGE_BACKEND_LIBSECRET;
+      else if(g_strcmp0(desktop, "XFCE") == 0)
+        _backend = PW_STORAGE_BACKEND_LIBSECRET;
+    #endif
 
-    dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] autodetected storage backend.\n");
+    dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] autodetected storage backend");
   }
   else if(strcmp(_backend_str, "none") == 0)
     _backend = PW_STORAGE_BACKEND_NONE;
@@ -77,9 +95,17 @@ const dt_pwstorage_t *dt_pwstorage_new()
   else if(strcmp(_backend_str, "kwallet") == 0)
     _backend = PW_STORAGE_BACKEND_KWALLET;
 #endif
+#ifdef HAVE_APPLE_KEYCHAIN
+  else if(strcmp(_backend_str, "apple_keychain") == 0)
+    _backend = PW_STORAGE_BACKEND_APPLE_KEYCHAIN;
+#endif
+#ifdef HAVE_WINDOWS_CREDENTIALS
+  else if(strcmp(_backend_str, "windows_credentials") == 0)
+    _backend = PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS;
+#endif
   else if(strcmp(_backend_str, "gnome keyring") == 0)
   {
-    fprintf(stderr, "[pwstorage_new] GNOME Keyring backend is no longer supported.\n");
+    dt_print(DT_DEBUG_ALWAYS, "[pwstorage_new] GNOME Keyring backend is no longer supported");
     dt_control_log(_("GNOME Keyring backend is no longer supported. configure a different one"));
     _backend = PW_STORAGE_BACKEND_NONE;
   }
@@ -87,20 +113,20 @@ const dt_pwstorage_t *dt_pwstorage_new()
   switch(_backend)
   {
     default:
-      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] unknown storage backend. Using none.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] unknown storage backend. Using none");
     case PW_STORAGE_BACKEND_NONE:
       pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
       pwstorage->backend_context = NULL;
       dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] no storage backend. not storing username/password. "
-                                   "please change in preferences, core tab.\n");
+                                   "please change in preferences, security tab");
       break;
     case PW_STORAGE_BACKEND_LIBSECRET:
 #ifdef HAVE_LIBSECRET
-      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using libsecret backend for username/password storage.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using libsecret backend for username/password storage");
       pwstorage->backend_context = (void *)dt_pwstorage_libsecret_new();
       if(pwstorage->backend_context == NULL)
       {
-        dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] error starting libsecret. using no storage backend.\n");
+        dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] error starting libsecret. using no storage backend");
         pwstorage->backend_context = NULL;
         pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
       }
@@ -111,17 +137,17 @@ const dt_pwstorage_t *dt_pwstorage_new()
       break;
 #else
       dt_print(DT_DEBUG_PWSTORAGE,
-               "[pwstorage_new] libsecret backend not available. using no storage backend.\n");
+               "[pwstorage_new] libsecret backend not available. using no storage backend");
       pwstorage->backend_context = NULL;
       pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
 #endif
     case PW_STORAGE_BACKEND_KWALLET:
 #ifdef HAVE_KWALLET
-      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using kwallet backend for username/password storage.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using kwallet backend for username/password storage");
       pwstorage->backend_context = (void *)dt_pwstorage_kwallet_new();
       if(pwstorage->backend_context == NULL)
       {
-        dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] error starting kwallet. using no storage backend.\n");
+        dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] error starting kwallet. using no storage backend");
         pwstorage->backend_context = NULL;
         pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
       }
@@ -129,14 +155,38 @@ const dt_pwstorage_t *dt_pwstorage_new()
       {
         pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_KWALLET;
       }
-      dt_print(DT_DEBUG_PWSTORAGE, "  done.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "  done.");
       break;
 #else
       dt_print(DT_DEBUG_PWSTORAGE,
-               "[pwstorage_new] kwallet backend not available. using no storage backend.\n");
+               "[pwstorage_new] kwallet backend not available. using no storage backend");
       pwstorage->backend_context = NULL;
       pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
 #endif
+    case PW_STORAGE_BACKEND_APPLE_KEYCHAIN:
+#ifdef HAVE_APPLE_KEYCHAIN
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using apple keychain backend for username/password storage");
+      pwstorage->backend_context = (void *)dt_pwstorage_apple_keychain_new();
+      pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_APPLE_KEYCHAIN;
+#else
+      dt_print(DT_DEBUG_PWSTORAGE,
+               "[pwstorage_new] apple keychain backend not available. using no storage backend");
+      pwstorage->backend_context = NULL;
+      pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
+#endif
+      break;
+    case PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS:
+#ifdef HAVE_WINDOWS_CREDENTIALS
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] using windows credentials backend for username/password storage");
+      pwstorage->backend_context = (void *)dt_pwstorage_windows_credentials_new();
+      pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS;
+#else
+      dt_print(DT_DEBUG_PWSTORAGE,
+               "[pwstorage_new] windows credentials backend not available. using no storage backend");
+      pwstorage->backend_context = NULL;
+      pwstorage->pw_storage_backend = PW_STORAGE_BACKEND_NONE;
+#endif
+      break;
   }
 
   switch(pwstorage->pw_storage_backend)
@@ -150,6 +200,12 @@ const dt_pwstorage_t *dt_pwstorage_new()
     case PW_STORAGE_BACKEND_KWALLET:
       dt_conf_set_string("plugins/pwstorage/pwstorage_backend", "kwallet");
       break;
+    case PW_STORAGE_BACKEND_APPLE_KEYCHAIN:
+      dt_conf_set_string("plugins/pwstorage/pwstorage_backend", "apple_keychain");
+      break;
+    case PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS:
+      dt_conf_set_string("plugins/pwstorage/pwstorage_backend", "windows_credentials");
+      break;
   }
 
   return pwstorage;
@@ -158,7 +214,7 @@ const dt_pwstorage_t *dt_pwstorage_new()
 /** Cleanup and destroy pwstorage context. \remarks After this point pointer at pwstorage is invalid. */
 void dt_pwstorage_destroy(const dt_pwstorage_t *pwstorage)
 {
-  dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] Destroying context %p\n", pwstorage);
+  dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_new] Destroying context %p", pwstorage);
   switch(darktable.pwstorage->pw_storage_backend)
   {
     case PW_STORAGE_BACKEND_NONE:
@@ -174,6 +230,16 @@ void dt_pwstorage_destroy(const dt_pwstorage_t *pwstorage)
       dt_pwstorage_kwallet_destroy(pwstorage->backend_context);
 #endif
       break;
+    case PW_STORAGE_BACKEND_APPLE_KEYCHAIN:
+#ifdef HAVE_APPLE_KEYCHAIN
+      dt_pwstorage_apple_keychain_destroy(pwstorage->backend_context);
+#endif
+      break;
+    case PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS:
+#ifdef HAVE_WINDOWS_CREDENTIALS
+      dt_pwstorage_windows_credentials_destroy(pwstorage->backend_context);
+#endif
+      break;
   }
 }
 
@@ -183,7 +249,7 @@ gboolean dt_pwstorage_set(const gchar *slot, GHashTable *table)
   switch(darktable.pwstorage->pw_storage_backend)
   {
     case PW_STORAGE_BACKEND_NONE:
-      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_set] no backend. not storing anything.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_set] no backend. not storing anything");
       break;
     case PW_STORAGE_BACKEND_LIBSECRET:
 #if HAVE_LIBSECRET
@@ -197,6 +263,18 @@ gboolean dt_pwstorage_set(const gchar *slot, GHashTable *table)
                                       table);
 #endif
       break;
+    case PW_STORAGE_BACKEND_APPLE_KEYCHAIN:
+#ifdef HAVE_APPLE_KEYCHAIN
+      return dt_pwstorage_apple_keychain_set((backend_apple_keychain_context_t *) darktable.pwstorage->backend_context,
+                                             slot, table);
+#endif
+      break;
+    case PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS:
+#ifdef HAVE_WINDOWS_CREDENTIALS
+      return dt_pwstorage_windows_credentials_set((backend_windows_credentials_context_t *) darktable.pwstorage->backend_context,
+                                                  slot, table);
+#endif
+      break;
   }
   return FALSE;
 }
@@ -207,7 +285,7 @@ GHashTable *dt_pwstorage_get(const gchar *slot)
   switch(darktable.pwstorage->pw_storage_backend)
   {
     case PW_STORAGE_BACKEND_NONE:
-      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_get] no backend. not reading anything.\n");
+      dt_print(DT_DEBUG_PWSTORAGE, "[pwstorage_get] no backend. not reading anything");
       break;
     case PW_STORAGE_BACKEND_LIBSECRET:
 #if HAVE_LIBSECRET
@@ -220,11 +298,26 @@ GHashTable *dt_pwstorage_get(const gchar *slot)
       return dt_pwstorage_kwallet_get((backend_kwallet_context_t *)darktable.pwstorage->backend_context, slot);
 #endif
       break;
+    case PW_STORAGE_BACKEND_APPLE_KEYCHAIN:
+#ifdef HAVE_APPLE_KEYCHAIN
+      return dt_pwstorage_apple_keychain_get((backend_apple_keychain_context_t *) darktable.pwstorage->backend_context,
+                                             slot);
+#endif
+      break;
+    case PW_STORAGE_BACKEND_WINDOWS_CREDENTIALS:
+#ifdef HAVE_WINDOWS_CREDENTIALS
+      return dt_pwstorage_windows_credentials_get((backend_windows_credentials_context_t *) darktable.pwstorage->backend_context,
+                                                  slot);
+#endif
+      break;
   }
 
   return g_hash_table_new(g_str_hash, g_str_equal);
 }
 
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on
+

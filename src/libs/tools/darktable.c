@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2020 darktable developers.
+    Copyright (C) 2011-2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -27,9 +27,7 @@
 #include "gui/gtk.h"
 #include "libs/lib.h"
 #include "libs/lib_api.h"
-#ifdef GDK_WINDOWING_QUARTZ
-#include "osx/osx.h"
-#endif
+#include "gui/about.h"
 
 #include <librsvg/rsvg.h>
 // ugh, ugly hack. why do people break stuff all the time?
@@ -53,22 +51,22 @@ typedef struct dt_lib_darktable_t
 
 
 /* expose function for darktable module */
-static gboolean _lib_darktable_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer user_data);
+static gboolean _lib_darktable_draw_callback(GtkWidget *widget,
+                                             cairo_t *cr,
+                                             dt_lib_module_t *self);
 /* button press callback */
-static gboolean _lib_darktable_button_press_callback(GtkWidget *widget, GdkEventButton *event,
-                                                     gpointer user_data);
-/* show the about dialog */
-static void _lib_darktable_show_about_dialog();
+static gboolean _lib_darktable_button_press_callback(GtkWidget *widget,
+                                                     GdkEventButton *event,
+                                                     dt_lib_module_t *self);
 
 const char *name(dt_lib_module_t *self)
 {
   return _("darktable");
 }
 
-const char **views(dt_lib_module_t *self)
+dt_view_type_flags_t views(dt_lib_module_t *self)
 {
-  static const char *v[] = {"*", NULL};
-  return v;
+  return DT_VIEW_ALL;
 }
 
 uint32_t container(dt_lib_module_t *self)
@@ -81,7 +79,7 @@ int expandable(dt_lib_module_t *self)
   return 0;
 }
 
-int position()
+int position(const dt_lib_module_t *self)
 {
   return 1001;
 }
@@ -89,14 +87,15 @@ int position()
 void gui_init(dt_lib_module_t *self)
 {
   /* initialize ui widgets */
-  dt_lib_darktable_t *d = (dt_lib_darktable_t *)g_malloc0(sizeof(dt_lib_darktable_t));
+  dt_lib_darktable_t *d = g_malloc0(sizeof(dt_lib_darktable_t));
   self->data = (void *)d;
 
   /* create drawing area */
   self->widget = gtk_event_box_new();
 
   /* connect callbacks */
-  g_signal_connect(G_OBJECT(self->widget), "draw", G_CALLBACK(_lib_darktable_draw_callback), self);
+  g_signal_connect(G_OBJECT(self->widget), "draw",
+                   G_CALLBACK(_lib_darktable_draw_callback), self);
   g_signal_connect(G_OBJECT(self->widget), "button-press-event",
                    G_CALLBACK(_lib_darktable_button_press_callback), self);
 
@@ -124,7 +123,8 @@ void gui_init(dt_lib_module_t *self)
     g_free(logo);
     if(cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS)
     {
-      fprintf(stderr, "warning: can't load darktable logo from PNG file `%s'\n", filename);
+      dt_print(DT_DEBUG_ALWAYS,
+               "warning: can't load darktable logo from PNG file `%s'", filename);
       goto done;
     }
     const int png_width = cairo_image_surface_get_width(surface),
@@ -137,10 +137,13 @@ void gui_init(dt_lib_module_t *self)
 
     d->image_buffer = (guint8 *)calloc((size_t)stride * height, sizeof(guint8));
     d->image
-        = dt_cairo_image_surface_create_for_data(d->image_buffer, CAIRO_FORMAT_ARGB32, width, height, stride);
+        = dt_cairo_image_surface_create_for_data(d->image_buffer,
+                                                 CAIRO_FORMAT_ARGB32,
+                                                 width, height, stride);
     if(cairo_surface_status(d->image) != CAIRO_STATUS_SUCCESS)
     {
-      fprintf(stderr, "warning: can't load darktable logo from PNG file `%s'\n", filename);
+      dt_print(DT_DEBUG_ALWAYS,
+               "warning: can't load darktable logo from PNG file `%s'", filename);
       free(d->image_buffer);
       d->image_buffer = NULL;
       cairo_surface_destroy(d->image);
@@ -177,7 +180,7 @@ done:
 
 void gui_cleanup(dt_lib_module_t *self)
 {
-  dt_lib_darktable_t *d = (dt_lib_darktable_t *)self->data;
+  dt_lib_darktable_t *d = self->data;
   cairo_surface_destroy(d->image);
   free(d->image_buffer);
 
@@ -193,10 +196,11 @@ void gui_cleanup(dt_lib_module_t *self)
 
 
 
-static gboolean _lib_darktable_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+static gboolean _lib_darktable_draw_callback(GtkWidget *widget,
+                                             cairo_t *cr,
+                                             dt_lib_module_t *self)
 {
-  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
-  dt_lib_darktable_t *d = (dt_lib_darktable_t *)self->data;
+  dt_lib_darktable_t *d = self->data;
 
   GtkStyleContext *context = gtk_widget_get_style_context(widget);
 
@@ -239,7 +243,8 @@ static gboolean _lib_darktable_draw_callback(GtkWidget *widget, cairo_t *cr, gpo
   {
     /* fallback using normal text */
     pango_font_description_set_weight(font_desc, PANGO_WEIGHT_BOLD);
-    pango_font_description_set_absolute_size(font_desc, DT_PIXEL_APPLY_DPI(25) * PANGO_SCALE);
+    pango_font_description_set_absolute_size(font_desc,
+                                             DT_PIXEL_APPLY_DPI(25) * PANGO_SCALE);
 
     pango_layout_set_font_description(layout, font_desc);
 
@@ -249,14 +254,19 @@ static gboolean _lib_darktable_draw_callback(GtkWidget *widget, cairo_t *cr, gpo
     pango_cairo_show_layout(cr, layout);
   }
 
-  /* print version */
+  /* print version & workspace */
+  const char *wp = dt_conf_get_string("workspace/label");
+  char *txt = g_strdup_printf("%s%s%s",
+                              darktable_package_version,
+                              *wp ? " - " : "",
+                              *wp ? wp    : "");
   pango_font_description_set_absolute_size(font_desc, DT_PIXEL_APPLY_DPI(10) * PANGO_SCALE);
   pango_layout_set_font_description(layout, font_desc);
-  pango_layout_set_text(layout, darktable_package_version, -1);
+  pango_layout_set_text(layout, txt, -1);
   cairo_move_to(cr, d->image_width + DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(32.0));
-  cairo_set_source_rgba(cr, tmpcolor->red, tmpcolor->green, tmpcolor->blue, 0.3);
+  cairo_set_source_rgba(cr, tmpcolor->red, tmpcolor->green, tmpcolor->blue, 0.7);
   pango_cairo_show_layout(cr, layout);
-
+  g_free(txt);
   /* cleanup */
   gdk_rgba_free(tmpcolor);
   g_object_unref(layout);
@@ -265,52 +275,17 @@ static gboolean _lib_darktable_draw_callback(GtkWidget *widget, cairo_t *cr, gpo
   return TRUE;
 }
 
-static gboolean _lib_darktable_button_press_callback(GtkWidget *widget, GdkEventButton *event,
-                                                     gpointer user_data)
+static gboolean _lib_darktable_button_press_callback(GtkWidget *widget,
+                                                     GdkEventButton *event,
+                                                     dt_lib_module_t *self)
 {
   /* show about box */
-  _lib_darktable_show_about_dialog();
+  darktable_show_about_dialog();
   return TRUE;
 }
 
-static void _lib_darktable_show_about_dialog()
-{
-  GtkWidget *dialog = gtk_about_dialog_new();
-  gtk_widget_set_name (dialog, "about_dialog");
-#ifdef GDK_WINDOWING_QUARTZ
-  dt_osx_disallow_fullscreen(dialog);
-#endif
-  gtk_about_dialog_set_program_name(GTK_ABOUT_DIALOG(dialog), PACKAGE_NAME);
-  gtk_about_dialog_set_version(GTK_ABOUT_DIALOG(dialog), darktable_package_version);
-  char *copyright = g_strdup_printf(_("copyright (c) the authors 2009-%s"), darktable_last_commit_year);
-  gtk_about_dialog_set_copyright(GTK_ABOUT_DIALOG(dialog), copyright);
-  g_free(copyright);
-  gtk_about_dialog_set_comments(GTK_ABOUT_DIALOG(dialog),
-                                _("organize and develop images from digital cameras"));
-  gtk_about_dialog_set_website(GTK_ABOUT_DIALOG(dialog), "https://www.darktable.org/");
-  gtk_about_dialog_set_website_label(GTK_ABOUT_DIALOG(dialog), "website");
-  dt_logo_season_t season = dt_util_get_logo_season();
-  char *icon;
-  if(season != DT_LOGO_SEASON_NONE)
-    icon = g_strdup_printf("darktable-%d", (int)season);
-  else
-    icon = g_strdup("darktable");
-  gtk_about_dialog_set_logo_icon_name(GTK_ABOUT_DIALOG(dialog), icon);
-  g_free(icon);
-
-  const char *str = _("all those of you that made previous releases possible");
-
-#include "tools/darktable_authors.h"
-
-  const char *final[] = {str, NULL };
-  gtk_about_dialog_add_credit_section (GTK_ABOUT_DIALOG(dialog), _("and..."), final);
-
-  gtk_about_dialog_set_translator_credits(GTK_ABOUT_DIALOG(dialog), _("translator-credits"));
-
-  gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(dt_ui_main_window(darktable.gui->ui)));
-  gtk_dialog_run(GTK_DIALOG(dialog));
-  gtk_widget_destroy(dialog);
-}
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
 // kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

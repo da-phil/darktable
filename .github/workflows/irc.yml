@@ -9,12 +9,13 @@ jobs:
   dtslave:
     if: github.repository == 'darktable-org/darktable'
     runs-on: ubuntu-latest
+    concurrency: irc_bot
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 200
           path: src
-      - uses: dawidd6/action-download-artifact@v2
+      - uses: dawidd6/action-download-artifact@v19
         continue-on-error: true
         with:
           workflow: irc.yml
@@ -59,7 +60,7 @@ jobs:
           message: |-
             Showing last ${{ steps.gitlog.outputs.llc }} commit(s) to ${{ github.repository }}:
             ${{ steps.gitlog.outputs.log }}
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v7
         with:
           name: recent_commit
           path: recent_commit
