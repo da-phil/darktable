@@ -57,6 +57,22 @@
 // Smoothness weight used when regularising the residual mesh.
 #define HDR_ALIGN_MESH_SMOOTH_LAMBDA 1.5f
 
+// --- Adaptive DOF escalation parameters ---
+// Weighted ECC score below which DOF escalation is attempted.
+// A score of 1.0 means perfect correlation; lower values indicate the
+// rigid model left residual misalignment.
+#define HDR_ALIGN_ESCALATION_RHO_THRESHOLD 0.85f
+// Minimum ρ improvement required to accept a higher-DOF result.
+#define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT 0.01f
+// Maximum Hessian condition number for accepting a higher-DOF result.
+// A poorly conditioned Hessian indicates the extra parameters are not
+// well determined by the data.
+#define HDR_ALIGN_ESCALATION_MAX_COND 1e6
+// Maximum ECC iterations for the escalated (higher-DOF) solver.
+#define HDR_ALIGN_ESCALATION_MAX_ITER 30
+// ECC convergence threshold for the escalated solver.
+#define HDR_ALIGN_ESCALATION_EPSILON 5e-3f
+
 #define HDR_ALIGN_MESH_INDEX(row, col) ((row) * DT_HDR_ALIGN_MESH_COLS + (col))
 
 // ---------------------------------------------------------------------------
@@ -549,6 +565,79 @@ static gboolean _solve_8x8(const double A[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM
 
   for(int r = 0; r < HDR_ALIGN_H_NPARAM; r++)
     x[r] = aug[r][HDR_ALIGN_H_NPARAM];
+
+  return TRUE;
+}
+
+/** Solve a dense n×n linear system A·x = b using Gauss-Jordan elimination
+ *  with partial pivoting.  n must be <= HDR_ALIGN_H_NPARAM (8).
+ *  Optionally returns a rough condition number estimate via the ratio
+ *  of the largest to smallest absolute pivot values.
+ *  Returns FALSE if the system is singular. */
+static gboolean _solve_NxN(const int n,
+                            const double A[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM],
+                            const double b[HDR_ALIGN_H_NPARAM],
+                            double x[HDR_ALIGN_H_NPARAM],
+                            double *out_cond_est)
+{
+  double aug[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM + 1];
+  double max_pivot = 0.0, min_pivot = 1e30;
+
+  for(int r = 0; r < n; r++)
+  {
+    for(int c = 0; c < n; c++)
+      aug[r][c] = A[r][c];
+    aug[r][n] = b[r];
+  }
+
+  for(int col = 0; col < n; col++)
+  {
+    int piv = col;
+    double max_abs = fabs(aug[col][col]);
+    for(int r = col + 1; r < n; r++)
+    {
+      const double v = fabs(aug[r][col]);
+      if(v > max_abs)
+      {
+        max_abs = v;
+        piv = r;
+      }
+    }
+
+    if(max_abs < 1e-16) return FALSE;
+
+    if(piv != col)
+    {
+      for(int c = col; c <= n; c++)
+      {
+        const double tmp = aug[col][c];
+        aug[col][c] = aug[piv][c];
+        aug[piv][c] = tmp;
+      }
+    }
+
+    const double pivot = aug[col][col];
+    const double abs_pivot = fabs(pivot);
+    if(abs_pivot > max_pivot) max_pivot = abs_pivot;
+    if(abs_pivot < min_pivot) min_pivot = abs_pivot;
+
+    for(int c = col; c <= n; c++) aug[col][c] /= pivot;
+
+    for(int r = 0; r < n; r++)
+    {
+      if(r == col) continue;
+      const double f = aug[r][col];
+      if(f == 0.0) continue;
+      for(int c = col; c <= n; c++)
+        aug[r][c] -= f * aug[col][c];
+    }
+  }
+
+  for(int r = 0; r < n; r++)
+    x[r] = aug[r][n];
+
+  if(out_cond_est)
+    *out_cond_est = min_pivot > 1e-30 ? max_pivot / min_pivot : 1e30;
 
   return TRUE;
 }
@@ -1289,6 +1378,597 @@ static float _ecc_refine_level(const float *ref,
   return 0.0f;
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive DOF escalation: 3-DOF → 6-DOF → 8-DOF
+// ---------------------------------------------------------------------------
+
+/** Compute the weighted ECC score ρ for a given homography on gradient-magnitude
+ *  images.  Returns the correlation coefficient in [-1, 1], or -2 on failure. */
+static float _ecc_compute_rho(const float *ref,
+                               const float *img,
+                               const int w,
+                               const int h,
+                               const float H[HDR_ALIGN_H_NPARAM])
+{
+  const size_t npix = (size_t)w * h;
+  const double scale = MAX((double)w - 1.0, (double)h - 1.0) * 0.5;
+  const double s = scale > 1.0 ? scale : 1.0;
+  const double cx = ((double)w - 1.0) * 0.5;
+  const double cy = ((double)h - 1.0) * 0.5;
+
+  float *mask = dt_alloc_align_float(npix);
+  if(!mask) return -2.0f;
+
+  float *warped = _warp_homography(img, w, h, H, mask);
+  if(!warped)
+  {
+    dt_free_align(mask);
+    return -2.0f;
+  }
+
+  double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
+  long nvalid = 0;
+
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] > 0.5f)
+      {
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        sum_r += wgt * (double)ref[i];
+        sum_w += wgt * (double)warped[i];
+        sum_weight += wgt;
+        nvalid++;
+      }
+    }
+
+  if(nvalid < (long)(npix * HDR_ALIGN_ECC_MIN_VALID_FRAC) || sum_weight < 1e-12)
+  {
+    dt_free_align(warped);
+    dt_free_align(mask);
+    return -2.0f;
+  }
+
+  const double mean_r = sum_r / sum_weight;
+  const double mean_w = sum_w / sum_weight;
+
+  double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] > 0.5f)
+      {
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        const double r = (double)ref[i] - mean_r;
+        const double tw = (double)warped[i] - mean_w;
+        norm2_r += wgt * r * r;
+        norm2_w += wgt * tw * tw;
+        dot_rw += wgt * r * tw;
+      }
+    }
+
+  dt_free_align(warped);
+  dt_free_align(mask);
+
+  const double denom = sqrt(norm2_r * norm2_w);
+  if(denom < 1e-12) return -2.0f;
+  return (float)(dot_rw / denom);
+}
+
+/** One iteration of forward-additive ECC for a higher-DOF model.
+ *  @p ndof selects the model:
+ *    6 → affine (H[0..5] free, H[6]=H[7]=0)
+ *    8 → full projective (H[0..7] free)
+ *
+ *  Returns the pixel-equivalent parameter update norm, or -1 on failure.
+ *  @p out_cond_est receives a rough condition number estimate of the Hessian
+ *  (pass NULL if not needed). */
+static float _ecc_iteration_higher_dof(const float *ref,
+                                        const float *img,
+                                        const int w,
+                                        const int h,
+                                        float H[HDR_ALIGN_H_NPARAM],
+                                        const int ndof,
+                                        double *out_cond_est)
+{
+  if(ndof != 6 && ndof != 8) return -1.0f;
+
+  const size_t npix = (size_t)w * h;
+  const double scale = MAX((double)w - 1.0, (double)h - 1.0) * 0.5;
+  const double s = scale > 1.0 ? scale : 1.0;
+  const double cx = ((double)w - 1.0) * 0.5;
+  const double cy = ((double)h - 1.0) * 0.5;
+
+  float Hn[HDR_ALIGN_H_NPARAM];
+  _homography_pixel_to_normalized(H, w, h, Hn);
+
+  float *mask = dt_alloc_align_float(npix);
+  if(!mask) return -1.0f;
+
+  float *warped = _warp_homography(img, w, h, H, mask);
+  if(!warped)
+  {
+    dt_free_align(mask);
+    return -1.0f;
+  }
+
+  float *gx = dt_alloc_align_float(npix);
+  float *gy = dt_alloc_align_float(npix);
+  if(!gx || !gy)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    dt_free_align(warped);
+    dt_free_align(mask);
+    return -1.0f;
+  }
+  _compute_gradients(warped, w, h, gx, gy);
+
+  // --- Pass 1: weighted means ---
+  double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
+  long nvalid = 0;
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] > 0.5f)
+      {
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        sum_r += wgt * (double)ref[i];
+        sum_w += wgt * (double)warped[i];
+        sum_weight += wgt;
+        nvalid++;
+      }
+    }
+
+  if(nvalid < (long)(npix * HDR_ALIGN_ECC_MIN_VALID_FRAC))
+  {
+    dt_free_align(gx);  dt_free_align(gy);
+    dt_free_align(warped);  dt_free_align(mask);
+    return -1.0f;
+  }
+
+  const double mean_r = sum_r / sum_weight;
+  const double mean_w = sum_w / sum_weight;
+
+  // --- Pass 2: norms and mean Jacobian ---
+  double norm2_r = 0.0, norm2_w = 0.0;
+  double sum_J[HDR_ALIGN_H_NPARAM] = { 0 };
+
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] < 0.5f) continue;
+
+      const double xn = ((double)x - cx) / s;
+      const double yn = ((double)y - cy) / s;
+      const double wgt = _ecc_spatial_weight(xn, yn);
+      const double gxi = (double)gx[i];
+      const double gyi = (double)gy[i];
+
+      double J[HDR_ALIGN_H_NPARAM];
+      if(ndof == 6)
+      {
+        // Affine Jacobian in normalized coordinates
+        J[0] = s * gxi * xn;
+        J[1] = s * gxi * yn;
+        J[2] = s * gxi;
+        J[3] = s * gyi * xn;
+        J[4] = s * gyi * yn;
+        J[5] = s * gyi;
+      }
+      else
+      {
+        // Projective Jacobian in normalized coordinates
+        const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
+        const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
+        const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
+        const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
+        J[0] = s * gxi * xn * id;
+        J[1] = s * gxi * yn * id;
+        J[2] = s * gxi * id;
+        J[3] = s * gyi * xn * id;
+        J[4] = s * gyi * yn * id;
+        J[5] = s * gyi * id;
+        J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
+        J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
+      }
+
+      const double r  = (double)ref[i] - mean_r;
+      const double tw = (double)warped[i] - mean_w;
+      norm2_r += wgt * r * r;
+      norm2_w += wgt * tw * tw;
+
+      for(int k = 0; k < ndof; k++)
+        sum_J[k] += wgt * J[k];
+    }
+
+  const double norm_r = sqrt(norm2_r);
+  const double norm_w = sqrt(norm2_w);
+  if(norm_r < 1e-12 || norm_w < 1e-12)
+  {
+    dt_free_align(gx);  dt_free_align(gy);
+    dt_free_align(warped);  dt_free_align(mask);
+    return -1.0f;
+  }
+
+  // --- Correlation coefficient ---
+  double dot_rw = 0.0;
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] > 0.5f)
+      {
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        dot_rw += wgt * ((double)ref[i] - mean_r)
+                       * ((double)warped[i] - mean_w);
+      }
+    }
+  const double rho = dot_rw / (norm_r * norm_w);
+
+  // --- Pass 3: projection coefficient ---
+  double mean_J[HDR_ALIGN_H_NPARAM];
+  for(int k = 0; k < ndof; k++)
+    mean_J[k] = sum_J[k] / sum_weight;
+
+  double proj_coeff[HDR_ALIGN_H_NPARAM] = { 0 };
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] < 0.5f) continue;
+
+      const double xn = ((double)x - cx) / s;
+      const double yn = ((double)y - cy) / s;
+      const double wgt = _ecc_spatial_weight(xn, yn);
+      const double gxi = (double)gx[i];
+      const double gyi = (double)gy[i];
+
+      double J[HDR_ALIGN_H_NPARAM];
+      if(ndof == 6)
+      {
+        J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
+        J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
+      }
+      else
+      {
+        const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
+        const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
+        const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
+        const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
+        J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
+        J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
+        J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
+        J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
+      }
+
+      const double tw = (double)warped[i] - mean_w;
+      for(int k = 0; k < ndof; k++)
+        proj_coeff[k] += wgt * tw * (J[k] - mean_J[k]);
+    }
+  for(int k = 0; k < ndof; k++)
+    proj_coeff[k] /= norm2_w;
+
+  // --- Pass 4: n×n Hessian and RHS ---
+  double Hess[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM] = { { 0 } };
+  double rhs_ecc[HDR_ALIGN_H_NPARAM] = { 0 };
+  const double scale_rw = norm_w / norm_r;
+
+  for(int y = 0; y < h; y++)
+    for(int x = 0; x < w; x++)
+    {
+      const size_t i = (size_t)y * w + x;
+      if(mask[i] < 0.5f) continue;
+
+      const double xn = ((double)x - cx) / s;
+      const double yn = ((double)y - cy) / s;
+      const double wgt = _ecc_spatial_weight(xn, yn);
+      const double gxi = (double)gx[i];
+      const double gyi = (double)gy[i];
+
+      double J[HDR_ALIGN_H_NPARAM];
+      if(ndof == 6)
+      {
+        J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
+        J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
+      }
+      else
+      {
+        const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
+        const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
+        const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
+        const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
+        J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
+        J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
+        J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
+        J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
+      }
+
+      const double tw = (double)warped[i] - mean_w;
+      const double r  = (double)ref[i] - mean_r;
+      const double ei = scale_rw * r - rho * tw;
+
+      double Jp[HDR_ALIGN_H_NPARAM];
+      for(int k = 0; k < ndof; k++)
+        Jp[k] = (J[k] - mean_J[k]) - proj_coeff[k] * tw;
+
+      for(int a = 0; a < ndof; a++)
+      {
+        rhs_ecc[a] += wgt * Jp[a] * ei;
+        for(int b2 = 0; b2 < ndof; b2++)
+          Hess[a][b2] += wgt * Jp[a] * Jp[b2];
+      }
+    }
+
+  dt_free_align(gx);  dt_free_align(gy);
+  dt_free_align(warped);  dt_free_align(mask);
+
+  // Tikhonov regularization.
+  {
+    double trace = 0.0;
+    for(int k = 0; k < ndof; k++) trace += Hess[k][k];
+    const double lambda = 0.01 * trace / (double)ndof;
+    for(int k = 0; k < ndof; k++)
+      Hess[k][k] += lambda;
+  }
+
+  // Solve n×n system.
+  double dp[HDR_ALIGN_H_NPARAM] = { 0 };
+  double cond_est = 0.0;
+  if(!_solve_NxN(ndof, Hess, rhs_ecc, dp, &cond_est))
+    return -1.0f;
+
+  if(out_cond_est)
+    *out_cond_est = cond_est;
+
+  // Clamp updates to prevent catastrophic steps.
+  // Affine diagonal/off-diagonal: max 0.02 per step.
+  // Translation: max 10% of half-diagonal per step.
+  // Perspective: max 0.001 per step.
+  const double max_affine = 0.02;
+  const double max_shift_n = 0.10;
+  const double max_persp = 0.001;
+
+  dp[0] = CLAMP(dp[0], -max_affine, max_affine);
+  dp[1] = CLAMP(dp[1], -max_affine, max_affine);
+  dp[2] = CLAMP(dp[2], -max_shift_n, max_shift_n);
+  dp[3] = CLAMP(dp[3], -max_affine, max_affine);
+  dp[4] = CLAMP(dp[4], -max_affine, max_affine);
+  dp[5] = CLAMP(dp[5], -max_shift_n, max_shift_n);
+  if(ndof == 8)
+  {
+    dp[6] = CLAMP(dp[6], -max_persp, max_persp);
+    dp[7] = CLAMP(dp[7], -max_persp, max_persp);
+  }
+
+  // Additive update in normalized coordinates.
+  for(int k = 0; k < ndof; k++)
+    Hn[k] += (float)dp[k];
+
+  // Force model constraints.
+  if(ndof == 6)
+  {
+    Hn[6] = 0.0f;
+    Hn[7] = 0.0f;
+  }
+
+  _homography_normalized_to_pixel(Hn, w, h, H);
+
+  // Convergence metric: pixel-equivalent displacement of the update.
+  double update_metric = 0.0;
+  for(int k = 0; k < ndof; k++)
+    update_metric += fabs(dp[k]);
+  update_metric *= s;
+
+  return (float)update_metric;
+}
+
+/** Run iterative higher-DOF ECC at a single pyramid level.
+ *  @p ndof must be 6 (affine) or 8 (projective).
+ *  Returns the final ρ after refinement, or -2 on failure. */
+static float _ecc_refine_level_higher_dof(const float *ref,
+                                            const float *img,
+                                            const int w,
+                                            const int h,
+                                            float H[HDR_ALIGN_H_NPARAM],
+                                            const int ndof)
+{
+  for(int iter = 0; iter < HDR_ALIGN_ESCALATION_MAX_ITER; iter++)
+  {
+    double cond_est = 0.0;
+    const float update = _ecc_iteration_higher_dof(ref, img, w, h, H,
+                                                    ndof, &cond_est);
+
+    if(update < 0.0f)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[hdr_merge]   %d-DOF ECC failed at iteration %d",
+               ndof, iter);
+      return -2.0f;
+    }
+
+    // Reject if the Hessian is poorly conditioned.
+    if(cond_est > HDR_ALIGN_ESCALATION_MAX_COND)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[hdr_merge]   %d-DOF ECC rejected: Hessian cond=%.1e > %.1e",
+               ndof, cond_est, HDR_ALIGN_ESCALATION_MAX_COND);
+      return -2.0f;
+    }
+
+    if(update < HDR_ALIGN_ESCALATION_EPSILON)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[hdr_merge]   %d-DOF ECC converged at iteration %d (update=%.6f, cond=%.1e)",
+               ndof, iter, update, cond_est);
+      break;
+    }
+  }
+
+  return _ecc_compute_rho(ref, img, w, h, H);
+}
+
+/** Sanity check for an escalated homography.  Looser than _homography_is_sane
+ *  because the higher-DOF model intentionally adds scale / shear / perspective
+ *  parameters, but the result must still be physically plausible. */
+static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
+                                               const int w, const int h,
+                                               const int ndof)
+{
+  float Hn[HDR_ALIGN_H_NPARAM];
+  _homography_pixel_to_normalized(H, w, h, Hn);
+
+  // Diagonal elements should be near 1 (allows some scale).
+  if(Hn[0] < 0.85f || Hn[0] > 1.15f) return FALSE;
+  if(Hn[4] < 0.85f || Hn[4] > 1.15f) return FALSE;
+
+  // Off-diagonal: allow more shear than the rigid check.
+  if(fabsf(Hn[1]) > 0.25f) return FALSE;
+  if(fabsf(Hn[3]) > 0.25f) return FALSE;
+
+  if(ndof == 6)
+  {
+    // Affine: perspective must remain zero.
+    if(fabsf(Hn[6]) > 1e-6f || fabsf(Hn[7]) > 1e-6f) return FALSE;
+  }
+  else
+  {
+    // Projective: allow small perspective.
+    if(fabsf(Hn[6]) > 0.02f) return FALSE;
+    if(fabsf(Hn[7]) > 0.02f) return FALSE;
+  }
+
+  // Check that the four image corners map to reasonable source positions.
+  // The mapped corner should not be further than 15% of the image diagonal
+  // from the original corner.
+  const float corners[4][2] = { { 0, 0 }, { (float)(w-1), 0 },
+                                 { 0, (float)(h-1) }, { (float)(w-1), (float)(h-1) } };
+  const float max_shift = 0.15f * sqrtf((float)((w-1)*(w-1) + (h-1)*(h-1)));
+
+  for(int i = 0; i < 4; i++)
+  {
+    const float xf = corners[i][0], yf = corners[i][1];
+    const float d = H[6] * xf + H[7] * yf + 1.0f;
+    if(fabsf(d) < 1e-6f) return FALSE;
+    const float sx = (H[0] * xf + H[1] * yf + H[2]) / d;
+    const float sy = (H[3] * xf + H[4] * yf + H[5]) / d;
+    const float dx = sx - xf, dy = sy - yf;
+    if(sqrtf(dx * dx + dy * dy) > max_shift) return FALSE;
+  }
+
+  return TRUE;
+}
+
+/** Attempt adaptive DOF escalation at the finest pyramid level.
+ *  Measures the weighted ECC score of the current 3-DOF result and
+ *  selectively tries higher-DOF models when the rigid fit is insufficient.
+ *
+ *  Escalation path: 3-DOF → 6-DOF affine → 8-DOF projective.
+ *  Each step is gated by measurable improvement in ρ, a Hessian conditioning
+ *  check, and a geometric sanity check.  Falls back to the input H if
+ *  escalation fails. */
+static void _try_dof_escalation(const float *ref_grad,
+                                 const float *img_grad,
+                                 const int w,
+                                 const int h,
+                                 float H[HDR_ALIGN_H_NPARAM])
+{
+  // Measure current (3-DOF) quality.
+  const float rho_3dof = _ecc_compute_rho(ref_grad, img_grad, w, h, H);
+  dt_print(DT_DEBUG_ALWAYS,
+           "[hdr_merge] DOF escalation: 3-DOF ρ = %.5f (threshold = %.2f)",
+           rho_3dof, HDR_ALIGN_ESCALATION_RHO_THRESHOLD);
+
+  if(rho_3dof >= HDR_ALIGN_ESCALATION_RHO_THRESHOLD || rho_3dof < -1.0f)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: not needed (ρ >= threshold)");
+    return;
+  }
+
+  // Save the 3-DOF result so we can fall back.
+  float H_3dof[HDR_ALIGN_H_NPARAM];
+  memcpy(H_3dof, H, sizeof(H_3dof));
+
+  // --- Stage 1: try 6-DOF affine ---
+  float H_6dof[HDR_ALIGN_H_NPARAM];
+  memcpy(H_6dof, H_3dof, sizeof(H_6dof));
+
+  const float rho_6dof = _ecc_refine_level_higher_dof(ref_grad, img_grad,
+                                                       w, h, H_6dof, 6);
+
+  const float improvement_6 = rho_6dof - rho_3dof;
+  const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
+
+  dt_print(DT_DEBUG_ALWAYS,
+           "[hdr_merge] DOF escalation: 6-DOF ρ = %.5f (Δρ = %.5f, sane = %d)",
+           rho_6dof, improvement_6, sane_6);
+
+  gboolean accept_6 = sane_6
+                       && rho_6dof > rho_3dof
+                       && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
+
+  // --- Stage 2: try 8-DOF projective, starting from the better of 3-DOF/6-DOF ---
+  float H_8dof[HDR_ALIGN_H_NPARAM];
+  float rho_base_for_8 = rho_3dof;
+  if(accept_6)
+  {
+    memcpy(H_8dof, H_6dof, sizeof(H_8dof));
+    rho_base_for_8 = rho_6dof;
+  }
+  else
+    memcpy(H_8dof, H_3dof, sizeof(H_8dof));
+
+  const float rho_8dof = _ecc_refine_level_higher_dof(ref_grad, img_grad,
+                                                       w, h, H_8dof, 8);
+
+  const float improvement_8 = rho_8dof - rho_base_for_8;
+  const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
+
+  dt_print(DT_DEBUG_ALWAYS,
+           "[hdr_merge] DOF escalation: 8-DOF ρ = %.5f (Δρ vs base = %.5f, sane = %d)",
+           rho_8dof, improvement_8, sane_8);
+
+  const gboolean accept_8 = sane_8
+                             && rho_8dof > rho_base_for_8
+                             && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
+
+  // --- Accept best result ---
+  if(accept_8)
+  {
+    memcpy(H, H_8dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f)",
+             rho_3dof, rho_8dof);
+  }
+  else if(accept_6)
+  {
+    memcpy(H, H_6dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: accepted 6-DOF (ρ %.5f → %.5f)",
+             rho_3dof, rho_6dof);
+  }
+  else
+  {
+    // Keep original 3-DOF result.
+    memcpy(H, H_3dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: no improvement, keeping 3-DOF");
+  }
+}
+
 /** Simple NCC on the full image (no patches / crops).
  *  Used only for the coarse exhaustive search at the smallest pyramid level. */
 static float _ncc_full(const float *ref,
@@ -1584,6 +2264,12 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                l);
       memcpy(H_level, H_backup, sizeof(H_level));
     }
+
+    // Adaptive DOF escalation at the finest level: if the 3-DOF rigid fit
+    // left significant residual misalignment (low ρ), attempt 6-DOF affine
+    // and then 8-DOF projective refinement gated by improvement and sanity.
+    if(l == 0)
+      _try_dof_escalation(ref_grad, img_grad, lw, lh, H_level);
 
     if(l <= 1)
       _corner_refine_level(ref_grad, img_grad, lw, lh, H_level);

@@ -475,13 +475,15 @@ The alignment pipeline uses different motion models at different stages:
 
 1. **ECC refinement** uses option (b), a native 3-DOF Euclidean model (rotation + translation). The optimizer builds its Hessian and Jacobian entirely in the $(\theta, t_x, t_y)$ parameter space, so no energy can leak into shear, scale, or perspective DOFs.
 
-2. **Corner refinement** uses option (e), computing a local 4-point homography correction from NCC patches at the four image corners. This absorbs weak perspective and residual scale that the rigid model cannot represent.
+2. **Adaptive DOF escalation** (at the finest pyramid level only): if the 3-DOF fit is insufficient, the pipeline selectively escalates to option (d) 6-DOF affine and then option (e) 8-DOF projective ECC, starting from the stable 3-DOF result. Each escalation step is gated by improvement, conditioning, and sanity checks.
 
-3. **Mesh residuals** add a small amount of option (f) behavior via a regularized $3\times3$ local displacement grid.
+3. **Corner refinement** uses option (e), computing a local 4-point homography correction from NCC patches at the four image corners. This absorbs weak perspective and residual scale that the preceding ECC model did not capture.
 
-The result is stored as an 8-DOF backward homography (the common representation used by corner refinement and the final warp), but the core iterative optimizer only ever solves for 3 parameters per step.
+4. **Mesh residuals** add a small amount of option (f) behavior via a regularized $3\times3$ local displacement grid.
 
-#### Why ECC uses the Euclidean model, not the full homography
+The result is stored as an 8-DOF backward homography (the common representation used by corner refinement and the final warp). The core iterative optimizer starts with only 3 parameters per step and selectively escalates to 6 or 8 when the data supports it.
+
+#### Why ECC starts with the Euclidean model
 
 An earlier version of the code ran ECC with the full 8-DOF projective Jacobian. This worked adequately on easy stacks but failed systematically on difficult HDR brackets (e.g. very dark + very bright exposures). The failure mode was:
 
@@ -493,17 +495,19 @@ Projecting the 8-DOF solution back onto 3-DOF after solving is not equivalent to
 
 The native 3-DOF solver eliminates this problem entirely: the 3×3 Hessian only has Euclidean directions, so every update is guaranteed to stay on the rigid-body manifold.
 
-The corner refinement and mesh residual stages then handle the remaining geometric effects (weak perspective, local parallax) using robust NCC-based patch matching, which is less sensitive to the exposure-difference problem because it operates on already-aligned images.
+The adaptive DOF escalation then introduces higher-DOF models only at the finest level, starting from the stable 3-DOF solution, and only accepts the result when improvement, conditioning, and sanity checks all pass. This avoids the instability problems of running higher-DOF ECC throughout the pyramid while still capturing perspective and scale corrections when the data supports them.
 
-#### Why not use higher-DOF models for ECC
+#### Why higher-DOF models are not used during the pyramid
 
-Options (c) through (e) were all tried as ECC models and found to be increasingly unstable under large exposure differences:
+Options (c) through (e) were all tried as ECC models during the multi-resolution pyramid and found to be increasingly unstable under large exposure differences:
 
 - Similarity (4 DOF): scale DOF absorbed gradient magnitude differences as geometric zoom
 - Affine (6 DOF): shear and anisotropic scale DOFs drifted under noise
 - Projective (8 DOF): perspective terms amplified instability, especially at coarse pyramid levels
 
-The fundamental issue is that ECC on gradient-magnitude images of differently-exposed brackets produces a Hessian with unfavorable condition numbers in the non-rigid directions. Restricting the solver to 3-DOF avoids this entirely.
+The fundamental issue is that ECC on gradient-magnitude images of differently-exposed brackets produces a Hessian with unfavorable condition numbers in the non-rigid directions. Restricting the pyramid solver to 3-DOF avoids this entirely.
+
+The adaptive escalation at the finest level sidesteps these problems because: (a) it starts from an already-converged 3-DOF solution, (b) it runs only at fine resolution where gradients are well-resolved, and (c) it is gated by conditioning and sanity checks that reject unstable solutions.
 
 Option (f), a general local warp, would be even more expressive but is too large a jump in complexity and risk for the current raw-domain HDR merge path.
 
@@ -536,10 +540,11 @@ For one candidate frame the estimator does the following:
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level.
 5. Convert that coarse Euclidean result into a backward homography.
 6. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on gradient-magnitude images.
-7. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
-8. Estimate local residual shifts on a small `3x3` grid of patches.
-9. Regularize that residual field with neighbor smoothness.
-10. Convert the final grayscale-level homography back to full-resolution Bayer coordinates.
+7. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
+8. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
+9. Estimate local residual shifts on a small `3x3` grid of patches.
+10. Regularize that residual field with neighbor smoothness.
+11. Convert the final grayscale-level homography back to full-resolution Bayer coordinates.
 
 ### Why The Estimator Uses Grayscale Bayer Blocks
 
@@ -931,17 +936,18 @@ Strengths:
 - works directly on raw-domain data
 - much more robust to exposure changes than pure raw-intensity NCC
 - native 3-DOF ECC is highly stable even under extreme exposure differences
-- layered architecture: rigid ECC → corner homography → local mesh, each stage adds flexibility incrementally
+- adaptive DOF escalation adds scale / shear / perspective correction only when the data supports it
+- layered architecture: rigid ECC → adaptive escalation → corner homography → local mesh, each stage adds flexibility incrementally
 - preserves CFA phase during the final warp
 - residual regularized mesh improves difficult corner cases at low additional cost
 
 Weaknesses:
 
 - Bayer only
-- the ECC stage can only correct rigid motion; perspective and scale are deferred to corner refinement
 - local residual correction is only low-order bilinear
 - strong parallax or non-planar scenes can still leave blur
 - relies on heuristic search ranges, weights, and trust-region clamps
+- escalation threshold and gating constants are empirical
 
 ### Why This Design Was Chosen
 
@@ -952,31 +958,143 @@ Multiple alternatives were tested iteratively:
 - 8-DOF ECC with projection onto 3-DOF subspace: failed because projecting the update vector after an 8×8 solve is not equivalent to natively solving 3-DOF
 - native 3-DOF Euclidean ECC: stable and correct — the optimizer can only move in $(\theta, t_x, t_y)$ directions
 
-The current layered design (3-DOF ECC + 4-point corner homography + mesh residuals) keeps the ECC solver maximally robust while still handling the full range of practical misalignment through the subsequent NCC-based correction stages.
+The current layered design (3-DOF ECC + adaptive DOF escalation + 4-point corner homography + mesh residuals) keeps the ECC solver maximally robust while still handling the full range of practical misalignment through the subsequent correction stages.
+
+### Adaptive DOF Escalation
+
+After the 3-DOF Euclidean ECC pyramid converges at the finest level, the alignment pipeline measures the weighted ECC score $\rho$ and decides whether the rigid fit is sufficient or whether higher-DOF models should be attempted.
+
+#### Motivation
+
+The 3-DOF Euclidean model is maximally stable under large exposure differences, but it can only correct rotation and translation. When the true misalignment includes weak perspective or anisotropic scale (e.g. from a slightly shifted viewpoint between brackets), the rigid model leaves residual blur that the subsequent corner refinement and mesh stages may not fully absorb.
+
+Adaptive DOF escalation addresses this by selectively introducing additional degrees of freedom only when the data supports them.
+
+#### Pipeline
+
+The escalation runs once, at pyramid level 0 (the finest grayscale level), between 3-DOF ECC convergence and corner refinement:
+
+1. **Measure baseline quality**: compute the weighted ECC score $\rho_{3}$ of the converged 3-DOF result on gradient-magnitude images. If $\rho_{3} \geq \rho_{thresh}$ (currently $0.85$), the rigid fit is considered sufficient and escalation is skipped entirely.
+
+2. **Try 6-DOF affine**: starting from the 3-DOF homography, run a limited number of forward-additive ECC iterations using a native 6-DOF affine Jacobian (scale, shear, and translation, but no perspective). Accept if:
+   - the refined $\rho_{6} > \rho_{3}$ with improvement $\geq \Delta\rho_{min}$
+   - the Hessian condition number is below the maximum allowed
+   - the result passes geometric sanity checks
+
+3. **Try 8-DOF projective**: starting from the better of the 3-DOF or 6-DOF result, run a limited number of ECC iterations with the full 8-DOF projective Jacobian. Accept under the same gating criteria as step 2.
+
+4. **Select best**: the pipeline accepts the highest-DOF result that passed all checks. If neither escalation step improved $\rho$, the original 3-DOF result is kept unchanged.
+
+#### Mathematical Formulation
+
+##### 6-DOF Affine Jacobian
+
+For the affine model in normalized coordinates, the warp is
+
+$$
+W_n(x_n, y_n) =
+\begin{bmatrix}
+H_n[0] x_n + H_n[1] y_n + H_n[2] \\
+H_n[3] x_n + H_n[4] y_n + H_n[5]
+\end{bmatrix},
+$$
+
+with $H_n[6] = H_n[7] = 0$. The 6-column Jacobian mapping parameter updates to intensity changes is
+
+$$
+J = \begin{bmatrix}
+s \, g_x x_n, & s \, g_x y_n, & s \, g_x, &
+s \, g_y x_n, & s \, g_y y_n, & s \, g_y
+\end{bmatrix},
+$$
+
+where $(g_x, g_y)$ are the spatial gradients of the warped feature image and $s$ is the normalization scale. The parameters are updated additively:
+
+$$
+H_n[k] \leftarrow H_n[k] + \Delta p_k, \qquad k \in \{0, \ldots, 5\}.
+$$
+
+##### 8-DOF Projective Jacobian
+
+For the full projective model, let
+
+$$
+d = H_n[6] x_n + H_n[7] y_n + 1,
+\qquad
+s_{x,n} = H_n[0] x_n + H_n[1] y_n + H_n[2],
+\qquad
+s_{y,n} = H_n[3] x_n + H_n[4] y_n + H_n[5].
+$$
+
+The 8-column Jacobian is
+
+$$
+J_k = s \, g_x \frac{\partial W_x}{\partial H_n[k]} + s \, g_y \frac{\partial W_y}{\partial H_n[k]},
+$$
+
+with the first 6 columns identical to the affine case scaled by $1/d$, and the perspective columns
+
+$$
+J_6 = -s \frac{(g_x s_{x,n} + g_y s_{y,n}) \, x_n}{d^2},
+\qquad
+J_7 = -s \frac{(g_x s_{x,n} + g_y s_{y,n}) \, y_n}{d^2}.
+$$
+
+#### Gating Criteria
+
+Each escalation step is gated by three checks:
+
+1. **Improvement gate**: the new $\rho$ must exceed the baseline by at least $\Delta\rho_{min}$ (`HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT`, currently $0.01$).
+
+2. **Conditioning gate**: during the Gauss-Jordan solve, the ratio of the largest to smallest absolute pivot values is tracked. If this exceeds `HDR_ALIGN_ESCALATION_MAX_COND` ($10^6$), the extra parameters are considered ill-determined and the result is rejected.
+
+3. **Sanity gate**: the escalated homography must pass `_homography_is_sane_escalated`, which checks:
+   - diagonal elements of the normalized homography are within $[0.85, 1.15]$ (allows ~15% scale)
+   - off-diagonal elements are within $[-0.25, 0.25]$ (allows moderate shear)
+   - for affine: perspective terms remain exactly zero
+   - for projective: perspective terms remain within $[-0.02, 0.02]$
+   - all four image corners map to source positions within 15% of the image diagonal
+
+#### Trust Region and Clamps
+
+The higher-DOF ECC iterations use per-component clamps to prevent catastrophic steps:
+
+| Parameter group   | Max update per iteration |
+|---|---|
+| Affine diagonal / off-diagonal ($H_n[0,1,3,4]$) | $0.02$ |
+| Translation ($H_n[2,5]$) | $0.10$ (normalized) |
+| Perspective ($H_n[6,7]$, 8-DOF only) | $0.001$ |
+
+Tikhonov regularization is applied to the Hessian diagonal with the same $\lambda = 0.01 \cdot \operatorname{tr}(H) / n$ formula as the 3-DOF solver, scaled to the appropriate dimension.
+
+#### Interaction with Corner Refinement
+
+Corner refinement still runs after DOF escalation. In practice:
+
+- If escalation absorbed the perspective / scale error, the corner NCC patches will report near-zero shifts and the corner refinement stage will be a no-op.
+- If escalation improved the global fit but left local corner residuals, corner refinement will absorb those residuals as before.
+- If escalation was skipped (high $\rho_{3}$), the pipeline is identical to the previous 3-DOF-only design.
+
+No changes to the corner refinement acceptance thresholds were needed.
+
+#### Configuration Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `HDR_ALIGN_ESCALATION_RHO_THRESHOLD` | $0.85$ | Minimum 3-DOF $\rho$ below which escalation is attempted |
+| `HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT` | $0.01$ | Minimum $\Delta\rho$ to accept a higher-DOF result |
+| `HDR_ALIGN_ESCALATION_MAX_COND` | $10^6$ | Maximum Hessian condition number for acceptance |
+| `HDR_ALIGN_ESCALATION_MAX_ITER` | $30$ | Maximum ECC iterations per escalation stage |
+| `HDR_ALIGN_ESCALATION_EPSILON` | $5 \times 10^{-3}$ | Convergence threshold for escalated ECC |
+
+These values were chosen conservatively. The threshold $\rho = 0.85$ means escalation only activates on stacks where the rigid fit leaves significant residual misalignment. The improvement gate ($0.01$) prevents accepting results that are numerically but not visually better.
 
 ## Future Work
 
-### Adaptive DOF escalation: 3-DOF → 8-DOF
+The adaptive DOF escalation feature could be further refined with:
 
-The current design always runs ECC with a 3-DOF Euclidean model to avoid the instability problems seen with the full 8-DOF projective solver. However, there are stacks where the true misalignment includes weak perspective or anisotropic scale that a rigid model cannot represent. A natural extension would be to start with 3-DOF and then selectively escalate to higher-DOF models when the data supports it.
-
-Proposed approach:
-
-1. Run the full pyramid with the native 3-DOF Euclidean ECC as today.
-2. At the finest pyramid level (or at full grayscale resolution), measure the reprojection error — e.g. the weighted ECC score $\rho$ or the RMS residual between the warped candidate and the reference on gradient-magnitude images.
-3. If $\rho$ is below a threshold (indicating the rigid fit is insufficient), attempt a few iterations of a higher-DOF ECC solver (6-DOF affine or 8-DOF projective) starting from the converged 3-DOF result.
-4. Accept the higher-DOF result only if it measurably improves the reprojection error without failing a sanity check.
-
-Open questions and considerations:
-
-- **Threshold calibration**: what reprojection error or ECC score should trigger escalation? This likely needs empirical tuning on a diverse set of HDR stacks.
-- **Which intermediate model**: jumping from 3-DOF directly to 8-DOF reintroduces the full instability risk. A 6-DOF affine model might be a safer intermediate step (no perspective terms, but adds scale and shear). The escalation could be 3 → 6 → 8 with each step gated by improvement.
-- **Conditioning check**: before accepting a higher-DOF result, verify that the Hessian condition number is acceptable. A poorly conditioned Hessian at 8-DOF is a signal that the extra parameters are not well determined by the data.
-- **Interaction with corner refinement**: the existing corner refinement stage already absorbs some perspective error via NCC patch matching. If adaptive DOF escalation is added to ECC, the corner refinement stage may become partially redundant or may need its acceptance thresholds adjusted.
-- **Per-level vs end-of-pyramid**: escalation could happen per pyramid level (expensive, more chances to diverge) or only once at the end (simpler, but the 3-DOF result at fine levels may already be locally optimal in the wrong basin).
-- **Fallback**: if the higher-DOF solver diverges or fails the sanity check, the system must fall back cleanly to the 3-DOF result. This is straightforward with a backup-and-revert strategy.
-
-This would let the alignment handle both easy rigid stacks (where 3-DOF is sufficient and maximally stable) and harder stacks with perspective shift (where additional DOFs genuinely help), without paying the instability cost on every stack.
+- **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ is conservative. Testing on a diverse corpus of HDR stacks could inform a better default or an adaptive threshold based on stack properties (number of frames, exposure range).
+- **Per-level escalation**: currently escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
 
 ## File Map
 
