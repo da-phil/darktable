@@ -294,6 +294,7 @@ void dt_dev_process_preview(dt_develop_t *dev)
 
 void dt_dev_process_preview2(dt_develop_t *dev)
 {
+  // proceed if gui_attached (normal dev) or if preview2 widget exists (pinned dev)
   if(!dev->gui_attached && !(dev->gui && dev->gui->preview2.widget)) return;
   const gboolean err = dt_control_add_job_res(dt_dev_process_preview2_job_create(dev), DT_CTL_WORKER_ZOOM_2);
   if(err) dt_print(DT_DEBUG_ALWAYS, "[dev_process_preview2] job queue exceeded!");
