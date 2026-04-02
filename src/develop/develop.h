@@ -103,14 +103,14 @@ typedef struct dt_dev_proxy_exposure_t
   float (*get_exposure)(struct dt_iop_module_t *exp);
   float (*get_effective_exposure)(struct dt_iop_module_t *exp);
   float (*get_black)(struct dt_iop_module_t *exp);
-  void (*handle_event)(int, gdouble, GdkModifierType, const gboolean);
+  void (*handle_event)(int, gdouble, guint, const gboolean);
 } dt_dev_proxy_exposure_t;
 
 struct dt_dev_pixelpipe_t;
 struct dt_develop_t;
+struct dt_develop_gui_t;
 typedef struct dt_dev_viewport_t
 {
-  GtkWidget *widget; // TODO (#18559): remove gtk stuff from here
   int32_t orig_width, orig_height;
 
   // dimensions of window
@@ -127,9 +127,6 @@ typedef struct dt_dev_viewport_t
 
   // image processing pipeline with caching
   struct dt_dev_pixelpipe_t *pipe;
-  
-  // Pin button for the second window
-  GtkWidget *pin_button;
   
   // Back-pointer to the owning develop structure
   struct dt_develop_t *dev;
@@ -272,7 +269,7 @@ typedef struct dt_develop_t
                                gchar *module);
       /* add or remove module or widget in current quick access list */
       gboolean (*basics_module_toggle)(struct dt_lib_module_t *self,
-                                       GtkWidget *widget,
+                                       gpointer widget,
                                        const gboolean doit);
     } modulegroups;
 
@@ -310,8 +307,6 @@ typedef struct dt_develop_t
   // for the overexposure indicator
   struct
   {
-    GtkWidget *floating_window, *button; // TODO (#18559): remove gtk stuff from here
-
     gboolean enabled;
     dt_dev_overexposed_colorscheme_t colorscheme;
     float lower;
@@ -322,34 +317,20 @@ typedef struct dt_develop_t
   // for the raw overexposure indicator
   struct
   {
-    GtkWidget *floating_window, *button; // TODO (#18559): remove gtk stuff from here
-
     gboolean enabled;
     dt_dev_rawoverexposed_mode_t mode;
     dt_dev_rawoverexposed_colorscheme_t colorscheme;
     float threshold;
   } rawoverexposed;
 
-  // Color assessment conditions
-  struct
-  {
-    GtkWidget *floating_window, *button; // TODO (#18559): remove gtk stuff from here
-  } color_assessment;
-
   // late scaling down from full roi
   struct
   {
-    GtkWidget *button; // TODO (#18559): remove gtk stuff from here
     gboolean enabled;
   } late_scaling;
 
-  // the display profile related things (softproof, gamut check, profiles ...)
-  struct
-  {
-    GtkWidget *floating_window, *softproof_button, *gamut_button; // TODO (#18559): remove gtk stuff from here
-  } profile;
-
-  GtkWidget *second_wnd, *second_wnd_button; // TODO (#18559): remove gtk stuff from here
+  // GUI-specific data (GtkWidget pointers etc.), NULL in non-GUI mode
+  struct dt_develop_gui_t *gui;
 
   // several views of the same image
   dt_dev_viewport_t full, preview2;
@@ -496,7 +477,7 @@ float dt_dev_exposure_get_effective_exposure(dt_develop_t *dev);
 float dt_dev_exposure_get_black(dt_develop_t *dev);
 
 void dt_dev_exposure_handle_event(int n_press, gdouble delta,
-                                  GdkModifierType state,
+                                  guint state,
                                   const gboolean is_blackpoint);
 
 /*
@@ -526,7 +507,7 @@ gboolean dt_dev_modulegroups_is_visible(dt_develop_t *dev,
                                         gchar *module);
 /** add or remove module or widget in current quick access list **/
 int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
-                                             GtkWidget *widget,
+                                             gpointer widget,
                                              const gboolean doit);
 
 /*
