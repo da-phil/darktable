@@ -2259,7 +2259,7 @@ static int _lib_modulegroups_basics_module_toggle_action(dt_lib_module_t *self,
 }
 
 static int _lib_modulegroups_basics_module_toggle(dt_lib_module_t *self,
-                                                  GtkWidget *widget,
+                                                  gpointer widget,
                                                   const gboolean doit)
 {
   if(GTK_IS_BUTTON(widget)) return 0;

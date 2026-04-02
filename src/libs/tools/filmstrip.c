@@ -23,6 +23,7 @@
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
+#include "develop/develop_gui.h"
 #include "dtgtk/thumbtable.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
@@ -120,8 +121,8 @@ static void _filmstrip_pin_in_second_window(dt_action_t *action)
   if(!dt_is_valid_imgid(imgid)) return;
 
   // Open the 2nd window if it is not already visible
-  if(!dev->second_wnd && dev->second_wnd_button)
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), TRUE);
+  if(!dev->gui->second_wnd && dev->gui->second_wnd_button)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->second_wnd_button), TRUE);
 
   dt_dev_pin_image(dev, imgid);
   const dt_image_t *img = dt_image_cache_get(imgid, 'r');
