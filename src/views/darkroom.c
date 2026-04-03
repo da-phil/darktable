@@ -40,6 +40,7 @@
 #include "control/jobs.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
+#include "develop/develop_gui.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "dtgtk/button.h"
@@ -224,9 +225,9 @@ void cleanup(dt_view_t *self)
   // unref the grid lines popover if needed
   if(darktable.view_manager->guides_popover) g_object_unref(darktable.view_manager->guides_popover);
 
-  if(dev->second_wnd)
+  if(dev->gui->second_wnd)
   {
-    GtkWidget *wnd = dev->second_wnd;
+    GtkWidget *wnd = dev->gui->second_wnd;
     
     if(gtk_widget_is_visible(wnd))
     {
@@ -477,8 +478,8 @@ static inline gboolean _preview2_request(dt_develop_t *dev)
        || dev->preview2.pipe->status == DT_DEV_PIXELPIPE_INVALID
        || dev->full.pipe->input_timestamp > dev->preview2.pipe->input_timestamp)
      && dev->gui_attached
-     && dev->preview2.widget
-     && GTK_IS_WIDGET(dev->preview2.widget);
+     && dev->gui->preview2.widget
+     && GTK_IS_WIDGET(dev->gui->preview2.widget);
 }
 
 static void _module_gui_post_expose(dt_iop_module_t *module,
@@ -1286,7 +1287,7 @@ static gboolean _dev_load_requested_image(gpointer user_data)
 
   dt_dev_pixelpipe_create_nodes(dev->full.pipe, dev);
   dt_dev_pixelpipe_create_nodes(dev->preview_pipe, dev);
-  if(dev->preview2.widget && GTK_IS_WIDGET(dev->preview2.widget))
+  if(dev->gui->preview2.widget && GTK_IS_WIDGET(dev->gui->preview2.widget))
     dt_dev_pixelpipe_create_nodes(dev->preview2.pipe, dev);
   dt_dev_read_history(dev);
 
@@ -1531,7 +1532,7 @@ static void _toggle_pin_second_window_action(dt_action_t *action)
   dt_view_t *self = dt_action_view(action);
   dt_develop_t *dev = self->data;
 
-  if(!dev->second_wnd) return;
+  if(!dev->gui->second_wnd) return;
 
   dt_dev_toggle_preview2_pinned(dev);
 }
@@ -1552,8 +1553,8 @@ static void _darkroom_ui_preview2_pipe_finish_signal_callback(gpointer instance,
 {
   dt_view_t *self = (dt_view_t *)user_data;
   dt_develop_t *dev = self->data;
-  if(dev->preview2.widget)
-    gtk_widget_queue_draw(dev->preview2.widget);
+  if(dev->gui->preview2.widget)
+    gtk_widget_queue_draw(dev->gui->preview2.widget);
 }
 
 static void _darkroom_ui_favorite_presets_popupmenu(GtkWidget *w,
@@ -1605,9 +1606,9 @@ static void _darkroom_ui_apply_style_popupmenu(GtkWidget *w,
 static void _second_window_quickbutton_clicked(GtkWidget *w,
                                                dt_develop_t *dev)
 {
-  if(dev->second_wnd && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
+  if(dev->gui->second_wnd && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
   {
-    GtkWidget *wnd = dev->second_wnd;
+    GtkWidget *wnd = dev->gui->second_wnd;
 
     // Disable the button for the duration of close+destroy to fix possible
     // race condition when re-opening the 2nd window while the cleanup code
@@ -1628,7 +1629,7 @@ static void _second_window_quickbutton_clicked(GtkWidget *w,
     // Re-enable the button when cleanup is done.
     gtk_widget_set_sensitive(w, TRUE);
   }
-  else if(dev->second_wnd == NULL && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
+  else if(dev->gui->second_wnd == NULL && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
     _darkroom_display_second_window(dev);
 }
 
@@ -1683,7 +1684,7 @@ static void _color_assessment_border_width_callback(GtkWidget *slider, gpointer 
   }
   else
   {
-    gtk_button_clicked(GTK_BUTTON(dev->color_assessment.button));
+    gtk_button_clicked(GTK_BUTTON(dev->gui->color_assessment.button));
   }
 }
 
@@ -1697,7 +1698,7 @@ static void _color_assessment_border_white_ratio_callback(GtkWidget *slider, gpo
   }
   else
   {
-    gtk_button_clicked(GTK_BUTTON(dev->color_assessment.button));
+    gtk_button_clicked(GTK_BUTTON(dev->gui->color_assessment.button));
   }
 }
 
@@ -1713,11 +1714,11 @@ static void _latescaling_quickbutton_clicked(GtkWidget *w,
   // we just toggled off and had one of HQ pipelines running
   if(!dev->late_scaling.enabled
       && (dev->full.pipe->processing
-          || (dev->second_wnd && dev->preview2.pipe->processing)))
+          || (dev->gui->second_wnd && dev->preview2.pipe->processing)))
   {
     if(dev->full.pipe->processing)
       dt_atomic_set_int(&dev->full.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_HQ);
-    if(dev->second_wnd && dev->preview2.pipe->processing)
+    if(dev->gui->second_wnd && dev->preview2.pipe->processing)
       dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_HQ);
 
     // do it the hard way for safety
@@ -1725,7 +1726,7 @@ static void _latescaling_quickbutton_clicked(GtkWidget *w,
   }
   else
   {
-    if(dev->second_wnd)
+    if(dev->gui->second_wnd)
       dt_dev_reprocess_all(dev);
     else
       dt_dev_reprocess_center(dev);
@@ -1764,7 +1765,7 @@ static void _colorscheme_callback(GtkWidget *combo,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->overexposed.colorscheme = dt_bauhaus_combobox_get(combo);
   if(d->overexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->overexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1775,7 +1776,7 @@ static void _lower_callback(GtkWidget *slider,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->overexposed.lower = dt_bauhaus_slider_get(slider);
   if(d->overexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->overexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1786,7 +1787,7 @@ static void _upper_callback(GtkWidget *slider,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->overexposed.upper = dt_bauhaus_slider_get(slider);
   if(d->overexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->overexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1797,7 +1798,7 @@ static void _mode_callback(GtkWidget *slider,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->overexposed.mode = dt_bauhaus_combobox_get(slider);
   if(d->overexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->overexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->overexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1818,7 +1819,7 @@ static void _rawoverexposed_mode_callback(GtkWidget *combo,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->rawoverexposed.mode = dt_bauhaus_combobox_get(combo);
   if(d->rawoverexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->rawoverexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1829,7 +1830,7 @@ static void _rawoverexposed_colorscheme_callback(GtkWidget *combo,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->rawoverexposed.colorscheme = dt_bauhaus_combobox_get(combo);
   if(d->rawoverexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->rawoverexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1840,7 +1841,7 @@ static void _rawoverexposed_threshold_callback(GtkWidget *slider,
   dt_develop_t *d = (dt_develop_t *)user_data;
   d->rawoverexposed.threshold = dt_bauhaus_slider_get(slider);
   if(d->rawoverexposed.enabled == FALSE)
-    gtk_button_clicked(GTK_BUTTON(d->rawoverexposed.button));
+    gtk_button_clicked(GTK_BUTTON(d->gui->rawoverexposed.button));
   else
     dt_dev_reprocess_center(d);
 }
@@ -1878,19 +1879,19 @@ static void _gamut_quickbutton_clicked(GtkWidget *w,
 /* set the gui state for both softproof and gamut checking */
 static void _update_softproof_gamut_checking(dt_develop_t *d)
 {
-  g_signal_handlers_block_by_func(d->profile.softproof_button,
+  g_signal_handlers_block_by_func(d->gui->profile.softproof_button,
                                   _softproof_quickbutton_clicked, d);
-  g_signal_handlers_block_by_func(d->profile.gamut_button,
+  g_signal_handlers_block_by_func(d->gui->profile.gamut_button,
                                   _gamut_quickbutton_clicked, d);
 
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->profile.softproof_button),
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->gui->profile.softproof_button),
                                darktable.color_profiles->mode == DT_PROFILE_SOFTPROOF);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->profile.gamut_button),
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->gui->profile.gamut_button),
                                darktable.color_profiles->mode == DT_PROFILE_GAMUTCHECK);
 
-  g_signal_handlers_unblock_by_func(d->profile.softproof_button,
+  g_signal_handlers_unblock_by_func(d->gui->profile.softproof_button,
                                     _softproof_quickbutton_clicked, d);
-  g_signal_handlers_unblock_by_func(d->profile.gamut_button,
+  g_signal_handlers_unblock_by_func(d->gui->profile.gamut_button,
                                     _gamut_quickbutton_clicked, d);
 }
 
@@ -2819,7 +2820,7 @@ void gui_init(dt_view_t *self)
   dev->full.ppd = darktable.gui->ppd;
   dev->full.dpi = darktable.gui->dpi;
   dev->full.dpi_factor = darktable.gui->dpi_factor;
-  dev->full.widget = dt_ui_center(darktable.gui->ui);
+  dev->gui->full.widget = dt_ui_center(darktable.gui->ui);
 
   dt_action_t *sa = &self->actions, *ac = NULL;
 
@@ -2850,15 +2851,15 @@ void gui_init(dt_view_t *self)
   /* ensure that we get strings from the style files shipped with darktable localized */
 
   /* create second window display button */
-  dev->second_wnd_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_display2, 0, NULL);
+  dev->gui->second_wnd_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_display2, 0, NULL);
   dt_action_define(sa, NULL, N_("second window"),
-                   dev->second_wnd_button, &dt_action_def_toggle);
-  g_signal_connect(G_OBJECT(dev->second_wnd_button), "clicked",
+                   dev->gui->second_wnd_button, &dt_action_def_toggle);
+  g_signal_connect(G_OBJECT(dev->gui->second_wnd_button), "clicked",
                    G_CALLBACK(_second_window_quickbutton_clicked),dev);
-  gtk_widget_set_tooltip_text(dev->second_wnd_button,
+  gtk_widget_set_tooltip_text(dev->gui->second_wnd_button,
                               _("display a second darkroom image window"));
   dt_view_manager_view_toolbox_add(darktable.view_manager,
-                                   dev->second_wnd_button, DT_VIEW_DARKROOM);
+                                   dev->gui->second_wnd_button, DT_VIEW_DARKROOM);
 
   /* Register a toggle-pin action for the second window as a command so the
      shortcut works independently of the pin button widget.  The pin button
@@ -2883,22 +2884,22 @@ void gui_init(dt_view_t *self)
 
   /* Enable color assessment conditions */
   {
-    dev->color_assessment.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_bulb, 0, NULL);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->color_assessment.button), dev->full.color_assessment);
-    ac = dt_action_define(DT_ACTION(self), NULL, N_("color assessment"), dev->color_assessment.button,
+    dev->gui->color_assessment.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_bulb, 0, NULL);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->color_assessment.button), dev->full.color_assessment);
+    ac = dt_action_define(DT_ACTION(self), NULL, N_("color assessment"), dev->gui->color_assessment.button,
                           &dt_action_def_toggle);
-    gtk_widget_set_tooltip_text(dev->color_assessment.button, _("toggle color assessment conditions\nright-click for options"));
+    gtk_widget_set_tooltip_text(dev->gui->color_assessment.button, _("toggle color assessment conditions\nright-click for options"));
     dt_shortcut_register(ac, 0, 0, GDK_KEY_b, GDK_CONTROL_MASK);
-    g_signal_connect(G_OBJECT(dev->color_assessment.button), "toggled",
+    g_signal_connect(G_OBJECT(dev->gui->color_assessment.button), "toggled",
                      G_CALLBACK(_full_color_assessment_callback), dev);
 
-    dt_view_manager_module_toolbox_add(darktable.view_manager, dev->color_assessment.button, DT_VIEW_DARKROOM);
+    dt_view_manager_module_toolbox_add(darktable.view_manager, dev->gui->color_assessment.button, DT_VIEW_DARKROOM);
     /* add pop-up window */
-    dev->color_assessment.floating_window = gtk_popover_new(dev->color_assessment.button);
-    connect_button_press_release(dev->color_assessment.button, dev->color_assessment.floating_window);
+    dev->gui->color_assessment.floating_window = gtk_popover_new(dev->gui->color_assessment.button);
+    connect_button_press_release(dev->gui->color_assessment.button, dev->gui->color_assessment.floating_window);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_container_add(GTK_CONTAINER(dev->color_assessment.floating_window), vbox);
+    gtk_container_add(GTK_CONTAINER(dev->gui->color_assessment.floating_window), vbox);
 
     /* total border width */
     GtkWidget *border_width_slider = dt_bauhaus_slider_new_action(DT_ACTION(self), 0.05, 0.4, 0.05, 0.2, 2);
@@ -2928,19 +2929,19 @@ void gui_init(dt_view_t *self)
   }
 
   /* Enable late-scaling button */
-  dev->late_scaling.button =
+  dev->gui->late_scaling.button =
     dtgtk_togglebutton_new(dtgtk_cairo_paint_lt_mode_fullpreview, 0, NULL);
   ac = dt_action_define(sa, NULL, N_("high quality processing"),
-                        dev->late_scaling.button, &dt_action_def_toggle);
+                        dev->gui->late_scaling.button, &dt_action_def_toggle);
   gtk_widget_set_tooltip_text
-    (dev->late_scaling.button,
+    (dev->gui->late_scaling.button,
      _("toggle high quality processing."
        " if activated darktable processes image data as it does while exporting"));
-  g_signal_connect(G_OBJECT(dev->late_scaling.button), "clicked",
+  g_signal_connect(G_OBJECT(dev->gui->late_scaling.button), "clicked",
                    G_CALLBACK(_latescaling_quickbutton_clicked), dev);
   dt_view_manager_module_toolbox_add(darktable.view_manager,
-                                     dev->late_scaling.button, DT_VIEW_DARKROOM);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->late_scaling.button),
+                                     dev->gui->late_scaling.button, DT_VIEW_DARKROOM);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->late_scaling.button),
                                dt_conf_get_bool("darkroom/ui/late_scaling/enabled"));
 
   GtkWidget *colorscheme, *mode;
@@ -2948,27 +2949,27 @@ void gui_init(dt_view_t *self)
   /* create rawoverexposed popup tool */
   {
     // the button
-    dev->rawoverexposed.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_rawoverexposed, 0, NULL);
+    dev->gui->rawoverexposed.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_rawoverexposed, 0, NULL);
     ac = dt_action_define(sa, N_("raw overexposed"), N_("toggle"),
-                          dev->rawoverexposed.button, &dt_action_def_toggle);
+                          dev->gui->rawoverexposed.button, &dt_action_def_toggle);
     dt_shortcut_register(ac, 0, 0, GDK_KEY_o, GDK_SHIFT_MASK);
-    gtk_widget_set_tooltip_text(dev->rawoverexposed.button,
+    gtk_widget_set_tooltip_text(dev->gui->rawoverexposed.button,
                                 _("toggle indication of raw overexposure\nright-click for options"));
-    g_signal_connect(G_OBJECT(dev->rawoverexposed.button), "clicked",
+    g_signal_connect(G_OBJECT(dev->gui->rawoverexposed.button), "clicked",
                      G_CALLBACK(_rawoverexposed_quickbutton_clicked), dev);
     dt_view_manager_module_toolbox_add(darktable.view_manager,
-                                       dev->rawoverexposed.button, DT_VIEW_DARKROOM);
-    dt_gui_add_help_link(dev->rawoverexposed.button, "rawoverexposed");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->rawoverexposed.button),
+                                       dev->gui->rawoverexposed.button, DT_VIEW_DARKROOM);
+    dt_gui_add_help_link(dev->gui->rawoverexposed.button, "rawoverexposed");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->rawoverexposed.button),
                                  dt_conf_get_bool("darkroom/ui/rawoverexposed/enabled"));
 
     // and the popup window
-    dev->rawoverexposed.floating_window = gtk_popover_new(dev->rawoverexposed.button);
-    connect_button_press_release(dev->rawoverexposed.button,
-                                 dev->rawoverexposed.floating_window);
+    dev->gui->rawoverexposed.floating_window = gtk_popover_new(dev->gui->rawoverexposed.button);
+    connect_button_press_release(dev->gui->rawoverexposed.button,
+                                 dev->gui->rawoverexposed.floating_window);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_container_add(GTK_CONTAINER(dev->rawoverexposed.floating_window), vbox);
+    gtk_container_add(GTK_CONTAINER(dev->gui->rawoverexposed.floating_window), vbox);
 
     /** let's fill the encapsulating widgets */
     /* mode of operation */
@@ -3012,30 +3013,30 @@ void gui_init(dt_view_t *self)
   /* create overexposed popup tool */
   {
     // the button
-    dev->overexposed.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_overexposed, 0, NULL);
+    dev->gui->overexposed.button = dtgtk_togglebutton_new(dtgtk_cairo_paint_overexposed, 0, NULL);
     ac = dt_action_define(DT_ACTION(self),
                           N_("overexposed"),
                           N_("toggle"),
-                          dev->overexposed.button,
+                          dev->gui->overexposed.button,
                           &dt_action_def_toggle);
     dt_shortcut_register(ac, 0, 0, GDK_KEY_o, 0);
-    gtk_widget_set_tooltip_text(dev->overexposed.button,
+    gtk_widget_set_tooltip_text(dev->gui->overexposed.button,
                                 _("toggle clipping indication\nright-click for options"));
-    g_signal_connect(G_OBJECT(dev->overexposed.button), "clicked",
+    g_signal_connect(G_OBJECT(dev->gui->overexposed.button), "clicked",
                      G_CALLBACK(_overexposed_quickbutton_clicked), dev);
     dt_view_manager_module_toolbox_add(darktable.view_manager,
-                                       dev->overexposed.button, DT_VIEW_DARKROOM);
-    dt_gui_add_help_link(dev->overexposed.button, "overexposed");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->overexposed.button),
+                                       dev->gui->overexposed.button, DT_VIEW_DARKROOM);
+    dt_gui_add_help_link(dev->gui->overexposed.button, "overexposed");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->overexposed.button),
                                  dt_conf_get_bool("darkroom/ui/overexposed/enabled"));
 
     // and the popup window
-    dev->overexposed.floating_window = gtk_popover_new(dev->overexposed.button);
-    connect_button_press_release(dev->overexposed.button,
-                                 dev->overexposed.floating_window);
+    dev->gui->overexposed.floating_window = gtk_popover_new(dev->gui->overexposed.button);
+    connect_button_press_release(dev->gui->overexposed.button,
+                                 dev->gui->overexposed.floating_window);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_container_add(GTK_CONTAINER(dev->overexposed.floating_window), vbox);
+    gtk_container_add(GTK_CONTAINER(dev->gui->overexposed.floating_window), vbox);
 
     /** let's fill the encapsulating widgets */
     /* preview mode */
@@ -3098,40 +3099,40 @@ void gui_init(dt_view_t *self)
   /* create profile popup tool & buttons (softproof + gamut) */
   {
     // the softproof button
-    dev->profile.softproof_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_softproof, 0, NULL);
+    dev->gui->profile.softproof_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_softproof, 0, NULL);
     ac = dt_action_define(sa, NULL, N_("softproof"),
-                          dev->profile.softproof_button, &dt_action_def_toggle);
+                          dev->gui->profile.softproof_button, &dt_action_def_toggle);
     dt_shortcut_register(ac, 0, 0, GDK_KEY_s, GDK_CONTROL_MASK);
-    gtk_widget_set_tooltip_text(dev->profile.softproof_button,
+    gtk_widget_set_tooltip_text(dev->gui->profile.softproof_button,
                                 _("toggle softproofing\nright-click for profile options"));
-    g_signal_connect(G_OBJECT(dev->profile.softproof_button), "clicked",
+    g_signal_connect(G_OBJECT(dev->gui->profile.softproof_button), "clicked",
                      G_CALLBACK(_softproof_quickbutton_clicked), dev);
     dt_view_manager_module_toolbox_add(darktable.view_manager,
-                                       dev->profile.softproof_button, DT_VIEW_DARKROOM);
-    dt_gui_add_help_link(dev->profile.softproof_button, "softproof");
+                                       dev->gui->profile.softproof_button, DT_VIEW_DARKROOM);
+    dt_gui_add_help_link(dev->gui->profile.softproof_button, "softproof");
 
     // the gamut check button
-    dev->profile.gamut_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_warning, 0, NULL);
+    dev->gui->profile.gamut_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_warning, 0, NULL);
     ac = dt_action_define(sa, NULL, N_("gamut check"),
-                          dev->profile.gamut_button, &dt_action_def_toggle);
+                          dev->gui->profile.gamut_button, &dt_action_def_toggle);
     dt_shortcut_register(ac, 0, 0, GDK_KEY_g, GDK_CONTROL_MASK);
-    gtk_widget_set_tooltip_text(dev->profile.gamut_button,
+    gtk_widget_set_tooltip_text(dev->gui->profile.gamut_button,
                  _("toggle gamut checking\nright-click for profile options"));
-    g_signal_connect(G_OBJECT(dev->profile.gamut_button), "clicked",
+    g_signal_connect(G_OBJECT(dev->gui->profile.gamut_button), "clicked",
                      G_CALLBACK(_gamut_quickbutton_clicked), dev);
     dt_view_manager_module_toolbox_add(darktable.view_manager,
-                                       dev->profile.gamut_button, DT_VIEW_DARKROOM);
-    dt_gui_add_help_link(dev->profile.gamut_button, "gamut");
+                                       dev->gui->profile.gamut_button, DT_VIEW_DARKROOM);
+    dt_gui_add_help_link(dev->gui->profile.gamut_button, "gamut");
 
     // and the popup window, which is shared between the two profile buttons
-    dev->profile.floating_window = gtk_popover_new(NULL);
-    connect_button_press_release(dev->second_wnd_button, dev->profile.floating_window);
-    connect_button_press_release(dev->profile.softproof_button,
-                                 dev->profile.floating_window);
-    connect_button_press_release(dev->profile.gamut_button, dev->profile.floating_window);
+    dev->gui->profile.floating_window = gtk_popover_new(NULL);
+    connect_button_press_release(dev->gui->second_wnd_button, dev->gui->profile.floating_window);
+    connect_button_press_release(dev->gui->profile.softproof_button,
+                                 dev->gui->profile.floating_window);
+    connect_button_press_release(dev->gui->profile.gamut_button, dev->gui->profile.floating_window);
     // randomly connect to one of the buttons, so widgets can be realized
-    gtk_popover_set_relative_to(GTK_POPOVER(dev->profile.floating_window),
-                                dev->second_wnd_button);
+    gtk_popover_set_relative_to(GTK_POPOVER(dev->gui->profile.floating_window),
+                                dev->gui->second_wnd_button);
 
     /** let's fill the encapsulating widgets */
     const int force_lcms2 = dt_conf_get_bool("plugins/lighttable/export/force_lcms2");
@@ -3283,7 +3284,7 @@ void gui_init(dt_view_t *self)
        softproof_profile, histogram_profile);
 
     gtk_widget_show_all(vbox);
-    gtk_container_add(GTK_CONTAINER(dev->profile.floating_window), vbox);
+    gtk_container_add(GTK_CONTAINER(dev->gui->profile.floating_window), vbox);
   }
 
   /* create grid changer popup tool */
@@ -3513,7 +3514,7 @@ void enter(dt_view_t *self)
   if(dt_conf_get_bool("second_window/last_visible"))
   {
     _darkroom_display_second_window(dev);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->second_wnd_button), TRUE);
   }
 
   // just make sure at this stage we have only history info into the undo, all automatic
@@ -3563,9 +3564,9 @@ void leave(dt_view_t *self)
   dt_develop_t *dev = self->data;
 
   // Close second window when leaving darkroom (save state first)
-  if(dev->second_wnd)
+  if(dev->gui->second_wnd)
   {
-    GtkWidget *wnd = dev->second_wnd;
+    GtkWidget *wnd = dev->gui->second_wnd;
     
     if(gtk_widget_is_visible(wnd))
     {
@@ -3576,7 +3577,7 @@ void leave(dt_view_t *self)
     _darkroom_ui_second_window_cleanup(dev);
     gtk_widget_hide(wnd);
     gtk_widget_destroy(wnd);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->second_wnd_button), FALSE);
   }
 
   // reset color assessment mode
@@ -3700,10 +3701,10 @@ void leave(dt_view_t *self)
   g_list_free_full(dev->allforms, (void (*)(void *))dt_masks_free_form);
   dev->allforms = NULL;
 
-  gtk_widget_hide(dev->overexposed.floating_window);
-  gtk_widget_hide(dev->rawoverexposed.floating_window);
-  gtk_widget_hide(dev->profile.floating_window);
-  gtk_widget_hide(dev->color_assessment.floating_window);
+  gtk_widget_hide(dev->gui->overexposed.floating_window);
+  gtk_widget_hide(dev->gui->rawoverexposed.floating_window);
+  gtk_widget_hide(dev->gui->profile.floating_window);
+  gtk_widget_hide(dev->gui->color_assessment.floating_window);
 
   dt_ui_scrollbars_show(darktable.gui->ui, FALSE);
 
@@ -4300,7 +4301,7 @@ GSList *mouse_actions(const dt_view_t *self)
 static void _dt_second_window_change_cursor(dt_develop_t *dev,
                                             const gchar *curs)
 {
-  GtkWidget *widget = dev->second_wnd;
+  GtkWidget *widget = dev->gui->second_wnd;
   GdkCursor *cursor = gdk_cursor_new_from_name(gdk_display_get_default(), curs);
   gdk_window_set_cursor(gtk_widget_get_window(widget), cursor);
   g_object_unref(cursor);
@@ -4314,7 +4315,7 @@ static void _second_window_leave(dt_develop_t *dev)
 
 static void _second_window_configure_ppd_dpi(dt_develop_t *dev)
 {
-  GtkWidget *widget = dev->second_wnd;
+  GtkWidget *widget = dev->gui->second_wnd;
 
   dev->preview2.ppd = dt_get_system_gui_ppd(widget);
   dev->preview2.dpi = dt_get_screen_resolution(widget);
@@ -4337,7 +4338,7 @@ static gboolean _second_window_draw_callback(GtkWidget *widget,
   cairo_paint(cri);
 
   // Early exit if we're in an inconsistent state
-  if(!dev->preview2.widget || dev->gui_leaving)
+  if(!dev->gui->preview2.widget || dev->gui_leaving)
     return TRUE;
 
   // Determine which develop and viewport to use
@@ -4664,7 +4665,7 @@ static void _darkroom_ui_second_window_init(GtkWidget *overlay,
   g_signal_connect(G_OBJECT(window), "leave-notify-event",
                    G_CALLBACK(_second_window_buttons_leave_notify_callback), event_box);
 
-  dev->preview2.pin_button = pin_button;
+  dev->gui->preview2.pin_button = pin_button;
   
   dev->preview2.border_size = 0;
   gtk_window_set_default_size(GTK_WINDOW(window), width, height);
@@ -4721,7 +4722,7 @@ static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev)
     dt_develop_t *pinned_dev = dev->preview2_pinned_dev;
     
     pinned_dev->gui_leaving = TRUE;
-    pinned_dev->preview2.widget = NULL;
+    pinned_dev->gui->preview2.widget = NULL;
     
     if(pinned_dev->preview2.pipe)
       dt_atomic_set_int(&pinned_dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
@@ -4744,9 +4745,9 @@ static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev)
     dev->preview2_pinned = FALSE;
   }
 
-  dev->second_wnd = NULL;
-  dev->preview2.widget = NULL;
-  dev->preview2.pin_button = NULL;
+  dev->gui->second_wnd = NULL;
+  dev->gui->preview2.widget = NULL;
+  dev->gui->preview2.pin_button = NULL;
 }
 
 static gboolean _second_window_delete_callback(GtkWidget *widget,
@@ -4762,7 +4763,7 @@ static gboolean _second_window_delete_callback(GtkWidget *widget,
 
   _darkroom_ui_second_window_cleanup(dev);
 
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), FALSE);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->second_wnd_button), FALSE);
 
   return FALSE;
 }
@@ -4808,42 +4809,42 @@ static void _darkroom_display_second_window(dt_develop_t *dev)
     dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
   }
     
-  if(dev->second_wnd == NULL)
+  if(dev->gui->second_wnd == NULL)
   {
     dev->preview2.width = -1;
     dev->preview2.height = -1;
 
-    dev->second_wnd = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_widget_set_name(dev->second_wnd, "second_window");
+    dev->gui->second_wnd = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_widget_set_name(dev->gui->second_wnd, "second_window");
 
     _second_window_configure_ppd_dpi(dev);
 
-    gtk_window_set_icon_name(GTK_WINDOW(dev->second_wnd), "darktable");
-    gtk_window_set_title(GTK_WINDOW(dev->second_wnd), _("darktable - darkroom preview"));
+    gtk_window_set_icon_name(GTK_WINDOW(dev->gui->second_wnd), "darktable");
+    gtk_window_set_title(GTK_WINDOW(dev->gui->second_wnd), _("darktable - darkroom preview"));
 
 #ifndef GDK_WINDOWING_QUARTZ
     // On macOS, transient_for is implemented via [NSWindow addChildWindow:ordered:],
     // which constrains the child to the parent's screen and prevents it from being
     // moved to a different monitor.  Use keep_above instead (see below, after show_all,
     // where the NSWindow is already realized).
-    gtk_window_set_transient_for(GTK_WINDOW(dev->second_wnd),
+    gtk_window_set_transient_for(GTK_WINDOW(dev->gui->second_wnd),
                                  GTK_WINDOW(dt_ui_main_window(darktable.gui->ui)));
 #endif
 
     // Create the overlay for the window
     GtkWidget *overlay = gtk_overlay_new();
     gtk_widget_add_events(overlay, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
-    gtk_container_add(GTK_CONTAINER(dev->second_wnd), overlay);
+    gtk_container_add(GTK_CONTAINER(dev->gui->second_wnd), overlay);
     
     // Create the drawing area and add it to the overlay
-    dev->preview2.widget = gtk_drawing_area_new();
-    gtk_container_add(GTK_CONTAINER(overlay), dev->preview2.widget);
-    gtk_widget_set_size_request(dev->preview2.widget, DT_PIXEL_APPLY_DPI_2ND_WND(dev, 50), DT_PIXEL_APPLY_DPI_2ND_WND(dev, 200));
-    gtk_widget_set_hexpand(dev->preview2.widget, TRUE);
-    gtk_widget_set_vexpand(dev->preview2.widget, TRUE);
-    gtk_widget_set_app_paintable(dev->preview2.widget, TRUE);
+    dev->gui->preview2.widget = gtk_drawing_area_new();
+    gtk_container_add(GTK_CONTAINER(overlay), dev->gui->preview2.widget);
+    gtk_widget_set_size_request(dev->gui->preview2.widget, DT_PIXEL_APPLY_DPI_2ND_WND(dev, 50), DT_PIXEL_APPLY_DPI_2ND_WND(dev, 200));
+    gtk_widget_set_hexpand(dev->gui->preview2.widget, TRUE);
+    gtk_widget_set_vexpand(dev->gui->preview2.widget, TRUE);
+    gtk_widget_set_app_paintable(dev->gui->preview2.widget, TRUE);
 
-    gtk_widget_set_events(dev->preview2.widget,
+    gtk_widget_set_events(dev->gui->preview2.widget,
                           GDK_POINTER_MOTION_MASK
                           | GDK_BUTTON_PRESS_MASK
                           | GDK_BUTTON_RELEASE_MASK
@@ -4852,44 +4853,44 @@ static void _darkroom_display_second_window(dt_develop_t *dev)
                           | darktable.gui->scroll_mask);
 
     /* connect callbacks */
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "draw",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "draw",
                      G_CALLBACK(_second_window_draw_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "scroll-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "scroll-event",
                      G_CALLBACK(_second_window_scrolled_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "button-press-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "button-press-event",
                      G_CALLBACK(_second_window_button_pressed_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "button-release-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "button-release-event",
                      G_CALLBACK(_second_window_button_released_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "motion-notify-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "motion-notify-event",
                      G_CALLBACK(_second_window_mouse_moved_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "leave-notify-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "leave-notify-event",
                      G_CALLBACK(_second_window_leave_callback), dev);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "configure-event",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "configure-event",
                      G_CALLBACK(_second_window_configure_callback), dev);
 
     /* dropping a filmstrip thumbnail pins it in the 2nd window */
-    gtk_drag_dest_set(dev->preview2.widget, GTK_DEST_DEFAULT_ALL,
+    gtk_drag_dest_set(dev->gui->preview2.widget, GTK_DEST_DEFAULT_ALL,
                       target_list_internal, n_targets_internal,
                       GDK_ACTION_COPY | GDK_ACTION_MOVE);
-    g_signal_connect(G_OBJECT(dev->preview2.widget), "drag-data-received",
+    g_signal_connect(G_OBJECT(dev->gui->preview2.widget), "drag-data-received",
                      G_CALLBACK(_second_window_dnd_received), dev);
 
-    g_signal_connect(G_OBJECT(dev->second_wnd), "delete-event",
+    g_signal_connect(G_OBJECT(dev->gui->second_wnd), "delete-event",
                      G_CALLBACK(_second_window_delete_callback), dev);
-    g_signal_connect(G_OBJECT(dev->second_wnd), "event",
+    g_signal_connect(G_OBJECT(dev->gui->second_wnd), "event",
                      G_CALLBACK(dt_shortcut_dispatcher), NULL);
 
     _darkroom_ui_second_window_init(overlay, dev);
   }
 
   // Show all widgets in the window
-  gtk_widget_show_all(dev->second_wnd);
+  gtk_widget_show_all(dev->gui->second_wnd);
 
 #ifdef GDK_WINDOWING_QUARTZ
   // keep_above must be set after the window is realized (i.e. after show_all),
   // because the Quartz backend applies the NSWindow level change only to an
   // already-existing NSWindow object.
-  gtk_window_set_keep_above(GTK_WINDOW(dev->second_wnd), TRUE);
+  gtk_window_set_keep_above(GTK_WINDOW(dev->gui->second_wnd), TRUE);
 #endif
 }
 
