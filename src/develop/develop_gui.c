@@ -52,7 +52,7 @@ gboolean dt_dev_gui_preview2_widget_valid(const dt_develop_gui_t *gui)
 
 void dt_dev_gui_preview2_queue_draw(dt_develop_gui_t *gui)
 {
-  if(gui && gui->preview2.widget)
+  if(dt_dev_gui_preview2_widget_valid(gui))
     gtk_widget_queue_draw(gui->preview2.widget);
 }
 
@@ -94,6 +94,7 @@ GtkWidget *dt_dev_gui_get_second_wnd(const dt_develop_gui_t *gui)
 void dt_dev_gui_ensure_second_wnd_open(dt_develop_gui_t *gui)
 {
   if(!gui) return;
-  if(!gui->second_wnd && gui->second_wnd_button)
+  if(!gui->second_wnd && gui->second_wnd_button
+     && GTK_IS_WIDGET(gui->second_wnd_button))
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(gui->second_wnd_button), TRUE);
 }
