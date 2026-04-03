@@ -726,7 +726,7 @@ $$
 w(x_n, y_n) = 1 + \lambda \min\left(1, \frac{x_n^2 + y_n^2}{2}\right),
 $$
 
-where $\lambda = \texttt{HDR\_ALIGN\_ECC\_EDGE\_WEIGHT}$.
+where $\lambda$ = `HDR_ALIGN_ECC_EDGE_WEIGHT`.
 
 Using weighted zero-mean signals
 
@@ -796,7 +796,7 @@ Here $J'$ is the Jacobian after subtracting the mean and projecting out the comp
 Tikhonov regularization is applied to the Hessian diagonal:
 
 $$
-H_{kk} \leftarrow H_{kk} + \lambda, \qquad \lambda = \frac{0.01}{3} \operatorname{tr}(H).
+H_{kk} \leftarrow H_{kk} + \lambda, \qquad \lambda = \frac{0.01}{3} \mathrm{tr}(H).
 $$
 
 This prevents singular or near-singular systems on low-texture images without biasing the solution significantly.
@@ -806,7 +806,7 @@ This prevents singular or near-singular systems on low-texture images without bi
 The rotation angle is updated exactly rather than via the usual additive linearization:
 
 $$
-\theta_{new} = \operatorname{atan2}(\sin\theta, \cos\theta) + \Delta\theta,
+\theta_{new} = \mathrm{atan2}(\sin\theta, \cos\theta) + \Delta\theta,
 $$
 
 $$
@@ -1065,7 +1065,7 @@ The higher-DOF ECC iterations use per-component clamps to prevent catastrophic s
 | Translation ($H_n[2,5]$) | $0.10$ (normalized) |
 | Perspective ($H_n[6,7]$, 8-DOF only) | $0.001$ |
 
-Tikhonov regularization is applied to the Hessian diagonal with the same $\lambda = 0.01 \cdot \operatorname{tr}(H) / n$ formula as the 3-DOF solver, scaled to the appropriate dimension.
+Tikhonov regularization is applied to the Hessian diagonal with the same $\lambda = 0.01 \cdot \mathrm{tr}(H) / n$ formula as the 3-DOF solver, scaled to the appropriate dimension.
 
 #### Interaction with Corner Refinement
 
