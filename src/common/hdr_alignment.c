@@ -50,6 +50,10 @@
 #define HDR_ALIGN_COARSE_SEARCH_FRAC 0.25f
 // Minimum image dimension for ECC to be numerically stable
 #define HDR_ALIGN_ECC_MIN_DIM 48
+// Number of consecutive iterations without improvement before declaring stall.
+// Avoids wasting iterations at coarse pyramid levels where the update metric
+// plateaus above the convergence threshold.
+#define HDR_ALIGN_ECC_PATIENCE 5
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
 // Number of Jacobi smoothing iterations for the residual mesh.
@@ -1352,6 +1356,9 @@ static float _ecc_refine_level(const float *ref,
                                const int h,
                                float H[HDR_ALIGN_H_NPARAM])
 {
+  float best_update = FLT_MAX;
+  int stall_count = 0;
+
   for(int iter = 0; iter < HDR_ALIGN_ECC_MAX_ITER; iter++)
   {
     const float update = _ecc_iteration(ref, img, w, h, H);
@@ -1369,6 +1376,22 @@ static float _ecc_refine_level(const float *ref,
                "[hdr_merge]   ECC converged at iteration %d (update=%.6f)",
                iter, update);
       return update;
+    }
+
+    // Plateau detection: if the update metric has not improved for several
+    // consecutive iterations the optimiser is stuck above the convergence
+    // threshold — continuing will not help.
+    if(update < best_update)
+    {
+      best_update = update;
+      stall_count = 0;
+    }
+    else if(++stall_count >= HDR_ALIGN_ECC_PATIENCE)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[hdr_merge]   ECC stalled at iteration %d (update=%.6f, best=%.6f)",
+               iter, update, best_update);
+      return best_update;
     }
   }
 

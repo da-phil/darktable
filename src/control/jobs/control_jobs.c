@@ -588,26 +588,12 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
     if(dt_hdr_align_compute(d->ref_mosaic, (const float *)ivoid,
                             d->wd, d->ht, &align))
     {
-      const float approx_dx = -align.H[2];
-      const float approx_dy = -align.H[5];
-      const float approx_angle = atan2f(align.H[1], align.H[0]);
       float mesh_max = 0.0f;
       for(int i = 0; i < DT_HDR_ALIGN_MESH_NODES; i++)
       {
         mesh_max = MAX(mesh_max, fabsf(align.mesh_dx[i]));
         mesh_max = MAX(mesh_max, fabsf(align.mesh_dy[i]));
       }
-
-      dt_print(DT_DEBUG_ALWAYS,
-               "[hdr_merge] alignment: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1], "
-               "approx dx=%.2f dy=%.2f angle=%.4f deg, mesh max=%.2f px, mesh center=(%.2f, %.2f)",
-               align.H[0], align.H[1], align.H[2],
-               align.H[3], align.H[4], align.H[5],
-               align.H[6], align.H[7],
-               approx_dx, approx_dy, approx_angle * 180.0f / (float)M_PI,
-               mesh_max,
-               align.mesh_dx[DT_HDR_ALIGN_MESH_COLS + 1],
-               align.mesh_dy[DT_HDR_ALIGN_MESH_COLS + 1]);
 
       // only apply warp if homography differs meaningfully from identity
       if(fabsf(align.H[2]) > 0.25f || fabsf(align.H[5]) > 0.25f
