@@ -46,8 +46,13 @@
 #define HDR_ALIGN_ECC_EDGE_WEIGHT 3.0
 // Minimum fraction of valid (in-bounds + unclipped) pixels for ECC to proceed
 #define HDR_ALIGN_ECC_MIN_VALID_FRAC 0.3f
-// Coarse search translation radius as fraction of image size
-#define HDR_ALIGN_COARSE_SEARCH_FRAC 0.25f
+// Coarse search translation radius as fraction of the longest side of the
+// coarsest pyramid level.  This must be large enough that the true
+// displacement between HDR brackets is always within the search area.
+// At a typical coarsest level of ~37×24 (scale factor ~128× from full-res),
+// a fraction of 0.35 gives radius=12, covering ~1536 full-resolution pixels —
+// enough for even large hand-held displacements.
+#define HDR_ALIGN_COARSE_SEARCH_FRAC 0.35f
 // Minimum image dimension for ECC to be numerically stable
 #define HDR_ALIGN_ECC_MIN_DIM 48
 // Number of consecutive iterations without improvement before declaring stall.
