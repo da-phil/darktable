@@ -103,7 +103,7 @@ typedef struct dt_dev_proxy_exposure_t
   float (*get_exposure)(struct dt_iop_module_t *exp);
   float (*get_effective_exposure)(struct dt_iop_module_t *exp);
   float (*get_black)(struct dt_iop_module_t *exp);
-  void (*handle_event)(int, gdouble, GdkModifierType, const gboolean);
+  void (*handle_event)(int, gdouble, guint, const gboolean);
 } dt_dev_proxy_exposure_t;
 
 struct dt_dev_pixelpipe_t;
@@ -269,7 +269,7 @@ typedef struct dt_develop_t
                                gchar *module);
       /* add or remove module or widget in current quick access list */
       gboolean (*basics_module_toggle)(struct dt_lib_module_t *self,
-                                       GtkWidget *widget,
+                                       gpointer widget,
                                        const gboolean doit);
     } modulegroups;
 
@@ -479,7 +479,7 @@ float dt_dev_exposure_get_effective_exposure(dt_develop_t *dev);
 float dt_dev_exposure_get_black(dt_develop_t *dev);
 
 void dt_dev_exposure_handle_event(int n_press, gdouble delta,
-                                  GdkModifierType state,
+                                  guint state,
                                   const gboolean is_blackpoint);
 
 /*
@@ -509,7 +509,7 @@ gboolean dt_dev_modulegroups_is_visible(dt_develop_t *dev,
                                         gchar *module);
 /** add or remove module or widget in current quick access list **/
 int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
-                                             GtkWidget *widget,
+                                             gpointer widget,
                                              const gboolean doit);
 
 /*

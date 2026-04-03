@@ -120,8 +120,9 @@ void dt_dev_gui_preview2_queue_draw(dt_develop_gui_t *gui);
  *  Used when tearing down a pinned dev that shares the gui struct. */
 void dt_dev_gui_preview2_widget_clear(dt_develop_gui_t *gui);
 
-/** Set the full viewport widget reference during initialization. */
-void dt_dev_gui_set_full_widget(dt_develop_gui_t *gui, GtkWidget *widget);
+/** Initialize the full viewport widget from the global GUI center area.
+ *  Called during dt_dev_init() instead of the business logic passing a widget. */
+void dt_dev_gui_init_full_viewport(dt_develop_gui_t *gui);
 
 /** Update the pin button state to reflect whether an image is pinned.
  *  Blocks signal handlers during the update to prevent recursive callbacks.
@@ -132,11 +133,6 @@ void dt_dev_gui_set_full_widget(dt_develop_gui_t *gui, GtkWidget *widget);
 void dt_dev_gui_update_pin_button(dt_develop_gui_t *gui,
                                   struct dt_develop_t *dev,
                                   gboolean pinned);
-
-/** Get the GtkWidget* for the second window, or NULL if not open.
- *  This is needed by colorspaces.c and gtk.c to query the display
- *  for color profile information. */
-GtkWidget *dt_dev_gui_get_second_wnd(const dt_develop_gui_t *gui);
 
 /** Open the second window if not already open.
  *  Activates the second window toggle button.

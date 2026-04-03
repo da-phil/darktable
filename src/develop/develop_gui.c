@@ -29,7 +29,9 @@
 
 #include "develop/develop_gui.h"
 #include "develop/develop.h"
+#include "develop/imageop.h"
 #include "common/darktable.h"
+#include "gui/gtk.h"
 
 #include <gtk/gtk.h>
 
@@ -62,10 +64,10 @@ void dt_dev_gui_preview2_widget_clear(dt_develop_gui_t *gui)
     gui->preview2.widget = NULL;
 }
 
-void dt_dev_gui_set_full_widget(dt_develop_gui_t *gui, GtkWidget *widget)
+void dt_dev_gui_init_full_viewport(dt_develop_gui_t *gui)
 {
-  if(gui)
-    gui->full.widget = widget;
+  if(gui && darktable.gui)
+    gui->full.widget = dt_ui_center(darktable.gui->ui);
 }
 
 void dt_dev_gui_update_pin_button(dt_develop_gui_t *gui,
@@ -86,15 +88,30 @@ void dt_dev_gui_update_pin_button(dt_develop_gui_t *gui,
                               pinned ? _("unpin image") : _("pin current image"));
 }
 
-GtkWidget *dt_dev_gui_get_second_wnd(const dt_develop_gui_t *gui)
-{
-  return gui ? gui->second_wnd : NULL;
-}
-
 void dt_dev_gui_ensure_second_wnd_open(dt_develop_gui_t *gui)
 {
   if(!gui) return;
   if(!gui->second_wnd && gui->second_wnd_button
      && GTK_IS_WIDGET(gui->second_wnd_button))
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(gui->second_wnd_button), TRUE);
+}
+
+void dt_dev_reorder_gui_module_list(dt_develop_t *dev)
+{
+  int pos_module = 0;
+  for(const GList *modules = g_list_last(dev->iop);
+      modules;
+      modules = g_list_previous(modules))
+  {
+    dt_iop_module_t *module = modules->data;
+
+    GtkWidget *expander = module->expander;
+    if(expander)
+    {
+      gtk_box_reorder_child(dt_ui_get_container(darktable.gui->ui,
+                                                DT_UI_CONTAINER_PANEL_RIGHT_CENTER),
+                            expander,
+                            pos_module++);
+    }
+  }
 }

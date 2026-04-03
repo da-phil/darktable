@@ -171,8 +171,8 @@ static void _init_main_table(GtkWidget *container);
 
 static void _fullscreen_key_accel_callback(dt_action_t *action)
 {
-  GtkWidget *second_wnd = darktable.develop
-                         ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
+  GtkWidget *second_wnd = (darktable.develop && darktable.develop->gui)
+                         ? darktable.develop->gui->second_wnd
                          : NULL;
   GtkWidget *widget = second_wnd &&
                       gtk_window_is_active(GTK_WINDOW(second_wnd))

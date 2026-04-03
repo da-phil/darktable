@@ -43,8 +43,6 @@
 #include "develop/lightroom.h"
 #include "develop/masks.h"
 #include "libs/modulegroups.h"
-#include "gui/gtk.h"
-#include "gui/presets.h"
 #include "imageio/imageio_common.h"
 
 #ifdef USE_LUA
@@ -117,7 +115,7 @@ void dt_dev_init(dt_develop_t *dev,
       dev->full.ppd = darktable.gui->ppd;
       dev->full.dpi = darktable.gui->dpi;
       dev->full.dpi_factor = darktable.gui->dpi_factor;
-      dt_dev_gui_set_full_widget(dev->gui, dt_ui_center(darktable.gui->ui));
+      dt_dev_gui_init_full_viewport(dev->gui);
     }
   }
 
@@ -593,7 +591,7 @@ void dt_dev_process_image_job(dt_develop_t *dev,
     return;
   }
 
-  if(port == &dev->preview2 && !(port->widget && GTK_IS_WIDGET(port->widget)))
+  if(port == &dev->preview2 && !dt_dev_gui_preview2_widget_valid(dev->gui))
   {
     return;
   }
@@ -3324,7 +3322,7 @@ float dt_dev_exposure_get_black(dt_develop_t *dev)
 }
 
 void dt_dev_exposure_handle_event(int n_press, gdouble delta,
-                                  GdkModifierType state,
+                                  guint state,
                                   const gboolean is_blackpoint)
 {
   if(darktable.develop->proxy.exposure.handle_event)
@@ -3395,7 +3393,7 @@ gboolean dt_dev_modulegroups_is_visible(dt_develop_t *dev,
 }
 
 int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
-                                             GtkWidget *widget,
+                                             gpointer widget,
                                              const gboolean doit)
 {
   if(dev->proxy.modulegroups.module
@@ -3791,27 +3789,6 @@ dt_hash_t dt_dev_hash_distort_plus(dt_develop_t *dev,
   }
   dt_pthread_mutex_unlock(&dev->history_mutex);
   return hash;
-}
-
-// set the module list order
-void dt_dev_reorder_gui_module_list(dt_develop_t *dev)
-{
-  int pos_module = 0;
-  for(const GList *modules = g_list_last(dev->iop);
-      modules;
-      modules = g_list_previous(modules))
-  {
-    dt_iop_module_t *module = modules->data;
-
-    GtkWidget *expander = module->expander;
-    if(expander)
-    {
-      gtk_box_reorder_child(dt_ui_get_container(darktable.gui->ui,
-                                                DT_UI_CONTAINER_PANEL_RIGHT_CENTER),
-                            expander,
-                            pos_module++);
-    }
-  }
 }
 
 void dt_dev_undo_start_record(dt_develop_t *dev)
