@@ -54,6 +54,10 @@
 // Avoids wasting iterations at coarse pyramid levels where the update metric
 // plateaus above the convergence threshold.
 #define HDR_ALIGN_ECC_PATIENCE 5
+// Maximum rotation change (degrees) that a single ECC pyramid level is allowed
+// to introduce.  If ECC drifts the angle further than this it has wandered to
+// a wrong local maximum; the result is reverted to the pre-level homography.
+#define HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG 2.0f
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
 // Number of Jacobi smoothing iterations for the residual mesh.
@@ -76,6 +80,14 @@
 #define HDR_ALIGN_ESCALATION_MAX_ITER 30
 // ECC convergence threshold for the escalated solver.
 #define HDR_ALIGN_ESCALATION_EPSILON 5e-3f
+
+// ECC correlation coefficient below which the identity transform is considered
+// as a fallback.  If the identity H (no alignment) has a higher ρ than the
+// computed H, the alignment failed to find the true solution and using the
+// wrong H would make the merge worse.  Identity is used instead.
+// 0.3 is well below the escalation threshold (0.85) and represents an
+// alignment so poor that even unaligned images are likely better correlated.
+#define HDR_ALIGN_IDENTITY_FALLBACK_RHO 0.3f
 
 #define HDR_ALIGN_MESH_INDEX(row, col) ((row) * DT_HDR_ALIGN_MESH_COLS + (col))
 
@@ -1365,7 +1377,7 @@ static float _ecc_refine_level(const float *ref,
   // definition had a *worse* update than the best -- and that drifted
   // homography poisons every finer pyramid level.
   float H_best[HDR_ALIGN_H_NPARAM];
-  memcpy(H_best, H, sizeof(H_best));
+  memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
 
   for(int iter = 0; iter < HDR_ALIGN_ECC_MAX_ITER; iter++)
   {
@@ -1375,7 +1387,7 @@ static float _ecc_refine_level(const float *ref,
     {
       dt_print(DT_DEBUG_ALWAYS,
                "[hdr_merge]   ECC failed at iteration %d", iter);
-      memcpy(H, H_best, sizeof(H_best));
+      memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
       return -1.0f;
     }
 
@@ -1394,14 +1406,14 @@ static float _ecc_refine_level(const float *ref,
     {
       best_update = update;
       stall_count = 0;
-      memcpy(H_best, H, sizeof(H_best));
+      memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
     }
     else if(++stall_count >= HDR_ALIGN_ECC_PATIENCE)
     {
       // Restore H to the state that gave the best update so far.
       // The current H corresponds to a worse iteration and must not be
       // used as the starting point for the next pyramid level.
-      memcpy(H, H_best, sizeof(H_best));
+      memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
       dt_print(DT_DEBUG_ALWAYS,
                "[hdr_merge]   ECC stalled at iteration %d (update=%.6f, best=%.6f)",
                iter, update, best_update);
@@ -1410,7 +1422,7 @@ static float _ecc_refine_level(const float *ref,
   }
 
   // Max iterations reached: restore best H seen so far.
-  memcpy(H, H_best, sizeof(H_best));
+  memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
   dt_print(DT_DEBUG_ALWAYS,
            "[hdr_merge]   ECC did not converge in %d iterations",
            HDR_ALIGN_ECC_MAX_ITER);
@@ -1917,8 +1929,11 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
  *  Escalation path: 3-DOF → 6-DOF affine → 8-DOF projective.
  *  Each step is gated by measurable improvement in ρ, a Hessian conditioning
  *  check, and a geometric sanity check.  Falls back to the input H if
- *  escalation fails. */
-static void _try_dof_escalation(const float *ref_grad,
+ *  escalation fails.
+ *
+ *  Returns the best ρ achieved (either from the accepted DOF level or the
+ *  original 3-DOF result).  Returns -2 on measurement failure. */
+static float _try_dof_escalation(const float *ref_grad,
                                  const float *img_grad,
                                  const int w,
                                  const int h,
@@ -1934,7 +1949,7 @@ static void _try_dof_escalation(const float *ref_grad,
   {
     dt_print(DT_DEBUG_ALWAYS,
              "[hdr_merge] DOF escalation: not needed (ρ >= threshold)");
-    return;
+    return rho_3dof;
   }
 
   // Save the 3-DOF result so we can fall back.
@@ -1991,6 +2006,7 @@ static void _try_dof_escalation(const float *ref_grad,
     dt_print(DT_DEBUG_ALWAYS,
              "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f)",
              rho_3dof, rho_8dof);
+    return rho_8dof;
   }
   else if(accept_6)
   {
@@ -1998,6 +2014,7 @@ static void _try_dof_escalation(const float *ref_grad,
     dt_print(DT_DEBUG_ALWAYS,
              "[hdr_merge] DOF escalation: accepted 6-DOF (ρ %.5f → %.5f)",
              rho_3dof, rho_6dof);
+    return rho_6dof;
   }
   else
   {
@@ -2005,6 +2022,7 @@ static void _try_dof_escalation(const float *ref_grad,
     memcpy(H, H_3dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
     dt_print(DT_DEBUG_ALWAYS,
              "[hdr_merge] DOF escalation: no improvement, keeping 3-DOF");
+    return rho_3dof;
   }
 }
 
@@ -2339,11 +2357,49 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       memcpy(H_level, H_backup, sizeof(H_level));
     }
 
+    // Angle drift guard: if ECC changed the rotation by more than the
+    // per-level tolerance it wandered to a wrong local maximum.  Revert to
+    // the pre-level homography so the error does not cascade to finer levels.
+    {
+      float delta = atan2f(H_level[3], H_level[0])
+                  - atan2f(H_backup[3], H_backup[0]);
+      if(delta >  (float)M_PI) delta -= 2.0f * (float)M_PI;
+      if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
+      const float max_delta = HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG * (float)M_PI / 180.0f;
+      if(fabsf(delta) > max_delta)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+                 "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
+                 l, delta * 180.0f / (float)M_PI, HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG);
+        memcpy(H_level, H_backup, sizeof(H_level));
+      }
+    }
+
     // Adaptive DOF escalation at the finest level: if the 3-DOF rigid fit
     // left significant residual misalignment (low ρ), attempt 6-DOF affine
     // and then 8-DOF projective refinement gated by improvement and sanity.
     if(l == 0)
-      _try_dof_escalation(ref_grad, img_grad, lw, lh, H_level);
+    {
+      const float rho_best = _try_dof_escalation(ref_grad, img_grad, lw, lh, H_level);
+
+      // Identity fallback: if the best alignment quality is still very low,
+      // check whether no alignment (identity H) correlates better than the
+      // computed H.  A wrong H is worse than no correction.
+      const float H_id[HDR_ALIGN_H_NPARAM]
+        = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+      if(rho_best < HDR_ALIGN_IDENTITY_FALLBACK_RHO)
+      {
+        const float rho_id = _ecc_compute_rho(ref_grad, img_grad, lw, lh, H_id);
+        if(rho_id > rho_best)
+        {
+          dt_print(DT_DEBUG_ALWAYS,
+                   "[hdr_merge] alignment failed (ρ=%.4f < %.2f), identity"
+                   " better (ρ=%.4f) -- reverting to identity",
+                   rho_best, (float)HDR_ALIGN_IDENTITY_FALLBACK_RHO, rho_id);
+          memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
+        }
+      }
+    }
 
     if(l <= 1)
       _corner_refine_level(ref_grad, img_grad, lw, lh, H_level);
