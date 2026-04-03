@@ -96,7 +96,7 @@ void dt_dev_init(dt_develop_t *dev,
 
   if(dev->gui_attached)
   {
-    dev->gui = dt_develop_gui_alloc();
+    dev->gui = dt_dev_gui_init();
     dev->full.pipe = malloc(sizeof(dt_dev_pixelpipe_t));
     dev->preview_pipe = malloc(sizeof(dt_dev_pixelpipe_t));
     dev->preview2.pipe = malloc(sizeof(dt_dev_pixelpipe_t));
@@ -117,7 +117,7 @@ void dt_dev_init(dt_develop_t *dev,
       dev->full.ppd = darktable.gui->ppd;
       dev->full.dpi = darktable.gui->dpi;
       dev->full.dpi_factor = darktable.gui->dpi_factor;
-      dev->gui->full.widget = dt_ui_center(darktable.gui->ui);
+      dt_dev_gui_set_full_widget(dev->gui, dt_ui_center(darktable.gui->ui));
     }
   }
 
@@ -173,8 +173,7 @@ static void _cleanup_pinned_dev(dt_develop_t *pinned_dev)
   if(!pinned_dev) return;
   
   pinned_dev->gui_leaving = TRUE;
-  if(pinned_dev->gui)
-    pinned_dev->gui->preview2.widget = NULL;
+  dt_dev_gui_preview2_widget_clear(pinned_dev->gui);
   
   if(pinned_dev->preview2.pipe)
     dt_atomic_set_int(&pinned_dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
@@ -274,7 +273,7 @@ void dt_dev_cleanup(dt_develop_t *dev)
 
   g_list_free(dev->module_filter_out);
 
-  dt_develop_gui_free(dev->gui);
+  dt_dev_gui_cleanup(dev->gui);
   dev->gui = NULL;
 }
 
@@ -295,7 +294,7 @@ void dt_dev_process_preview(dt_develop_t *dev)
 void dt_dev_process_preview2(dt_develop_t *dev)
 {
   // proceed if gui_attached (normal dev) or if preview2 widget exists (pinned dev)
-  if(!dev->gui_attached && !(dev->gui && dev->gui->preview2.widget)) return;
+  if(!dev->gui_attached && !dt_dev_gui_preview2_widget_valid(dev->gui)) return;
   const gboolean err = dt_control_add_job_res(dt_dev_process_preview2_job_create(dev), DT_CTL_WORKER_ZOOM_2);
   if(err) dt_print(DT_DEBUG_ALWAYS, "[dev_process_preview2] job queue exceeded!");
 }
@@ -445,17 +444,7 @@ static void _activate_pinned_dev(dt_develop_t *dev, dt_develop_t *new_pinned_dev
 
   dt_dev_process_preview2(new_pinned_dev);
 
-  // Update the pin button without re-firing its toggled callback, which would
-  // call dt_dev_toggle_preview2_pinned and undo the pin.
-  if(dev->gui && dev->gui->preview2.pin_button)
-  {
-    g_signal_handlers_block_matched(G_OBJECT(dev->gui->preview2.pin_button),
-                                    G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, dev);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->preview2.pin_button), TRUE);
-    g_signal_handlers_unblock_matched(G_OBJECT(dev->gui->preview2.pin_button),
-                                      G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, dev);
-    gtk_widget_set_tooltip_text(dev->gui->preview2.pin_button, _("unpin image"));
-  }
+  dt_dev_gui_update_pin_button(dev->gui, dev, TRUE);
 
   dt_toast_log(_("image pinned"));
 }
@@ -509,15 +498,7 @@ static void _unpin_image(dt_develop_t *dev)
   dev->preview2.pipe->changed |= DT_DEV_PIPE_SYNCH;
 
   // Update the pin button without re-firing its toggled callback.
-  if(dev->gui && dev->gui->preview2.pin_button)
-  {
-    g_signal_handlers_block_matched(G_OBJECT(dev->gui->preview2.pin_button),
-                                    G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, dev);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->gui->preview2.pin_button), FALSE);
-    g_signal_handlers_unblock_matched(G_OBJECT(dev->gui->preview2.pin_button),
-                                      G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, dev);
-    gtk_widget_set_tooltip_text(dev->gui->preview2.pin_button, _("pin current image"));
-  }
+  dt_dev_gui_update_pin_button(dev->gui, dev, FALSE);
 
   dt_toast_log(_("image unpinned"));
 }
@@ -550,8 +531,7 @@ void dt_dev_toggle_preview2_pinned(dt_develop_t *dev)
     _unpin_image(dev);
 
   // Force a redraw of the second window
-  if(dev->gui && dev->gui->preview2.widget)
-    gtk_widget_queue_draw(dev->gui->preview2.widget);
+  dt_dev_gui_preview2_queue_draw(dev->gui);
 }
 
 void dt_dev_pin_image(dt_develop_t *dev, const dt_imgid_t imgid)
@@ -3344,7 +3324,7 @@ float dt_dev_exposure_get_black(dt_develop_t *dev)
 }
 
 void dt_dev_exposure_handle_event(int n_press, gdouble delta,
-                                  guint state,
+                                  GdkModifierType state,
                                   const gboolean is_blackpoint)
 {
   if(darktable.develop->proxy.exposure.handle_event)
@@ -3415,7 +3395,7 @@ gboolean dt_dev_modulegroups_is_visible(dt_develop_t *dev,
 }
 
 int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
-                                             gpointer widget,
+                                             GtkWidget *widget,
                                              const gboolean doit)
 {
   if(dev->proxy.modulegroups.module

@@ -103,7 +103,7 @@ typedef struct dt_dev_proxy_exposure_t
   float (*get_exposure)(struct dt_iop_module_t *exp);
   float (*get_effective_exposure)(struct dt_iop_module_t *exp);
   float (*get_black)(struct dt_iop_module_t *exp);
-  void (*handle_event)(int, gdouble, guint, const gboolean);
+  void (*handle_event)(int, gdouble, GdkModifierType, const gboolean);
 } dt_dev_proxy_exposure_t;
 
 struct dt_dev_pixelpipe_t;
@@ -269,7 +269,7 @@ typedef struct dt_develop_t
                                gchar *module);
       /* add or remove module or widget in current quick access list */
       gboolean (*basics_module_toggle)(struct dt_lib_module_t *self,
-                                       gpointer widget,
+                                       GtkWidget *widget,
                                        const gboolean doit);
     } modulegroups;
 
@@ -329,7 +329,9 @@ typedef struct dt_develop_t
     gboolean enabled;
   } late_scaling;
 
-  // GUI-specific data (GtkWidget pointers etc.), NULL in non-GUI mode
+  // GUI-specific data (widget pointers etc.), NULL in non-GUI mode.
+  // Business logic should use the API in develop_gui.h, not access
+  // this struct directly.  See issue #18559.
   struct dt_develop_gui_t *gui;
 
   // several views of the same image
@@ -477,7 +479,7 @@ float dt_dev_exposure_get_effective_exposure(dt_develop_t *dev);
 float dt_dev_exposure_get_black(dt_develop_t *dev);
 
 void dt_dev_exposure_handle_event(int n_press, gdouble delta,
-                                  guint state,
+                                  GdkModifierType state,
                                   const gboolean is_blackpoint);
 
 /*
@@ -507,7 +509,7 @@ gboolean dt_dev_modulegroups_is_visible(dt_develop_t *dev,
                                         gchar *module);
 /** add or remove module or widget in current quick access list **/
 int dt_dev_modulegroups_basics_module_toggle(dt_develop_t *dev,
-                                             gpointer widget,
+                                             GtkWidget *widget,
                                              const gboolean doit);
 
 /*

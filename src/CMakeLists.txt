@@ -116,6 +116,7 @@ FILE(GLOB SOURCE_FILES
   "develop/blends/blendif_rgb_jzczhz.c"
   "develop/borders_helper.c"
   "develop/develop.c"
+  "develop/develop_gui.c"
   "develop/format.c"
   "develop/imageop.c"
   "develop/imageop_gui.c"

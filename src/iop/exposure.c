@@ -827,7 +827,7 @@ static float _exposure_proxy_get_effective_exposure(dt_iop_module_t *self)
 
 static void _exposure_proxy_handle_event(int n_press,
                                          gdouble delta,
-                                         guint state,
+                                         GdkModifierType state,
                                          const gboolean is_blackpoint)
 {
   const dt_iop_module_t *const self = darktable.develop->proxy.exposure.module;
