@@ -2385,10 +2385,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Identity fallback: if the best alignment quality is still very low,
       // check whether no alignment (identity H) correlates better than the
       // computed H.  A wrong H is worse than no correction.
-      const float H_id[HDR_ALIGN_H_NPARAM]
-        = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
       if(rho_best < HDR_ALIGN_IDENTITY_FALLBACK_RHO)
       {
+        const float H_id[HDR_ALIGN_H_NPARAM]
+          = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
         const float rho_id = _ecc_compute_rho(ref_grad, img_grad, lw, lh, H_id);
         if(rho_id > rho_best)
         {
