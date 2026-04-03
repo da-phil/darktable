@@ -2163,16 +2163,48 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            "[hdr_merge] coarse search: %dx%d, radius=%d, angle_step=%.1f°",
            cw, ch, search_radius, HDR_ALIGN_COARSE_ANGLE_STEP);
 
+  // Compute gradient magnitude images for exposure-invariant coarse search.
+  // Raw-pixel NCC can fail badly when the exposure difference between
+  // brackets is very large (clipped highlights, noisy shadows).  Gradient
+  // magnitude removes the intensity DC component so that edges — which
+  // appear at the same locations regardless of exposure — drive the match.
+  // This is the same preprocessing that the ECC refinement uses.
+  const size_t cpix = (size_t)cw * ch;
+  float *coarse_ref_grad = NULL;
+  float *coarse_img_grad = NULL;
+  {
+    float *tmp_ref = dt_alloc_align_float(cpix);
+    float *tmp_img = dt_alloc_align_float(cpix);
+    if(tmp_ref && tmp_img)
+    {
+      memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
+      memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
+      _normalize_image_01(tmp_ref, cpix);
+      _normalize_image_01(tmp_img, cpix);
+      coarse_ref_grad = _gradient_magnitude(tmp_ref, cw, ch);
+      coarse_img_grad = _gradient_magnitude(tmp_img, cw, ch);
+    }
+    dt_free_align(tmp_ref);
+    dt_free_align(tmp_img);
+  }
+  // Fall back to raw pixels if either gradient computation failed.
+  // Both must succeed — mixing gradient and raw images would be wrong.
+  const gboolean use_grad = coarse_ref_grad && coarse_img_grad;
+  const float *coarse_ref = use_grad ? coarse_ref_grad
+                                     : pyr_ref.data[coarsest];
+  const float *coarse_img = use_grad ? coarse_img_grad
+                                     : pyr_img.data[coarsest];
+
   for(float angle = -max_angle_rad; angle <= max_angle_rad;
       angle += angle_step_rad)
   {
     // Warp coarsest-level input by candidate angle (no translation yet)
     float *rotated = NULL;
-    const float *candidate = pyr_img.data[coarsest];
+    const float *candidate = coarse_img;
 
     if(fabsf(angle) > 1e-6f)
     {
-      rotated = _warp_euclidean(pyr_img.data[coarsest], cw, ch,
+      rotated = _warp_euclidean(coarse_img, cw, ch,
                                 0.0f, 0.0f, angle, NULL);
       if(!rotated) continue;
       candidate = rotated;
@@ -2181,7 +2213,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     for(int dy = -search_radius; dy <= search_radius; dy++)
       for(int dx = -search_radius; dx <= search_radius; dx++)
       {
-        const float ncc = _ncc_full(pyr_ref.data[coarsest], candidate,
+        const float ncc = _ncc_full(coarse_ref, candidate,
                                     cw, ch, dx, dy);
         if(ncc > best_ncc)
         {
@@ -2194,6 +2226,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
     dt_free_align(rotated);
   }
+
+  dt_free_align(coarse_ref_grad);
+  dt_free_align(coarse_img_grad);
 
   dt_print(DT_DEBUG_ALWAYS,
            "[hdr_merge] coarse result: tx=%.0f ty=%.0f angle=%.2f° ncc=%.4f",
