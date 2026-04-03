@@ -1359,6 +1359,14 @@ static float _ecc_refine_level(const float *ref,
   float best_update = FLT_MAX;
   int stall_count = 0;
 
+  // Keep a copy of H at the iteration that produced the best update metric
+  // so we can restore it on stall, max-iterations, or failure exit.
+  // Without this, H is left in the last-iteration state -- which by
+  // definition had a *worse* update than the best -- and that drifted
+  // homography poisons every finer pyramid level.
+  float H_best[HDR_ALIGN_H_NPARAM];
+  memcpy(H_best, H, sizeof(H_best));
+
   for(int iter = 0; iter < HDR_ALIGN_ECC_MAX_ITER; iter++)
   {
     const float update = _ecc_iteration(ref, img, w, h, H);
@@ -1367,6 +1375,7 @@ static float _ecc_refine_level(const float *ref,
     {
       dt_print(DT_DEBUG_ALWAYS,
                "[hdr_merge]   ECC failed at iteration %d", iter);
+      memcpy(H, H_best, sizeof(H_best));
       return -1.0f;
     }
 
@@ -1385,9 +1394,14 @@ static float _ecc_refine_level(const float *ref,
     {
       best_update = update;
       stall_count = 0;
+      memcpy(H_best, H, sizeof(H_best));
     }
     else if(++stall_count >= HDR_ALIGN_ECC_PATIENCE)
     {
+      // Restore H to the state that gave the best update so far.
+      // The current H corresponds to a worse iteration and must not be
+      // used as the starting point for the next pyramid level.
+      memcpy(H, H_best, sizeof(H_best));
       dt_print(DT_DEBUG_ALWAYS,
                "[hdr_merge]   ECC stalled at iteration %d (update=%.6f, best=%.6f)",
                iter, update, best_update);
@@ -1395,6 +1409,8 @@ static float _ecc_refine_level(const float *ref,
     }
   }
 
+  // Max iterations reached: restore best H seen so far.
+  memcpy(H, H_best, sizeof(H_best));
   dt_print(DT_DEBUG_ALWAYS,
            "[hdr_merge]   ECC did not converge in %d iterations",
            HDR_ALIGN_ECC_MAX_ITER);
@@ -2166,8 +2182,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   // Compute gradient magnitude images for exposure-invariant coarse search.
   // Raw-pixel NCC can fail badly when the exposure difference between
   // brackets is very large (clipped highlights, noisy shadows).  Gradient
-  // magnitude removes the intensity DC component so that edges — which
-  // appear at the same locations regardless of exposure — drive the match.
+  // magnitude removes the intensity DC component so that edges -- which
+  // appear at the same locations regardless of exposure -- drive the match.
   // This is the same preprocessing that the ECC refinement uses.
   const size_t cpix = (size_t)cw * ch;
   float *coarse_ref_grad = NULL;
