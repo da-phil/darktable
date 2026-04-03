@@ -30,6 +30,7 @@
 #include "gui/splash.h"
 #include "bauhaus/bauhaus.h"
 #include "develop/develop.h"
+#include "develop/develop_gui.h"
 #include "develop/imageop.h"
 #include "dtgtk/drawingarea.h"
 #include "dtgtk/expander.h"
@@ -170,10 +171,12 @@ static void _init_main_table(GtkWidget *container);
 
 static void _fullscreen_key_accel_callback(dt_action_t *action)
 {
-  GtkWidget *widget = darktable.develop &&
-                      darktable.develop->second_wnd &&
-                      gtk_window_is_active(GTK_WINDOW(darktable.develop->second_wnd))
-                    ? darktable.develop->second_wnd
+  GtkWidget *second_wnd = darktable.develop
+                         ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
+                         : NULL;
+  GtkWidget *widget = second_wnd &&
+                      gtk_window_is_active(GTK_WINDOW(second_wnd))
+                    ? second_wnd
                     : dt_ui_main_window(darktable.gui->ui);
 
   if(gdk_window_get_state(gtk_widget_get_window(widget)) & GDK_WINDOW_STATE_FULLSCREEN)

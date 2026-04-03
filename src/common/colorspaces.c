@@ -29,6 +29,7 @@
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/imageop.h"
+#include "develop/develop_gui.h"
 
 #include <lcms2.h>
 #include <strings.h>
@@ -1941,7 +1942,7 @@ void dt_colorspaces_set_display_profile
   if(use_xatom)
   {
     GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
-      ? darktable.develop->second_wnd
+      ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
       : dt_ui_center(darktable.gui->ui);
     GdkWindow *window = gtk_widget_get_window(widget);
     GdkScreen *screen = gtk_widget_get_screen(widget);
@@ -1972,7 +1973,7 @@ void dt_colorspaces_set_display_profile
   {
     CdWindow *window = cd_window_new();
     GtkWidget *center_widget = (profile_type == DT_COLORSPACE_DISPLAY2)
-                                   ? darktable.develop->second_wnd
+                                   ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
                                    : dt_ui_center(darktable.gui->ui);
     cd_window_get_profile(window, center_widget, NULL,
                           dt_colorspaces_get_display_profile_colord_callback,
@@ -1983,7 +1984,7 @@ void dt_colorspaces_set_display_profile
 #elif defined GDK_WINDOWING_QUARTZ
 #if 0
   GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
-    ? darktable.develop->second_wnd
+    ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
     : dt_ui_center(darktable.gui->ui);
   GdkScreen *screen = gtk_widget_get_screen(widget);
   if(screen == NULL) screen = gdk_screen_get_default();
@@ -2015,7 +2016,7 @@ void dt_colorspaces_set_display_profile
 #endif
 #elif defined G_OS_WIN32
   GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
-      ? darktable.develop->second_wnd
+      ? dt_dev_gui_get_second_wnd(darktable.develop->gui)
       : dt_ui_center(darktable.gui->ui);
   GdkWindow *window = gtk_widget_get_window(widget);
   HWND hwnd = (HWND)gdk_win32_window_get_handle(window);  // get window handle
