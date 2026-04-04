@@ -30,7 +30,7 @@
 #include "gui/splash.h"
 #include "bauhaus/bauhaus.h"
 #include "develop/develop.h"
-#include "develop/develop_gui.h"
+#include "develop/develop_gui_struct.h"
 #include "develop/imageop.h"
 #include "dtgtk/drawingarea.h"
 #include "dtgtk/expander.h"

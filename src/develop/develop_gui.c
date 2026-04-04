@@ -27,10 +27,11 @@
  * See issue #18559.
  */
 
-#include "develop/develop_gui.h"
+#include "develop/develop_gui_struct.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "common/darktable.h"
+#include "control/control.h"
 #include "gui/gtk.h"
 
 #include <gtk/gtk.h>
@@ -114,4 +115,20 @@ void dt_dev_reorder_gui_module_list(dt_develop_t *dev)
                             pos_module++);
     }
   }
+}
+
+void dt_dev_gui_queue_redraw_viewport(dt_develop_gui_t *gui,
+                                      const dt_dev_viewport_t *port,
+                                      const dt_develop_t *dev)
+{
+  if(!gui || !port || !dev) return;
+
+  GtkWidget *widget = NULL;
+  if(port == &dev->full)
+    widget = gui->full.widget;
+  else if(port == &dev->preview2)
+    widget = gui->preview2.widget;
+
+  if(widget && GTK_IS_WIDGET(widget))
+    dt_control_queue_redraw_widget(widget);
 }

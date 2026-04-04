@@ -40,7 +40,7 @@
 #include "control/jobs.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
-#include "develop/develop_gui.h"
+#include "develop/develop_gui_struct.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "dtgtk/button.h"

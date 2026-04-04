@@ -797,8 +797,8 @@ restart:
   // maybe we got zoomed/panned in the meantime?
   if(port && pipe->changed != DT_DEV_PIPE_UNCHANGED)
   {
-    if(port->widget && !problem)
-      dt_control_queue_redraw_widget(port->widget);
+    if(!problem)
+      dt_dev_gui_queue_redraw_viewport(dev->gui, port, dev);
     dt_atomic_set_int(&pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
     goto restart;
   }
@@ -817,9 +817,9 @@ restart:
   {
     if(signalling && signal != DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED)
       DT_CONTROL_SIGNAL_RAISE(signal);
-    else if(port->widget && !dev->gui_attached)
+    else if(!dev->gui_attached)
       // pinned dev has gui_attached=FALSE, so manually queue redraw
-      dt_control_queue_redraw_widget(port->widget);
+      dt_dev_gui_queue_redraw_viewport(dev->gui, port, dev);
     return;
   }
 
@@ -3180,8 +3180,7 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   // Mark pipe as needing zoom update
   port->pipe->changed |= DT_DEV_PIPE_ZOOMED;
   
-  if(port->widget)
-    dt_control_queue_redraw_widget(port->widget);
+  dt_dev_gui_queue_redraw_viewport(dev->gui, port, dev);
   if(port == &dev->full)
     dt_control_navigation_redraw();
 }

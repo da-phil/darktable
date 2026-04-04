@@ -29,7 +29,7 @@
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/imageop.h"
-#include "develop/develop_gui.h"
+#include "develop/develop_gui_struct.h"
 
 #include <lcms2.h>
 #include <strings.h>

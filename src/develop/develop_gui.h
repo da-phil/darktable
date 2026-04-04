@@ -20,80 +20,28 @@
 
 /**
  * @file develop_gui.h
- * @brief GUI API for the develop module.
+ * @brief GTK-free public API for the develop GUI module.
  *
- * This header provides a proper API between the develop business logic
- * (develop.h/develop.c) and the GUI layer (darkroom.c).  It defines both
- * the GUI data structure (dt_develop_gui_t) and API functions that the
- * business logic can call to communicate with the GUI without depending
- * on GTK directly.
+ * This header provides an opaque forward declaration of dt_develop_gui_t
+ * and API functions that business logic code (develop.c) can call to
+ * communicate with the GUI without depending on GTK directly.
  *
- * The GUI data structure is defined in full here so that darkroom.c
- * (the GUI translation unit) can access widget pointers directly.
- * The business logic in develop.c should ONLY use the API functions
- * declared below, never access the struct members.
+ * Business logic code should include ONLY this header.
+ * GUI code that needs direct access to widget pointers should include
+ * develop_gui_struct.h instead (which includes this header).
  *
  * See issue #18559.
  */
 
-#include <gtk/gtk.h>
+#include <glib.h>
 
 struct dt_develop_t;
+struct dt_dev_viewport_t;
 
-/** GUI widgets associated with a viewport (full or second window) */
-typedef struct dt_dev_viewport_gui_t
-{
-  GtkWidget *widget;
-  GtkWidget *pin_button;  // only used for preview2 viewport
-} dt_dev_viewport_gui_t;
-
-/** All GUI-specific data for the develop module.
- *
- *  This struct holds ALL GtkWidget pointers that were previously
- *  stored directly in dt_develop_t and dt_dev_viewport_t.
- *
- *  darkroom.c (the GUI layer) accesses these members directly.
- *  develop.c (business logic) should use the API functions below.
+/**
+ * Opaque type for GUI data.  Full definition in develop_gui_struct.h.
  */
-typedef struct dt_develop_gui_t
-{
-  // viewport widgets
-  dt_dev_viewport_gui_t full;
-  dt_dev_viewport_gui_t preview2;
-
-  // for the overexposure indicator
-  struct
-  {
-    GtkWidget *floating_window, *button;
-  } overexposed;
-
-  // for the raw overexposure indicator
-  struct
-  {
-    GtkWidget *floating_window, *button;
-  } rawoverexposed;
-
-  // Color assessment conditions
-  struct
-  {
-    GtkWidget *floating_window, *button;
-  } color_assessment;
-
-  // late scaling down from full roi
-  struct
-  {
-    GtkWidget *button;
-  } late_scaling;
-
-  // the display profile related things (softproof, gamut check, profiles ...)
-  struct
-  {
-    GtkWidget *floating_window, *softproof_button, *gamut_button;
-  } profile;
-
-  // second window and its toggle button
-  GtkWidget *second_wnd, *second_wnd_button;
-} dt_develop_gui_t;
+typedef struct dt_develop_gui_t dt_develop_gui_t;
 
 
 /*
@@ -138,3 +86,14 @@ void dt_dev_gui_update_pin_button(dt_develop_gui_t *gui,
  *  Activates the second window toggle button.
  *  Used by filmstrip.c when pinning from filmstrip. */
 void dt_dev_gui_ensure_second_wnd_open(dt_develop_gui_t *gui);
+
+/** Queue a redraw of the widget associated with a viewport.
+ *  Maps the viewport pointer to the correct GUI widget and schedules
+ *  a redraw.  Safe to call when gui is NULL or the widget doesn't exist.
+ *  @param gui the GUI data (may be NULL)
+ *  @param port the viewport whose widget should be redrawn
+ *  @param dev the develop struct (used to determine which viewport)
+ */
+void dt_dev_gui_queue_redraw_viewport(dt_develop_gui_t *gui,
+                                      const struct dt_dev_viewport_t *port,
+                                      const struct dt_develop_t *dev);
