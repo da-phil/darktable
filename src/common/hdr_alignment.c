@@ -63,6 +63,14 @@
 // to introduce.  If ECC drifts the angle further than this it has wandered to
 // a wrong local maximum; the result is reverted to the pre-level homography.
 #define HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG 2.0f
+// Maximum translation change (pixels at the current level) that a single ECC
+// pyramid level may introduce.  Each level inherits a 2×-scaled estimate from
+// its parent, so the parent's accuracy at the child's scale is ~2 px.
+// Allowing up to 3 px gives sufficient room for genuine sub-pixel refinement
+// while catching runaway ECC drift that would compound across levels.
+// In well-aligned tripod shots the per-level change is typically <1 px;
+// hand-held brackets occasionally reach ~2.5 px at coarser levels.
+#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX 3.0f
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
 // Number of Jacobi smoothing iterations for the residual mesh.
@@ -2391,6 +2399,26 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         dt_print(DT_DEBUG_ALWAYS,
                  "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
                  l, delta * 180.0f / (float)M_PI, HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG);
+        memcpy(H_level, H_backup, sizeof(H_level));
+      }
+    }
+
+    // Translation drift guard: if ECC shifted the translation by more than
+    // the per-level tolerance, the optimiser has wandered.  Each level
+    // inherits a 2×-scaled estimate from its parent, so the expected
+    // correction is at most a few pixels.  Large shifts at any single level
+    // indicate a wrong local minimum, and the error doubles at every finer
+    // level, producing catastrophically wrong final alignments.
+    {
+      const float dtx = H_level[2] - H_backup[2];
+      const float dty = H_level[5] - H_backup[5];
+      if(fabsf(dtx) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX
+         || fabsf(dty) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+                 "[hdr_merge] ECC level %d: translation drift (%.2f, %.2f) px"
+                 " > limit %.1f px, reverting",
+                 l, dtx, dty, HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX);
         memcpy(H_level, H_backup, sizeof(H_level));
       }
     }
