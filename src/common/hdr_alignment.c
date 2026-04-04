@@ -101,13 +101,12 @@
 // vignetting gradients as geometric scaling, producing a wrong result.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.01f
 
-// ECC correlation coefficient below which the identity transform is considered
-// as a fallback.  If the identity H (no alignment) has a higher ρ than the
-// computed H, the alignment failed to find the true solution and using the
-// wrong H would make the merge worse.  Identity is used instead.
-// 0.3 is well below the escalation threshold (0.85) and represents an
-// alignment so poor that even unaligned images are likely better correlated.
-#define HDR_ALIGN_IDENTITY_FALLBACK_RHO 0.3f
+// Coarse NCC score for identity (tx=0, ty=0, angle=0°) above which the
+// images are considered already well-aligned and the full ECC pyramid is
+// skipped.  Gradient-domain NCC values above 0.98 indicate near-perfect
+// edge alignment at the coarsest level -- any ECC refinement risks
+// introducing drift for no gain.
+#define HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC 0.98f
 
 #define HDR_ALIGN_MESH_INDEX(row, col) ((row) * DT_HDR_ALIGN_MESH_COLS + (col))
 
@@ -2257,6 +2256,11 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   const float *coarse_img = use_grad ? coarse_img_grad
                                      : pyr_img.data[coarsest];
 
+  // Capture the identity NCC (tx=0, ty=0, angle=0°) before the full search.
+  // This tells us how well-aligned the images already are without any
+  // correction, providing an early-out and a baseline for quality checks.
+  const float ncc_identity = _ncc_full(coarse_ref, coarse_img, cw, ch, 0, 0);
+
   for(float angle = -max_angle_rad; angle <= max_angle_rad;
       angle += angle_step_rad)
   {
@@ -2293,8 +2297,35 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   dt_free_align(coarse_img_grad);
 
   dt_print(DT_DEBUG_ALWAYS,
-           "[hdr_merge] coarse result: tx=%.0f ty=%.0f angle=%.2f° ncc=%.4f",
-           best_tx, best_ty, best_angle * 180.0f / (float)M_PI, best_ncc);
+           "[hdr_merge] coarse result: tx=%.0f ty=%.0f angle=%.2f° ncc=%.4f"
+           " (identity ncc=%.4f)",
+           best_tx, best_ty, best_angle * 180.0f / (float)M_PI, best_ncc,
+           ncc_identity);
+
+  // Early-out: if the images are already extremely well-aligned (identity
+  // NCC close to 1.0), the full ECC pyramid would risk introducing drift
+  // for no benefit.  Return identity immediately.
+  if(ncc_identity >= HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] identity ncc %.4f >= %.2f -- images already aligned,"
+             " skipping ECC",
+             ncc_identity, HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC);
+    out_align->H[0] = 1.0f; out_align->H[1] = 0.0f; out_align->H[2] = 0.0f;
+    out_align->H[3] = 0.0f; out_align->H[4] = 1.0f; out_align->H[5] = 0.0f;
+    out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
+    _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
+
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] final homography: H=[1.00000 0.00000 0.00;"
+             " 0.00000 1.00000 0.00; 0.0000000 0.0000000 1],"
+             " approx dx=0.00 dy=0.00 angle=0.0000°,"
+             " mesh max=0.00 px, mesh center=(0.00, 0.00)");
+
+    _free_pyramid(&pyr_ref);
+    _free_pyramid(&pyr_img);
+    return TRUE;
+  }
 
   // Initialise projective model from coarse Euclidean estimate.
   float H_level[HDR_ALIGN_H_NPARAM];
@@ -2430,20 +2461,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       const float rho_best = _try_dof_escalation(ref_grad, img_grad, lw, lh, H_level);
 
-      // Identity fallback: if the best alignment quality is still very low,
-      // check whether no alignment (identity H) correlates better than the
-      // computed H.  A wrong H is worse than no correction.
-      if(rho_best < HDR_ALIGN_IDENTITY_FALLBACK_RHO)
+      // Identity comparison: always check whether the identity transform
+      // (no alignment) correlates at least as well as the computed H.
+      // A wrong H — even one with moderate ρ — is worse than no correction
+      // if the images are already well-aligned or the alignment wandered
+      // to a wrong local minimum.  This catches both low-ρ catastrophic
+      // failures and medium-ρ wrong solutions.
       {
         const float H_id[HDR_ALIGN_H_NPARAM]
           = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
         const float rho_id = _ecc_compute_rho(ref_grad, img_grad, lw, lh, H_id);
-        if(rho_id > rho_best)
+        dt_print(DT_DEBUG_ALWAYS,
+                 "[hdr_merge] identity check: ρ_aligned=%.5f ρ_identity=%.5f",
+                 rho_best, rho_id);
+        if(rho_id >= rho_best)
         {
           dt_print(DT_DEBUG_ALWAYS,
-                   "[hdr_merge] alignment failed (ρ=%.4f < %.2f), identity"
-                   " better (ρ=%.4f) -- reverting to identity",
-                   rho_best, (float)HDR_ALIGN_IDENTITY_FALLBACK_RHO, rho_id);
+                   "[hdr_merge] identity ρ >= aligned ρ -- reverting to identity");
           memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
         }
       }
