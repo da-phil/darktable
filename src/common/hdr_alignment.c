@@ -86,6 +86,13 @@
 // ECC convergence threshold for the escalated solver.
 #define HDR_ALIGN_ESCALATION_EPSILON 5e-3f
 
+// Maximum area-scaling deviation allowed in an escalated homography.
+// The determinant of the upper-left 2×2 equals the local area magnification;
+// for HDR brackets from the same camera / lens this must be very close to 1.0.
+// Values far from 1 indicate that the extra DOF are fitting exposure or
+// vignetting gradients as geometric scaling, producing a wrong result.
+#define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.01f
+
 // ECC correlation coefficient below which the identity transform is considered
 // as a fallback.  If the identity H (no alignment) has a higher ρ than the
 // computed H, the alignment failed to find the true solution and using the
@@ -1893,6 +1900,14 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
   // Off-diagonal: allow more shear than the rigid check.
   if(fabsf(Hn[1]) > 0.25f) return FALSE;
   if(fabsf(Hn[3]) > 0.25f) return FALSE;
+
+  // Area scaling: the determinant of the affine part (upper-left 2×2 of the
+  // normalised matrix) equals the local area magnification at image centre.
+  // For HDR brackets from the same camera/lens there is no physical reason
+  // for area scaling; if the extra DOF introduce significant scaling they
+  // are fitting exposure or vignetting gradients, not real geometry.
+  const float det_2x2 = Hn[0] * Hn[4] - Hn[1] * Hn[3];
+  if(fabsf(det_2x2 - 1.0f) > HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION) return FALSE;
 
   if(ndof == 6)
   {
