@@ -537,14 +537,16 @@ For one candidate frame the estimator does the following:
 1. Reduce the Bayer mosaic to half-resolution grayscale by averaging each `2x2` Bayer block.
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
 3. Normalize each pyramid level to `[0, 1]` so gradient magnitudes from dark and bright exposures have comparable numerical scale.
-4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level.
-5. Convert that coarse Euclidean result into a backward homography.
-6. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on gradient-magnitude images.
-7. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
-8. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
-9. Estimate local residual shifts on a small `3x3` grid of patches.
-10. Regularize that residual field with neighbor smoothness.
-11. Convert the final grayscale-level homography back to full-resolution Bayer coordinates.
+4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
+5. **Early-out**: if the identity NCC is very high ($\geq 0.98$), the images are already well-aligned — return identity immediately and skip all remaining steps.
+6. Convert the coarse Euclidean result into a backward homography.
+7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on gradient-magnitude images, with per-level drift guards.
+8. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
+9. **Identity comparison**: always compare the aligned $\rho$ against identity $\rho$ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
+10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
+11. Estimate local residual shifts on a small `3x3` grid of patches.
+12. Regularize that residual field with neighbor smoothness.
+13. Convert the final grayscale-level homography back to full-resolution Bayer coordinates.
 
 ### Why The Estimator Uses Grayscale Bayer Blocks
 
@@ -827,6 +829,28 @@ $$
 
 The translation clamp is in normalized coordinates, so $0.10$ corresponds to $10\%$ of the image half-diagonal per iteration. No post-hoc parameter clamping is needed because the 3-DOF parameterization cannot produce shear, scale drift, or perspective artifacts.
 
+#### Per-level drift guards
+
+In addition to the per-iteration trust region clamps, the pipeline applies two per-level drift guards that compare the homography after ECC refinement against the pre-ECC backup:
+
+1. **Angle drift guard**: if the rotation change introduced by a single pyramid level exceeds `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` ($2°$), ECC is considered to have wandered to a wrong local maximum and the result is reverted to the pre-level homography. The angle change is computed as $\Delta\theta = \mathrm{atan2}(H[3], H[0]) - \mathrm{atan2}(H_{backup}[3], H_{backup}[0])$.
+
+2. **Translation drift guard**: if the translation change at a single level exceeds `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` ($3.0$ px) in either component, the result is reverted. Each level inherits a $2\times$-scaled estimate from its parent, so the parent's accuracy at the child's scale is $\sim 2$ px. Allowing up to $3$ px gives room for genuine sub-pixel refinement while catching runaway drift.
+
+These guards prevent small per-level ECC errors from compounding across the pyramid. In well-aligned tripod shots the per-level translation change is typically $<1$ px; hand-held brackets occasionally reach $\sim 2.5$ px at coarser levels.
+
+The guards are conservative by design: they fire only when the refinement has clearly diverged, not when it is making normal progress. In the log example below, both guards fire on levels where ECC stalled and then drifted:
+
+```
+ECC level 2: translation drift (-1.25, 3.01) px > limit 3.0 px, reverting
+ECC level 0: translation drift (5.23, -0.98) px > limit 3.0 px, reverting
+```
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` | $2°$ | Maximum rotation change per level |
+| `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` | $3.0$ px | Maximum translation change per level |
+
 #### Residual regularized mesh
 
 After homography refinement, the code estimates residual translations on a regular `3x3` patch grid over the image. Let the node values be
@@ -1054,6 +1078,7 @@ Each escalation step is gated by three checks:
    - for affine: perspective terms remain exactly zero
    - for projective: perspective terms remain within $[-0.02, 0.02]$
    - all four image corners map to source positions within 15% of the image diagonal
+   - **area-scaling check**: $|\det(A_{2\times2}) - 1| < \epsilon$ where $A_{2\times2}$ is the upper-left $2\times 2$ submatrix of the normalized homography and $\epsilon$ = `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` ($0.01 = 1\%$). The determinant equals the local area magnification; for HDR brackets from the same camera/lens this must be very close to $1.0$. Values far from $1$ indicate that the extra DOFs are fitting exposure or vignetting gradients as geometric scaling, producing a wrong result. This check is computed on the normalized $H_n$, which preserves the affine determinant since normalization uses isotropic scaling.
 
 #### Trust Region and Clamps
 
@@ -1086,15 +1111,131 @@ No changes to the corner refinement acceptance thresholds were needed.
 | `HDR_ALIGN_ESCALATION_MAX_COND` | $10^6$ | Maximum Hessian condition number for acceptance |
 | `HDR_ALIGN_ESCALATION_MAX_ITER` | $30$ | Maximum ECC iterations per escalation stage |
 | `HDR_ALIGN_ESCALATION_EPSILON` | $5 \times 10^{-3}$ | Convergence threshold for escalated ECC |
+| `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.01$ | Maximum $|\det(A_{2\times2}) - 1|$ for area-scaling sanity |
 
 These values were chosen conservatively. The threshold $\rho = 0.85$ means escalation only activates on stacks where the rigid fit leaves significant residual misalignment. The improvement gate ($0.01$) prevents accepting results that are numerically but not visually better.
 
+### Identity Detection
+
+The alignment pipeline includes two layers of identity detection that determine whether images are already well-aligned and should not be warped. This answers the question: "can we determine if a set of images doesn't even need alignment?"
+
+#### Why identity detection is needed
+
+Even when the alignment optimizer converges, the resulting homography may be wrong. This happens when:
+
+- the images were taken on a tripod and are already perfectly aligned
+- the exposure difference is extreme, causing ECC to wander to a local minimum
+- the coarse search finds a spurious match with marginally higher NCC than identity
+
+In all these cases, applying a computed homography makes the merge worse than no alignment. The pipeline therefore compares the quality of the aligned result against the identity transform at two stages.
+
+#### Layer 1: Coarse identity early-out
+
+Before the ECC pyramid begins, the pipeline computes the identity NCC — the gradient-domain NCC at $(t_x=0, t_y=0, \theta=0°)$ — at the coarsest pyramid level:
+
+$$
+\rho_{identity}^{coarse} = \mathrm{NCC}(G_{ref}, G_{img}, 0, 0).
+$$
+
+If $\rho_{identity}^{coarse} \geq$ `HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` (currently $0.98$), the images are considered already perfectly aligned and the full ECC pyramid is skipped entirely. The pipeline returns the identity homography with a zero mesh.
+
+This early-out saves the cost of the entire ECC pyramid for tripod shots or stacks where the camera did not move between brackets.
+
+The threshold $0.98$ is deliberately high: gradient-domain NCC values this close to $1.0$ indicate near-perfect edge alignment, where any ECC refinement risks introducing drift for no gain.
+
+#### Layer 2: Fine-level identity comparison
+
+At pyramid level 0 (the finest grayscale level), after DOF escalation has produced the best available alignment, the pipeline always computes the weighted ECC score $\rho$ for the identity transform:
+
+$$
+\rho_{identity} = \rho(H_{id}, G_{ref}, G_{img}),
+$$
+
+where $H_{id}$ is the $3\times 3$ identity homography. This is compared against the aligned $\rho$:
+
+$$
+\text{if} \quad \rho_{identity} \geq \rho_{aligned}, \quad \text{revert to identity.}
+$$
+
+This comparison is unconditional — it runs regardless of the aligned $\rho$ value. An earlier implementation only checked identity when $\rho_{aligned}$ was below a low threshold ($0.3$), which missed cases where the alignment converged to a wrong solution with moderate $\rho$.
+
+The unconditional comparison catches both failure modes:
+
+1. **Low-$\rho$ catastrophic failures**: the optimizer wandered to a wrong minimum with very poor correlation.
+2. **Medium-$\rho$ wrong solutions**: the optimizer converged to a plausible-looking but incorrect alignment that is still worse than no correction.
+
+Both the aligned and identity $\rho$ values are always logged for diagnostics:
+
+```
+identity check: ρ_aligned=0.50410 ρ_identity=0.51763
+identity ρ >= aligned ρ -- reverting to identity
+```
+
+#### Worked example from a real merge
+
+The following log shows identity detection in action on a pair of near-aligned HDR brackets:
+
+```
+coarse result: tx=0 ty=0 angle=-1.00° ncc=0.8163 (identity ncc=0.8137)
+```
+
+The coarse search found a $-1°$ angle as the best match, but identity NCC ($0.8137$) was very close to the best NCC ($0.8163$). This is a warning sign — the $-1°$ angle is likely noise.
+
+The ECC pyramid then struggled to refine this marginal initial estimate:
+
+```
+ECC level 6: ECC did not converge in 50 iterations
+ECC level 5: ECC stalled at iteration 5
+ECC level 4: ECC stalled at iteration 6
+ECC level 3: ECC stalled at iteration 6
+ECC level 2: translation drift (-1.25, 3.01) px > limit 3.0 px, reverting
+ECC level 1: ECC stalled at iteration 5
+ECC level 0: translation drift (5.23, -0.98) px > limit 3.0 px, reverting
+```
+
+Every level either stalled or triggered a drift guard. At level 0, DOF escalation was attempted:
+
+```
+DOF escalation: 3-DOF ρ = 0.44036 (threshold = 0.85)
+DOF escalation: 6-DOF ρ = 0.50410 (Δρ = 0.06374, sane = 1)
+DOF escalation: 8-DOF ρ = 0.49912 (Δρ vs base = -0.00498, sane = 1)
+DOF escalation: accepted 6-DOF (ρ 0.44036 → 0.50410)
+```
+
+The 6-DOF model improved $\rho$ from $0.44$ to $0.50$ — but both values are poor. The 8-DOF model did not improve over 6-DOF.
+
+The identity comparison then caught the problem:
+
+```
+identity check: ρ_aligned=0.50410 ρ_identity=0.51763
+identity ρ >= aligned ρ -- reverting to identity
+```
+
+The identity transform ($\rho = 0.518$) correlated better than the best alignment ($\rho = 0.504$). The pipeline correctly reverted to identity, avoiding a wrong warp.
+
+The final result:
+
+```
+final homography: H=[1.00000 0.00000 0.00; 0.00000 1.00000 0.00; 0.0000000 0.0000000 1],
+  approx dx=-0.00 dy=-0.00 angle=0.0000°, mesh max=15.14 px, mesh center=(-0.39, -1.87)
+```
+
+The homography is identity, but the mesh residuals are non-zero (max 15.14 px). This is expected: the mesh estimation still runs after the identity revert and can capture local corrections that the global model failed to represent.
+
+#### Configuration Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` | $0.98$ | Identity NCC above which the full ECC pyramid is skipped |
+
 ## Future Work
 
-The adaptive DOF escalation feature could be further refined with:
+Potential refinements to the alignment pipeline:
 
-- **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ is conservative. Testing on a diverse corpus of HDR stacks could inform a better default or an adaptive threshold based on stack properties (number of frames, exposure range).
-- **Per-level escalation**: currently escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
+- **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ and identity skip NCC $= 0.98$ are conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range, identity NCC margin).
+- **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
+- **Adaptive drift guard thresholds**: the per-level translation drift limit ($3.0$ px) and angle drift limit ($2°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
+- **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
 
 ## File Map
 
