@@ -474,9 +474,9 @@ static void _compute_gradients(const float *img,
     }
 }
 
-/** Normalise a float image to [0, 1] in-place.  This ensures that
- *  gradient magnitudes computed on dark and bright exposures have
- *  comparable numerical scale, preventing ill-conditioned ECC systems. */
+/** Normalise a float image to [0, 1] in-place using a linear min-max stretch.
+ *  Used on raw pixel images before gradient computation to bring dark and
+ *  bright exposures to a comparable numerical scale. */
 static void _normalize_image_01(float *img, const size_t npix)
 {
   float vmin = FLT_MAX, vmax = -FLT_MAX;
@@ -492,6 +492,62 @@ static void _normalize_image_01(float *img, const size_t npix)
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
     img[i] = (img[i] - vmin) * inv_range;
+}
+
+/** Normalise a gradient magnitude image to [0, 1] in-place using a
+ *  99th-percentile stretch.
+ *
+ *  Gradient magnitude distributions are heavily right-skewed: the vast
+ *  majority of pixels are near-zero (uniform regions), while a small number
+ *  of strong edges carry large values.  A naive global min-max stretch leaves
+ *  the result almost entirely black, depriving ECC of usable contrast.
+ *
+ *  This function clips the top 1 % of pixel values to 1.0 and stretches the
+ *  remaining range linearly to [0, 1].  The result fills the full dynamic
+ *  range with actual edge structure, which:
+ *   - increases the magnitude of the ECC Jacobian entries → larger update
+ *     steps per iteration → faster convergence;
+ *   - raises ρ values on well-aligned images, improving quality detection;
+ *   - makes the algorithm less sensitive to a handful of very bright
+ *     outlier edges (e.g. specular highlights on a Bayer grid). */
+static void _normalize_image_percentile(float *img, const size_t npix)
+{
+  if(!img || npix == 0) return;
+
+  // Find the global maximum to set histogram range.
+  float vmax = 0.0f;
+  for(size_t i = 0; i < npix; i++)
+    if(img[i] > vmax) vmax = img[i];
+
+  if(vmax < 1e-12f) return;
+
+  // Build a 4096-bin histogram over [0, vmax].
+  enum { NBINS = 4096 };
+  size_t hist[NBINS] = { 0 };
+  const float inv_vmax = (float)(NBINS - 1) / vmax;
+  for(size_t i = 0; i < npix; i++)
+  {
+    const int bin = (int)(img[i] * inv_vmax);
+    hist[CLAMP(bin, 0, NBINS - 1)]++;
+  }
+
+  // Walk the histogram to find the 99th-percentile bin as white point.
+  const size_t target = (size_t)((double)npix * 0.99);
+  size_t cumul = 0;
+  int p99_bin = NBINS - 1;
+  for(int b = 0; b < NBINS; b++)
+  {
+    cumul += hist[b];
+    if(cumul >= target) { p99_bin = b; break; }
+  }
+  const float white_point = (float)(p99_bin + 1) / (float)NBINS * vmax;
+  if(white_point < 1e-12f) return;
+
+  // Stretch [0, white_point] → [0, 1], clamp values above white_point.
+  const float inv_wp = 1.0f / white_point;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    img[i] = CLAMP(img[i] * inv_wp, 0.0f, 1.0f);
 }
 
 /** Check whether a homography is plausible for hand-held HDR brackets.
@@ -544,77 +600,13 @@ static float *_gradient_magnitude(const float *img, const int w, const int h)
   return gx;
 }
 
-/** Build a contrast-enhanced copy of a gradient magnitude image for debug
- *  export.  Gradient images are heavily right-skewed (most pixels near zero,
- *  only strong edges carry large values), so a naive [min,max]→[0,1] stretch
- *  leaves the result almost entirely black.  Instead we clip at the 99th
- *  percentile to use it as the white point, then stretch linearly and clamp.
- *
- *  Returns a heap-allocated float buffer (caller must dt_free_align it), or
- *  NULL on allocation failure. */
-static float *_stretch_gradient_for_debug(const float *grad, const size_t npix)
-{
-  if(!grad || npix == 0) return NULL;
-
-  float *out = dt_alloc_align_float(npix);
-  if(!out) return NULL;
-
-  // Find the global maximum (after _normalize_image_01 the image is in [0,1],
-  // so the max is 1.0 – but we recompute to be safe).
-  float vmax = 0.0f;
-  for(size_t i = 0; i < npix; i++)
-    if(grad[i] > vmax) vmax = grad[i];
-
-  if(vmax < 1e-12f)
-  {
-    memset(out, 0, npix * sizeof(float));
-    return out;
-  }
-
-  // Build a 4096-bin histogram to find the 99th-percentile white point.
-  // Using 4096 bins gives good resolution even for large images.
-  enum { NBINS = 4096 };
-  size_t hist[NBINS] = { 0 };
-  const float inv_vmax = (float)(NBINS - 1) / vmax;
-  for(size_t i = 0; i < npix; i++)
-  {
-    const int bin = (int)(grad[i] * inv_vmax);
-    hist[CLAMP(bin, 0, NBINS - 1)]++;
-  }
-
-  // Find the bin corresponding to the 99th percentile.
-  const size_t target = (size_t)((double)npix * 0.99);
-  size_t cumul = 0;
-  int p99_bin = NBINS - 1;
-  for(int b = 0; b < NBINS; b++)
-  {
-    cumul += hist[b];
-    if(cumul >= target) { p99_bin = b; break; }
-  }
-  const float white_point = (float)(p99_bin + 1) / (float)NBINS * vmax;
-  if(white_point < 1e-12f)
-  {
-    memset(out, 0, npix * sizeof(float));
-    return out;
-  }
-
-  // Stretch: map [0, white_point] → [0, 1], clamp above.
-  const float inv_wp = 1.0f / white_point;
-  for(size_t i = 0; i < npix; i++)
-    out[i] = CLAMP(grad[i] * inv_wp, 0.0f, 1.0f);
-
-  return out;
-}
-
 /** Write a single-channel float image as a grayscale PFM file for debugging.
  *  Only active when the DT_DEBUG_VERBOSE flag is set.
  *  Files are written to darktable's tmp directory as
  *  "hdr_align_grad_<label>.pfm".
- *  A 99th-percentile contrast stretch is applied to the debug copy so that
- *  the exported image reveals structural detail even when raw gradient values
- *  are very small (heavily right-skewed distributions).
- *  If the temporary buffer for contrast enhancement cannot be allocated, the
- *  function falls back to writing the raw (unenhanced) gradient data. */
+ *  Gradient images fed to ECC are already normalised with
+ *  _normalize_image_percentile(), so the values are well-distributed across
+ *  [0, 1] and no additional contrast enhancement is needed here. */
 static void _debug_export_gradient_pfm(const float *grad,
                                        const int w,
                                        const int h,
@@ -623,18 +615,13 @@ static void _debug_export_gradient_pfm(const float *grad,
   if(!(darktable.unmuted & DT_DEBUG_VERBOSE)) return;
   if(!grad || w <= 0 || h <= 0) return;
 
-  const size_t npix = (size_t)w * h;
-  float *enhanced = _stretch_gradient_for_debug(grad, npix);
-
   char fname[64];
   snprintf(fname, sizeof(fname), "hdr_align_grad_%s.pfm", label);
   char *path = g_build_filename(darktable.tmp_directory, fname, NULL);
-  dt_write_pfm(path, w, h, enhanced ? enhanced : grad, sizeof(float));
+  dt_write_pfm(path, w, h, grad, sizeof(float));
   dt_print(DT_DEBUG_VERBOSE,
-           "[hdr_align] exported gradient image (%dx%d) → %s"
-           " (99th-pct contrast stretch)", w, h, path);
+           "[hdr_align] exported gradient image (%dx%d) → %s", w, h, path);
   g_free(path);
-  dt_free_align(enhanced);
 }
 
 /** Solve an 8x8 linear system A·x = b using Gauss-Jordan elimination with
@@ -2342,6 +2329,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       _normalize_image_01(tmp_img, cpix);
       coarse_ref_grad = _gradient_magnitude(tmp_ref, cw, ch);
       coarse_img_grad = _gradient_magnitude(tmp_img, cw, ch);
+      _normalize_image_percentile(coarse_ref_grad, cpix);
+      _normalize_image_percentile(coarse_img_grad, cpix);
     }
     dt_free_align(tmp_ref);
     dt_free_align(tmp_img);
@@ -2515,6 +2504,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
     }
+    _normalize_image_percentile(ref_grad, lpix);
+    _normalize_image_percentile(img_grad, lpix);
 
     // Export gradient images for debugging when DT_DEBUG_VERBOSE is set.
     {
@@ -2648,6 +2639,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
           _normalize_image_01(in, npix0);
           ref_grad0 = _gradient_magnitude(rn, pyr_ref.width[0], pyr_ref.height[0]);
           img_grad0 = _gradient_magnitude(in, pyr_img.width[0], pyr_img.height[0]);
+          _normalize_image_percentile(ref_grad0, npix0);
+          _normalize_image_percentile(img_grad0, npix0);
         }
         dt_free_align(rn);
         dt_free_align(in);
