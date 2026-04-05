@@ -474,42 +474,27 @@ static void _compute_gradients(const float *img,
     }
 }
 
-/** Normalise a float image to [0, 1] in-place using a linear min-max stretch.
- *  Used on raw pixel images before gradient computation to bring dark and
- *  bright exposures to a comparable numerical scale. */
-static void _normalize_image_01(float *img, const size_t npix)
+/** Apply log(1 + x) transform in-place.
+ *  Compresses the dynamic range so that dark and bright exposures produce
+ *  comparable gradient magnitudes.  Applied after percentile normalisation
+ *  and before Sobel gradient computation. */
+static void _log1p_transform(float *img, const size_t npix)
 {
-  float vmin = FLT_MAX, vmax = -FLT_MAX;
-  DT_OMP_FOR(reduction(min:vmin) reduction(max:vmax))
-  for(size_t i = 0; i < npix; i++)
-  {
-    if(img[i] < vmin) vmin = img[i];
-    if(img[i] > vmax) vmax = img[i];
-  }
-  const float range = vmax - vmin;
-  if(range < 1e-12f) return;
-  const float inv_range = 1.0f / range;
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
-    img[i] = (img[i] - vmin) * inv_range;
+    img[i] = logf(1.0f + img[i]);
 }
 
-/** Normalise a gradient magnitude image to [0, 1] in-place using a
+/** Normalise a non-negative image to [0, 1] in-place using a
  *  99th-percentile stretch.
  *
- *  Gradient magnitude distributions are heavily right-skewed: the vast
- *  majority of pixels are near-zero (uniform regions), while a small number
- *  of strong edges carry large values.  A naive global min-max stretch leaves
- *  the result almost entirely black, depriving ECC of usable contrast.
+ *  Many image distributions are right-skewed.  A naive global min-max stretch
+ *  would let a few bright outliers compress the useful range.
  *
  *  This function clips the top 1 % of pixel values to 1.0 and stretches the
- *  remaining range linearly to [0, 1].  The result fills the full dynamic
- *  range with actual edge structure, which:
- *   - increases the magnitude of the ECC Jacobian entries → larger update
- *     steps per iteration → faster convergence;
- *   - raises ρ values on well-aligned images, improving quality detection;
- *   - makes the algorithm less sensitive to a handful of very bright
- *     outlier edges (e.g. specular highlights on a Bayer grid). */
+ *  remaining range linearly to [0, 1].  When used on raw pixel images before
+ *  gradient computation, it brings dark and bright exposures to a comparable
+ *  scale and reduces the influence of saturated highlights. */
 static void _normalize_image_percentile(float *img, const size_t npix)
 {
   if(!img || npix == 0) return;
@@ -574,10 +559,11 @@ static gboolean _homography_is_sane(const float H[HDR_ALIGN_H_NPARAM],
   return TRUE;
 }
 
-/** Compute gradient magnitude image.  Removes the exposure-dependent
- *  DC component, making the feature image suitable for comparing HDR
- *  brackets with different exposure levels.  Caller must free result. */
-static float *_gradient_magnitude(const float *img, const int w, const int h)
+/** Compute signed Sobel gradient sum (gx + gy) image.
+ *  ECC benefits from signed gradients that preserve structure and direction,
+ *  rather than unsigned magnitude.  The sum gx + gy retains sign information
+ *  from both axes in a single channel.  Caller must free result. */
+static float *_gradient_sobel_sum(const float *img, const int w, const int h)
 {
   const size_t npix = (size_t)w * h;
   float *gx = dt_alloc_align_float(npix);
@@ -591,22 +577,42 @@ static float *_gradient_magnitude(const float *img, const int w, const int h)
 
   _compute_gradients(img, w, h, gx, gy);
 
-  // Re-use gx buffer for magnitude output
+  // Combine as gx + gy — preserves sign and direction information.
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
-    gx[i] = sqrtf(gx[i] * gx[i] + gy[i] * gy[i]);
+    gx[i] = gx[i] + gy[i];
 
   dt_free_align(gy);
   return gx;
 }
 
+/** Normalise a signed gradient image in-place by its mean absolute value.
+ *  g[i] = g[i] / (mean(|g|) + ε)
+ *  This prevents one image from dominating due to exposure differences,
+ *  while preserving the sign of gradients. */
+static void _normalize_gradient_mad(float *g, const size_t npix)
+{
+  if(!g || npix == 0) return;
+
+  double sum_abs = 0.0;
+  DT_OMP_FOR(reduction(+:sum_abs))
+  for(size_t i = 0; i < npix; i++)
+    sum_abs += (double)fabsf(g[i]);
+
+  const float mean_abs = (float)(sum_abs / (double)npix);
+  const float inv_scale = 1.0f / (mean_abs + 1e-7f);
+
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    g[i] *= inv_scale;
+}
+
 /** Write a single-channel float image as a grayscale PFM file for debugging.
  *  Only active when the DT_DEBUG_VERBOSE flag is set.
- *  Files are written to darktable's tmp directory as
- *  "hdr_align_grad_<label>.pfm".
+ *  Files are written to /tmp as "hdr_align_grad_<label>.pfm".
  *  Gradient images fed to ECC are already normalised with
- *  _normalize_image_percentile(), so the values are well-distributed across
- *  [0, 1] and no additional contrast enhancement is needed here. */
+ *  _normalize_gradient_mad(), so the values are well-distributed and
+ *  no additional contrast enhancement is needed here. */
 static void _debug_export_gradient_pfm(const float *grad,
                                        const int w,
                                        const int h,
@@ -617,7 +623,7 @@ static void _debug_export_gradient_pfm(const float *grad,
 
   char fname[64];
   snprintf(fname, sizeof(fname), "hdr_align_grad_%s.pfm", label);
-  char *path = g_build_filename(darktable.tmp_directory, fname, NULL);
+  char *path = g_build_filename("/tmp", fname, NULL);
   dt_write_pfm(path, w, h, grad, sizeof(float));
   dt_print(DT_DEBUG_VERBOSE,
            "[hdr_align] exported gradient image (%dx%d) → %s", w, h, path);
@@ -2309,11 +2315,12 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            "[hdr_merge] coarse search: %dx%d, radius=%d, angle_step=%.1f°",
            cw, ch, search_radius, HDR_ALIGN_COARSE_ANGLE_STEP);
 
-  // Compute gradient magnitude images for exposure-invariant coarse search.
+  // Compute signed Sobel gradient images for exposure-invariant coarse search.
   // Raw-pixel NCC can fail badly when the exposure difference between
-  // brackets is very large (clipped highlights, noisy shadows).  Gradient
-  // magnitude removes the intensity DC component so that edges -- which
-  // appear at the same locations regardless of exposure -- drive the match.
+  // brackets is very large (clipped highlights, noisy shadows).  Signed
+  // gradients preserve structure and direction while removing the intensity
+  // DC component so that edges drive the match.
+  // Pipeline: percentile normalize → log1p → Sobel sum (gx+gy) → MAD norm.
   // This is the same preprocessing that the ECC refinement uses.
   const size_t cpix = (size_t)cw * ch;
   float *coarse_ref_grad = NULL;
@@ -2325,12 +2332,18 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
-      _normalize_image_01(tmp_ref, cpix);
-      _normalize_image_01(tmp_img, cpix);
-      coarse_ref_grad = _gradient_magnitude(tmp_ref, cw, ch);
-      coarse_img_grad = _gradient_magnitude(tmp_img, cw, ch);
-      _normalize_image_percentile(coarse_ref_grad, cpix);
-      _normalize_image_percentile(coarse_img_grad, cpix);
+      // Step 1: Percentile normalize raw pixels
+      _normalize_image_percentile(tmp_ref, cpix);
+      _normalize_image_percentile(tmp_img, cpix);
+      // Step 2: Log transform to compress dynamic range
+      _log1p_transform(tmp_ref, cpix);
+      _log1p_transform(tmp_img, cpix);
+      // Step 3: Signed Sobel gradient (gx + gy)
+      coarse_ref_grad = _gradient_sobel_sum(tmp_ref, cw, ch);
+      coarse_img_grad = _gradient_sobel_sum(tmp_img, cw, ch);
+      // Step 4: MAD gradient normalization
+      if(coarse_ref_grad) _normalize_gradient_mad(coarse_ref_grad, cpix);
+      if(coarse_img_grad) _normalize_gradient_mad(coarse_img_grad, cpix);
     }
     dt_free_align(tmp_ref);
     dt_free_align(tmp_img);
@@ -2471,11 +2484,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       continue;
     }
 
-    // Compute gradient magnitude images for exposure-invariant ECC.
-    // Gradient magnitude removes the multiplicative exposure difference
-    // that causes raw-pixel ECC to fail on HDR brackets.
-    // Normalise each pyramid level to [0,1] first so that the gradient
-    // magnitudes of dark and bright exposures are on a comparable scale.
+    // Compute signed Sobel gradient images for exposure-invariant ECC.
+    // The signed gradient sum (gx + gy) preserves structure and direction,
+    // which ECC exploits for better convergence than unsigned magnitude.
+    // Pipeline: percentile normalize → log1p → Sobel sum → MAD normalize.
     const size_t lpix = (size_t)lw * lh;
     float *ref_norm = dt_alloc_align_float(lpix);
     float *img_norm = dt_alloc_align_float(lpix);
@@ -2489,11 +2501,16 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     }
     memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
     memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
-    _normalize_image_01(ref_norm, lpix);
-    _normalize_image_01(img_norm, lpix);
+    // Step 1: Percentile normalize raw pixels
+    _normalize_image_percentile(ref_norm, lpix);
+    _normalize_image_percentile(img_norm, lpix);
+    // Step 2: Log transform
+    _log1p_transform(ref_norm, lpix);
+    _log1p_transform(img_norm, lpix);
 
-    float *ref_grad = _gradient_magnitude(ref_norm, lw, lh);
-    float *img_grad = _gradient_magnitude(img_norm, lw, lh);
+    // Step 3: Signed Sobel gradient (gx + gy)
+    float *ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
+    float *img_grad = _gradient_sobel_sum(img_norm, lw, lh);
     dt_free_align(ref_norm);
     dt_free_align(img_norm);
     if(!ref_grad || !img_grad)
@@ -2504,8 +2521,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
     }
-    _normalize_image_percentile(ref_grad, lpix);
-    _normalize_image_percentile(img_grad, lpix);
+    // Step 4: MAD gradient normalization
+    _normalize_gradient_mad(ref_grad, lpix);
+    _normalize_gradient_mad(img_grad, lpix);
 
     // Export gradient images for debugging when DT_DEBUG_VERBOSE is set.
     {
@@ -2635,12 +2653,18 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         {
           memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
           memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
-          _normalize_image_01(rn, npix0);
-          _normalize_image_01(in, npix0);
-          ref_grad0 = _gradient_magnitude(rn, pyr_ref.width[0], pyr_ref.height[0]);
-          img_grad0 = _gradient_magnitude(in, pyr_img.width[0], pyr_img.height[0]);
-          _normalize_image_percentile(ref_grad0, npix0);
-          _normalize_image_percentile(img_grad0, npix0);
+          // Step 1: Percentile normalize raw pixels
+          _normalize_image_percentile(rn, npix0);
+          _normalize_image_percentile(in, npix0);
+          // Step 2: Log transform
+          _log1p_transform(rn, npix0);
+          _log1p_transform(in, npix0);
+          // Step 3: Signed Sobel gradient (gx + gy)
+          ref_grad0 = _gradient_sobel_sum(rn, pyr_ref.width[0], pyr_ref.height[0]);
+          img_grad0 = _gradient_sobel_sum(in, pyr_img.width[0], pyr_img.height[0]);
+          // Step 4: MAD gradient normalization
+          if(ref_grad0) _normalize_gradient_mad(ref_grad0, npix0);
+          if(img_grad0) _normalize_gradient_mad(img_grad0, npix0);
         }
         dt_free_align(rn);
         dt_free_align(in);
