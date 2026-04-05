@@ -544,10 +544,75 @@ static float *_gradient_magnitude(const float *img, const int w, const int h)
   return gx;
 }
 
+/** Build a contrast-enhanced copy of a gradient magnitude image for debug
+ *  export.  Gradient images are heavily right-skewed (most pixels near zero,
+ *  only strong edges carry large values), so a naive [min,max]→[0,1] stretch
+ *  leaves the result almost entirely black.  Instead we clip at the 99th
+ *  percentile to use it as the white point, then stretch linearly and clamp.
+ *
+ *  Returns a heap-allocated float buffer (caller must dt_free_align it), or
+ *  NULL on allocation failure. */
+static float *_stretch_gradient_for_debug(const float *grad, const size_t npix)
+{
+  if(!grad || npix == 0) return NULL;
+
+  float *out = dt_alloc_align_float(npix);
+  if(!out) return NULL;
+
+  // Find the global maximum (after _normalize_image_01 the image is in [0,1],
+  // so the max is 1.0 – but we recompute to be safe).
+  float vmax = 0.0f;
+  for(size_t i = 0; i < npix; i++)
+    if(grad[i] > vmax) vmax = grad[i];
+
+  if(vmax < 1e-12f)
+  {
+    memset(out, 0, npix * sizeof(float));
+    return out;
+  }
+
+  // Build a 4096-bin histogram to find the 99th-percentile white point.
+  // Using 4096 bins gives good resolution even for large images.
+  const int NBINS = 4096;
+  size_t hist[4096] = { 0 };
+  const float inv_vmax = (float)(NBINS - 1) / vmax;
+  for(size_t i = 0; i < npix; i++)
+  {
+    const int bin = (int)(grad[i] * inv_vmax);
+    hist[CLAMP(bin, 0, NBINS - 1)]++;
+  }
+
+  // Find the bin corresponding to the 99th percentile.
+  const size_t target = (size_t)((double)npix * 0.99);
+  size_t cumul = 0;
+  int p99_bin = NBINS - 1;
+  for(int b = 0; b < NBINS; b++)
+  {
+    cumul += hist[b];
+    if(cumul >= target) { p99_bin = b; break; }
+  }
+  const float white_point = (float)(p99_bin + 1) / (float)NBINS * vmax;
+  if(white_point < 1e-12f)
+  {
+    memset(out, 0, npix * sizeof(float));
+    return out;
+  }
+
+  // Stretch: map [0, white_point] → [0, 1], clamp above.
+  const float inv_wp = 1.0f / white_point;
+  for(size_t i = 0; i < npix; i++)
+    out[i] = CLAMP(grad[i] * inv_wp, 0.0f, 1.0f);
+
+  return out;
+}
+
 /** Write a single-channel float image as a grayscale PFM file for debugging.
  *  Only active when the DT_DEBUG_VERBOSE flag is set.
  *  Files are written to darktable's tmp directory as
- *  "hdr_align_grad_<label>.pfm". */
+ *  "hdr_align_grad_<label>.pfm".
+ *  A 99th-percentile contrast stretch is applied to the debug copy so that
+ *  the exported image reveals structural detail even when raw gradient values
+ *  are very small (heavily right-skewed distributions). */
 static void _debug_export_gradient_pfm(const float *grad,
                                        const int w,
                                        const int h,
@@ -556,13 +621,18 @@ static void _debug_export_gradient_pfm(const float *grad,
   if(!(darktable.unmuted & DT_DEBUG_VERBOSE)) return;
   if(!grad || w <= 0 || h <= 0) return;
 
+  const size_t npix = (size_t)w * h;
+  float *enhanced = _stretch_gradient_for_debug(grad, npix);
+
   char fname[64];
   snprintf(fname, sizeof(fname), "hdr_align_grad_%s.pfm", label);
   char *path = g_build_filename(darktable.tmp_directory, fname, NULL);
-  dt_write_pfm(path, w, h, grad, sizeof(float));
+  dt_write_pfm(path, w, h, enhanced ? enhanced : grad, sizeof(float));
   dt_print(DT_DEBUG_VERBOSE,
-           "[hdr_align] exported gradient image (%dx%d) → %s", w, h, path);
+           "[hdr_align] exported gradient image (%dx%d) → %s"
+           " (99th-pct contrast stretch)", w, h, path);
   g_free(path);
+  dt_free_align(enhanced);
 }
 
 /** Solve an 8x8 linear system A·x = b using Gauss-Jordan elimination with
