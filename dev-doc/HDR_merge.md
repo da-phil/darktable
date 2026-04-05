@@ -538,7 +538,7 @@ For one candidate frame the estimator does the following:
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
 3. Normalize each pyramid level to `[0, 1]` so gradient magnitudes from dark and bright exposures have comparable numerical scale.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
-5. **Early-out**: if the identity NCC is very high ($\geq 0.98$), the images are already well-aligned — return identity immediately and skip all remaining steps.
+5. **Early-out**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the images are already well-aligned — return identity immediately and skip all remaining steps.
 6. Convert the coarse Euclidean result into a backward homography.
 7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on gradient-magnitude images, with per-level drift guards.
 8. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
@@ -1129,19 +1129,20 @@ Even when the alignment optimizer converges, the resulting homography may be wro
 
 In all these cases, applying a computed homography makes the merge worse than no alignment. The pipeline therefore compares the quality of the aligned result against the identity transform at two stages.
 
-#### Layer 1: Coarse identity early-out
+#### Layer 1: Coarse ECC ρ early-out
 
-Before the ECC pyramid begins, the pipeline computes the identity NCC — the gradient-domain NCC at $(t_x=0, t_y=0, \theta=0°)$ — at the coarsest pyramid level:
+After the exhaustive NCC search finds the best candidate $(t_x, t_y, \theta)$, the pipeline computes the weighted ECC correlation coefficient $\rho$ at the coarsest pyramid level for both the identity transform and the NCC-winning candidate:
 
 $$
-\rho_{identity}^{coarse} = \mathrm{NCC}(G_{ref}, G_{img}, 0, 0).
+\rho_{identity}^{coarse} = \rho(H_{id}, G_{ref}, G_{img}), \quad
+\rho_{candidate}^{coarse} = \rho(H_{candidate}, G_{ref}, G_{img}).
 $$
 
-If $\rho_{identity}^{coarse} \geq$ `HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` (currently $0.98$), the images are considered already perfectly aligned and the full ECC pyramid is skipped entirely. The pipeline returns the identity homography with a zero mesh.
+If $\rho_{identity}^{coarse} \geq \rho_{candidate}^{coarse}$, the images are considered already well-aligned and the full ECC pyramid is skipped entirely. The pipeline returns the identity homography with a zero mesh.
 
-This early-out saves the cost of the entire ECC pyramid for tripod shots or stacks where the camera did not move between brackets.
+This early-out uses the same metric (weighted ECC $\rho$) as the level-0 identity comparison (Layer 2 below), making the entire decision chain consistent. The previous implementation used a gradient-domain NCC threshold (`HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` $= 0.98$), which was an arbitrary constant on a different metric than the rest of the pipeline.
 
-The threshold $0.98$ is deliberately high: gradient-domain NCC values this close to $1.0$ indicate near-perfect edge alignment, where any ECC refinement risks introducing drift for no gain.
+By comparing $\rho$ values directly, the early-out participates in the same comparison chain as the level-0 identity check — both ask the same question ("does the candidate alignment correlate better than identity?") using the same score.
 
 #### Layer 2: Fine-level identity comparison
 
@@ -1224,9 +1225,7 @@ The homography is identity, but the mesh residuals are non-zero (max 15.14 px). 
 
 #### Configuration Constants
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` | $0.98$ | Identity NCC above which the full ECC pyramid is skipped |
+The identity detection at Layer 1 uses the same `_ecc_compute_rho` function as Layer 2, with no separate threshold constant. The decision is purely comparative: identity wins if and only if its $\rho$ is at least as good as the candidate's.
 
 ## Performance Optimization
 
@@ -1245,7 +1244,7 @@ All image-scanning passes now use `DT_OMP_FOR` with reduction directives:
 | `_ecc_iteration_higher_dof` pass 1 | Same as 3-DOF | 4 accumulators |
 | `_ecc_iteration_higher_dof` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 11 accumulators (norms + 8 Jacobian sums) |
 | `_ecc_iteration_higher_dof` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 8 projection accumulators |
-| `_ecc_iteration_higher_dof` pass 4 | Thread-local + `critical` merge | Up to 8×8 Hessian entries — too many for flat reduction |
+| `_ecc_iteration_higher_dof` pass 4 | Thread-local + `critical` merge | Up to 8×8 Hessian entries — too many for flat reduction. The `Hess` and `rhs_ecc` arrays must be `shared` (not `firstprivate`) so the critical section merges into the shared copy. |
 | `_ecc_compute_rho` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 accumulators |
 | `_ecc_compute_rho` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 3 accumulators |
 
@@ -1295,7 +1294,7 @@ For a typical HDR merge of a 4784×3188 bracket pair:
 
 Potential refinements to the alignment pipeline:
 
-- **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ and identity skip NCC $= 0.98$ are conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range, identity NCC margin).
+- **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ for DOF escalation is conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range).
 - **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
 - **Adaptive drift guard thresholds**: the per-level translation drift limit ($3.0$ px) and angle drift limit ($2°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
