@@ -20,6 +20,7 @@
 #include "common/darktable.h"
 #include "common/interpolation.h"
 #include "common/math.h"
+#include "common/pfm.h"
 
 #include <float.h>
 #include <math.h>
@@ -83,6 +84,11 @@
 // A score of 1.0 means perfect correlation; lower values indicate the
 // rigid model left residual misalignment.
 #define HDR_ALIGN_ESCALATION_RHO_THRESHOLD 0.85f
+// Minimum 3-DOF ρ required before DOF escalation is attempted.
+// Below this value the rigid-body alignment has completely failed (strong
+// local minimum, motion blur, heavy noise) and higher-DOF solvers would
+// only fit image noise — producing a worse result than keeping 3-DOF.
+#define HDR_ALIGN_ESCALATION_MIN_RHO 0.3f
 // Minimum ρ improvement required to accept a higher-DOF result.
 #define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT 0.01f
 // Maximum Hessian condition number for accepting a higher-DOF result.
@@ -474,6 +480,7 @@ static void _compute_gradients(const float *img,
 static void _normalize_image_01(float *img, const size_t npix)
 {
   float vmin = FLT_MAX, vmax = -FLT_MAX;
+  DT_OMP_FOR(reduction(min:vmin) reduction(max:vmax))
   for(size_t i = 0; i < npix; i++)
   {
     if(img[i] < vmin) vmin = img[i];
@@ -535,6 +542,27 @@ static float *_gradient_magnitude(const float *img, const int w, const int h)
 
   dt_free_align(gy);
   return gx;
+}
+
+/** Write a single-channel float image as a grayscale PFM file for debugging.
+ *  Only active when the DT_DEBUG_VERBOSE flag is set.
+ *  Files are written to darktable's tmp directory as
+ *  "hdr_align_grad_<label>.pfm". */
+static void _debug_export_gradient_pfm(const float *grad,
+                                       const int w,
+                                       const int h,
+                                       const char *label)
+{
+  if(!(darktable.unmuted & DT_DEBUG_VERBOSE)) return;
+  if(!grad || w <= 0 || h <= 0) return;
+
+  char fname[64];
+  snprintf(fname, sizeof(fname), "hdr_align_grad_%s.pfm", label);
+  char *path = g_build_filename(darktable.tmp_directory, fname, NULL);
+  dt_write_pfm(path, w, h, grad, sizeof(float));
+  dt_print(DT_DEBUG_VERBOSE,
+           "[hdr_align] exported gradient image (%dx%d) → %s", w, h, path);
+  g_free(path);
 }
 
 /** Solve an 8x8 linear system A·x = b using Gauss-Jordan elimination with
@@ -1148,18 +1176,24 @@ static float _ecc_iteration(const float *ref,
   const double mean_r = sum_r / sum_weight;
   const double mean_w = sum_w / sum_weight;
 
-  // --- Pass 2: norms, mean Jacobian, and correlation coefficient ---
+  // --- Pass 2: norms, mean Jacobian, projection coefficients, and ρ ---
   // 3-DOF Jacobian: J = (J_θ, J_tx, J_ty)
   //   J_θ  = s·(gx·(−sin θ·xn + cos θ·yn) + gy·(−cos θ·xn − sin θ·yn))
   //   J_tx = s·gx
   //   J_ty = s·gy
-  // We merge the old pass 2 (norms + sum_J) and old correlation coefficient
-  // pass into a single parallel pass to reduce memory bandwidth overhead.
+  //
+  // The projection coefficient for parameter k is:
+  //   proj_coeff[k] = Σ wgt·tw·(J[k] − mean_J[k]) / norm2_w
+  // Since Σ wgt·tw = 0 by definition of mean_w, this simplifies to:
+  //   proj_coeff[k] = Σ wgt·tw·J[k] / norm2_w
+  // so we can accumulate sJw[k] = Σ wgt·tw·J[k] alongside the existing
+  // pass 2 sums and eliminate the former pass 3 sweep entirely.
   double norm2_r = 0.0, norm2_w = 0.0;
   double sum_J0 = 0.0, sum_J1 = 0.0, sum_J2 = 0.0;
+  double sJw0 = 0.0, sJw1 = 0.0, sJw2 = 0.0;
   double dot_rw = 0.0;
 
-  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, sum_J0, sum_J1, sum_J2, dot_rw))
+  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, sum_J0, sum_J1, sum_J2, sJw0, sJw1, sJw2, dot_rw))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1188,6 +1222,10 @@ static float _ecc_iteration(const float *ref,
       sum_J0 += wgt * J0;
       sum_J1 += wgt * J1;
       sum_J2 += wgt * J2;
+
+      sJw0 += wgt * tw * J0;
+      sJw1 += wgt * tw * J1;
+      sJw2 += wgt * tw * J2;
     }
 
   const double norm_r = sqrt(norm2_r);
@@ -1203,45 +1241,18 @@ static float _ecc_iteration(const float *ref,
 
   const double rho = dot_rw / (norm_r * norm_w);
 
-  // --- Pass 3: projection coefficient ---
+  // Derive projection coefficients from the pass 2 sums (no separate sweep).
   const double mean_J[3] = { sum_J0 / sum_weight,
                               sum_J1 / sum_weight,
                               sum_J2 / sum_weight };
 
-  double proj0 = 0.0, proj1 = 0.0, proj2 = 0.0;
-  DT_OMP_FOR(collapse(2) reduction(+:proj0, proj1, proj2))
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
-    {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] < 0.5f) continue;
+  // proj_coeff[k] = sJw[k] / norm2_w  (the mean_J correction term vanishes
+  // because Σ wgt·tw = 0 by definition of mean_w).
+  const double proj_coeff[3] = { sJw0 / norm2_w,
+                                  sJw1 / norm2_w,
+                                  sJw2 / norm2_w };
 
-      const double xn = ((double)x - cx) / s;
-      const double yn = ((double)y - cy) / s;
-      const double wgt = _ecc_spatial_weight(xn, yn);
-      const double gxi = (double)gx[i];
-      const double gyi = (double)gy[i];
-
-      const double J[3] = {
-        s * (gxi * (-sin_t * xn + cos_t * yn)
-           + gyi * (-cos_t * xn - sin_t * yn)),
-        s * gxi,
-        s * gyi
-      };
-
-      const double tw = (double)warped[i] - mean_w;
-      proj0 += wgt * tw * (J[0] - mean_J[0]);
-      proj1 += wgt * tw * (J[1] - mean_J[1]);
-      proj2 += wgt * tw * (J[2] - mean_J[2]);
-    }
-
-  const double proj_coeff[3] = { proj0 / norm2_w,
-                                  proj1 / norm2_w,
-                                  proj2 / norm2_w };
-
-  // --- Pass 4: 3×3 Hessian and RHS ---
-  // Use scalar accumulators for OMP reduction (arrays not directly
-  // reducible with the DT_OMP_FOR macro).
+  // --- Pass 3 (formerly Pass 4): 3×3 Hessian and RHS ---
   double H00 = 0.0, H01 = 0.0, H02 = 0.0;
   double H11 = 0.0, H12 = 0.0, H22 = 0.0;
   double rhs0 = 0.0, rhs1 = 0.0, rhs2 = 0.0;
@@ -1478,10 +1489,18 @@ static float _ecc_compute_rho(const float *ref,
     return -2.0f;
   }
 
+  // Single-pass weighted covariance formula.
+  // Accumulates sum_r, sum_w, sum_rr, sum_ww, sum_rw and sum_weight in one
+  // sweep, then derives norm2_r, norm2_w, dot_rw via the identity:
+  //   norm2_r = sum_rr - sum_r² / sum_weight
+  // This avoids a second full image traversal at the cost of six instead of
+  // three accumulation variables.  Gradient images are normalised to [0,1]
+  // so cancellation errors are negligible.
   double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
+  double sum_rr = 0.0, sum_ww = 0.0, sum_rw = 0.0;
   long nvalid = 0;
 
-  DT_OMP_FOR(collapse(2) reduction(+:sum_r, sum_w, sum_weight, nvalid))
+  DT_OMP_FOR(collapse(2) reduction(+:sum_r, sum_w, sum_weight, sum_rr, sum_ww, sum_rw, nvalid))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1491,8 +1510,13 @@ static float _ecc_compute_rho(const float *ref,
         const double xn = ((double)x - cx) / s;
         const double yn = ((double)y - cy) / s;
         const double wgt = _ecc_spatial_weight(xn, yn);
-        sum_r += wgt * (double)ref[i];
-        sum_w += wgt * (double)warped[i];
+        const double rv = (double)ref[i];
+        const double wv = (double)warped[i];
+        sum_r      += wgt * rv;
+        sum_w      += wgt * wv;
+        sum_rr     += wgt * rv * rv;
+        sum_ww     += wgt * wv * wv;
+        sum_rw     += wgt * rv * wv;
         sum_weight += wgt;
         nvalid++;
       }
@@ -1505,27 +1529,10 @@ static float _ecc_compute_rho(const float *ref,
     return -2.0f;
   }
 
-  const double mean_r = sum_r / sum_weight;
-  const double mean_w = sum_w / sum_weight;
-
-  double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
-  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, dot_rw))
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
-    {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] > 0.5f)
-      {
-        const double xn = ((double)x - cx) / s;
-        const double yn = ((double)y - cy) / s;
-        const double wgt = _ecc_spatial_weight(xn, yn);
-        const double r = (double)ref[i] - mean_r;
-        const double tw = (double)warped[i] - mean_w;
-        norm2_r += wgt * r * r;
-        norm2_w += wgt * tw * tw;
-        dot_rw += wgt * r * tw;
-      }
-    }
+  // Compute variance / covariance from aggregated sums.
+  const double norm2_r = sum_rr - sum_r * sum_r / sum_weight;
+  const double norm2_w = sum_ww - sum_w * sum_w / sum_weight;
+  const double dot_rw  = sum_rw - sum_r * sum_w / sum_weight;
 
   dt_free_align(warped);
   dt_free_align(mask);
@@ -1614,14 +1621,22 @@ static float _ecc_iteration_higher_dof(const float *ref,
   const double mean_r = sum_r / sum_weight;
   const double mean_w = sum_w / sum_weight;
 
-  // --- Pass 2: norms, mean Jacobian, and correlation coefficient ---
-  // We merge old pass 2 and the correlation pass into one parallel sweep.
+  // --- Pass 2: norms, mean Jacobian, projection coefficients, and ρ ---
   // Use scalar accumulators for OMP reduction (up to 8 DOF).
+  //
+  // Projection coefficient identity (analogous to the 3-DOF case):
+  //   proj_coeff[k] = Σ wgt·tw·(J[k] − mean_J[k]) / norm2_w
+  // Since Σ wgt·tw = 0 by definition of mean_w:
+  //   proj_coeff[k] = Σ wgt·tw·J[k] / norm2_w
+  // We therefore add sJw[k] = Σ wgt·tw·J[k] to this pass and eliminate
+  // the former pass 3 sweep entirely.
   double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
   double sJ0 = 0.0, sJ1 = 0.0, sJ2 = 0.0, sJ3 = 0.0;
   double sJ4 = 0.0, sJ5 = 0.0, sJ6 = 0.0, sJ7 = 0.0;
+  double sJw0 = 0.0, sJw1 = 0.0, sJw2 = 0.0, sJw3 = 0.0;
+  double sJw4 = 0.0, sJw5 = 0.0, sJw6 = 0.0, sJw7 = 0.0;
 
-  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, dot_rw, sJ0, sJ1, sJ2, sJ3, sJ4, sJ5, sJ6, sJ7))
+  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, dot_rw, sJ0, sJ1, sJ2, sJ3, sJ4, sJ5, sJ6, sJ7, sJw0, sJw1, sJw2, sJw3, sJw4, sJw5, sJw6, sJw7))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1672,6 +1687,11 @@ static float _ecc_iteration_higher_dof(const float *ref,
       sJ2 += wgt * J[2];  sJ3 += wgt * J[3];
       sJ4 += wgt * J[4];  sJ5 += wgt * J[5];
       sJ6 += wgt * J[6];  sJ7 += wgt * J[7];
+
+      sJw0 += wgt * tw * J[0];  sJw1 += wgt * tw * J[1];
+      sJw2 += wgt * tw * J[2];  sJw3 += wgt * tw * J[3];
+      sJw4 += wgt * tw * J[4];  sJw5 += wgt * tw * J[5];
+      sJw6 += wgt * tw * J[6];  sJw7 += wgt * tw * J[7];
     }
 
   const double norm_r = sqrt(norm2_r);
@@ -1686,67 +1706,19 @@ static float _ecc_iteration_higher_dof(const float *ref,
   const double rho = dot_rw / (norm_r * norm_w);
   const double sum_J[HDR_ALIGN_H_NPARAM] = { sJ0, sJ1, sJ2, sJ3, sJ4, sJ5, sJ6, sJ7 };
 
-  // --- Pass 3: projection coefficient ---
+  // Derive mean_J and proj_coeff from pass 2 sums (no separate sweep).
   double mean_J[HDR_ALIGN_H_NPARAM];
   for(int k = 0; k < ndof; k++)
     mean_J[k] = sum_J[k] / sum_weight;
 
+  // proj_coeff[k] = sJw[k] / norm2_w  (the mean_J correction term vanishes
+  // because Σ wgt·tw = 0 by definition of mean_w).
   double proj_coeff[HDR_ALIGN_H_NPARAM] = { 0 };
-  {
-    double pc0 = 0.0, pc1 = 0.0, pc2 = 0.0, pc3 = 0.0;
-    double pc4 = 0.0, pc5 = 0.0, pc6 = 0.0, pc7 = 0.0;
-    DT_OMP_FOR(collapse(2) reduction(+:pc0, pc1, pc2, pc3, pc4, pc5, pc6, pc7))
-    for(int y = 0; y < h; y++)
-      for(int x = 0; x < w; x++)
-      {
-        const size_t i = (size_t)y * w + x;
-        if(mask[i] < 0.5f) continue;
+  const double sJw[HDR_ALIGN_H_NPARAM] = { sJw0, sJw1, sJw2, sJw3, sJw4, sJw5, sJw6, sJw7 };
+  for(int k = 0; k < ndof; k++)
+    proj_coeff[k] = sJw[k] / norm2_w;
 
-        const double xn = ((double)x - cx) / s;
-        const double yn = ((double)y - cy) / s;
-        const double wgt = _ecc_spatial_weight(xn, yn);
-        const double gxi = (double)gx[i];
-        const double gyi = (double)gy[i];
-
-        double J[HDR_ALIGN_H_NPARAM];
-        if(ndof == 6)
-        {
-          J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
-          J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
-          J[6] = 0.0;  J[7] = 0.0;
-        }
-        else
-        {
-          const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
-          const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
-          const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
-          const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
-          J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
-          J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
-          J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
-          J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
-        }
-
-        const double tw = (double)warped[i] - mean_w;
-        pc0 += wgt * tw * (J[0] - mean_J[0]);
-        pc1 += wgt * tw * (J[1] - mean_J[1]);
-        pc2 += wgt * tw * (J[2] - mean_J[2]);
-        pc3 += wgt * tw * (J[3] - mean_J[3]);
-        pc4 += wgt * tw * (J[4] - mean_J[4]);
-        pc5 += wgt * tw * (J[5] - mean_J[5]);
-        pc6 += wgt * tw * (J[6] - mean_J[6]);
-        pc7 += wgt * tw * (J[7] - mean_J[7]);
-      }
-    proj_coeff[0] = pc0 / norm2_w;  proj_coeff[1] = pc1 / norm2_w;
-    proj_coeff[2] = pc2 / norm2_w;  proj_coeff[3] = pc3 / norm2_w;
-    proj_coeff[4] = pc4 / norm2_w;  proj_coeff[5] = pc5 / norm2_w;
-    proj_coeff[6] = pc6 / norm2_w;  proj_coeff[7] = pc7 / norm2_w;
-  }
-
-  // --- Pass 4: n×n Hessian and RHS ---
-  // For OMP reduction, we use 36 scalar accumulators for the upper triangle
-  // of the symmetric 8×8 Hessian (H[a][b] with a<=b) plus 8 for RHS.
-  // We store them in a flat array and reduce in a critical section per thread.
+  // --- Pass 3 (formerly Pass 4): n×n Hessian and RHS ---
   double Hess[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM] = { { 0 } };
   double rhs_ecc[HDR_ALIGN_H_NPARAM] = { 0 };
   const double scale_rw = norm_w / norm_r;
@@ -2019,6 +1991,20 @@ static float _try_dof_escalation(const float *ref_grad,
     return rho_3dof;
   }
 
+  // Gate: if the 3-DOF alignment is too poor, escalation cannot help.
+  // A very low ρ indicates the rigid-body solver landed in a wrong local
+  // minimum (motion blur, heavy noise, very large displacement).  Applying
+  // higher-DOF refinement from a bad starting point only fits image noise
+  // and produces a result worse than keeping the 3-DOF H unchanged.
+  if(rho_3dof < HDR_ALIGN_ESCALATION_MIN_RHO)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: skipped (ρ=%.5f < min=%.2f,"
+             " 3-DOF alignment too poor)",
+             rho_3dof, HDR_ALIGN_ESCALATION_MIN_RHO);
+    return rho_3dof;
+  }
+
   // Save the 3-DOF result so we can fall back.
   float H_3dof[HDR_ALIGN_H_NPARAM];
   memcpy(H_3dof, H, sizeof(H_3dof));
@@ -2287,6 +2273,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     }
     dt_free_align(tmp_ref);
     dt_free_align(tmp_img);
+    _debug_export_gradient_pfm(coarse_ref_grad, cw, ch, "coarse_ref");
+    _debug_export_gradient_pfm(coarse_img_grad, cw, ch, "coarse_img");
   }
   // Fall back to raw pixels if either gradient computation failed.
   // Both must succeed — mixing gradient and raw images would be wrong.
@@ -2454,6 +2442,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       dt_print(DT_DEBUG_ALWAYS,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
+    }
+
+    // Export gradient images for debugging when DT_DEBUG_VERBOSE is set.
+    {
+      char label_ref[32], label_img[32];
+      snprintf(label_ref, sizeof(label_ref), "ref_L%d", l);
+      snprintf(label_img, sizeof(label_img), "img_L%d", l);
+      _debug_export_gradient_pfm(ref_grad, lw, lh, label_ref);
+      _debug_export_gradient_pfm(img_grad, lw, lh, label_img);
     }
 
     dt_print(DT_DEBUG_ALWAYS,
