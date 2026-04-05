@@ -1759,7 +1759,7 @@ static float _ecc_iteration_higher_dof(const float *ref,
 
   // For the Hessian, we use thread-local accumulation with a critical merge.
   // This avoids needing 36+ scalar reduction variables.
-  DT_OMP_PRAGMA(parallel default(firstprivate))
+  DT_OMP_PRAGMA(parallel default(firstprivate) shared(Hess, rhs_ecc))
   {
     double Hess_local[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM] = { { 0 } };
     double rhs_local[HDR_ALIGN_H_NPARAM] = { 0 };
