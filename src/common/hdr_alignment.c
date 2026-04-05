@@ -573,8 +573,8 @@ static float *_stretch_gradient_for_debug(const float *grad, const size_t npix)
 
   // Build a 4096-bin histogram to find the 99th-percentile white point.
   // Using 4096 bins gives good resolution even for large images.
-  const int NBINS = 4096;
-  size_t hist[4096] = { 0 };
+  enum { NBINS = 4096 };
+  size_t hist[NBINS] = { 0 };
   const float inv_vmax = (float)(NBINS - 1) / vmax;
   for(size_t i = 0; i < npix; i++)
   {
@@ -612,7 +612,9 @@ static float *_stretch_gradient_for_debug(const float *grad, const size_t npix)
  *  "hdr_align_grad_<label>.pfm".
  *  A 99th-percentile contrast stretch is applied to the debug copy so that
  *  the exported image reveals structural detail even when raw gradient values
- *  are very small (heavily right-skewed distributions). */
+ *  are very small (heavily right-skewed distributions).
+ *  If the temporary buffer for contrast enhancement cannot be allocated, the
+ *  function falls back to writing the raw (unenhanced) gradient data. */
 static void _debug_export_gradient_pfm(const float *grad,
                                        const int w,
                                        const int h,
