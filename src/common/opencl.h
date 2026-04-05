@@ -219,6 +219,7 @@ struct dt_dwt_cl_global_t; // wavelet decompose
 struct dt_heal_cl_global_t; // healing
 struct dt_colorspaces_cl_global_t; // colorspaces transform
 struct dt_guided_filter_cl_global_t;
+struct dt_hdr_alignment_cl_global_t;
 
 /**
  * main struct, stored in darktable.opencl.
@@ -272,6 +273,9 @@ typedef struct dt_opencl_t
 
   // global kernels for guided filter.
   struct dt_guided_filter_cl_global_t *guided_filter;
+
+  // global kernels for HDR alignment.
+  struct dt_hdr_alignment_cl_global_t *hdr_alignment;
 
   // saved kernel info for deferred initialisation
   int program_saved[DT_OPENCL_MAX_KERNELS];

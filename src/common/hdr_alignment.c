@@ -2784,6 +2784,53 @@ void dt_hdr_align_apply(const float *in_mosaic,
   }
 }
 
+// ---------------------------------------------------------------------------
+// OpenCL global init / cleanup
+// ---------------------------------------------------------------------------
+
+#ifdef HAVE_OPENCL
+
+#include "common/opencl.h"
+
+dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void)
+{
+  dt_hdr_alignment_cl_global_t *g = malloc(sizeof(*g));
+  if(!g) return NULL;
+
+  const int program = 41; // hdr_alignment.cl, from programs.conf
+
+  g->kernel_warp_homography  = dt_opencl_create_kernel(program, "hdr_align_warp_homography");
+  g->kernel_compute_gradients = dt_opencl_create_kernel(program, "hdr_align_compute_gradients");
+  g->kernel_gradient_magnitude = dt_opencl_create_kernel(program, "hdr_align_gradient_magnitude");
+  g->kernel_normalize_01     = dt_opencl_create_kernel(program, "hdr_align_normalize_01");
+  g->kernel_mosaic_to_gray   = dt_opencl_create_kernel(program, "hdr_align_mosaic_to_gray");
+  g->kernel_downsample_2x    = dt_opencl_create_kernel(program, "hdr_align_downsample_2x");
+  g->kernel_ecc_means        = dt_opencl_create_kernel(program, "hdr_align_ecc_means");
+  g->kernel_ecc_norms        = dt_opencl_create_kernel(program, "hdr_align_ecc_norms");
+  g->kernel_ecc_hessian      = dt_opencl_create_kernel(program, "hdr_align_ecc_hessian");
+  g->kernel_ecc_hessian_final = dt_opencl_create_kernel(program, "hdr_align_ecc_hessian_final");
+
+  return g;
+}
+
+void dt_hdr_alignment_free_cl_global(dt_hdr_alignment_cl_global_t *g)
+{
+  if(!g) return;
+  dt_opencl_free_kernel(g->kernel_warp_homography);
+  dt_opencl_free_kernel(g->kernel_compute_gradients);
+  dt_opencl_free_kernel(g->kernel_gradient_magnitude);
+  dt_opencl_free_kernel(g->kernel_normalize_01);
+  dt_opencl_free_kernel(g->kernel_mosaic_to_gray);
+  dt_opencl_free_kernel(g->kernel_downsample_2x);
+  dt_opencl_free_kernel(g->kernel_ecc_means);
+  dt_opencl_free_kernel(g->kernel_ecc_norms);
+  dt_opencl_free_kernel(g->kernel_ecc_hessian);
+  dt_opencl_free_kernel(g->kernel_ecc_hessian_final);
+  free(g);
+}
+
+#endif /* HAVE_OPENCL */
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

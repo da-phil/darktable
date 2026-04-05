@@ -76,6 +76,32 @@ void dt_hdr_align_apply(const float *in_mosaic,
                         const uint32_t filters,
                         const dt_hdr_alignment_t *align);
 
+#ifdef HAVE_OPENCL
+
+/** OpenCL global data for HDR alignment kernels. */
+typedef struct dt_hdr_alignment_cl_global_t
+{
+  int kernel_warp_homography;
+  int kernel_compute_gradients;
+  int kernel_gradient_magnitude;
+  int kernel_normalize_01;
+  int kernel_mosaic_to_gray;
+  int kernel_downsample_2x;
+  int kernel_ecc_means;
+  int kernel_ecc_norms;
+  int kernel_ecc_hessian;
+  int kernel_ecc_hessian_final;
+} dt_hdr_alignment_cl_global_t;
+
+/** Initialize OpenCL kernels for HDR alignment.
+ *  Called once at startup; result is stored in darktable.opencl. */
+dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void);
+
+/** Free OpenCL kernel handles. */
+void dt_hdr_alignment_free_cl_global(dt_hdr_alignment_cl_global_t *g);
+
+#endif /* HAVE_OPENCL */
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

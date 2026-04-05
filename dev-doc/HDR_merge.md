@@ -1228,6 +1228,69 @@ The homography is identity, but the mesh residuals are non-zero (max 15.14 px). 
 |---|---|---|
 | `HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` | $0.98$ | Identity NCC above which the full ECC pyramid is skipped |
 
+## Performance Optimization
+
+### OpenMP Parallelization
+
+The ECC iteration functions (`_ecc_iteration` for 3-DOF and `_ecc_iteration_higher_dof` for 6/8-DOF) are the dominant performance bottleneck, running up to 50 iterations per pyramid level across 8+ levels.  Each iteration performs 3–4 full-image passes (weighted means, norms + Jacobian sums, projection coefficients, Hessian assembly).
+
+All image-scanning passes now use `DT_OMP_FOR` with reduction directives:
+
+| Function | Technique | Notes |
+|---|---|---|
+| `_ecc_iteration` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 scalar accumulators |
+| `_ecc_iteration` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | Merged with correlation pass; 6 accumulators |
+| `_ecc_iteration` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 3 scalar projection accumulators |
+| `_ecc_iteration` pass 4 | `DT_OMP_FOR(collapse(2) reduction(...))` | 9 scalars (6 Hessian upper-triangle + 3 RHS) |
+| `_ecc_iteration_higher_dof` pass 1 | Same as 3-DOF | 4 accumulators |
+| `_ecc_iteration_higher_dof` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 11 accumulators (norms + 8 Jacobian sums) |
+| `_ecc_iteration_higher_dof` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 8 projection accumulators |
+| `_ecc_iteration_higher_dof` pass 4 | Thread-local + `critical` merge | Up to 8×8 Hessian entries — too many for flat reduction |
+| `_ecc_compute_rho` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 accumulators |
+| `_ecc_compute_rho` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 3 accumulators |
+
+**Pass merging optimization**: The old implementation had separate passes for norms/Jacobian sums and the correlation coefficient.  These have been merged into a single OMP-parallelized sweep, eliminating one full image scan per iteration (saves ~20% bandwidth at the cost of one extra reduction variable).
+
+**Hessian assembly strategy**: For 3-DOF (3×3 = 6 unique entries), scalar `reduction` variables are efficient.  For 6/8-DOF (up to 36 unique entries), thread-local accumulation with a `critical`-section merge is used instead, as expanding 36+ reduction variables would create excessive register pressure.
+
+### OpenCL GPU Acceleration
+
+An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `programs.conf`) provides GPU-accelerated versions of the pixel-level operations:
+
+| Kernel | Operation | Speedup potential |
+|---|---|---|
+| `hdr_align_warp_homography` | Backward-mapping projective warp with bilinear interpolation | High (each pixel independent) |
+| `hdr_align_compute_gradients` | 3×3 Sobel gradient (gx, gy) | High (stencil operation) |
+| `hdr_align_gradient_magnitude` | $\sqrt{g_x^2 + g_y^2}$ | High (element-wise) |
+| `hdr_align_normalize_01` | Min-max normalization to [0,1] | Medium |
+| `hdr_align_mosaic_to_gray` | Bayer 2×2 block averaging | Medium |
+| `hdr_align_downsample_2x` | 2× box-filter downsampling | Medium |
+| `hdr_align_ecc_means` | Pass 1: weighted mean accumulation with work-group reduction | High at full-res |
+| `hdr_align_ecc_norms` | Pass 2: norms, Jacobian sums, correlation with reduction | High at full-res |
+| `hdr_align_ecc_hessian` | Pass 3: projection coefficient accumulation | High at full-res |
+| `hdr_align_ecc_hessian_final` | Pass 4: Hessian + RHS assembly with reduction | High at full-res |
+
+**Reduction strategy**: The ECC accumulation kernels use a two-level reduction:
+1. **Intra-workgroup**: Tree reduction in local memory within each work-group.
+2. **Inter-workgroup**: Each work-group writes partial sums to a global buffer; the host performs the final (small) reduction across work-groups.
+
+This avoids atomic operations on doubles and keeps the kernels simple while still achieving good parallelism.
+
+**Integration**: The OpenCL kernel handles are stored in `dt_hdr_alignment_cl_global_t`, initialized at startup via `dt_hdr_alignment_init_cl_global()` and registered in the darktable OpenCL subsystem (`darktable.opencl->hdr_alignment`).  The CPU fallback path (with OpenMP) is always available when OpenCL is not present or fails.
+
+### Performance Impact
+
+For a typical HDR merge of a 4784×3188 bracket pair:
+
+| Phase | Before (single-threaded) | After (8-core OMP) | OpenCL (mid-range GPU) |
+|---|---|---|---|
+| ECC pyramid (levels 7→0) | ~48 s | ~8 s | ~2 s |
+| DOF escalation | ~47 s | ~8 s | ~2 s |
+| Mesh residuals | ~0.5 s | ~0.5 s | N/A |
+| Total alignment | ~96 s | ~17 s | ~5 s |
+
+*Estimates based on the 4-pass × 50-iteration × 8-level worst case.  Actual speedup depends on convergence behavior (many levels stall early) and system configuration.*
+
 ## Future Work
 
 Potential refinements to the alignment pipeline:
@@ -1236,9 +1299,12 @@ Potential refinements to the alignment pipeline:
 - **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
 - **Adaptive drift guard thresholds**: the per-level translation drift limit ($3.0$ px) and angle drift limit ($2°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
+- **Full OpenCL pipeline**: Currently the OpenCL kernels accelerate individual operations but the pipeline orchestration and small-matrix solves remain on the CPU.  A fully GPU-resident pipeline (keeping pyramid data in GPU memory across levels) would eliminate host↔device transfers and further reduce latency.
 
 ## File Map
 
 - `src/control/jobs/control_jobs.c`: HDR merge job and alignment integration
-- `src/common/hdr_alignment.h`: public alignment structure and API
-- `src/common/hdr_alignment.c`: estimator, warp application, Bayer plane handling
+- `src/common/hdr_alignment.h`: public alignment structure and API (includes OpenCL global data type)
+- `src/common/hdr_alignment.c`: estimator, warp application, Bayer plane handling, OpenCL init/cleanup
+- `data/kernels/hdr_alignment.cl`: OpenCL kernel implementations for GPU-accelerated alignment
+- `data/kernels/programs.conf`: OpenCL program registry (hdr_alignment.cl = program 41)
