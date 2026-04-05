@@ -1125,6 +1125,7 @@ static float _ecc_iteration(const float *ref,
   double sum_r = 0.0, sum_w = 0.0;
   double sum_weight = 0.0;
   long nvalid = 0;
+  DT_OMP_FOR(collapse(2) reduction(+:sum_r, sum_w, sum_weight, nvalid))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1153,14 +1154,18 @@ static float _ecc_iteration(const float *ref,
   const double mean_r = sum_r / sum_weight;
   const double mean_w = sum_w / sum_weight;
 
-  // --- Pass 2: norms and mean Jacobian ---
+  // --- Pass 2: norms, mean Jacobian, and correlation coefficient ---
   // 3-DOF Jacobian: J = (J_θ, J_tx, J_ty)
   //   J_θ  = s·(gx·(−sin θ·xn + cos θ·yn) + gy·(−cos θ·xn − sin θ·yn))
   //   J_tx = s·gx
   //   J_ty = s·gy
+  // We merge the old pass 2 (norms + sum_J) and old correlation coefficient
+  // pass into a single parallel pass to reduce memory bandwidth overhead.
   double norm2_r = 0.0, norm2_w = 0.0;
-  double sum_J[3] = { 0.0, 0.0, 0.0 };
+  double sum_J0 = 0.0, sum_J1 = 0.0, sum_J2 = 0.0;
+  double dot_rw = 0.0;
 
+  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, sum_J0, sum_J1, sum_J2, dot_rw))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1174,21 +1179,21 @@ static float _ecc_iteration(const float *ref,
       const double gxi = (double)gx[i];
       const double gyi = (double)gy[i];
 
-      const double J[3] = {
-        s * (gxi * (-sin_t * xn + cos_t * yn)
-           + gyi * (-cos_t * xn - sin_t * yn)),
-        s * gxi,
-        s * gyi
-      };
+      const double J0 = s * (gxi * (-sin_t * xn + cos_t * yn)
+                            + gyi * (-cos_t * xn - sin_t * yn));
+      const double J1 = s * gxi;
+      const double J2 = s * gyi;
 
       const double r  = (double)ref[i] - mean_r;
       const double tw = (double)warped[i] - mean_w;
 
       norm2_r += wgt * r * r;
       norm2_w += wgt * tw * tw;
+      dot_rw  += wgt * r * tw;
 
-      for(int k = 0; k < 3; k++)
-        sum_J[k] += wgt * J[k];
+      sum_J0 += wgt * J0;
+      sum_J1 += wgt * J1;
+      sum_J2 += wgt * J2;
     }
 
   const double norm_r = sqrt(norm2_r);
@@ -1202,28 +1207,15 @@ static float _ecc_iteration(const float *ref,
     return -1.0f;
   }
 
-  // --- Correlation coefficient ---
-  double dot_rw = 0.0;
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
-    {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] > 0.5f)
-      {
-        const double xn = ((double)x - cx) / s;
-        const double yn = ((double)y - cy) / s;
-        const double wgt = _ecc_spatial_weight(xn, yn);
-        dot_rw += wgt * ((double)ref[i] - mean_r) * ((double)warped[i] - mean_w);
-      }
-    }
   const double rho = dot_rw / (norm_r * norm_w);
 
   // --- Pass 3: projection coefficient ---
-  double mean_J[3];
-  for(int k = 0; k < 3; k++)
-    mean_J[k] = sum_J[k] / sum_weight;
+  const double mean_J[3] = { sum_J0 / sum_weight,
+                              sum_J1 / sum_weight,
+                              sum_J2 / sum_weight };
 
-  double proj_coeff[3] = { 0.0, 0.0, 0.0 };
+  double proj0 = 0.0, proj1 = 0.0, proj2 = 0.0;
+  DT_OMP_FOR(collapse(2) reduction(+:proj0, proj1, proj2))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1244,18 +1236,24 @@ static float _ecc_iteration(const float *ref,
       };
 
       const double tw = (double)warped[i] - mean_w;
-      for(int k = 0; k < 3; k++)
-        proj_coeff[k] += wgt * tw * (J[k] - mean_J[k]);
+      proj0 += wgt * tw * (J[0] - mean_J[0]);
+      proj1 += wgt * tw * (J[1] - mean_J[1]);
+      proj2 += wgt * tw * (J[2] - mean_J[2]);
     }
 
-  for(int k = 0; k < 3; k++)
-    proj_coeff[k] /= norm2_w;
+  const double proj_coeff[3] = { proj0 / norm2_w,
+                                  proj1 / norm2_w,
+                                  proj2 / norm2_w };
 
   // --- Pass 4: 3×3 Hessian and RHS ---
-  double Hess[3][3] = { { 0.0 } };
-  double rhs_ecc[3] = { 0.0 };
+  // Use scalar accumulators for OMP reduction (arrays not directly
+  // reducible with the DT_OMP_FOR macro).
+  double H00 = 0.0, H01 = 0.0, H02 = 0.0;
+  double H11 = 0.0, H12 = 0.0, H22 = 0.0;
+  double rhs0 = 0.0, rhs1 = 0.0, rhs2 = 0.0;
   const double scale_rw = norm_w / norm_r;
 
+  DT_OMP_FOR(collapse(2) reduction(+:H00, H01, H02, H11, H12, H22, rhs0, rhs1, rhs2))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1279,17 +1277,27 @@ static float _ecc_iteration(const float *ref,
       const double r  = (double)ref[i] - mean_r;
       const double ei = scale_rw * r - rho * tw;
 
-      double Jp[3];
-      for(int k = 0; k < 3; k++)
-        Jp[k] = (J[k] - mean_J[k]) - proj_coeff[k] * tw;
+      const double Jp0 = (J[0] - mean_J[0]) - proj_coeff[0] * tw;
+      const double Jp1 = (J[1] - mean_J[1]) - proj_coeff[1] * tw;
+      const double Jp2 = (J[2] - mean_J[2]) - proj_coeff[2] * tw;
 
-      for(int a = 0; a < 3; a++)
-      {
-        rhs_ecc[a] += wgt * Jp[a] * ei;
-        for(int b2 = 0; b2 < 3; b2++)
-          Hess[a][b2] += wgt * Jp[a] * Jp[b2];
-      }
+      rhs0 += wgt * Jp0 * ei;
+      rhs1 += wgt * Jp1 * ei;
+      rhs2 += wgt * Jp2 * ei;
+
+      H00 += wgt * Jp0 * Jp0;
+      H01 += wgt * Jp0 * Jp1;
+      H02 += wgt * Jp0 * Jp2;
+      H11 += wgt * Jp1 * Jp1;
+      H12 += wgt * Jp1 * Jp2;
+      H22 += wgt * Jp2 * Jp2;
     }
+
+  // Assemble symmetric Hessian and RHS from scalar accumulators.
+  double Hess[3][3] = { { H00, H01, H02 },
+                         { H01, H11, H12 },
+                         { H02, H12, H22 } };
+  double rhs_ecc[3] = { rhs0, rhs1, rhs2 };
 
   dt_free_align(gx);
   dt_free_align(gy);
@@ -1479,6 +1487,7 @@ static float _ecc_compute_rho(const float *ref,
   double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
   long nvalid = 0;
 
+  DT_OMP_FOR(collapse(2) reduction(+:sum_r, sum_w, sum_weight, nvalid))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1506,6 +1515,7 @@ static float _ecc_compute_rho(const float *ref,
   const double mean_w = sum_w / sum_weight;
 
   double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
+  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, dot_rw))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1583,6 +1593,7 @@ static float _ecc_iteration_higher_dof(const float *ref,
   // --- Pass 1: weighted means ---
   double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
   long nvalid = 0;
+  DT_OMP_FOR(collapse(2) reduction(+:sum_r, sum_w, sum_weight, nvalid))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1609,10 +1620,14 @@ static float _ecc_iteration_higher_dof(const float *ref,
   const double mean_r = sum_r / sum_weight;
   const double mean_w = sum_w / sum_weight;
 
-  // --- Pass 2: norms and mean Jacobian ---
-  double norm2_r = 0.0, norm2_w = 0.0;
-  double sum_J[HDR_ALIGN_H_NPARAM] = { 0 };
+  // --- Pass 2: norms, mean Jacobian, and correlation coefficient ---
+  // We merge old pass 2 and the correlation pass into one parallel sweep.
+  // Use scalar accumulators for OMP reduction (up to 8 DOF).
+  double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
+  double sJ0 = 0.0, sJ1 = 0.0, sJ2 = 0.0, sJ3 = 0.0;
+  double sJ4 = 0.0, sJ5 = 0.0, sJ6 = 0.0, sJ7 = 0.0;
 
+  DT_OMP_FOR(collapse(2) reduction(+:norm2_r, norm2_w, dot_rw, sJ0, sJ1, sJ2, sJ3, sJ4, sJ5, sJ6, sJ7))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
@@ -1628,17 +1643,17 @@ static float _ecc_iteration_higher_dof(const float *ref,
       double J[HDR_ALIGN_H_NPARAM];
       if(ndof == 6)
       {
-        // Affine Jacobian in normalized coordinates
         J[0] = s * gxi * xn;
         J[1] = s * gxi * yn;
         J[2] = s * gxi;
         J[3] = s * gyi * xn;
         J[4] = s * gyi * yn;
         J[5] = s * gyi;
+        J[6] = 0.0;
+        J[7] = 0.0;
       }
       else
       {
-        // Projective Jacobian in normalized coordinates
         const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
         const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
         const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
@@ -1657,9 +1672,12 @@ static float _ecc_iteration_higher_dof(const float *ref,
       const double tw = (double)warped[i] - mean_w;
       norm2_r += wgt * r * r;
       norm2_w += wgt * tw * tw;
+      dot_rw  += wgt * r * tw;
 
-      for(int k = 0; k < ndof; k++)
-        sum_J[k] += wgt * J[k];
+      sJ0 += wgt * J[0];  sJ1 += wgt * J[1];
+      sJ2 += wgt * J[2];  sJ3 += wgt * J[3];
+      sJ4 += wgt * J[4];  sJ5 += wgt * J[5];
+      sJ6 += wgt * J[6];  sJ7 += wgt * J[7];
     }
 
   const double norm_r = sqrt(norm2_r);
@@ -1671,22 +1689,8 @@ static float _ecc_iteration_higher_dof(const float *ref,
     return -1.0f;
   }
 
-  // --- Correlation coefficient ---
-  double dot_rw = 0.0;
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
-    {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] > 0.5f)
-      {
-        const double xn = ((double)x - cx) / s;
-        const double yn = ((double)y - cy) / s;
-        const double wgt = _ecc_spatial_weight(xn, yn);
-        dot_rw += wgt * ((double)ref[i] - mean_r)
-                       * ((double)warped[i] - mean_w);
-      }
-    }
   const double rho = dot_rw / (norm_r * norm_w);
+  const double sum_J[HDR_ALIGN_H_NPARAM] = { sJ0, sJ1, sJ2, sJ3, sJ4, sJ5, sJ6, sJ7 };
 
   // --- Pass 3: projection coefficient ---
   double mean_J[HDR_ALIGN_H_NPARAM];
@@ -1694,93 +1698,135 @@ static float _ecc_iteration_higher_dof(const float *ref,
     mean_J[k] = sum_J[k] / sum_weight;
 
   double proj_coeff[HDR_ALIGN_H_NPARAM] = { 0 };
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
-    {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] < 0.5f) continue;
-
-      const double xn = ((double)x - cx) / s;
-      const double yn = ((double)y - cy) / s;
-      const double wgt = _ecc_spatial_weight(xn, yn);
-      const double gxi = (double)gx[i];
-      const double gyi = (double)gy[i];
-
-      double J[HDR_ALIGN_H_NPARAM];
-      if(ndof == 6)
+  {
+    double pc0 = 0.0, pc1 = 0.0, pc2 = 0.0, pc3 = 0.0;
+    double pc4 = 0.0, pc5 = 0.0, pc6 = 0.0, pc7 = 0.0;
+    DT_OMP_FOR(collapse(2) reduction(+:pc0, pc1, pc2, pc3, pc4, pc5, pc6, pc7))
+    for(int y = 0; y < h; y++)
+      for(int x = 0; x < w; x++)
       {
-        J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
-        J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
-      }
-      else
-      {
-        const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
-        const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
-        const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
-        const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
-        J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
-        J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
-        J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
-        J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
-      }
+        const size_t i = (size_t)y * w + x;
+        if(mask[i] < 0.5f) continue;
 
-      const double tw = (double)warped[i] - mean_w;
-      for(int k = 0; k < ndof; k++)
-        proj_coeff[k] += wgt * tw * (J[k] - mean_J[k]);
-    }
-  for(int k = 0; k < ndof; k++)
-    proj_coeff[k] /= norm2_w;
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        const double gxi = (double)gx[i];
+        const double gyi = (double)gy[i];
+
+        double J[HDR_ALIGN_H_NPARAM];
+        if(ndof == 6)
+        {
+          J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
+          J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
+          J[6] = 0.0;  J[7] = 0.0;
+        }
+        else
+        {
+          const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
+          const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
+          const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
+          const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
+          J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
+          J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
+          J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
+          J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
+        }
+
+        const double tw = (double)warped[i] - mean_w;
+        pc0 += wgt * tw * (J[0] - mean_J[0]);
+        pc1 += wgt * tw * (J[1] - mean_J[1]);
+        pc2 += wgt * tw * (J[2] - mean_J[2]);
+        pc3 += wgt * tw * (J[3] - mean_J[3]);
+        pc4 += wgt * tw * (J[4] - mean_J[4]);
+        pc5 += wgt * tw * (J[5] - mean_J[5]);
+        pc6 += wgt * tw * (J[6] - mean_J[6]);
+        pc7 += wgt * tw * (J[7] - mean_J[7]);
+      }
+    proj_coeff[0] = pc0 / norm2_w;  proj_coeff[1] = pc1 / norm2_w;
+    proj_coeff[2] = pc2 / norm2_w;  proj_coeff[3] = pc3 / norm2_w;
+    proj_coeff[4] = pc4 / norm2_w;  proj_coeff[5] = pc5 / norm2_w;
+    proj_coeff[6] = pc6 / norm2_w;  proj_coeff[7] = pc7 / norm2_w;
+  }
 
   // --- Pass 4: n×n Hessian and RHS ---
+  // For OMP reduction, we use 36 scalar accumulators for the upper triangle
+  // of the symmetric 8×8 Hessian (H[a][b] with a<=b) plus 8 for RHS.
+  // We store them in a flat array and reduce in a critical section per thread.
   double Hess[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM] = { { 0 } };
   double rhs_ecc[HDR_ALIGN_H_NPARAM] = { 0 };
   const double scale_rw = norm_w / norm_r;
 
-  for(int y = 0; y < h; y++)
-    for(int x = 0; x < w; x++)
+  // For the Hessian, we use thread-local accumulation with a critical merge.
+  // This avoids needing 36+ scalar reduction variables.
+  DT_OMP_PRAGMA(parallel default(firstprivate))
+  {
+    double Hess_local[HDR_ALIGN_H_NPARAM][HDR_ALIGN_H_NPARAM] = { { 0 } };
+    double rhs_local[HDR_ALIGN_H_NPARAM] = { 0 };
+
+    DT_OMP_PRAGMA(for collapse(2) schedule(static))
+    for(int y = 0; y < h; y++)
+      for(int x = 0; x < w; x++)
+      {
+        const size_t i = (size_t)y * w + x;
+        if(mask[i] < 0.5f) continue;
+
+        const double xn = ((double)x - cx) / s;
+        const double yn = ((double)y - cy) / s;
+        const double wgt = _ecc_spatial_weight(xn, yn);
+        const double gxi = (double)gx[i];
+        const double gyi = (double)gy[i];
+
+        double J[HDR_ALIGN_H_NPARAM];
+        if(ndof == 6)
+        {
+          J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
+          J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
+          J[6] = 0.0;  J[7] = 0.0;
+        }
+        else
+        {
+          const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
+          const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
+          const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
+          const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
+          J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
+          J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
+          J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
+          J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
+        }
+
+        const double tw = (double)warped[i] - mean_w;
+        const double r  = (double)ref[i] - mean_r;
+        const double ei = scale_rw * r - rho * tw;
+
+        double Jp[HDR_ALIGN_H_NPARAM];
+        for(int k = 0; k < ndof; k++)
+          Jp[k] = (J[k] - mean_J[k]) - proj_coeff[k] * tw;
+
+        for(int a = 0; a < ndof; a++)
+        {
+          rhs_local[a] += wgt * Jp[a] * ei;
+          for(int b2 = a; b2 < ndof; b2++)
+            Hess_local[a][b2] += wgt * Jp[a] * Jp[b2];
+        }
+      }
+
+    DT_OMP_PRAGMA(critical)
     {
-      const size_t i = (size_t)y * w + x;
-      if(mask[i] < 0.5f) continue;
-
-      const double xn = ((double)x - cx) / s;
-      const double yn = ((double)y - cy) / s;
-      const double wgt = _ecc_spatial_weight(xn, yn);
-      const double gxi = (double)gx[i];
-      const double gyi = (double)gy[i];
-
-      double J[HDR_ALIGN_H_NPARAM];
-      if(ndof == 6)
-      {
-        J[0] = s * gxi * xn;  J[1] = s * gxi * yn;  J[2] = s * gxi;
-        J[3] = s * gyi * xn;  J[4] = s * gyi * yn;  J[5] = s * gyi;
-      }
-      else
-      {
-        const double d = (double)Hn[6] * xn + (double)Hn[7] * yn + 1.0;
-        const double id = (fabs(d) > 1e-12) ? 1.0 / d : 0.0;
-        const double sxn = (double)Hn[0] * xn + (double)Hn[1] * yn + (double)Hn[2];
-        const double syn = (double)Hn[3] * xn + (double)Hn[4] * yn + (double)Hn[5];
-        J[0] = s * gxi * xn * id;  J[1] = s * gxi * yn * id;  J[2] = s * gxi * id;
-        J[3] = s * gyi * xn * id;  J[4] = s * gyi * yn * id;  J[5] = s * gyi * id;
-        J[6] = -s * (gxi * sxn + gyi * syn) * xn * id * id;
-        J[7] = -s * (gxi * sxn + gyi * syn) * yn * id * id;
-      }
-
-      const double tw = (double)warped[i] - mean_w;
-      const double r  = (double)ref[i] - mean_r;
-      const double ei = scale_rw * r - rho * tw;
-
-      double Jp[HDR_ALIGN_H_NPARAM];
-      for(int k = 0; k < ndof; k++)
-        Jp[k] = (J[k] - mean_J[k]) - proj_coeff[k] * tw;
-
       for(int a = 0; a < ndof; a++)
       {
-        rhs_ecc[a] += wgt * Jp[a] * ei;
-        for(int b2 = 0; b2 < ndof; b2++)
-          Hess[a][b2] += wgt * Jp[a] * Jp[b2];
+        rhs_ecc[a] += rhs_local[a];
+        for(int b2 = a; b2 < ndof; b2++)
+          Hess[a][b2] += Hess_local[a][b2];
       }
     }
+  }
+
+  // Fill lower triangle from upper triangle (symmetric).
+  for(int a = 0; a < ndof; a++)
+    for(int b2 = 0; b2 < a; b2++)
+      Hess[a][b2] = Hess[b2][a];
 
   dt_free_align(gx);  dt_free_align(gy);
   dt_free_align(warped);  dt_free_align(mask);
