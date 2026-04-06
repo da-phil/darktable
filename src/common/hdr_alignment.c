@@ -58,9 +58,17 @@
 // processed.  Levels below this threshold are skipped: at very small
 // resolutions the gradient images carry insufficient spatial information to
 // produce a reliable alignment update, and the Hessian becomes ill-conditioned.
-// 128 pixels on the shortest edge is the practical lower bound — anything
-// coarser than that does not benefit the ECC refinement.
-#define HDR_ALIGN_ECC_MIN_DIM 128
+//
+// This value must be chosen carefully: setting it too high skips the
+// intermediate "stepping-stone" levels (e.g. 74×49, 149×99) between the
+// coarse NCC level (~37×24) and the first large ECC level (~299×199).
+// Those stepping stones are critical — ECC at 74×49 refines a 2.5° coarse
+// rotation to ~0.6° before the estimate is passed to higher resolutions.
+// Without them ECC at 299×199 stalls because 2.5° exceeds its convergence
+// radius.  48 px is chosen as approximately 2× the coarsest NCC level's
+// shortest edge (~24 px), which guarantees ECC starts one octave above the
+// NCC level and no more.
+#define HDR_ALIGN_ECC_MIN_DIM 48
 // Number of consecutive iterations without improvement before declaring stall.
 // Avoids wasting iterations at coarse pyramid levels where the update metric
 // plateaus above the convergence threshold.
@@ -2449,10 +2457,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     if(l < coarsest)
       _homography_scale_to_finer(H_level);
 
-    // Skip ECC on levels where the shortest edge is below the minimum useful
-    // resolution.  At those scales the gradient image carries too little spatial
-    // information and the Hessian is ill-conditioned; the coarse NCC estimate
-    // already covers the large-displacement component.
+    // Skip ECC on the coarsest levels that are too small for a numerically
+    // stable Hessian.  This covers only the NCC coarsest level (~37×24) and
+    // leaves the next levels (~74×49, ~149×99) intact as essential stepping
+    // stones between the coarse NCC result and the first large ECC level.
     if(MIN(lw, lh) < HDR_ALIGN_ECC_MIN_DIM)
     {
       dt_print(DT_DEBUG_HDRMERGE,
