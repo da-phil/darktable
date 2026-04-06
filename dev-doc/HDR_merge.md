@@ -475,7 +475,7 @@ The alignment pipeline uses different motion models at different stages:
 
 1. **ECC refinement** uses option (b), a native 3-DOF Euclidean model (rotation + translation). The optimizer builds its Hessian and Jacobian entirely in the $(\theta, t_x, t_y)$ parameter space, so no energy can leak into shear, scale, or perspective DOFs.
 
-2. **Adaptive DOF escalation** (at the finest pyramid level only): if the 3-DOF fit is insufficient, the pipeline selectively escalates to option (d) 6-DOF affine and then option (e) 8-DOF projective ECC, starting from the stable 3-DOF result. Each escalation step is gated by improvement, conditioning, and sanity checks.
+2. **Adaptive DOF escalation** (at the finest pyramid level only): if the 3-DOF fit is insufficient, the pipeline attempts chain escalation — first to option (d) 6-DOF affine, and only if that improves ρ, then to option (e) 8-DOF projective ECC. Each accepted step must pass improvement, conditioning, and sanity checks. If a step does not improve ρ, escalation stops and reverts to the last accepted model.
 
 3. **Corner refinement** uses option (e), computing a local 4-point homography correction from NCC patches at the four image corners. This absorbs weak perspective and residual scale that the preceding ECC model did not capture.
 
@@ -495,7 +495,7 @@ Projecting the 8-DOF solution back onto 3-DOF after solving is not equivalent to
 
 The native 3-DOF solver eliminates this problem entirely: the 3×3 Hessian only has Euclidean directions, so every update is guaranteed to stay on the rigid-body manifold.
 
-The adaptive DOF escalation then introduces higher-DOF models only at the finest level, starting from the stable 3-DOF solution, and only accepts the result when improvement, conditioning, and sanity checks all pass. This avoids the instability problems of running higher-DOF ECC throughout the pyramid while still capturing perspective and scale corrections when the data supports them.
+The adaptive DOF escalation then introduces higher-DOF models only at the finest level, using chain escalation: starting from the stable 3-DOF solution, it first tries 6-DOF affine; if that improves ρ, it tries 8-DOF projective from the 6-DOF result; if any step does not improve, escalation stops and keeps the last accepted model. This avoids the instability problems of running higher-DOF ECC throughout the pyramid while still capturing perspective and scale corrections when the data supports them.
 
 #### Why higher-DOF models are not used during the pyramid
 
@@ -1113,7 +1113,7 @@ No changes to the corner refinement acceptance thresholds were needed.
 | `HDR_ALIGN_ESCALATION_EPSILON` | $5 \times 10^{-3}$ | Convergence threshold for escalated ECC |
 | `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.01$ | Maximum $|\det(A_{2\times2}) - 1|$ for area-scaling sanity |
 
-These values were chosen conservatively. The threshold $\rho = 0.85$ means escalation only activates on stacks where the rigid fit leaves significant residual misalignment. The improvement gate ($0.01$) prevents accepting results that are numerically but not visually better.
+These values were chosen conservatively. The threshold $\rho = 0.85$ means escalation only activates on stacks where the rigid fit leaves significant residual misalignment. The improvement gate ($0.01$) prevents accepting results that are numerically but not visually better. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed to help, while ensuring that even very poor 3-DOF fits (e.g. $\rho < 0.3$) still get a chance at higher-DOF correction.
 
 ### Identity Detection
 

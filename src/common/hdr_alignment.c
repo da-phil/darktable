@@ -84,11 +84,6 @@
 // A score of 1.0 means perfect correlation; lower values indicate the
 // rigid model left residual misalignment.
 #define HDR_ALIGN_ESCALATION_RHO_THRESHOLD 0.85f
-// Minimum 3-DOF ρ required before DOF escalation is attempted.
-// Below this value the rigid-body alignment has completely failed (strong
-// local minimum, motion blur, heavy noise) and higher-DOF solvers would
-// only fit image noise — producing a worse result than keeping 3-DOF.
-#define HDR_ALIGN_ESCALATION_MIN_RHO 0.3f
 // Minimum ρ improvement required to accept a higher-DOF result.
 #define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT 0.01f
 // Maximum Hessian condition number for accepting a higher-DOF result.
@@ -2031,9 +2026,10 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
  *  selectively tries higher-DOF models when the rigid fit is insufficient.
  *
  *  Escalation path: 3-DOF → 6-DOF affine → 8-DOF projective.
- *  Each step is gated by measurable improvement in ρ, a Hessian conditioning
- *  check, and a geometric sanity check.  Falls back to the input H if
- *  escalation fails.
+ *  Each step is only attempted when the previous step improved ρ.
+ *  If a step does not improve, escalation stops and falls back to
+ *  the last accepted model.  Each accepted step must also pass a
+ *  Hessian conditioning check and a geometric sanity check.
  *
  *  Returns the best ρ achieved (either from the accepted DOF level or the
  *  original 3-DOF result).  Returns -2 on measurement failure. */
@@ -2056,20 +2052,6 @@ static float _try_dof_escalation(const float *ref_grad,
     return rho_3dof;
   }
 
-  // Gate: if the 3-DOF alignment is too poor, escalation cannot help.
-  // A very low ρ indicates the rigid-body solver landed in a wrong local
-  // minimum (motion blur, heavy noise, very large displacement).  Applying
-  // higher-DOF refinement from a bad starting point only fits image noise
-  // and produces a result worse than keeping the 3-DOF H unchanged.
-  if(rho_3dof < HDR_ALIGN_ESCALATION_MIN_RHO)
-  {
-    dt_print(DT_DEBUG_ALWAYS,
-             "[hdr_merge] DOF escalation: skipped (ρ=%.5f < min=%.2f,"
-             " 3-DOF alignment too poor)",
-             rho_3dof, HDR_ALIGN_ESCALATION_MIN_RHO);
-    return rho_3dof;
-  }
-
   // Save the 3-DOF result so we can fall back.
   float H_3dof[HDR_ALIGN_H_NPARAM];
   memcpy(H_3dof, H, sizeof(H_3dof));
@@ -2088,33 +2070,39 @@ static float _try_dof_escalation(const float *ref_grad,
            "[hdr_merge] DOF escalation: 6-DOF ρ = %.5f (Δρ = %.5f, sane = %d)",
            rho_6dof, improvement_6, sane_6);
 
-  gboolean accept_6 = sane_6
-                       && rho_6dof > rho_3dof
-                       && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
+  const gboolean accept_6 = sane_6
+                             && rho_6dof > rho_3dof
+                             && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
-  // --- Stage 2: try 8-DOF projective, starting from the better of 3-DOF/6-DOF ---
-  float H_8dof[HDR_ALIGN_H_NPARAM];
-  float rho_base_for_8 = rho_3dof;
-  if(accept_6)
+  // --- Stage 2: try 8-DOF projective only if 6-DOF improved ---
+  // We only escalate further when the previous step produced a measurable
+  // improvement.  If 6-DOF did not help, the starting point is unlikely
+  // to support even more degrees of freedom.
+  if(!accept_6)
   {
-    memcpy(H_8dof, H_6dof, sizeof(H_8dof));
-    rho_base_for_8 = rho_6dof;
+    // 6-DOF did not improve — keep 3-DOF and stop.
+    memcpy(H, H_3dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
+    dt_print(DT_DEBUG_ALWAYS,
+             "[hdr_merge] DOF escalation: 6-DOF no improvement, keeping 3-DOF");
+    return rho_3dof;
   }
-  else
-    memcpy(H_8dof, H_3dof, sizeof(H_8dof));
+
+  // 6-DOF improved — try 8-DOF starting from the 6-DOF result.
+  float H_8dof[HDR_ALIGN_H_NPARAM];
+  memcpy(H_8dof, H_6dof, sizeof(H_8dof));
 
   const float rho_8dof = _ecc_refine_level_higher_dof(ref_grad, img_grad,
                                                        w, h, H_8dof, 8);
 
-  const float improvement_8 = rho_8dof - rho_base_for_8;
+  const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
 
   dt_print(DT_DEBUG_ALWAYS,
-           "[hdr_merge] DOF escalation: 8-DOF ρ = %.5f (Δρ vs base = %.5f, sane = %d)",
+           "[hdr_merge] DOF escalation: 8-DOF ρ = %.5f (Δρ vs 6-DOF = %.5f, sane = %d)",
            rho_8dof, improvement_8, sane_8);
 
   const gboolean accept_8 = sane_8
-                             && rho_8dof > rho_base_for_8
+                             && rho_8dof > rho_6dof
                              && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
   // --- Accept best result ---
@@ -2122,25 +2110,18 @@ static float _try_dof_escalation(const float *ref_grad,
   {
     memcpy(H, H_8dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
     dt_print(DT_DEBUG_ALWAYS,
-             "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f)",
-             rho_3dof, rho_8dof);
+             "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f → %.5f)",
+             rho_3dof, rho_6dof, rho_8dof);
     return rho_8dof;
   }
-  else if(accept_6)
+  else
   {
+    // 8-DOF did not improve — keep 6-DOF result.
     memcpy(H, H_6dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
     dt_print(DT_DEBUG_ALWAYS,
              "[hdr_merge] DOF escalation: accepted 6-DOF (ρ %.5f → %.5f)",
              rho_3dof, rho_6dof);
     return rho_6dof;
-  }
-  else
-  {
-    // Keep original 3-DOF result.
-    memcpy(H, H_3dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
-    dt_print(DT_DEBUG_ALWAYS,
-             "[hdr_merge] DOF escalation: no improvement, keeping 3-DOF");
-    return rho_3dof;
   }
 }
 
