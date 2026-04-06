@@ -54,8 +54,13 @@
 // a fraction of 0.35 gives radius=12, covering ~1536 full-resolution pixels —
 // enough for even large hand-held displacements.
 #define HDR_ALIGN_COARSE_SEARCH_FRAC 0.35f
-// Minimum image dimension for ECC to be numerically stable
-#define HDR_ALIGN_ECC_MIN_DIM 48
+// Minimum size of the shortest edge (pixels) for an ECC pyramid level to be
+// processed.  Levels below this threshold are skipped: at very small
+// resolutions the gradient images carry insufficient spatial information to
+// produce a reliable alignment update, and the Hessian becomes ill-conditioned.
+// 128 pixels on the shortest edge is the practical lower bound — anything
+// coarser than that does not benefit the ECC refinement.
+#define HDR_ALIGN_ECC_MIN_DIM 128
 // Number of consecutive iterations without improvement before declaring stall.
 // Avoids wasting iterations at coarse pyramid levels where the update metric
 // plateaus above the convergence threshold.
@@ -2444,9 +2449,11 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     if(l < coarsest)
       _homography_scale_to_finer(H_level);
 
-    // Skip ECC on very small levels — the Hessian is ill-conditioned
-    // and the coarse NCC result is sufficient at these scales.
-    if(lw < HDR_ALIGN_ECC_MIN_DIM || lh < HDR_ALIGN_ECC_MIN_DIM)
+    // Skip ECC on levels where the shortest edge is below the minimum useful
+    // resolution.  At those scales the gradient image carries too little spatial
+    // information and the Hessian is ill-conditioned; the coarse NCC estimate
+    // already covers the large-displacement component.
+    if(MIN(lw, lh) < HDR_ALIGN_ECC_MIN_DIM)
     {
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d (%dx%d): skipped (too small)",
@@ -2671,6 +2678,35 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            mesh_max,
            out_align->mesh_dx[HDR_ALIGN_MESH_INDEX(1, 1)],
            out_align->mesh_dy[HDR_ALIGN_MESH_INDEX(1, 1)]);
+
+  // Named decomposition of the homography elements.
+  // H = [ h11  h12  tx  ]   h11≈cos(θ)·sx  h12≈sin(θ)·sy  tx = translation x
+  //     [ h21  h22  ty  ]   h21≈-sin(θ)·sx h22≈cos(θ)·sy  ty = translation y
+  //     [ p1   p2    1  ]   p1,p2 = projective (perspective) terms
+  // scale_x = column-1 norm = sqrt(h11²+h21²), scale_y = column-2 norm
+  // shear   = normalised dot product of the two columns; 0 for pure rotation
+  {
+    const float sx = sqrtf(out_align->H[0] * out_align->H[0]
+                           + out_align->H[3] * out_align->H[3]);
+    const float sy = sqrtf(out_align->H[1] * out_align->H[1]
+                           + out_align->H[4] * out_align->H[4]);
+    const float shear = (sx > 0.0f && sy > 0.0f)
+      ? (out_align->H[0] * out_align->H[1] + out_align->H[3] * out_align->H[4])
+        / (sx * sy)
+      : 0.0f;
+    dt_print(DT_DEBUG_HDRMERGE,
+             "[hdr_merge] final homography decomposed:"
+             " tx=%.2f ty=%.2f rotation=%.4f°"
+             " scale_x=%.5f scale_y=%.5f shear=%.5f"
+             " h11=%.5f h12=%.5f h21=%.5f h22=%.5f"
+             " p1=%.7f p2=%.7f",
+             out_align->H[2], out_align->H[5],
+             approx_angle * 180.0f / (float)M_PI,
+             sx, sy, shear,
+             out_align->H[0], out_align->H[1],
+             out_align->H[3], out_align->H[4],
+             out_align->H[6], out_align->H[7]);
+  }
 
   _free_pyramid(&pyr_ref);
   _free_pyramid(&pyr_img);
