@@ -548,6 +548,50 @@ For one candidate frame the estimator does the following:
 12. Regularize that residual field with neighbor smoothness.
 13. Convert the final grayscale-level homography back to full-resolution Bayer coordinates.
 
+### Alignment Pipeline Flow Diagram
+
+```mermaid
+flowchart TD
+    START([dt_hdr_align_compute]) --> MINDIM{wd,ht ≥ MIN_DIM\n64 px?}
+    MINDIM -- No --> FAIL([return FALSE])
+    MINDIM -- Yes --> M2G[mosaic_to_grayscale\n2×2 Bayer average]
+    M2G --> PYR[build_pyramid\ndownsample until longest side\n≤ COARSEST_SIZE = 64 px]
+    PYR --> PREP_C[preprocess coarsest level\npercentile norm → log1p\n→ Sobel sum gx+gy → MAD norm]
+    PREP_C --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
+    NCC --> RHO_C[compute ECC ρ at coarsest level\nfor identity and NCC winner]
+    RHO_C --> EARLY{ρ_identity ≥\nρ_candidate?}
+    EARLY -- Yes --> ID_RETURN([return identity H\nmesh = 0])
+    EARLY -- No --> INIT_H[init H from NCC winner\nEuclidean homography]
+    INIT_H --> ECC_LOOP
+
+    subgraph ECC_LOOP [ECC pyramid loop: coarsest → level 0]
+        direction TB
+        NEXT_LVL[next pyramid level] --> SKIP{MIN of level dims\n< ECC_MIN_DIM = 48 px?}
+        SKIP -- Yes --> NEXT_LVL
+        SKIP -- No --> PREP_L[preprocess this level\npercentile norm → log1p\n→ Sobel sum → MAD norm]
+        PREP_L --> BCK[backup H_level]
+        BCK --> ECC3[3-DOF Euclidean ECC\nmax 50 iterations\nper-iteration trust region]
+        ECC3 --> DRIFT{angle drift > 2°\nor trans drift > 3 px?}
+        DRIFT -- Yes --> REVERT[revert to H_level backup]
+        DRIFT -- No --> KEEP[keep ECC result]
+        REVERT --> NEXT_LVL
+        KEEP --> NEXT_LVL
+    end
+
+    ECC_LOOP -- level 0 reached --> PREP_0[preprocess level 0\npercentile norm → log1p\n→ Sobel sum → MAD norm]
+    PREP_0 --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
+    DOF --> ID_CHK{ρ_identity ≥\nρ_aligned?}
+    ID_CHK -- Yes --> REVERT_ID[revert to identity H]
+    ID_CHK -- No --> KEEP_H[keep aligned H]
+    REVERT_ID --> CORNER
+    KEEP_H --> CORNER[corner NCC correction\n4-point local homography]
+    CORNER --> MESH[estimate 3×3 residual mesh]
+    MESH --> SMOOTH[regularize mesh\nJacobi smoothing × 12]
+    SMOOTH --> SCALE[convert grayscale H\nto full-res Bayer coords]
+    SCALE --> DONE([return H + mesh])
+```
+
+
 ### Why The Estimator Uses Grayscale Bayer Blocks
 
 The estimator does not run directly on the mosaiced image because raw Bayer phases contain structured color sampling differences that are not geometric motion.
@@ -581,7 +625,7 @@ The main optimizer is a forward-additive ECC-style update using a native 3-DOF E
 
 Important implementation choices:
 
-- the feature images are gradient magnitudes, not raw intensities
+- the feature images are signed Sobel gradient sums (gx+gy), not raw intensities
 - the current rotation angle $\theta$ is extracted from the normalized homography via $\cos\theta = H_n[0]$, $\sin\theta = H_n[1]$
 - the Jacobian is a 3-column matrix mapping $(\Delta\theta, \Delta t_x, \Delta t_y)$ to pixel intensity changes
 - the normal equations are solved as a dense 3×3 system with inline Gauss-Jordan elimination
@@ -597,10 +641,11 @@ Why the native 3-DOF formulation:
 - projecting an 8-DOF solution onto the 3-DOF Euclidean subspace after solving does not help, because the 8×8 Hessian inverse already mixes all DOFs
 - building the Hessian natively in $(\theta, t_x, t_y)$ space guarantees that every update stays on the rigid-body manifold
 
-Why gradient magnitude is used:
+Why signed gradient sum is used:
 
 - HDR brackets differ in exposure, so raw intensity correlation is unstable
-- gradient magnitude removes much of the exposure-dependent DC and scale variation
+- gradient-domain features remove much of the exposure-dependent DC and scale variation
+- the signed sum (gx+gy) preserves edge directionality which anchors rotational alignment; the unsigned magnitude discards sign and makes edges of opposite polarity indistinguishable
 - edge structure survives better across the bracketed stack
 
 Why normalized coordinates are used:
@@ -712,13 +757,13 @@ This keeps the projective parameters on a usable scale.
 
 #### Feature image
 
-ECC is run on gradient magnitude, not raw intensity. With Sobel derivatives $(g_x, g_y)$,
+ECC is run on signed Sobel gradient sum, not raw intensity. The gradient feature image is
 
 $$
-F(x, y) = \sqrt{g_x(x, y)^2 + g_y(x, y)^2}.
+F(x, y) = g_x(x, y) + g_y(x, y),
 $$
 
-The reference feature image is $T(x)$ and the warped candidate feature image is $I_H(x)$.
+where $g_x$ and $g_y$ are the horizontal and vertical Sobel gradients scaled by $0.125$.  Using the signed sum rather than the unsigned magnitude preserves directional edge information and removes the need for a sign-agnostic loss function.
 
 #### Weighted ECC objective
 
@@ -1231,46 +1276,45 @@ The identity detection at Layer 1 uses the same `_ecc_compute_rho` function as L
 
 ### OpenMP Parallelization
 
-The ECC iteration functions (`_ecc_iteration` for 3-DOF and `_ecc_iteration_higher_dof` for 6/8-DOF) are the dominant performance bottleneck, running up to 50 iterations per pyramid level across 8+ levels.  Each iteration performs 3–4 full-image passes (weighted means, norms + Jacobian sums, projection coefficients, Hessian assembly).
+The ECC iteration functions (`_ecc_iteration` for 3-DOF and `_ecc_iteration_higher_dof` for 6/8-DOF) are the dominant performance bottleneck, running up to 50 iterations per pyramid level across 8+ levels.  Each iteration performs 3 full-image passes (weighted means, combined norms + projection, Hessian assembly).
 
 All image-scanning passes now use `DT_OMP_FOR` with reduction directives:
 
 | Function | Technique | Notes |
 |---|---|---|
-| `_ecc_iteration` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 scalar accumulators |
-| `_ecc_iteration` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | Merged with correlation pass; 6 accumulators |
-| `_ecc_iteration` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 3 scalar projection accumulators |
-| `_ecc_iteration` pass 4 | `DT_OMP_FOR(collapse(2) reduction(...))` | 9 scalars (6 Hessian upper-triangle + 3 RHS) |
+| `_ecc_iteration` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 scalar accumulators (sum_r, sum_w, sum_weight, nvalid) |
+| `_ecc_iteration` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 9 accumulators: norms, correlation, mean Jacobian (sJ), and sJw projection sums |
+| `_ecc_iteration` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 9 scalars (6 Hessian upper-triangle + 3 RHS) |
 | `_ecc_iteration_higher_dof` pass 1 | Same as 3-DOF | 4 accumulators |
-| `_ecc_iteration_higher_dof` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 11 accumulators (norms + 8 Jacobian sums) |
-| `_ecc_iteration_higher_dof` pass 3 | `DT_OMP_FOR(collapse(2) reduction(...))` | 8 projection accumulators |
-| `_ecc_iteration_higher_dof` pass 4 | Thread-local + `critical` merge | Up to 8×8 Hessian entries — too many for flat reduction. The `Hess` and `rhs_ecc` arrays must be `shared` (not `firstprivate`) so the critical section merges into the shared copy. |
+| `_ecc_iteration_higher_dof` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 19 accumulators: norms, correlation, 8 Jacobian sums (sJ), and 8 sJw projection sums |
+| `_ecc_iteration_higher_dof` pass 3 | Thread-local + `critical` merge | Up to 8×8 Hessian entries — too many for flat reduction. The `Hess` and `rhs_ecc` arrays must be `shared` (not `firstprivate`) so the critical section merges into the shared copy. |
 | `_ecc_compute_rho` pass 1 | `DT_OMP_FOR(collapse(2) reduction(...))` | 4 accumulators |
 | `_ecc_compute_rho` pass 2 | `DT_OMP_FOR(collapse(2) reduction(...))` | 3 accumulators |
 
-**Pass merging optimization**: The old implementation had separate passes for norms/Jacobian sums and the correlation coefficient.  These have been merged into a single OMP-parallelized sweep, eliminating one full image scan per iteration (saves ~20% bandwidth at the cost of one extra reduction variable).
+**Pass merging optimization (sJw)**: Pass 2 now accumulates both the mean Jacobian terms (sJ[k] = Σ wgt·J[k]) and the projection numerator terms (sJw[k] = Σ wgt·tw·J[k]) in the same sweep.  The host then computes proj_coeff[k] = sJw[k] / norm2_w without a separate image pass, because the mean_J correction vanishes (Σ wgt·tw = 0 by definition of mean_w).  This eliminates what was formerly a separate pass 3, reducing each ECC iteration from 4 passes to 3 (saves ~25% bandwidth).
 
 **Hessian assembly strategy**: For 3-DOF (3×3 = 6 unique entries), scalar `reduction` variables are efficient.  For 6/8-DOF (up to 36 unique entries), thread-local accumulation with a `critical`-section merge is used instead, as expanding 36+ reduction variables would create excessive register pressure.
 
 ### OpenCL GPU Acceleration
 
-An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `programs.conf`) provides GPU-accelerated versions of the pixel-level operations:
+An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `programs.conf`) provides GPU-accelerated implementations of all pixel-level operations used by the alignment pipeline:
 
 | Kernel | Operation | Speedup potential |
 |---|---|---|
 | `hdr_align_warp_homography` | Backward-mapping projective warp with bilinear interpolation | High (each pixel independent) |
 | `hdr_align_compute_gradients` | 3×3 Sobel gradient (gx, gy) | High (stencil operation) |
 | `hdr_align_log1p` | $\log(1 + x)$ dynamic-range compression (in-place) | High (element-wise) |
-| `hdr_align_gradient_sobel_sum` | Signed gradient sum: $g_x + g_y$ (in-place, replaces unsigned magnitude) | High (element-wise) |
+| `hdr_align_gradient_sobel_sum` | Signed gradient sum: $g_x + g_y$ (in-place) | High (element-wise) |
 | `hdr_align_normalize_mad` | MAD normalisation: $g / (\text{mean}(\|g\|) + \varepsilon)$; inv\_scale supplied by host | High (element-wise) |
 | `hdr_align_mosaic_to_gray` | Bayer 2×2 block averaging | Medium |
 | `hdr_align_downsample_2x` | 2× box-filter downsampling | Medium |
-| `hdr_align_ecc_means` | Pass 1: weighted mean accumulation with work-group reduction | High at full-res |
-| `hdr_align_ecc_norms` | Pass 2: norms, Jacobian sums, correlation with reduction | High at full-res |
-| `hdr_align_ecc_hessian` | Pass 3: projection coefficient accumulation | High at full-res |
-| `hdr_align_ecc_hessian_final` | Pass 4: Hessian + RHS assembly with reduction | High at full-res |
+| `hdr_align_ecc_means` | ECC pass 1: weighted mean accumulation with work-group reduction | High at full-res |
+| `hdr_align_ecc_norms` | ECC pass 2: norms, Jacobian sums, sJw projection sums, correlation | High at full-res |
+| `hdr_align_ecc_hessian_final` | ECC pass 3: Hessian + RHS assembly given pre-computed proj_coeff | High at full-res |
 
-> **Note**: Percentile normalisation of raw pixels (step 1 of the gradient pipeline) remains CPU-only because it requires a two-pass histogram reduction that maps poorly to single-pass GPU kernels.  All subsequent steps (`log1p`, Sobel sum, MAD normalisation) are GPU-accelerated.
+> **Note**: Percentile normalisation of raw pixels (step 1 of the gradient pipeline) remains CPU-only because it requires a two-pass histogram reduction that maps poorly to single-pass GPU kernels.  All subsequent steps (`log1p`, Sobel sum, MAD normalisation) are GPU-ready.
+
+**3-pass ECC design (matching CPU)**: `hdr_align_ecc_norms` accumulates 9 values per work-group: `norm2_r`, `norm2_w`, `dot_rw`, `sum_J0..J2` (mean Jacobian numerators), and `sJw0..sJw2` (projection numerators, where sJw[k] = Σ wgt·tw·J[k]).  The host derives `proj_coeff[k] = sJw[k] / norm2_w` without a separate image pass — matching the same sJw optimisation used in the CPU `_ecc_iteration`.  This eliminates the former separate projection kernel and reduces each ECC iteration to 3 GPU passes.
 
 **Reduction strategy**: The ECC accumulation kernels use a two-level reduction:
 1. **Intra-workgroup**: Tree reduction in local memory within each work-group.
@@ -1278,20 +1322,22 @@ An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `pro
 
 This avoids atomic operations on doubles and keeps the kernels simple while still achieving good parallelism.
 
-**Integration**: The OpenCL kernel handles are stored in `dt_hdr_alignment_cl_global_t`, initialized at startup via `dt_hdr_alignment_init_cl_global()` and registered in the darktable OpenCL subsystem (`darktable.opencl->hdr_alignment`).  The CPU fallback path (with OpenMP) is always available when OpenCL is not present or fails.
+**Constants**: Pyramid control constants (`HDR_ALIGN_COARSEST_SIZE` and `HDR_ALIGN_MIN_DIM`) govern host-side decisions (when to stop building the pyramid; minimum image size to attempt alignment) and are therefore not present in the OpenCL device code.  Computation constants used inside kernels (e.g. `HDR_ALIGN_ECC_EDGE_WEIGHT`) are passed as kernel arguments from the host so that both paths always use the same values.
+
+**Status**: The OpenCL kernel handles are stored in `dt_hdr_alignment_cl_global_t`, compiled and registered at startup via `dt_hdr_alignment_init_cl_global()`.  The kernels form a complete set of building blocks for a GPU-accelerated alignment pipeline, but the full pipeline orchestration (pyramid loop, convergence checks, drift guards, small-matrix solves) is not yet wired up — `dt_hdr_align_compute()` is currently CPU-only with OpenMP.  The OpenMP path remains the active implementation.
 
 ### Performance Impact
 
 For a typical HDR merge of a 4784×3188 bracket pair:
 
-| Phase | Before (single-threaded) | After (8-core OMP) | OpenCL (mid-range GPU) |
-|---|---|---|---|
-| ECC pyramid (levels 7→0) | ~48 s | ~8 s | ~2 s |
-| DOF escalation | ~47 s | ~8 s | ~2 s |
-| Mesh residuals | ~0.5 s | ~0.5 s | N/A |
-| Total alignment | ~96 s | ~17 s | ~5 s |
+| Phase | Before (single-threaded) | After (8-core OMP) |
+|---|---|---|
+| ECC pyramid (levels 7→0) | ~48 s | ~8 s |
+| DOF escalation | ~47 s | ~8 s |
+| Mesh residuals | ~0.5 s | ~0.5 s |
+| Total alignment | ~96 s | ~17 s |
 
-*Estimates based on the 4-pass × 50-iteration × 8-level worst case.  Actual speedup depends on convergence behavior (many levels stall early) and system configuration.*
+*Estimates based on the 3-pass × 50-iteration × 8-level worst case.  Actual speedup depends on convergence behavior (many levels stall early) and system configuration.*
 
 ## Future Work
 
@@ -1301,7 +1347,7 @@ Potential refinements to the alignment pipeline:
 - **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
 - **Adaptive drift guard thresholds**: the per-level translation drift limit ($3.0$ px) and angle drift limit ($2°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
-- **Full OpenCL pipeline**: Currently the OpenCL kernels accelerate individual operations but the pipeline orchestration and small-matrix solves remain on the CPU.  A fully GPU-resident pipeline (keeping pyramid data in GPU memory across levels) would eliminate host↔device transfers and further reduce latency.
+- **Full OpenCL pipeline**: The OpenCL kernels cover all pixel-level operations needed for a full GPU-resident alignment pipeline. The remaining work is pipeline orchestration: building the pyramid on the GPU, running the convergence/drift loops on the GPU, and keeping data in GPU memory across levels to eliminate host↔device transfers.
 
 ## File Map
 

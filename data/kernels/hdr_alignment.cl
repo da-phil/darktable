@@ -331,11 +331,18 @@ hdr_align_ecc_means(global const float *ref,
 }
 
 
-/* ---------- ECC Pass 2: Norms, Jacobian sums, correlation ----------
+/* ---------- ECC Pass 2: Norms, Jacobian sums, projection sums, correlation ----------
  *
  * Computes partial sums for a work-group tile.
  * out_sums layout per work-group:
- *   [norm2_r, norm2_w, dot_rw, sum_J0, sum_J1, sum_J2]  (6 floats)
+ *   [norm2_r, norm2_w, dot_rw, sum_J0, sum_J1, sum_J2,
+ *    sJw0, sJw1, sJw2]  (9 floats)
+ *
+ * sJw[k] = Σ wgt·tw·J[k].  Together with norm2_w this lets the host compute
+ * the projection coefficients without a separate image sweep:
+ *   proj_coeff[k] = sJw[k] / norm2_w
+ * (the mean_J correction term cancels because Σ wgt·tw = 0 by definition
+ * of mean_w, matching the CPU sJw optimisation in _ecc_iteration).
  */
 kernel void
 hdr_align_ecc_norms(global const float *ref,
@@ -364,7 +371,8 @@ hdr_align_ecc_norms(global const float *ref,
   const int x = get_global_id(0);
   const int y = get_global_id(1);
 
-  float acc[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+  float acc[9];
+  for(int k = 0; k < 9; k++) acc[k] = 0.0f;
 
   if(x < width && y < height)
   {
@@ -392,12 +400,15 @@ hdr_align_ecc_norms(global const float *ref,
       acc[3] = wgt * J0;          // sum_J0
       acc[4] = wgt * J1;          // sum_J1
       acc[5] = wgt * J2;          // sum_J2
+      acc[6] = wgt * tw * J0;     // sJw0
+      acc[7] = wgt * tw * J1;     // sJw1
+      acc[8] = wgt * tw * J2;     // sJw2
     }
   }
 
   // Store in local memory
-  for(int k = 0; k < 6; k++)
-    local_sums[lid * 6 + k] = acc[k];
+  for(int k = 0; k < 9; k++)
+    local_sums[lid * 9 + k] = acc[k];
   barrier(CLK_LOCAL_MEM_FENCE);
 
   // Tree reduction
@@ -405,122 +416,28 @@ hdr_align_ecc_norms(global const float *ref,
   {
     if(lid < stride)
     {
-      for(int k = 0; k < 6; k++)
-        local_sums[lid * 6 + k] += local_sums[(lid + stride) * 6 + k];
+      for(int k = 0; k < 9; k++)
+        local_sums[lid * 9 + k] += local_sums[(lid + stride) * 9 + k];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 
   if(lid == 0)
   {
-    for(int k = 0; k < 6; k++)
-      out_sums[gid * 6 + k] = local_sums[k];
+    for(int k = 0; k < 9; k++)
+      out_sums[gid * 9 + k] = local_sums[k];
   }
 }
 
 
-/* ---------- ECC Pass 3+4: Projection + Hessian/RHS ----------
+/* ---------- ECC Pass 3 (with known proj_coeff): Hessian + RHS ----------
  *
- * Combined pass computing projection coefficients and the 3×3 Hessian
- * plus 3-element RHS in a single image sweep.
- *
- * out_sums layout per work-group:
- *   [proj0, proj1, proj2, H00, H01, H02, H11, H12, H22,
- *    rhs0, rhs1, rhs2]  (12 floats)
- */
-kernel void
-hdr_align_ecc_hessian(global const float *ref,
-                      global const float *warped,
-                      global const float *mask,
-                      global const float *gx,
-                      global const float *gy,
-                      global float *out_sums,
-                      const int width,
-                      const int height,
-                      const float cx,
-                      const float cy,
-                      const float inv_s,
-                      const float s,
-                      const float edge_weight,
-                      const float mean_r,
-                      const float mean_w,
-                      const float cos_t,
-                      const float sin_t,
-                      const float mean_J0,
-                      const float mean_J1,
-                      const float mean_J2,
-                      const float norm2_w,
-                      const float scale_rw,
-                      const float rho,
-                      local float *local_sums)
-{
-  const int lid = get_local_id(0) + get_local_id(1) * get_local_size(0);
-  const int lsize = get_local_size(0) * get_local_size(1);
-  const int gid = get_group_id(0) + get_group_id(1) * get_num_groups(0);
-
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-
-  // 12 accumulators: proj[3], Hess upper-triangle[6], rhs[3]
-  float acc[12];
-  for(int k = 0; k < 12; k++) acc[k] = 0.0f;
-
-  if(x < width && y < height)
-  {
-    const size_t i = (size_t)y * width + x;
-    if(mask[i] > 0.5f)
-    {
-      const float xn = ((float)x - cx) * inv_s;
-      const float yn = ((float)y - cy) * inv_s;
-      const float r2 = min(1.0f, 0.5f * (xn * xn + yn * yn));
-      const float wgt = 1.0f + edge_weight * r2;
-      const float gxi = gx[i];
-      const float gyi = gy[i];
-
-      const float J0 = s * (gxi * (-sin_t * xn + cos_t * yn)
-                           + gyi * (-cos_t * xn - sin_t * yn));
-      const float J1 = s * gxi;
-      const float J2 = s * gyi;
-
-      const float tw = warped[i] - mean_w;
-
-      // Projection coefficients (partial sum, will be divided by norm2_w on host)
-      acc[0] = wgt * tw * (J0 - mean_J0);
-      acc[1] = wgt * tw * (J1 - mean_J1);
-      acc[2] = wgt * tw * (J2 - mean_J2);
-
-      // The projection coefficients and Hessian need the final proj_coeff,
-      // which requires a separate pass. We provide proj_coeff via pre-computation
-      // on the host between Pass 2 and this pass, then compute Jp and Hessian
-      // in a separate kernel call. See hdr_align_ecc_hessian_final below.
-    }
-  }
-
-  // Store in local memory
-  for(int k = 0; k < 12; k++)
-    local_sums[lid * 12 + k] = acc[k];
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Tree reduction
-  for(int stride = lsize / 2; stride > 0; stride >>= 1)
-  {
-    if(lid < stride)
-    {
-      for(int k = 0; k < 12; k++)
-        local_sums[lid * 12 + k] += local_sums[(lid + stride) * 12 + k];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  if(lid == 0)
-  {
-    for(int k = 0; k < 12; k++)
-      out_sums[gid * 12 + k] = local_sums[k];
-  }
-}
-
-
-/* ---------- ECC Pass 4 (with known proj_coeff): Hessian + RHS ----------
+ * The proj_coeff values are derived by the host from the sJw accumulators
+ * returned by hdr_align_ecc_norms:
+ *   proj_coeff[k] = sJw[k] / norm2_w
+ * (the mean_J correction term cancels because Σ wgt·tw = 0).
+ * This mirrors the CPU sJw optimisation that eliminated the old separate
+ * projection pass.
  *
  * out_sums layout per work-group:
  *   [H00, H01, H02, H11, H12, H22, rhs0, rhs1, rhs2]  (9 floats)

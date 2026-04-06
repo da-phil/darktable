@@ -2925,7 +2925,6 @@ dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void)
   g->kernel_downsample_2x    = dt_opencl_create_kernel(program, "hdr_align_downsample_2x");
   g->kernel_ecc_means        = dt_opencl_create_kernel(program, "hdr_align_ecc_means");
   g->kernel_ecc_norms        = dt_opencl_create_kernel(program, "hdr_align_ecc_norms");
-  g->kernel_ecc_hessian      = dt_opencl_create_kernel(program, "hdr_align_ecc_hessian");
   g->kernel_ecc_hessian_final = dt_opencl_create_kernel(program, "hdr_align_ecc_hessian_final");
 
   return g;
@@ -2943,7 +2942,6 @@ void dt_hdr_alignment_free_cl_global(dt_hdr_alignment_cl_global_t *g)
   dt_opencl_free_kernel(g->kernel_downsample_2x);
   dt_opencl_free_kernel(g->kernel_ecc_means);
   dt_opencl_free_kernel(g->kernel_ecc_norms);
-  dt_opencl_free_kernel(g->kernel_ecc_hessian);
   dt_opencl_free_kernel(g->kernel_ecc_hessian_final);
   free(g);
 }

@@ -90,7 +90,6 @@ typedef struct dt_hdr_alignment_cl_global_t
   int kernel_downsample_2x;
   int kernel_ecc_means;
   int kernel_ecc_norms;
-  int kernel_ecc_hessian;
   int kernel_ecc_hessian_final;
 } dt_hdr_alignment_cl_global_t;
 
