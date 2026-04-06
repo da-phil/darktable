@@ -484,8 +484,11 @@ static void _compute_gradients(const float *img,
 
 /** Apply log(1 + x) transform in-place.
  *  Compresses the dynamic range so that dark and bright exposures produce
- *  comparable gradient magnitudes.  Applied after percentile normalisation
- *  and before Sobel gradient computation. */
+ *  comparable gradient values.  log(1+x) is chosen because it is monotone,
+ *  maps [0,∞) to [0,∞), and its derivative 1/(1+x) down-weights large
+ *  intensities so highlight edges do not overwhelm shadow edges after Sobel
+ *  differentiation.  Applied after percentile normalisation and before the
+ *  Sobel gradient computation. */
 static void _log1p_transform(float *img, const size_t npix)
 {
   DT_OMP_FOR()

@@ -153,7 +153,9 @@ hdr_align_compute_gradients(global const float *in,
  *
  * Applied in-place after percentile normalisation and before Sobel gradient
  * computation.  Compresses highlights so that dark and bright exposures
- * produce comparable gradient magnitudes.
+ * produce comparable gradient values: the derivative 1/(1+x) down-weights
+ * large intensities so highlight edges do not overwhelm shadow edges after
+ * Sobel differentiation.
  */
 kernel void
 hdr_align_log1p(global float *img,
