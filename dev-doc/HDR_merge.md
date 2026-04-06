@@ -536,11 +536,11 @@ For one candidate frame the estimator does the following:
 
 1. Reduce the Bayer mosaic to half-resolution grayscale by averaging each `2x2` Bayer block.
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
-3. Normalize each pyramid level to `[0, 1]` so gradient magnitudes from dark and bright exposures have comparable numerical scale.
+3. Preprocess each pyramid level with: percentile normalisation → log(1+x) → signed Sobel gradient sum (gx+gy) → MAD normalisation (g / mean(|g|) + ε). This pipeline brings dark and bright exposures to a comparable scale and removes the intensity DC component so that edges — not absolute brightness — drive alignment.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
 5. **Early-out**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the images are already well-aligned — return identity immediately and skip all remaining steps.
 6. Convert the coarse Euclidean result into a backward homography.
-7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on gradient-magnitude images, with per-level drift guards.
+7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with per-level drift guards.
 8. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
 9. **Identity comparison**: always compare the aligned $\rho$ against identity $\rho$ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
 10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
@@ -1260,14 +1260,17 @@ An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `pro
 |---|---|---|
 | `hdr_align_warp_homography` | Backward-mapping projective warp with bilinear interpolation | High (each pixel independent) |
 | `hdr_align_compute_gradients` | 3×3 Sobel gradient (gx, gy) | High (stencil operation) |
-| `hdr_align_gradient_magnitude` | $\sqrt{g_x^2 + g_y^2}$ | High (element-wise) |
-| `hdr_align_normalize_01` | Min-max normalization to [0,1] | Medium |
+| `hdr_align_log1p` | $\log(1 + x)$ dynamic-range compression (in-place) | High (element-wise) |
+| `hdr_align_gradient_sobel_sum` | Signed gradient sum: $g_x + g_y$ (in-place, replaces unsigned magnitude) | High (element-wise) |
+| `hdr_align_normalize_mad` | MAD normalisation: $g / (\text{mean}(\|g\|) + \varepsilon)$; inv\_scale supplied by host | High (element-wise) |
 | `hdr_align_mosaic_to_gray` | Bayer 2×2 block averaging | Medium |
 | `hdr_align_downsample_2x` | 2× box-filter downsampling | Medium |
 | `hdr_align_ecc_means` | Pass 1: weighted mean accumulation with work-group reduction | High at full-res |
 | `hdr_align_ecc_norms` | Pass 2: norms, Jacobian sums, correlation with reduction | High at full-res |
 | `hdr_align_ecc_hessian` | Pass 3: projection coefficient accumulation | High at full-res |
 | `hdr_align_ecc_hessian_final` | Pass 4: Hessian + RHS assembly with reduction | High at full-res |
+
+> **Note**: Percentile normalisation of raw pixels (step 1 of the gradient pipeline) remains CPU-only because it requires a two-pass histogram reduction that maps poorly to single-pass GPU kernels.  All subsequent steps (`log1p`, Sobel sum, MAD normalisation) are GPU-accelerated.
 
 **Reduction strategy**: The ECC accumulation kernels use a two-level reduction:
 1. **Intra-workgroup**: Tree reduction in local memory within each work-group.

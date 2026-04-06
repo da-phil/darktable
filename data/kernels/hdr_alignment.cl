@@ -23,11 +23,19 @@
  * pipeline:
  *   - Image warping by a 3×3 homography
  *   - Sobel gradient computation
- *   - Gradient magnitude
- *   - Image normalization to [0,1]
+ *   - log(1 + x) dynamic-range compression
+ *   - Signed Sobel gradient sum (gx + gy) for exposure-invariant ECC input
+ *   - Mean-absolute-deviation gradient normalisation
  *   - Bayer mosaic to grayscale conversion
  *   - 2× box-filter downsampling
  *   - ECC weighted accumulation passes
+ *
+ * Gradient preprocessing pipeline (applied before ECC):
+ *   1. Percentile normalisation of raw pixels [CPU-only due to histogram pass]
+ *   2. hdr_align_log1p          – log(1 + x) dynamic range compression
+ *   3. hdr_align_compute_gradients – Sobel gx, gy
+ *   4. hdr_align_gradient_sobel_sum – combine into gx + gy (signed)
+ *   5. hdr_align_normalize_mad  – g / (mean(|g|) + ε)
  */
 
 /* ---------- Warp by projective homography ----------
@@ -141,31 +149,65 @@ hdr_align_compute_gradients(global const float *in,
 }
 
 
-/* ---------- Gradient magnitude ---------- */
+/* ---------- log(1 + x) dynamic-range compression ----------
+ *
+ * Applied in-place after percentile normalisation and before Sobel gradient
+ * computation.  Compresses highlights so that dark and bright exposures
+ * produce comparable gradient magnitudes.
+ */
 kernel void
-hdr_align_gradient_magnitude(global const float *gx,
+hdr_align_log1p(global float *img,
+                const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+
+  img[i] = log1p(img[i]);
+}
+
+
+/* ---------- Signed Sobel gradient sum (gx + gy) ----------
+ *
+ * Combines the horizontal (gx) and vertical (gy) Sobel gradients into a
+ * single signed channel: out = gx + gy.  The result retains sign and
+ * directional information from both axes.  This is the ECC feature image
+ * used instead of the unsigned gradient magnitude.
+ *
+ * Both gx and gy must have been filled by hdr_align_compute_gradients first.
+ * The combined result is written back to gx (in-place); gy is not modified.
+ */
+kernel void
+hdr_align_gradient_sobel_sum(global float *gx,
                              global const float *gy,
-                             global float *out,
                              const int npix)
 {
   const int i = get_global_id(0);
   if(i >= npix) return;
 
-  out[i] = sqrt(gx[i] * gx[i] + gy[i] * gy[i]);
+  gx[i] = gx[i] + gy[i];
 }
 
 
-/* ---------- Normalize image to [0,1] ---------- */
+/* ---------- Mean-absolute-deviation gradient normalisation ----------
+ *
+ * Normalises a signed gradient image in-place:
+ *   g[i] = g[i] / (mean(|g|) + ε)
+ *
+ * This prevents one image from dominating the ECC objective due to exposure
+ * differences while preserving gradient sign.
+ *
+ * The mean absolute value must be computed on the host (a two-pass reduction)
+ * and supplied as inv_scale = 1.0f / (mean_abs + 1e-7f).
+ */
 kernel void
-hdr_align_normalize_01(global float *img,
-                       const int npix,
-                       const float vmin,
-                       const float inv_range)
+hdr_align_normalize_mad(global float *g,
+                        const int npix,
+                        const float inv_scale)
 {
   const int i = get_global_id(0);
   if(i >= npix) return;
 
-  img[i] = (img[i] - vmin) * inv_range;
+  g[i] *= inv_scale;
 }
 
 

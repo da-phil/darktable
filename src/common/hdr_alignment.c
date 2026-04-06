@@ -2904,8 +2904,9 @@ dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void)
 
   g->kernel_warp_homography  = dt_opencl_create_kernel(program, "hdr_align_warp_homography");
   g->kernel_compute_gradients = dt_opencl_create_kernel(program, "hdr_align_compute_gradients");
-  g->kernel_gradient_magnitude = dt_opencl_create_kernel(program, "hdr_align_gradient_magnitude");
-  g->kernel_normalize_01     = dt_opencl_create_kernel(program, "hdr_align_normalize_01");
+  g->kernel_log1p            = dt_opencl_create_kernel(program, "hdr_align_log1p");
+  g->kernel_gradient_sobel_sum = dt_opencl_create_kernel(program, "hdr_align_gradient_sobel_sum");
+  g->kernel_normalize_mad    = dt_opencl_create_kernel(program, "hdr_align_normalize_mad");
   g->kernel_mosaic_to_gray   = dt_opencl_create_kernel(program, "hdr_align_mosaic_to_gray");
   g->kernel_downsample_2x    = dt_opencl_create_kernel(program, "hdr_align_downsample_2x");
   g->kernel_ecc_means        = dt_opencl_create_kernel(program, "hdr_align_ecc_means");
@@ -2921,8 +2922,9 @@ void dt_hdr_alignment_free_cl_global(dt_hdr_alignment_cl_global_t *g)
   if(!g) return;
   dt_opencl_free_kernel(g->kernel_warp_homography);
   dt_opencl_free_kernel(g->kernel_compute_gradients);
-  dt_opencl_free_kernel(g->kernel_gradient_magnitude);
-  dt_opencl_free_kernel(g->kernel_normalize_01);
+  dt_opencl_free_kernel(g->kernel_log1p);
+  dt_opencl_free_kernel(g->kernel_gradient_sobel_sum);
+  dt_opencl_free_kernel(g->kernel_normalize_mad);
   dt_opencl_free_kernel(g->kernel_mosaic_to_gray);
   dt_opencl_free_kernel(g->kernel_downsample_2x);
   dt_opencl_free_kernel(g->kernel_ecc_means);

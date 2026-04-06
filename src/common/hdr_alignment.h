@@ -83,8 +83,9 @@ typedef struct dt_hdr_alignment_cl_global_t
 {
   int kernel_warp_homography;
   int kernel_compute_gradients;
-  int kernel_gradient_magnitude;
-  int kernel_normalize_01;
+  int kernel_log1p;
+  int kernel_gradient_sobel_sum;
+  int kernel_normalize_mad;
   int kernel_mosaic_to_gray;
   int kernel_downsample_2x;
   int kernel_ecc_means;
