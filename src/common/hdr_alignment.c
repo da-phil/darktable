@@ -1477,7 +1477,7 @@ static float _ecc_refine_level(const float *ref,
 
     if(update < 0.0f)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   ECC failed at iteration %d", iter);
       memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
       return -1.0f;
@@ -1485,7 +1485,7 @@ static float _ecc_refine_level(const float *ref,
 
     if(update < HDR_ALIGN_ECC_EPSILON)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   ECC converged at iteration %d (update=%.6f)",
                iter, update);
       return update;
@@ -1506,7 +1506,7 @@ static float _ecc_refine_level(const float *ref,
       // The current H corresponds to a worse iteration and must not be
       // used as the starting point for the next pyramid level.
       memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   ECC stalled at iteration %d (update=%.6f, best=%.6f)",
                iter, update, best_update);
       return best_update;
@@ -1515,7 +1515,7 @@ static float _ecc_refine_level(const float *ref,
 
   // Max iterations reached: restore best H seen so far.
   memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge]   ECC did not converge in %d iterations",
            HDR_ALIGN_ECC_MAX_ITER);
   return 0.0f;
@@ -1935,7 +1935,7 @@ static float _ecc_refine_level_higher_dof(const float *ref,
 
     if(update < 0.0f)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC failed at iteration %d",
                ndof, iter);
       return -2.0f;
@@ -1944,7 +1944,7 @@ static float _ecc_refine_level_higher_dof(const float *ref,
     // Reject if the Hessian is poorly conditioned.
     if(cond_est > HDR_ALIGN_ESCALATION_MAX_COND)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC rejected: Hessian cond=%.1e > %.1e",
                ndof, cond_est, HDR_ALIGN_ESCALATION_MAX_COND);
       return -2.0f;
@@ -1952,7 +1952,7 @@ static float _ecc_refine_level_higher_dof(const float *ref,
 
     if(update < HDR_ALIGN_ESCALATION_EPSILON)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC converged at iteration %d (update=%.6f, cond=%.1e)",
                ndof, iter, update, cond_est);
       break;
@@ -2041,13 +2041,13 @@ static float _try_dof_escalation(const float *ref_grad,
 {
   // Measure current (3-DOF) quality.
   const float rho_3dof = _ecc_compute_rho(ref_grad, img_grad, w, h, H);
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] DOF escalation: 3-DOF ρ = %.5f (threshold = %.2f)",
            rho_3dof, HDR_ALIGN_ESCALATION_RHO_THRESHOLD);
 
   if(rho_3dof >= HDR_ALIGN_ESCALATION_RHO_THRESHOLD || rho_3dof < -1.0f)
   {
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] DOF escalation: not needed (ρ >= threshold)");
     return rho_3dof;
   }
@@ -2066,7 +2066,7 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_6 = rho_6dof - rho_3dof;
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] DOF escalation: 6-DOF ρ = %.5f (Δρ = %.5f, sane = %d)",
            rho_6dof, improvement_6, sane_6);
 
@@ -2082,7 +2082,7 @@ static float _try_dof_escalation(const float *ref_grad,
   {
     // 6-DOF did not improve — keep 3-DOF and stop.
     memcpy(H, H_3dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] DOF escalation: 6-DOF no improvement, keeping 3-DOF");
     return rho_3dof;
   }
@@ -2097,7 +2097,7 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] DOF escalation: 8-DOF ρ = %.5f (Δρ vs 6-DOF = %.5f, sane = %d)",
            rho_8dof, improvement_8, sane_8);
 
@@ -2109,7 +2109,7 @@ static float _try_dof_escalation(const float *ref_grad,
   if(accept_8)
   {
     memcpy(H, H_8dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f → %.5f)",
              rho_3dof, rho_6dof, rho_8dof);
     return rho_8dof;
@@ -2118,7 +2118,7 @@ static float _try_dof_escalation(const float *ref_grad,
   {
     // 8-DOF did not improve — keep 6-DOF result.
     memcpy(H, H_6dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] DOF escalation: accepted 6-DOF (ρ %.5f → %.5f)",
              rho_3dof, rho_6dof);
     return rho_6dof;
@@ -2281,7 +2281,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   const int cw = pyr_ref.width[coarsest];
   const int ch = pyr_ref.height[coarsest];
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] pyramid: %d levels, coarsest %dx%d, finest %dx%d",
            pyr_ref.nlevels, cw, ch, pyr_ref.width[0], pyr_ref.height[0]);
 
@@ -2292,7 +2292,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   const float angle_step_rad = HDR_ALIGN_COARSE_ANGLE_STEP * (float)M_PI / 180.0f;
   const float max_angle_rad = HDR_ALIGN_MAX_ANGLE_DEG * (float)M_PI / 180.0f;
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] coarse search: %dx%d, radius=%d, angle_step=%.1f°",
            cw, ch, search_radius, HDR_ALIGN_COARSE_ANGLE_STEP);
 
@@ -2376,7 +2376,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     dt_free_align(rotated);
   }
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] coarse result: tx=%.0f ty=%.0f angle=%.2f° ncc=%.4f"
            " (identity ncc=%.4f)",
            best_tx, best_ty, best_angle * 180.0f / (float)M_PI, best_ncc,
@@ -2400,13 +2400,13 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     const float rho_candidate = _ecc_compute_rho(coarse_ref_grad, coarse_img_grad,
                                                    cw, ch, H_candidate);
 
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] coarse ECC ρ: identity=%.5f candidate=%.5f",
              rho_id_coarse, rho_candidate);
 
     if(rho_id_coarse > -1.0f && rho_id_coarse >= rho_candidate)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] identity ρ >= candidate ρ at coarsest level"
                " -- images already aligned, skipping ECC");
 
@@ -2418,7 +2418,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
       _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
 
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] final homography: H=[1.00000 0.00000 0.00;"
                " 0.00000 1.00000 0.00; 0.0000000 0.0000000 1],"
                " approx dx=0.00 dy=0.00 angle=0.0000°,"
@@ -2459,7 +2459,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // and the coarse NCC result is sufficient at these scales.
     if(lw < HDR_ALIGN_ECC_MIN_DIM || lh < HDR_ALIGN_ECC_MIN_DIM)
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d (%dx%d): skipped (too small)",
                l, lw, lh);
       continue;
@@ -2476,7 +2476,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       dt_free_align(ref_norm);
       dt_free_align(img_norm);
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d: norm alloc failed", l);
       continue;
     }
@@ -2498,7 +2498,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       dt_free_align(ref_grad);
       dt_free_align(img_grad);
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
     }
@@ -2515,7 +2515,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       _debug_export_gradient_pfm(img_grad, lw, lh, label_img);
     }
 
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] ECC level %d (%dx%d): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
              l, lw, lh,
              H_level[0], H_level[1], H_level[2],
@@ -2532,7 +2532,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // homography (e.g. large scale change or perspective).
     if(!_homography_is_sane(H_level, lw, lh))
     {
-      dt_print(DT_DEBUG_ALWAYS,
+      dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d: result failed sanity check, reverting",
                l);
       memcpy(H_level, H_backup, sizeof(H_level));
@@ -2549,7 +2549,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       const float max_delta = HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG * (float)M_PI / 180.0f;
       if(fabsf(delta) > max_delta)
       {
-        dt_print(DT_DEBUG_ALWAYS,
+        dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
                  l, delta * 180.0f / (float)M_PI, HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG);
         memcpy(H_level, H_backup, sizeof(H_level));
@@ -2568,7 +2568,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       if(fabsf(dtx) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX
          || fabsf(dty) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX)
       {
-        dt_print(DT_DEBUG_ALWAYS,
+        dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] ECC level %d: translation drift (%.2f, %.2f) px"
                  " > limit %.1f px, reverting",
                  l, dtx, dty, HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX);
@@ -2593,12 +2593,12 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         const float H_id[HDR_ALIGN_H_NPARAM]
           = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
         const float rho_id = _ecc_compute_rho(ref_grad, img_grad, lw, lh, H_id);
-        dt_print(DT_DEBUG_ALWAYS,
+        dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] identity check: ρ_aligned=%.5f ρ_identity=%.5f",
                  rho_best, rho_id);
         if(rho_id >= rho_best)
         {
-          dt_print(DT_DEBUG_ALWAYS,
+          dt_print(DT_DEBUG_HDRMERGE,
                    "[hdr_merge] identity ρ >= aligned ρ -- reverting to identity");
           memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
         }
@@ -2611,7 +2611,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     dt_free_align(ref_grad);
     dt_free_align(img_grad);
 
-    dt_print(DT_DEBUG_ALWAYS,
+    dt_print(DT_DEBUG_HDRMERGE,
             "[hdr_merge] ECC level %d result: H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
             l,
             H_level[0], H_level[1], H_level[2],
@@ -2673,7 +2673,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       const float approx_angle = atan2f(out_align->H[1], out_align->H[0]);
         const float mesh_max = _mesh_max_abs(out_align->mesh_dx, out_align->mesh_dy);
 
-  dt_print(DT_DEBUG_ALWAYS,
+  dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] final homography: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1], approx dx=%.2f dy=%.2f angle=%.4f°, mesh max=%.2f px, mesh center=(%.2f, %.2f)",
                out_align->H[0], out_align->H[1], out_align->H[2],
                out_align->H[3], out_align->H[4], out_align->H[5],
