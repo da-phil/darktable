@@ -2408,25 +2408,14 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] identity ρ >= candidate ρ at coarsest level"
-               " -- images already aligned, skipping ECC");
-
-      dt_free_align(coarse_ref_grad);
-      dt_free_align(coarse_img_grad);
-
-      out_align->H[0] = 1.0f; out_align->H[1] = 0.0f; out_align->H[2] = 0.0f;
-      out_align->H[3] = 0.0f; out_align->H[4] = 1.0f; out_align->H[5] = 0.0f;
-      out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
-      _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
-
-      dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] final homography: H=[1.00000 0.00000 0.00;"
-               " 0.00000 1.00000 0.00; 0.0000000 0.0000000 1],"
-               " approx dx=0.00 dy=0.00 angle=0.0000°,"
-               " mesh max=0.00 px, mesh center=(0.00, 0.00)");
-
-      _free_pyramid(&pyr_ref);
-      _free_pyramid(&pyr_img);
-      return TRUE;
+               " -- using identity as ECC starting point");
+      // Don't skip: run the full ECC pyramid and DOF escalation starting from
+      // identity.  There may be residual misalignment visible at finer pyramid
+      // levels that the coarsest-level comparison cannot detect.  Reset the
+      // Euclidean estimate to identity so H_level is initialised correctly.
+      best_tx = 0.0f;
+      best_ty = 0.0f;
+      best_angle = 0.0f;
     }
   }
 
