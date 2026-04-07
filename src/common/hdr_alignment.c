@@ -33,8 +33,13 @@
 #define HDR_ALIGN_COARSE_ANGLE_STEP 0.5f
 // Maximum number of pyramid levels (enough for up to 32k images)
 #define HDR_ALIGN_MAX_PYRAMID_LEVELS 12
-// Target longest-side for the coarsest pyramid level
-#define HDR_ALIGN_COARSEST_SIZE 64
+// Target longest-side for the coarsest pyramid level.
+// The coarse NCC search runs at the coarsest pyramid level.  A too-small
+// coarsest image (37×24 = 888 px) cannot reliably discriminate between the
+// true alignment and false NCC maxima when scale, rotation and translation
+// vary simultaneously.  Setting the threshold to 128 makes the coarsest level
+// 74×49 (3626 px, 4× more pixels) which gives a sharper NCC landscape.
+#define HDR_ALIGN_COARSEST_SIZE 128
 // Minimum image dimension for alignment to make sense
 #define HDR_ALIGN_MIN_DIM 64
 // Maximum ECC iterations per pyramid level
@@ -89,23 +94,38 @@
 // A score of 1.0 means perfect correlation; lower values indicate the
 // rigid model left residual misalignment.
 #define HDR_ALIGN_ESCALATION_RHO_THRESHOLD 0.85f
-// Minimum ρ improvement required to accept a higher-DOF result.
+// Minimum ρ improvement required to accept a 6-DOF result over 3-DOF.
 #define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT 0.01f
+// Minimum ρ improvement required to accept 8-DOF over 6-DOF.
+// Lower than the 3→6 threshold because 8-DOF adds only 2 extra parameters
+// (perspective) over 6-DOF, so the expected noise gain is smaller.
+#define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF 0.005f
 // Maximum Hessian condition number for accepting a higher-DOF result.
 // A poorly conditioned Hessian indicates the extra parameters are not
 // well determined by the data.
 #define HDR_ALIGN_ESCALATION_MAX_COND 1e6
+// Coarse NCC scale search range and step (isotropic scale).
+// Lens breathing, aperture changes and non-equal zoom can introduce
+// significant scale differences between HDR brackets.  The scale search
+// ensures the coarse translation/rotation search is in the correct basin
+// even when the images differ in size by up to 45%.
+#define HDR_ALIGN_COARSE_SCALE_MIN  0.70f
+#define HDR_ALIGN_COARSE_SCALE_MAX  1.45f
+#define HDR_ALIGN_COARSE_SCALE_STEP 0.05f
 // Maximum ECC iterations for the escalated (higher-DOF) solver.
-#define HDR_ALIGN_ESCALATION_MAX_ITER 30
+// 50 iterations are needed when the rigid pyramid left a large residual
+// scale error (~15%) that the 6-DOF solver must bridge incrementally.
+#define HDR_ALIGN_ESCALATION_MAX_ITER 50
 // ECC convergence threshold for the escalated solver.
 #define HDR_ALIGN_ESCALATION_EPSILON 5e-3f
 
-// Maximum area-scaling deviation allowed in an escalated homography.
-// The determinant of the upper-left 2×2 equals the local area magnification;
-// for HDR brackets from the same camera / lens this must be very close to 1.0.
-// Values far from 1 indicate that the extra DOF are fitting exposure or
-// vignetting gradients as geometric scaling, producing a wrong result.
-#define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.01f
+// Maximum geometric-mean scale deviation allowed in an escalated homography.
+// sqrt(det(A)) is the per-axis scale factor; we allow up to ±50% deviation
+// from 1.0 to accommodate lens breathing, aperture-induced scale change, and
+// different focal lengths.  Values beyond this range indicate the extra DOF
+// are fitting non-geometric variation (exposure gradients, vignetting) rather
+// than real image geometry.
+#define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
 
 
 #define HDR_ALIGN_MESH_INDEX(row, col) ((row) * DT_HDR_ALIGN_MESH_COLS + (col))
@@ -174,35 +194,32 @@ static float *_downsample_2x(const float *in,
   return out;
 }
 
-/** Warp an image by a Euclidean transform (translation + rotation around
- *  image centre).  Out-of-bounds pixels are set to 0 and the corresponding
- *  mask entry is set to 0.  Valid pixels get mask = 1.
- *  @p mask may be NULL if the caller doesn't need it.
- *  Caller must free returned image (and mask if non-NULL). */
-static float *_warp_euclidean(const float *in,
-                              const int w,
-                              const int h,
-                              const float tx,
-                              const float ty,
-                              const float angle,
-                              float *mask)
+/** Warp an image by isotropic scale×rotation about the image centre.
+ *  Translation is excluded so that the NCC slide search can handle it.
+ *  Caller must free the returned buffer. */
+static float *_warp_similarity_nocrop(const float *in,
+                                      const int w,
+                                      const int h,
+                                      const float angle,
+                                      const float scale)
 {
   float *out = dt_alloc_align_float((size_t)w * h);
   if(!out) return NULL;
 
   const float cx = (w - 1) * 0.5f;
   const float cy = (h - 1) * 0.5f;
-  // Inverse rotation for backward mapping
+  // Inverse rotation for backward mapping; inverse scale = 1/scale
   const float cos_a = cosf(-angle);
   const float sin_a = sinf(-angle);
+  const float inv_s = 1.0f / scale;
 
   DT_OMP_FOR(collapse(2))
   for(int y = 0; y < h; y++)
     for(int x = 0; x < w; x++)
     {
-      // Inverse warp: output(x,y) ← source at inverse-transformed location
-      const float ox = (float)x - tx - cx;
-      const float oy = (float)y - ty - cy;
+      // Shift to centre, apply inverse scale, then inverse rotation.
+      const float ox = ((float)x - cx) * inv_s;
+      const float oy = ((float)y - cy) * inv_s;
       const float sx = cos_a * ox - sin_a * oy + cx;
       const float sy = sin_a * ox + cos_a * oy + cy;
 
@@ -217,38 +234,43 @@ static float *_warp_euclidean(const float *in,
                         + fx * (1.0f - fy) * in[iy * w + ix + 1]
                         + (1.0f - fx) * fy * in[(iy + 1) * w + ix]
                         + fx * fy * in[(iy + 1) * w + ix + 1];
-        if(mask) mask[y * w + x] = 1.0f;
       }
       else
       {
         out[y * w + x] = 0.0f;
-        if(mask) mask[y * w + x] = 0.0f;
       }
     }
 
   return out;
 }
 
-/** Initialise a backward-mapping homography from Euclidean parameters
- *  compatible with _warp_euclidean semantics. */
-static void _homography_from_euclidean(const float tx,
-                                       const float ty,
-                                       const float angle,
-                                       const int w,
-                                       const int h,
-                                       float H[HDR_ALIGN_H_NPARAM])
+/** Initialise a backward-mapping similarity homography (scale + rotation +
+ *  translation) about the image centre.  When scale=1 this reduces exactly
+ *  to _homography_from_euclidean.  The backward mapping divides the centred
+ *  offset by scale before applying the inverse rotation, so a warped pixel
+ *  at distance r from the centre in the destination came from distance r/scale
+ *  in the source — matching the forward model where img features appear
+ *  scale× larger than in ref. */
+static void _homography_from_similarity(const float tx,
+                                        const float ty,
+                                        const float angle,
+                                        const float scale,
+                                        const int w,
+                                        const int h,
+                                        float H[HDR_ALIGN_H_NPARAM])
 {
   const float cx = (w - 1) * 0.5f;
   const float cy = (h - 1) * 0.5f;
   const float ca = cosf(angle);
   const float sa = sinf(angle);
+  const float inv_s = 1.0f / scale;
 
-  H[0] = ca;
-  H[1] = sa;
-  H[2] = -ca * (tx + cx) - sa * (ty + cy) + cx;
-  H[3] = -sa;
-  H[4] = ca;
-  H[5] =  sa * (tx + cx) - ca * (ty + cy) + cy;
+  H[0] =  ca * inv_s;
+  H[1] =  sa * inv_s;
+  H[2] = -ca * inv_s * (tx + cx) - sa * inv_s * (ty + cy) + cx;
+  H[3] = -sa * inv_s;
+  H[4] =  ca * inv_s;
+  H[5] =  sa * inv_s * (tx + cx) - ca * inv_s * (ty + cy) + cy;
   H[6] = 0.0f;
   H[7] = 0.0f;
 }
@@ -560,6 +582,34 @@ static gboolean _homography_is_sane(const float H[HDR_ALIGN_H_NPARAM],
   if(fabsf(Hn[0] - Hn[4]) > 0.03f) return FALSE;
   if(fabsf(Hn[1] + Hn[3]) > 0.03f) return FALSE;
   return TRUE;
+}
+
+/** Compute unsigned Sobel gradient magnitude sqrt(gx² + gy²) image.
+ *  Used for quality-score computation (ρ) where sign cancellation in the
+ *  signed sum would drive PCC to near-zero for natural images with diverse
+ *  edge orientations, even when the images are well-aligned.  Caller must
+ *  free the result. */
+static float *_gradient_sobel_magnitude(const float *img, const int w, const int h)
+{
+  const size_t npix = (size_t)w * h;
+  float *gx = dt_alloc_align_float(npix);
+  float *gy = dt_alloc_align_float(npix);
+  if(!gx || !gy)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    return NULL;
+  }
+
+  _compute_gradients(img, w, h, gx, gy);
+
+  // Compute magnitude in-place into gx.
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    gx[i] = sqrtf(gx[i] * gx[i] + gy[i] * gy[i]);
+
+  dt_free_align(gy);
+  return gx;
 }
 
 /** Compute signed Sobel gradient sum (gx + gy) image.
@@ -1440,14 +1490,21 @@ static float _ecc_iteration(const float *ref,
   dty = CLAMP(dty, -max_shift_n, max_shift_n);
 
   // Apply Euclidean update exactly (no linearisation error).
+  // Preserve the row norm (= inv_scale) that _homography_from_similarity
+  // encodes in the upper-left 2×2 block.  The 3-DOF solver optimises only
+  // rotation and translation; any scale component in H must be carried
+  // forward unchanged so the 6-DOF escalation at the finest level starts
+  // from the correct scale basin.  For scale=1 (normal case) sc=1 and
+  // behaviour is identical to before.
+  const double sc = sqrt(cos_t * cos_t + sin_t * sin_t);
   const double theta_old = atan2(sin_t, cos_t);
   const double theta_new = theta_old + dtheta;
 
-  Hn[0] = (float)cos(theta_new);
-  Hn[1] = (float)sin(theta_new);
+  Hn[0] =  (float)(sc * cos(theta_new));
+  Hn[1] =  (float)(sc * sin(theta_new));
   Hn[2] += (float)dtx;
-  Hn[3] = -(float)sin(theta_new);
-  Hn[4] = (float)cos(theta_new);
+  Hn[3] = -(float)(sc * sin(theta_new));
+  Hn[4] =  (float)(sc * cos(theta_new));
   Hn[5] += (float)dty;
   Hn[6] = 0.0f;
   Hn[7] = 0.0f;
@@ -1533,10 +1590,21 @@ static float _ecc_refine_level(const float *ref,
 // Adaptive DOF escalation: 3-DOF → 6-DOF → 8-DOF
 // ---------------------------------------------------------------------------
 
-/** Compute the weighted ECC score ρ for a given homography on gradient-magnitude
- *  images.  Returns the correlation coefficient in [-1, 1], or -2 on failure. */
-static float _ecc_compute_rho(const float *ref,
-                               const float *img,
+/** Compute the weighted ECC alignment score ρ from *intensity* images.
+ *
+ *  Both @p ref_intensity and @p img_intensity must be preprocessed intensity
+ *  images (e.g. percentile-normalised + log-transformed).  The function warps
+ *  img_intensity by H, then computes Sobel gradient *magnitude* images for
+ *  both ref and the warped img, and returns their Pearson correlation.
+ *
+ *  Using gradient magnitude (always ≥ 0, rotation-invariant) instead of the
+ *  signed gx+gy sum avoids the sign-cancellation artefact that drives the PCC
+ *  to near zero for natural images with diverse edge orientations even when
+ *  the images are perfectly aligned.
+ *
+ *  Returns the correlation coefficient in [-1, 1], or -2 on failure. */
+static float _ecc_compute_rho(const float *ref_intensity,
+                               const float *img_intensity,
                                const int w,
                                const int h,
                                const float H[HDR_ALIGN_H_NPARAM])
@@ -1547,12 +1615,29 @@ static float _ecc_compute_rho(const float *ref,
   const double cx = ((double)w - 1.0) * 0.5;
   const double cy = ((double)h - 1.0) * 0.5;
 
+  // Warp img_intensity by H and record the valid-pixel mask.
   float *mask = dt_alloc_align_float(npix);
   if(!mask) return -2.0f;
 
-  float *warped = _warp_homography(img, w, h, H, mask);
+  float *warped = _warp_homography(img_intensity, w, h, H, mask);
   if(!warped)
   {
+    dt_free_align(mask);
+    return -2.0f;
+  }
+
+  // Compute gradient magnitude images: ref_mag from ref_intensity,
+  // warp_mag from the already-warped image.  Magnitude is always ≥ 0 and
+  // is invariant to the sign convention of the Sobel filter, so the PCC
+  // correctly reflects structural similarity regardless of edge orientation.
+  float *ref_mag = _gradient_sobel_magnitude(ref_intensity, w, h);
+  float *warp_mag = _gradient_sobel_magnitude(warped, w, h);
+  dt_free_align(warped);
+
+  if(!ref_mag || !warp_mag)
+  {
+    dt_free_align(ref_mag);
+    dt_free_align(warp_mag);
     dt_free_align(mask);
     return -2.0f;
   }
@@ -1561,9 +1646,8 @@ static float _ecc_compute_rho(const float *ref,
   // Accumulates sum_r, sum_w, sum_rr, sum_ww, sum_rw and sum_weight in one
   // sweep, then derives norm2_r, norm2_w, dot_rw via the identity:
   //   norm2_r = sum_rr - sum_r² / sum_weight
-  // This avoids a second full image traversal at the cost of six instead of
-  // three accumulation variables.  Gradient images are normalised to [0,1]
-  // so cancellation errors are negligible.
+  // Gradient magnitudes are non-negative and well-scaled (mean ≈ 1 after
+  // normalization), so catastrophic cancellation is not a concern.
   double sum_r = 0.0, sum_w = 0.0, sum_weight = 0.0;
   double sum_rr = 0.0, sum_ww = 0.0, sum_rw = 0.0;
   long nvalid = 0;
@@ -1573,13 +1657,17 @@ static float _ecc_compute_rho(const float *ref,
     for(int x = 0; x < w; x++)
     {
       const size_t i = (size_t)y * w + x;
+      // The valid-pixel mask comes from the warp; border pixels where the
+      // Sobel kernel reaches outside the image are zeroed by _compute_gradients,
+      // but they still have mask=1 if the warp mapped them inside the image.
+      // That is fine: zero-gradient boundary pixels contribute correctly.
       if(mask[i] > 0.5f)
       {
         const double xn = ((double)x - cx) / s;
         const double yn = ((double)y - cy) / s;
         const double wgt = _ecc_spatial_weight(xn, yn);
-        const double rv = (double)ref[i];
-        const double wv = (double)warped[i];
+        const double rv = (double)ref_mag[i];
+        const double wv = (double)warp_mag[i];
         sum_r      += wgt * rv;
         sum_w      += wgt * wv;
         sum_rr     += wgt * rv * rv;
@@ -1590,20 +1678,17 @@ static float _ecc_compute_rho(const float *ref,
       }
     }
 
+  dt_free_align(ref_mag);
+  dt_free_align(warp_mag);
+  dt_free_align(mask);
+
   if(nvalid < (long)(npix * HDR_ALIGN_ECC_MIN_VALID_FRAC) || sum_weight < 1e-12)
-  {
-    dt_free_align(warped);
-    dt_free_align(mask);
     return -2.0f;
-  }
 
   // Compute variance / covariance from aggregated sums.
   const double norm2_r = sum_rr - sum_r * sum_r / sum_weight;
   const double norm2_w = sum_ww - sum_w * sum_w / sum_weight;
   const double dot_rw  = sum_rw - sum_r * sum_w / sum_weight;
-
-  dt_free_align(warped);
-  dt_free_align(mask);
 
   const double denom = sqrt(norm2_r * norm2_w);
   if(denom < 1e-12) return -2.0f;
@@ -1928,8 +2013,18 @@ static float _ecc_iteration_higher_dof(const float *ref,
 /** Run iterative higher-DOF ECC at a single pyramid level.
  *  @p ndof must be 6 (affine) or 8 (projective).
  *  Returns the final ρ after refinement, or -2 on failure. */
-static float _ecc_refine_level_higher_dof(const float *ref,
-                                            const float *img,
+/** Run iterative higher-DOF ECC at a single pyramid level.
+ *  @p ref_grad and @p img_grad are the signed-gradient images used for
+ *  the ECC optimisation.  @p ref_intensity and @p img_intensity are the
+ *  corresponding pre-Sobel intensity images used by _ecc_compute_rho for
+ *  reliable gradient-magnitude quality scoring.
+ *
+ *  Returns the weighted magnitude-correlation ρ after convergence,
+ *  or -2 on failure. */
+static float _ecc_refine_level_higher_dof(const float *ref_grad,
+                                            const float *img_grad,
+                                            const float *ref_intensity,
+                                            const float *img_intensity,
                                             const int w,
                                             const int h,
                                             float H[HDR_ALIGN_H_NPARAM],
@@ -1938,7 +2033,7 @@ static float _ecc_refine_level_higher_dof(const float *ref,
   for(int iter = 0; iter < HDR_ALIGN_ESCALATION_MAX_ITER; iter++)
   {
     double cond_est = 0.0;
-    const float update = _ecc_iteration_higher_dof(ref, img, w, h, H,
+    const float update = _ecc_iteration_higher_dof(ref_grad, img_grad, w, h, H,
                                                     ndof, &cond_est);
 
     if(update < 0.0f)
@@ -1967,7 +2062,7 @@ static float _ecc_refine_level_higher_dof(const float *ref,
     }
   }
 
-  return _ecc_compute_rho(ref, img, w, h, H);
+  return _ecc_compute_rho(ref_intensity, img_intensity, w, h, H);
 }
 
 /** Sanity check for an escalated homography.  Looser than _homography_is_sane
@@ -1980,21 +2075,22 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
   float Hn[HDR_ALIGN_H_NPARAM];
   _homography_pixel_to_normalized(H, w, h, Hn);
 
-  // Diagonal elements should be near 1 (allows some scale).
-  if(Hn[0] < 0.85f || Hn[0] > 1.15f) return FALSE;
-  if(Hn[4] < 0.85f || Hn[4] > 1.15f) return FALSE;
+  // Diagonal elements should be within the coarse scale search range.
+  // Lens breathing and aperture changes can introduce up to ±45% scale.
+  if(Hn[0] < 0.70f || Hn[0] > 1.45f) return FALSE;
+  if(Hn[4] < 0.70f || Hn[4] > 1.45f) return FALSE;
 
   // Off-diagonal: allow more shear than the rigid check.
   if(fabsf(Hn[1]) > 0.25f) return FALSE;
   if(fabsf(Hn[3]) > 0.25f) return FALSE;
 
-  // Area scaling: the determinant of the affine part (upper-left 2×2 of the
-  // normalised matrix) equals the local area magnification at image centre.
-  // For HDR brackets from the same camera/lens there is no physical reason
-  // for area scaling; if the extra DOF introduce significant scaling they
-  // are fitting exposure or vignetting gradients, not real geometry.
+  // Scale consistency: the geometric-mean scale sqrt(det(A)) must stay
+  // within HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION of 1.0.  Using the
+  // geometric mean (rather than raw det) gives a symmetric, per-axis bound.
   const float det_2x2 = Hn[0] * Hn[4] - Hn[1] * Hn[3];
-  if(fabsf(det_2x2 - 1.0f) > HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION) return FALSE;
+  if(det_2x2 <= 0.0f) return FALSE;
+  const float geom_scale = sqrtf(det_2x2);
+  if(fabsf(geom_scale - 1.0f) > HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION) return FALSE;
 
   if(ndof == 6)
   {
@@ -2033,6 +2129,9 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
  *  Measures the weighted ECC score of the current 3-DOF result and
  *  selectively tries higher-DOF models when the rigid fit is insufficient.
  *
+ *  @p ref_grad / @p img_grad   : signed-gradient images for ECC optimisation.
+ *  @p ref_intensity / @p img_intensity : pre-Sobel intensity images for ρ scoring.
+ *
  *  Escalation path: 3-DOF → 6-DOF affine → 8-DOF projective.
  *  Each step is only attempted when the previous step improved ρ.
  *  If a step does not improve, escalation stops and falls back to
@@ -2043,12 +2142,14 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
  *  original 3-DOF result).  Returns -2 on measurement failure. */
 static float _try_dof_escalation(const float *ref_grad,
                                  const float *img_grad,
+                                 const float *ref_intensity,
+                                 const float *img_intensity,
                                  const int w,
                                  const int h,
                                  float H[HDR_ALIGN_H_NPARAM])
 {
-  // Measure current (3-DOF) quality.
-  const float rho_3dof = _ecc_compute_rho(ref_grad, img_grad, w, h, H);
+  // Measure current (3-DOF) quality using gradient magnitude PCC.
+  const float rho_3dof = _ecc_compute_rho(ref_intensity, img_intensity, w, h, H);
   dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] DOF escalation: 3-DOF ρ = %.5f (threshold = %.2f)",
            rho_3dof, HDR_ALIGN_ESCALATION_RHO_THRESHOLD);
@@ -2069,6 +2170,7 @@ static float _try_dof_escalation(const float *ref_grad,
   memcpy(H_6dof, H_3dof, sizeof(H_6dof));
 
   const float rho_6dof = _ecc_refine_level_higher_dof(ref_grad, img_grad,
+                                                       ref_intensity, img_intensity,
                                                        w, h, H_6dof, 6);
 
   const float improvement_6 = rho_6dof - rho_3dof;
@@ -2100,6 +2202,7 @@ static float _try_dof_escalation(const float *ref_grad,
   memcpy(H_8dof, H_6dof, sizeof(H_8dof));
 
   const float rho_8dof = _ecc_refine_level_higher_dof(ref_grad, img_grad,
+                                                       ref_intensity, img_intensity,
                                                        w, h, H_8dof, 8);
 
   const float improvement_8 = rho_8dof - rho_6dof;
@@ -2111,7 +2214,7 @@ static float _try_dof_escalation(const float *ref_grad,
 
   const gboolean accept_8 = sane_8
                              && rho_8dof > rho_6dof
-                             && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
+                             && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF;
 
   // --- Accept best result ---
   if(accept_8)
@@ -2293,7 +2396,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            "[hdr_merge] pyramid: %d levels, coarsest %dx%d, finest %dx%d",
            pyr_ref.nlevels, cw, ch, pyr_ref.width[0], pyr_ref.height[0]);
 
-  float best_tx = 0.0f, best_ty = 0.0f, best_angle = 0.0f;
+  float best_tx = 0.0f, best_ty = 0.0f, best_angle = 0.0f, best_scale = 1.0f;
   float best_ncc = -2.0f;
 
   const int search_radius = (int)(MAX(cw, ch) * HDR_ALIGN_COARSE_SEARCH_FRAC);
@@ -2314,6 +2417,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   const size_t cpix = (size_t)cw * ch;
   float *coarse_ref_grad = NULL;
   float *coarse_img_grad = NULL;
+  // Also keep the pre-Sobel intensity images alive for gradient-magnitude
+  // ρ scoring after the NCC search (see below).
+  float *coarse_ref_norm = NULL;
+  float *coarse_img_norm = NULL;
   {
     float *tmp_ref = dt_alloc_align_float(cpix);
     float *tmp_img = dt_alloc_align_float(cpix);
@@ -2333,9 +2440,19 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Step 4: MAD gradient normalization
       if(coarse_ref_grad) _normalize_gradient_mad(coarse_ref_grad, cpix);
       if(coarse_img_grad) _normalize_gradient_mad(coarse_img_grad, cpix);
+
+      // Keep the intensity images for gradient-magnitude ρ scoring below.
+      if(coarse_ref_grad && coarse_img_grad)
+      {
+        coarse_ref_norm = tmp_ref;
+        coarse_img_norm = tmp_img;
+      }
+      else
+      {
+        dt_free_align(tmp_ref);
+        dt_free_align(tmp_img);
+      }
     }
-    dt_free_align(tmp_ref);
-    dt_free_align(tmp_img);
     _debug_export_gradient_pfm(coarse_ref_grad, cw, ch, "coarse_ref");
     _debug_export_gradient_pfm(coarse_img_grad, cw, ch, "coarse_img");
   }
@@ -2352,19 +2469,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   // correction, providing an early-out and a baseline for quality checks.
   const float ncc_identity = _ncc_full(coarse_ref, coarse_img, cw, ch, 0, 0);
 
+  for(float scale = HDR_ALIGN_COARSE_SCALE_MIN; scale <= HDR_ALIGN_COARSE_SCALE_MAX + 1e-4f;
+      scale += HDR_ALIGN_COARSE_SCALE_STEP)
+  {
   for(float angle = -max_angle_rad; angle <= max_angle_rad;
       angle += angle_step_rad)
   {
-    // Warp coarsest-level input by candidate angle (no translation yet)
-    float *rotated = NULL;
+    // Warp coarsest-level input by candidate scale×rotation (no translation)
+    float *similarity = NULL;
     const float *candidate = coarse_img;
 
-    if(fabsf(angle) > 1e-6f)
+    const gboolean need_warp = (fabsf(angle) > 1e-6f
+                                 || fabsf(scale - 1.0f) > 1e-4f);
+    if(need_warp)
     {
-      rotated = _warp_euclidean(coarse_img, cw, ch,
-                                0.0f, 0.0f, angle, NULL);
-      if(!rotated) continue;
-      candidate = rotated;
+      similarity = _warp_similarity_nocrop(coarse_img, cw, ch, angle, scale);
+      if(!similarity) continue;
+      candidate = similarity;
     }
 
     for(int dy = -search_radius; dy <= search_radius; dy++)
@@ -2378,11 +2499,13 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
           best_tx = (float)dx;
           best_ty = (float)dy;
           best_angle = angle;
+          best_scale = scale;
         }
       }
 
-    dt_free_align(rotated);
+    dt_free_align(similarity);
   }
+  } // end scale loop
 
   dt_print(DT_DEBUG_HDRMERGE,
            "[hdr_merge] coarse result: tx=%.0f ty=%.0f angle=%.2f° ncc=%.4f"
@@ -2390,22 +2513,27 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            best_tx, best_ty, best_angle * 180.0f / (float)M_PI, best_ncc,
            ncc_identity);
 
-  // Early-out using ECC ρ: compute the weighted correlation coefficient at
-  // the coarsest level for both the identity transform and the NCC-winning
-  // candidate.  If identity ρ >= candidate ρ, the images are already
-  // well-aligned and the full ECC pyramid would risk drift for no gain.
-  // This uses the same metric (ECC ρ) as the level-0 identity comparison,
-  // making the entire decision chain consistent.
-  if(use_grad)
+  // Early-out using ECC ρ: compute the weighted gradient-magnitude
+  // correlation coefficient at the coarsest level for both the identity
+  // transform and the NCC-winning candidate.  If identity ρ >= candidate ρ,
+  // the images are already well-aligned and the full ECC pyramid would risk
+  // drift for no gain.
+  //
+  // We use the intensity images (coarse_ref_norm / coarse_img_norm) so that
+  // _ecc_compute_rho can form proper gradient *magnitude* PCC, which is
+  // robust at all scales unlike the signed-gradient PCC used during
+  // optimisation.
+  if(coarse_ref_norm && coarse_img_norm)
   {
     const float H_id_coarse[HDR_ALIGN_H_NPARAM]
       = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
     float H_candidate[HDR_ALIGN_H_NPARAM];
-    _homography_from_euclidean(best_tx, best_ty, best_angle, cw, ch, H_candidate);
+    _homography_from_similarity(best_tx, best_ty, best_angle, best_scale,
+                                cw, ch, H_candidate);
 
-    const float rho_id_coarse = _ecc_compute_rho(coarse_ref_grad, coarse_img_grad,
+    const float rho_id_coarse = _ecc_compute_rho(coarse_ref_norm, coarse_img_norm,
                                                    cw, ch, H_id_coarse);
-    const float rho_candidate = _ecc_compute_rho(coarse_ref_grad, coarse_img_grad,
+    const float rho_candidate = _ecc_compute_rho(coarse_ref_norm, coarse_img_norm,
                                                    cw, ch, H_candidate);
 
     dt_print(DT_DEBUG_HDRMERGE,
@@ -2424,15 +2552,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       best_tx = 0.0f;
       best_ty = 0.0f;
       best_angle = 0.0f;
+      best_scale = 1.0f;
     }
+
+    dt_free_align(coarse_ref_norm);
+    dt_free_align(coarse_img_norm);
   }
 
   dt_free_align(coarse_ref_grad);
   dt_free_align(coarse_img_grad);
 
-  // Initialise projective model from coarse Euclidean estimate.
+  // Initialise projective model from coarse similarity estimate.
   float H_level[HDR_ALIGN_H_NPARAM];
-  _homography_from_euclidean(best_tx, best_ty, best_angle, cw, ch, H_level);
+  _homography_from_similarity(best_tx, best_ty, best_angle, best_scale, cw, ch, H_level);
+
+  // Note: the 3-DOF rigid ECC at intermediate pyramid levels will overwrite the
+  // scale component of H (it only optimises rotation + translation).  The 6-DOF
+  // escalation at level 0 will recover scale from the correct translation basin.
 
   // Step 4: Multi-resolution ECC refinement.
   //
@@ -2491,12 +2627,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // Step 3: Signed Sobel gradient (gx + gy)
     float *ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
     float *img_grad = _gradient_sobel_sum(img_norm, lw, lh);
-    dt_free_align(ref_norm);
-    dt_free_align(img_norm);
+
+    // At level 0 we need the intensity images (ref_norm / img_norm) alive
+    // for gradient-magnitude ρ scoring in DOF escalation and identity check.
+    // At other levels they are safe to free immediately.
+    if(l != 0)
+    {
+      dt_free_align(ref_norm);
+      dt_free_align(img_norm);
+      ref_norm = img_norm = NULL;
+    }
+
     if(!ref_grad || !img_grad)
     {
       dt_free_align(ref_grad);
       dt_free_align(img_grad);
+      dt_free_align(ref_norm);
+      dt_free_align(img_norm);
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
@@ -2525,7 +2672,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     float H_backup[HDR_ALIGN_H_NPARAM];
     memcpy(H_backup, H_level, sizeof(H_backup));
 
-    _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+    const float ecc_update = _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+    // ecc_update < HDR_ALIGN_ECC_EPSILON means the optimiser genuinely
+    // converged; stall or max-iteration exits return a larger (or zero) value.
+    const gboolean ecc_converged = (ecc_update >= 0.0f && ecc_update < HDR_ALIGN_ECC_EPSILON);
 
     // Sanity check: revert if ECC produced a physically implausible
     // homography (e.g. large scale change or perspective).
@@ -2540,6 +2690,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // Angle drift guard: if ECC changed the rotation by more than the
     // per-level tolerance it wandered to a wrong local maximum.  Revert to
     // the pre-level homography so the error does not cascade to finer levels.
+    // Skip the guard when ECC genuinely converged — a converged rotation is
+    // trustworthy even if it moved more than the default tolerance.
+    if(!ecc_converged)
     {
       float delta = atan2f(H_level[3], H_level[0])
                   - atan2f(H_backup[3], H_backup[0]);
@@ -2561,6 +2714,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // correction is at most a few pixels.  Large shifts at any single level
     // indicate a wrong local minimum, and the error doubles at every finer
     // level, producing catastrophically wrong final alignments.
+    // Skip the guard when ECC genuinely converged — the result is trusted.
+    if(!ecc_converged)
     {
       const float dtx = H_level[2] - H_backup[2];
       const float dty = H_level[5] - H_backup[5];
@@ -2580,7 +2735,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // and then 8-DOF projective refinement gated by improvement and sanity.
     if(l == 0)
     {
-      const float rho_best = _try_dof_escalation(ref_grad, img_grad, lw, lh, H_level);
+      // ref_norm / img_norm are still alive at level 0 for ρ scoring.
+      const float rho_best = _try_dof_escalation(ref_grad, img_grad,
+                                                  ref_norm, img_norm,
+                                                  lw, lh, H_level);
 
       // Identity comparison: always check whether the identity transform
       // (no alignment) correlates at least as well as the computed H.
@@ -2591,7 +2749,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       {
         const float H_id[HDR_ALIGN_H_NPARAM]
           = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
-        const float rho_id = _ecc_compute_rho(ref_grad, img_grad, lw, lh, H_id);
+        const float rho_id = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_id);
         dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] identity check: ρ_aligned=%.5f ρ_identity=%.5f",
                  rho_best, rho_id);
@@ -2602,6 +2760,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
           memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
         }
       }
+
+      dt_free_align(ref_norm);
+      dt_free_align(img_norm);
+      ref_norm = img_norm = NULL;
     }
 
     if(l <= 1)
