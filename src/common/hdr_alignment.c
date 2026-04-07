@@ -46,7 +46,7 @@
 #define HDR_ALIGN_ECC_MAX_ITER 50
 // ECC convergence threshold (pixel-equivalent): stop when parameter update
 // norm (|Δtx| + |Δty| + |Δθ|·corner_dist) is below this value.
-#define HDR_ALIGN_ECC_EPSILON 1e-2f
+#define HDR_ALIGN_ECC_EPSILON 1e-3f
 // Extra weight given to outer image regions during ECC so edge/corner
 // alignment has enough influence over the homography estimate.
 #define HDR_ALIGN_ECC_EDGE_WEIGHT 3.0
@@ -81,7 +81,7 @@
 // while catching runaway ECC drift that would compound across levels.
 // In well-aligned tripod shots the per-level change is typically <1 px;
 // hand-held brackets occasionally reach ~2.5 px at coarser levels.
-#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX 3.0f
+#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX 5.0f
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
 // Number of Jacobi smoothing iterations for the residual mesh.
@@ -90,10 +90,6 @@
 #define HDR_ALIGN_MESH_SMOOTH_LAMBDA 1.5f
 
 // --- Adaptive DOF escalation parameters ---
-// Weighted ECC score below which DOF escalation is attempted.
-// A score of 1.0 means perfect correlation; lower values indicate the
-// rigid model left residual misalignment.
-#define HDR_ALIGN_ESCALATION_RHO_THRESHOLD 0.85f
 // Minimum ρ improvement required to accept a 6-DOF result over 3-DOF.
 #define HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT 0.01f
 // Minimum ρ improvement required to accept 8-DOF over 6-DOF.
@@ -2056,7 +2052,7 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
     if(update < HDR_ALIGN_ESCALATION_EPSILON)
     {
       dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge]   %d-DOF ECC converged at iteration %d (update=%.6f, cond=%.1e)",
+               "[hdr_merge]   %d-DOF ECC converged at iteration %d (update=%.6f, cond=%.2f)",
                ndof, iter, update, cond_est);
       break;
     }
@@ -2150,16 +2146,7 @@ static float _try_dof_escalation(const float *ref_grad,
 {
   // Measure current (3-DOF) quality using gradient magnitude PCC.
   const float rho_3dof = _ecc_compute_rho(ref_intensity, img_intensity, w, h, H);
-  dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 3-DOF ρ = %.5f (threshold = %.2f)",
-           rho_3dof, HDR_ALIGN_ESCALATION_RHO_THRESHOLD);
-
-  if(rho_3dof >= HDR_ALIGN_ESCALATION_RHO_THRESHOLD || rho_3dof < -1.0f)
-  {
-    dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] DOF escalation: not needed (ρ >= threshold)");
-    return rho_3dof;
-  }
+  dt_print(DT_DEBUG_HDRMERGE, "[hdr_merge] DOF escalation: 3-DOF ρ = %.5f", rho_3dof);
 
   // Save the 3-DOF result so we can fall back.
   float H_3dof[HDR_ALIGN_H_NPARAM];
@@ -2829,20 +2816,11 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       dt_free_align(ref_grad0);
       dt_free_align(img_grad0);
 
-      const float approx_dx = -out_align->H[2];
-      const float approx_dy = -out_align->H[5];
-      const float approx_angle = atan2f(out_align->H[1], out_align->H[0]);
-        const float mesh_max = _mesh_max_abs(out_align->mesh_dx, out_align->mesh_dy);
-
   dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] final homography: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1], approx dx=%.2f dy=%.2f angle=%.4f°, mesh max=%.2f px, mesh center=(%.2f, %.2f)",
+             "[hdr_merge] final homography: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1]",
                out_align->H[0], out_align->H[1], out_align->H[2],
                out_align->H[3], out_align->H[4], out_align->H[5],
-               out_align->H[6], out_align->H[7],
-           approx_dx, approx_dy, approx_angle * 180.0f / (float)M_PI,
-           mesh_max,
-           out_align->mesh_dx[HDR_ALIGN_MESH_INDEX(1, 1)],
-           out_align->mesh_dy[HDR_ALIGN_MESH_INDEX(1, 1)]);
+               out_align->H[6], out_align->H[7]);
 
   // Named decomposition of the homography elements.
   // H = [ h11  h12  tx  ]   h11≈cos(θ)·sx  h12≈sin(θ)·sy  tx = translation x
@@ -2859,18 +2837,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       ? (out_align->H[0] * out_align->H[1] + out_align->H[3] * out_align->H[4])
         / (sx * sy)
       : 0.0f;
-    dt_print(DT_DEBUG_HDRMERGE,
+      const float approx_angle = atan2f(out_align->H[1], out_align->H[0]);
+      const float mesh_max = _mesh_max_abs(out_align->mesh_dx, out_align->mesh_dy);
+      dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] final homography decomposed:"
-             " tx=%.2f ty=%.2f rotation=%.4f°"
+             " tx=%.1f ty=%.1f rotation=%.3f°"
              " scale_x=%.5f scale_y=%.5f shear=%.5f"
              " h11=%.5f h12=%.5f h21=%.5f h22=%.5f"
-             " p1=%.7f p2=%.7f",
+             " p1=%.7f p2=%.7f, mesh max=%.2f px, mesh center=(%.2f, %.2f)",
              out_align->H[2], out_align->H[5],
              approx_angle * 180.0f / (float)M_PI,
              sx, sy, shear,
              out_align->H[0], out_align->H[1],
              out_align->H[3], out_align->H[4],
-             out_align->H[6], out_align->H[7]);
+             out_align->H[6], out_align->H[7],
+             mesh_max,
+             out_align->mesh_dx[HDR_ALIGN_MESH_INDEX(1, 1)],
+             out_align->mesh_dy[HDR_ALIGN_MESH_INDEX(1, 1)]);
   }
 
   _free_pyramid(&pyr_ref);
