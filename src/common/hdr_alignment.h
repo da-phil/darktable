@@ -41,18 +41,34 @@ typedef struct dt_hdr_alignment_t
  *  Both images must be single-channel float Bayer mosaic data of identical
  *  dimensions (as produced by the rawprepare IOP).
  *
- *  @param ref_mosaic  Reference image (first exposure), single-channel float
- *  @param img_mosaic  Candidate image to align, single-channel float
- *  @param wd          Image width in pixels
- *  @param ht          Image height in pixels
- *  @param out_align   [out] Full-resolution backward homography plus a
- *                     residual regular mesh in output coordinates.
+ *  The full Bayer resolution is used for alignment so no downsampling
+ *  occurs before the pyramid is built.  Each pixel is first normalised:
+ *    normalised = max(pixel - black_level, 0) / (relative_exposure × relative_iso)
+ *  Both black levels are typically 0 when rawprepare has already subtracted
+ *  them.  The reference image uses relative_exposure = 1 and relative_iso = 1.
+ *
+ *  @param ref_mosaic        Reference image (first exposure), single-channel float
+ *  @param img_mosaic        Candidate image to align, single-channel float
+ *  @param wd                Image width in pixels
+ *  @param ht                Image height in pixels
+ *  @param ref_black_level   Black level already subtracted from ref_mosaic
+ *                           (pass 0 if rawprepare already removed it)
+ *  @param img_black_level   Black level already subtracted from img_mosaic
+ *                           (pass 0 if rawprepare already removed it)
+ *  @param relative_exposure img exposure / ref exposure (e.g. 2.0 if img is 2× longer)
+ *  @param relative_iso      img ISO / ref ISO  (e.g. 2.0 if img is ISO 2× higher)
+ *  @param out_align         [out] Full-resolution backward homography plus a
+ *                           residual regular mesh in output coordinates.
  *  @return TRUE on success, FALSE on failure (e.g. allocation error)
  */
 gboolean dt_hdr_align_compute(const float *ref_mosaic,
                               const float *img_mosaic,
                               const int wd,
                               const int ht,
+                              const float ref_black_level,
+                              const float img_black_level,
+                              const float relative_exposure,
+                              const float relative_iso,
                               dt_hdr_alignment_t *out_align);
 
 /** Apply alignment transformation to a Bayer mosaic image using
@@ -86,7 +102,7 @@ typedef struct dt_hdr_alignment_cl_global_t
   int kernel_log1p;
   int kernel_gradient_sobel_sum;
   int kernel_normalize_mad;
-  int kernel_mosaic_to_gray;
+  int kernel_gradient_bayer_cfa_sobel;
   int kernel_downsample_2x;
   int kernel_ecc_means;
   int kernel_ecc_norms;

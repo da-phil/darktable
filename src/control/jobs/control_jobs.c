@@ -414,6 +414,10 @@ typedef struct dt_control_merge_hdr_t
 
   // copy of the first image's mosaic data used as alignment reference
   float *ref_mosaic;
+  // EXIF metadata of the reference image needed for relative normalisation
+  // when aligning subsequent images.
+  float ref_exposure;   // shutter speed in seconds
+  float ref_iso;        // ISO value
 
   int wd;
   int ht;
@@ -575,18 +579,30 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
 
   if(!d->ref_mosaic)
   {
-    // first image: store a copy as alignment reference
+    // first image: store a copy as alignment reference together with its
+    // EXIF metadata so later images can compute relative exposure and ISO.
     d->ref_mosaic = malloc(sizeof(float) * (size_t)d->wd * d->ht);
     if(d->ref_mosaic)
       memcpy(d->ref_mosaic, ivoid, sizeof(float) * (size_t)d->wd * d->ht);
+    d->ref_exposure = image.exif_exposure > 0.0f ? image.exif_exposure : 1.0f;
+    d->ref_iso      = image.exif_iso      > 0.0f ? image.exif_iso      : 100.0f;
   }
   else if(d->first_filter != 9u) // alignment supported for Bayer only
   {
     dt_hdr_alignment_t align = { 0 };
     align.H[0] = 1.0f;
     align.H[4] = 1.0f;
+    // Compute relative exposure and ISO so the alignment normalisation can
+    // bring the candidate image to the same photon-count scale as the reference.
+    const float cur_exposure = image.exif_exposure > 0.0f ? image.exif_exposure : 1.0f;
+    const float cur_iso      = image.exif_iso      > 0.0f ? image.exif_iso      : 100.0f;
+    const float rel_exposure = cur_exposure / d->ref_exposure;
+    const float rel_iso      = cur_iso      / d->ref_iso;
     if(dt_hdr_align_compute(d->ref_mosaic, (const float *)ivoid,
-                            d->wd, d->ht, &align))
+                            d->wd, d->ht,
+                            0.0f, 0.0f,        // black already subtracted by rawprepare
+                            rel_exposure, rel_iso,
+                            &align))
     {
       float mesh_max = 0.0f;
       for(int i = 0; i < DT_HDR_ALIGN_MESH_NODES; i++)
