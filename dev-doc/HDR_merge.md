@@ -538,11 +538,11 @@ For one candidate frame the estimator does the following:
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
 3. Preprocess each pyramid level with: percentile normalisation → log(1+x) → signed Sobel gradient sum (gx+gy) → MAD normalisation (g / mean(|g|) + ε). This pipeline brings dark and bright exposures to a comparable scale and removes the intensity DC component so that edges — not absolute brightness — drive alignment.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
-5. **Early-out**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the images are already well-aligned — return identity immediately and skip all remaining steps.
+5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
 7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with per-level drift guards.
-8. At the finest level, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
-9. **Identity comparison**: always compare the aligned $\rho$ against identity $\rho$ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
+8. At the finest level, check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, skip DOF escalation entirely and revert to identity immediately (the ECC pyramid wandered to a wrong local minimum). Otherwise, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
+9. **Identity comparison**: if DOF escalation ran, compare the best aligned ρ against identity ρ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
 10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
 11. Estimate local residual shifts on a small `3x3` grid of patches.
 12. Regularize that residual field with neighbor smoothness.
@@ -560,18 +560,20 @@ flowchart TD
     PREP_C --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
     NCC --> RHO_C[compute ECC ρ at coarsest level\nfor identity and NCC winner]
     RHO_C --> EARLY{ρ_identity ≥\nρ_candidate?}
-    EARLY -- Yes --> ID_RETURN([return identity H\nmesh = 0])
+    EARLY -- Yes --> ID_RESET[reset ECC start to identity\ncontinue pyramid from identity]
     EARLY -- No --> INIT_H[init H from NCC winner\nEuclidean homography]
+    ID_RESET --> INIT_H
     INIT_H --> ECC_LOOP
 
     subgraph ECC_LOOP [ECC pyramid loop: coarsest → level 0]
         direction TB
-        NEXT_LVL[next pyramid level] --> SKIP{MIN of level dims\n< ECC_MIN_DIM = 48 px?}
-        SKIP -- Yes --> NEXT_LVL
+        NEXT_LVL[next pyramid level] --> SKIP{MIN of level dims\n< ECC_MIN_DIM = 64 px?}
+        SKIP -- Yes --> NEXT_LVL2[scale H to next level]
+        NEXT_LVL2 --> NEXT_LVL
         SKIP -- No --> PREP_L[preprocess this level\npercentile norm → log1p\n→ Sobel sum → MAD norm]
         PREP_L --> BCK[backup H_level]
         BCK --> ECC3[3-DOF Euclidean ECC\nmax 50 iterations\nper-iteration trust region]
-        ECC3 --> DRIFT{angle drift > 2°\nor trans drift > 3 px?}
+        ECC3 --> DRIFT{angle drift > 5°\nor trans drift > 5 px?}
         DRIFT -- Yes --> REVERT[revert to H_level backup]
         DRIFT -- No --> KEEP[keep ECC result]
         REVERT --> NEXT_LVL
@@ -579,7 +581,10 @@ flowchart TD
     end
 
     ECC_LOOP -- level 0 reached --> PREP_0[preprocess level 0\npercentile norm → log1p\n→ Sobel sum → MAD norm]
-    PREP_0 --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
+    PREP_0 --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
+    PRE_ID_CHK -- Yes --> REVERT_PRE[revert to identity\nskip DOF escalation]
+    PRE_ID_CHK -- No --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
+    REVERT_PRE --> CORNER
     DOF --> ID_CHK{ρ_identity ≥\nρ_aligned?}
     ID_CHK -- Yes --> REVERT_ID[revert to identity H]
     ID_CHK -- No --> KEEP_H[keep aligned H]
@@ -878,23 +883,23 @@ The translation clamp is in normalized coordinates, so $0.10$ corresponds to $10
 
 In addition to the per-iteration trust region clamps, the pipeline applies two per-level drift guards that compare the homography after ECC refinement against the pre-ECC backup:
 
-1. **Angle drift guard**: if the rotation change introduced by a single pyramid level exceeds `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` ($2°$), ECC is considered to have wandered to a wrong local maximum and the result is reverted to the pre-level homography. The angle change is computed as $\Delta\theta = \mathrm{atan2}(H[3], H[0]) - \mathrm{atan2}(H_{backup}[3], H_{backup}[0])$.
+1. **Angle drift guard**: if the rotation change introduced by a single pyramid level exceeds `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` ($5°$), ECC is considered to have wandered to a wrong local maximum and the result is reverted to the pre-level homography. The angle change is computed as $\Delta\theta = \mathrm{atan2}(H[3], H[0]) - \mathrm{atan2}(H_{backup}[3], H_{backup}[0])$.
 
-2. **Translation drift guard**: if the translation change at a single level exceeds `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` ($3.0$ px) in either component, the result is reverted. Each level inherits a $2\times$-scaled estimate from its parent, so the parent's accuracy at the child's scale is $\sim 2$ px. Allowing up to $3$ px gives room for genuine sub-pixel refinement while catching runaway drift.
+2. **Translation drift guard**: if the translation change at a single level exceeds `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` ($5.0$ px) in either component, the result is reverted. Each level inherits a $2\times$-scaled estimate from its parent, so the parent's accuracy at the child's scale is $\sim 2$ px. Allowing up to $5$ px gives room for genuine sub-pixel refinement at coarser levels while catching runaway drift.
 
 These guards prevent small per-level ECC errors from compounding across the pyramid. In well-aligned tripod shots the per-level translation change is typically $<1$ px; hand-held brackets occasionally reach $\sim 2.5$ px at coarser levels.
 
 The guards are conservative by design: they fire only when the refinement has clearly diverged, not when it is making normal progress. In the log example below, both guards fire on levels where ECC stalled and then drifted:
 
 ```
-ECC level 2: translation drift (-1.25, 3.01) px > limit 3.0 px, reverting
-ECC level 0: translation drift (5.23, -0.98) px > limit 3.0 px, reverting
+ECC level 2: translation drift (-1.25, 3.01) px > limit 5.0 px, reverting
+ECC level 0: translation drift (5.23, -0.98) px > limit 5.0 px, reverting
 ```
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` | $2°$ | Maximum rotation change per level |
-| `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` | $3.0$ px | Maximum translation change per level |
+| `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` | $5°$ | Maximum rotation change per level |
+| `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` | $5.0$ px | Maximum translation change per level |
 
 #### Residual regularized mesh
 
@@ -1043,16 +1048,18 @@ Adaptive DOF escalation addresses this by selectively introducing additional deg
 
 The escalation runs once, at pyramid level 0 (the finest grayscale level), between 3-DOF ECC convergence and corner refinement:
 
-1. **Measure baseline quality**: compute the weighted ECC score $\rho_{3}$ of the converged 3-DOF result on gradient-magnitude images. If $\rho_{3} \geq \rho_{thresh}$ (currently $0.85$), the rigid fit is considered sufficient and escalation is skipped entirely.
+1. **Pre-escalation identity gate**: measure the 3-DOF result ρ and the identity ρ at the finest level. If 3-DOF ρ ≤ identity ρ, the ECC pyramid has already degraded below identity — skip all escalation and revert to identity immediately. This prevents higher-DOF models (which start from a bad basin) from producing spurious large transforms.
 
-2. **Try 6-DOF affine**: starting from the 3-DOF homography, run a limited number of forward-additive ECC iterations using a native 6-DOF affine Jacobian (scale, shear, and translation, but no perspective). Accept if:
+2. **Measure baseline quality**: compute the weighted ECC score $\rho_{3}$ of the converged 3-DOF result on gradient-magnitude images.
+
+3. **Try 6-DOF affine**: starting from the 3-DOF homography, run up to `HDR_ALIGN_ESCALATION_MAX_ITER` forward-additive ECC iterations using a native 6-DOF affine Jacobian (scale, shear, and translation, but no perspective). Accept if:
    - the refined $\rho_{6} > \rho_{3}$ with improvement $\geq \Delta\rho_{min}$
    - the Hessian condition number is below the maximum allowed
    - the result passes geometric sanity checks
 
-3. **Try 8-DOF projective**: starting from the better of the 3-DOF or 6-DOF result, run a limited number of ECC iterations with the full 8-DOF projective Jacobian. Accept under the same gating criteria as step 2.
+4. **Try 8-DOF projective** (only if 6-DOF improved): starting from the 6-DOF result, run up to `HDR_ALIGN_ESCALATION_MAX_ITER` ECC iterations with the full 8-DOF projective Jacobian. Accept under the same gating criteria. If 6-DOF did not improve, escalation stops here.
 
-4. **Select best**: the pipeline accepts the highest-DOF result that passed all checks. If neither escalation step improved $\rho$, the original 3-DOF result is kept unchanged.
+5. **Select best**: the pipeline accepts the highest-DOF result that passed all checks. If neither escalation step improved $\rho$, the original 3-DOF result is kept unchanged.
 
 #### Mathematical Formulation
 
@@ -1118,12 +1125,12 @@ Each escalation step is gated by three checks:
 2. **Conditioning gate**: during the Gauss-Jordan solve, the ratio of the largest to smallest absolute pivot values is tracked. If this exceeds `HDR_ALIGN_ESCALATION_MAX_COND` ($10^6$), the extra parameters are considered ill-determined and the result is rejected.
 
 3. **Sanity gate**: the escalated homography must pass `_homography_is_sane_escalated`, which checks:
-   - diagonal elements of the normalized homography are within $[0.85, 1.15]$ (allows ~15% scale)
+   - diagonal elements of the normalized homography are within $[0.70, 1.45]$ (accommodates lens breathing and aperture-induced scale change)
    - off-diagonal elements are within $[-0.25, 0.25]$ (allows moderate shear)
    - for affine: perspective terms remain exactly zero
    - for projective: perspective terms remain within $[-0.02, 0.02]$
    - all four image corners map to source positions within 15% of the image diagonal
-   - **area-scaling check**: $|\det(A_{2\times2}) - 1| < \epsilon$ where $A_{2\times2}$ is the upper-left $2\times 2$ submatrix of the normalized homography and $\epsilon$ = `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` ($0.01 = 1\%$). The determinant equals the local area magnification; for HDR brackets from the same camera/lens this must be very close to $1.0$. Values far from $1$ indicate that the extra DOFs are fitting exposure or vignetting gradients as geometric scaling, producing a wrong result. This check is computed on the normalized $H_n$, which preserves the affine determinant since normalization uses isotropic scaling.
+   - **geometric-mean scale check**: $|\sqrt{\det(A_{2\times2})} - 1| < \epsilon_{scale}$ where $A_{2\times2}$ is the upper-left $2\times 2$ submatrix of the normalized homography and $\epsilon_{scale}$ = `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` ($0.50 = 50\%$). The geometric mean $\sqrt{\det}$ is the per-axis scale factor; values far from $1$ indicate the extra DOFs are fitting non-geometric variation rather than real image geometry.
 
 #### Trust Region and Clamps
 
@@ -1151,14 +1158,14 @@ No changes to the corner refinement acceptance thresholds were needed.
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `HDR_ALIGN_ESCALATION_RHO_THRESHOLD` | $0.85$ | Minimum 3-DOF $\rho$ below which escalation is attempted |
-| `HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT` | $0.01$ | Minimum $\Delta\rho$ to accept a higher-DOF result |
+| `HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT` | $0.01$ | Minimum $\Delta\rho$ to accept a 6-DOF result over 3-DOF |
+| `HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF` | $0.005$ | Minimum $\Delta\rho$ to accept 8-DOF over 6-DOF (lower bar, only 2 extra params) |
 | `HDR_ALIGN_ESCALATION_MAX_COND` | $10^6$ | Maximum Hessian condition number for acceptance |
-| `HDR_ALIGN_ESCALATION_MAX_ITER` | $30$ | Maximum ECC iterations per escalation stage |
+| `HDR_ALIGN_ESCALATION_MAX_ITER` | $50$ | Maximum ECC iterations per escalation stage |
 | `HDR_ALIGN_ESCALATION_EPSILON` | $5 \times 10^{-3}$ | Convergence threshold for escalated ECC |
-| `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.01$ | Maximum $|\det(A_{2\times2}) - 1|$ for area-scaling sanity |
+| `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.50$ | Maximum $|\sqrt{\det(A_{2\times2})} - 1|$ for geometric-mean scale sanity |
 
-These values were chosen conservatively. The threshold $\rho = 0.85$ means escalation only activates on stacks where the rigid fit leaves significant residual misalignment. The improvement gate ($0.01$) prevents accepting results that are numerically but not visually better. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed to help, while ensuring that even very poor 3-DOF fits (e.g. $\rho < 0.3$) still get a chance at higher-DOF correction.
+The pre-escalation identity gate (step 1) is the primary safeguard for well-aligned stacks: if 3-DOF ρ ≤ identity ρ (images already well-aligned or ECC wandered), escalation is skipped entirely. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed. The improvement gates ($0.01$ for 6-DOF, $0.005$ for 8-DOF) prevent accepting results that are numerically but not visually better.
 
 ### Identity Detection
 
@@ -1174,7 +1181,7 @@ Even when the alignment optimizer converges, the resulting homography may be wro
 
 In all these cases, applying a computed homography makes the merge worse than no alignment. The pipeline therefore compares the quality of the aligned result against the identity transform at two stages.
 
-#### Layer 1: Coarse ECC ρ early-out
+#### Layer 1: Coarse ECC ρ identity reset
 
 After the exhaustive NCC search finds the best candidate $(t_x, t_y, \theta)$, the pipeline computes the weighted ECC correlation coefficient $\rho$ at the coarsest pyramid level for both the identity transform and the NCC-winning candidate:
 
@@ -1183,7 +1190,7 @@ $$
 \rho_{candidate}^{coarse} = \rho(H_{candidate}, G_{ref}, G_{img}).
 $$
 
-If $\rho_{identity}^{coarse} \geq \rho_{candidate}^{coarse}$, the images are considered already well-aligned and the full ECC pyramid is skipped entirely. The pipeline returns the identity homography with a zero mesh.
+If $\rho_{identity}^{coarse} \geq \rho_{candidate}^{coarse}$, the NCC winner is no better than identity at coarse scale. Rather than skipping the pyramid entirely, the pipeline resets the ECC starting point to identity. The full pyramid then refines from identity — capturing any fine-level misalignment that is invisible at coarse resolution. Only if the finest-level identity check (Layer 2) also wins does the pipeline return identity without any warp.
 
 This early-out uses the same metric (weighted ECC $\rho$) as the level-0 identity comparison (Layer 2 below), making the entire decision chain consistent. The previous implementation used a gradient-domain NCC threshold (`HDR_ALIGN_COARSE_IDENTITY_SKIP_NCC` $= 0.98$), which was an arbitrary constant on a different metric than the rest of the pipeline.
 
@@ -1191,7 +1198,9 @@ By comparing $\rho$ values directly, the early-out participates in the same comp
 
 #### Layer 2: Fine-level identity comparison
 
-At pyramid level 0 (the finest grayscale level), after DOF escalation has produced the best available alignment, the pipeline always computes the weighted ECC score $\rho$ for the identity transform:
+At pyramid level 0 (the finest grayscale level), **before** attempting DOF escalation, the pipeline computes the 3-DOF ρ and compares it immediately against the identity ρ. If 3-DOF ρ ≤ identity ρ, the ECC pyramid already degraded below identity and DOF escalation is skipped — the pipeline reverts to identity immediately.
+
+If 3-DOF ρ > identity ρ, DOF escalation runs normally. After escalation, the pipeline performs a final identity comparison:
 
 $$
 \rho_{identity} = \rho(H_{id}, G_{ref}, G_{img}),
@@ -1203,12 +1212,11 @@ $$
 \text{if} \quad \rho_{identity} \geq \rho_{aligned}, \quad \text{revert to identity.}
 $$
 
-This comparison is unconditional — it runs regardless of the aligned $\rho$ value. An earlier implementation only checked identity when $\rho_{aligned}$ was below a low threshold ($0.3$), which missed cases where the alignment converged to a wrong solution with moderate $\rho$.
+The post-escalation identity comparison runs only when DOF escalation was attempted (3-DOF ρ > identity ρ at the start). Together with the pre-escalation gate, the two-stage check at level 0 catches:
 
-The unconditional comparison catches both failure modes:
-
-1. **Low-$\rho$ catastrophic failures**: the optimizer wandered to a wrong minimum with very poor correlation.
-2. **Medium-$\rho$ wrong solutions**: the optimizer converged to a plausible-looking but incorrect alignment that is still worse than no correction.
+1. **ECC pyramid drift** (pre-escalation gate): 3-DOF result already below identity → skip escalation, use identity.
+2. **Escalation overshoot** (post-escalation check): escalated result still worse than identity → revert to identity.
+3. **Medium-$\rho$ wrong solutions** (post-escalation check): the optimizer converged to a plausible-looking but incorrect alignment that is still worse than no correction.
 
 Both the aligned and identity $\rho$ values are always logged for diagnostics:
 
@@ -1234,30 +1242,19 @@ ECC level 6: ECC did not converge in 50 iterations
 ECC level 5: ECC stalled at iteration 5
 ECC level 4: ECC stalled at iteration 6
 ECC level 3: ECC stalled at iteration 6
-ECC level 2: translation drift (-1.25, 3.01) px > limit 3.0 px, reverting
+ECC level 2: translation drift (-1.25, 3.01) px > limit 5.0 px, reverting
 ECC level 1: ECC stalled at iteration 5
-ECC level 0: translation drift (5.23, -0.98) px > limit 3.0 px, reverting
+ECC level 0: translation drift (5.23, -0.98) px > limit 5.0 px, reverting
 ```
 
-Every level either stalled or triggered a drift guard. At level 0, DOF escalation was attempted:
+Every level either stalled or triggered a drift guard. At level 0, the pre-escalation identity check fires:
 
 ```
-DOF escalation: 3-DOF ρ = 0.44036 (threshold = 0.85)
-DOF escalation: 6-DOF ρ = 0.50410 (Δρ = 0.06374, sane = 1)
-DOF escalation: 8-DOF ρ = 0.49912 (Δρ vs base = -0.00498, sane = 1)
-DOF escalation: accepted 6-DOF (ρ 0.44036 → 0.50410)
+pre-escalation: 3-DOF ρ=0.44036 identity ρ=0.51763
+3-DOF ρ already degraded below identity -- skipping DOF escalation, reverting to identity
 ```
 
-The 6-DOF model improved $\rho$ from $0.44$ to $0.50$ — but both values are poor. The 8-DOF model did not improve over 6-DOF.
-
-The identity comparison then caught the problem:
-
-```
-identity check: ρ_aligned=0.50410 ρ_identity=0.51763
-identity ρ >= aligned ρ -- reverting to identity
-```
-
-The identity transform ($\rho = 0.518$) correlated better than the best alignment ($\rho = 0.504$). The pipeline correctly reverted to identity, avoiding a wrong warp.
+The 3-DOF result was already below identity, so DOF escalation is skipped entirely, saving computation and avoiding a spurious transform.
 
 The final result:
 
@@ -1314,7 +1311,7 @@ An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `pro
 
 > **Note**: Percentile normalisation of raw pixels (step 1 of the gradient pipeline) remains CPU-only because it requires a two-pass histogram reduction that maps poorly to single-pass GPU kernels.  All subsequent steps (`log1p`, Sobel sum, MAD normalisation) are GPU-ready.
 
-**3-pass ECC design (matching CPU)**: `hdr_align_ecc_norms` accumulates 9 values per work-group: `norm2_r`, `norm2_w`, `dot_rw`, `sum_J0..J2` (mean Jacobian numerators), and `sJw0..sJw2` (projection numerators, where sJw[k] = Σ wgt·tw·J[k]).  The host derives `proj_coeff[k] = sJw[k] / norm2_w` without a separate image pass — matching the same sJw optimisation used in the CPU `_ecc_iteration`.  This eliminates the former separate projection kernel and reduces each ECC iteration to 3 GPU passes.
+**3-pass ECC design (matching CPU)**: `hdr_align_ecc_norms` accumulates 9 values per work-group: `norm2_r`, `norm2_w`, `dot_rw`, `sum_J0..J2` (mean Jacobian numerators), and `sJw0..sJw2` (projection numerators, where `sJw[k]` = Σ `wgt·tw·J[k]`).  The host derives `proj_coeff[k] = sJw[k] / norm2_w` without a separate image pass — matching the same `sJw` optimisation used in the CPU `_ecc_iteration`.  The former separate intermediate kernel `hdr_align_ecc_hessian` has been removed; `hdr_align_ecc_hessian_final` now follows directly from `hdr_align_ecc_norms`, reducing each ECC iteration to 3 GPU passes.
 
 **Reduction strategy**: The ECC accumulation kernels use a two-level reduction:
 1. **Intra-workgroup**: Tree reduction in local memory within each work-group.
@@ -1345,7 +1342,7 @@ Potential refinements to the alignment pipeline:
 
 - **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ for DOF escalation is conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range).
 - **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
-- **Adaptive drift guard thresholds**: the per-level translation drift limit ($3.0$ px) and angle drift limit ($2°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
+- **Adaptive drift guard thresholds**: the per-level translation drift limit ($5.0$ px) and angle drift limit ($5°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
 - **Full OpenCL pipeline**: The OpenCL kernels cover all pixel-level operations needed for a full GPU-resident alignment pipeline. The remaining work is pipeline orchestration: building the pyramid on the GPU, running the convergence/drift loops on the GPU, and keeping data in GPU memory across levels to eliminate host↔device transfers.
 

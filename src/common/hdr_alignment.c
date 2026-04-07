@@ -22,6 +22,10 @@
 #include "common/math.h"
 #include "common/pfm.h"
 
+#ifdef HAVE_OPENCL
+#include "common/opencl.h"
+#endif
+
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
@@ -2332,18 +2336,45 @@ static void _free_pyramid(_pyramid_t *pyr)
 // Public API: alignment computation (multi-resolution ECC)
 // ---------------------------------------------------------------------------
 
+#ifdef HAVE_OPENCL
+// Forward declarations: defined further below, after the CFA warp helpers.
+static gboolean _ecc_refine_level_cl(const int devid,
+                                      const dt_hdr_alignment_cl_global_t *g,
+                                      const float *ref_grad,
+                                      const float *img_grad,
+                                      const int w,
+                                      const int h,
+                                      float H[HDR_ALIGN_H_NPARAM]);
+#endif
+
 gboolean dt_hdr_align_compute(const float *ref_mosaic,
                               const float *img_mosaic,
                               const int wd,
                               const int ht,
                               dt_hdr_alignment_t *out_align)
 {
+#ifdef HAVE_OPENCL
+  const dt_hdr_alignment_cl_global_t *const g_cl = darktable.opencl->hdr_alignment;
+  const gboolean want_cl = (g_cl != NULL) && dt_opencl_running();
+  const int devid = want_cl ? dt_opencl_lock_device(0) : DT_DEVICE_CPU;
+  const gboolean use_cl = (devid > DT_DEVICE_CPU);
+  dt_print(DT_DEBUG_HDRMERGE,
+           "[hdr_merge] alignment: using %s path", use_cl ? "OpenCL" : "CPU/OpenMP");
+#else
+  dt_print(DT_DEBUG_HDRMERGE, "[hdr_merge] alignment: using CPU/OpenMP path");
+#endif
   out_align->H[0] = 1.0f; out_align->H[1] = 0.0f; out_align->H[2] = 0.0f;
   out_align->H[3] = 0.0f; out_align->H[4] = 1.0f; out_align->H[5] = 0.0f;
   out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
   _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
 
-  if(wd < HDR_ALIGN_MIN_DIM || ht < HDR_ALIGN_MIN_DIM) return FALSE;
+  if(wd < HDR_ALIGN_MIN_DIM || ht < HDR_ALIGN_MIN_DIM)
+  {
+#ifdef HAVE_OPENCL
+    dt_opencl_unlock_device(devid);
+#endif
+    return FALSE;
+  }
 
   // Step 1: Convert Bayer mosaic to grayscale
   int gw_ref, gh_ref, gw_img, gh_img;
@@ -2357,6 +2388,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   {
     dt_free_align(gray_ref);
     dt_free_align(gray_img);
+#ifdef HAVE_OPENCL
+    dt_opencl_unlock_device(devid);
+#endif
     return FALSE;
   }
   if(!_build_pyramid(gray_img, gw_img, gh_img, &pyr_img))
@@ -2364,6 +2398,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     _free_pyramid(&pyr_ref);
     dt_free_align(gray_ref);
     dt_free_align(gray_img);
+#ifdef HAVE_OPENCL
+    dt_opencl_unlock_device(devid);
+#endif
     return FALSE;
   }
 
@@ -2659,7 +2696,24 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     float H_backup[HDR_ALIGN_H_NPARAM];
     memcpy(H_backup, H_level, sizeof(H_backup));
 
-    const float ecc_update = _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+    gboolean ran_cl = FALSE;
+#ifdef HAVE_OPENCL
+    if(use_cl)
+      ran_cl = _ecc_refine_level_cl(devid, g_cl, ref_grad, img_grad, lw, lh, H_level);
+#endif
+    float ecc_update;
+    if(ran_cl)
+    {
+      // GPU path ran; compute the convergence metric for the guard checks.
+      // We don't propagate the per-iteration update from the CL path out of
+      // _ecc_refine_level_cl, so treat a successful CL run as converged for
+      // the drift guards (they compare H_level vs H_backup regardless).
+      ecc_update = 0.0f;
+    }
+    else
+    {
+      ecc_update = _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+    }
     // ecc_update < HDR_ALIGN_ECC_EPSILON means the optimiser genuinely
     // converged; stall or max-iteration exits return a larger (or zero) value.
     const gboolean ecc_converged = (ecc_update >= 0.0f && ecc_update < HDR_ALIGN_ECC_EPSILON);
@@ -2723,20 +2777,48 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     if(l == 0)
     {
       // ref_norm / img_norm are still alive at level 0 for ρ scoring.
-      const float rho_best = _try_dof_escalation(ref_grad, img_grad,
-                                                  ref_norm, img_norm,
-                                                  lw, lh, H_level);
 
-      // Identity comparison: always check whether the identity transform
-      // (no alignment) correlates at least as well as the computed H.
-      // A wrong H — even one with moderate ρ — is worse than no correction
-      // if the images are already well-aligned or the alignment wandered
-      // to a wrong local minimum.  This catches both low-ρ catastrophic
-      // failures and medium-ρ wrong solutions.
+      // Compute identity ρ first so we can gate DOF escalation correctly.
+      // If the 3-DOF result is already worse than identity, the ECC pyramid
+      // wandered to a wrong local minimum.  Higher-DOF models starting from
+      // that degraded point will only drift further — skip escalation entirely
+      // and use identity directly, which is the correct result for images that
+      // are already well-aligned.
+      const float H_id[HDR_ALIGN_H_NPARAM]
+        = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+      const float rho_id = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_id);
+      const float rho_3dof = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_level);
+
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] pre-escalation: 3-DOF ρ=%.5f identity ρ=%.5f",
+               rho_3dof, rho_id);
+
+      float rho_best;
+      if(rho_3dof <= rho_id)
       {
-        const float H_id[HDR_ALIGN_H_NPARAM]
-          = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
-        const float rho_id = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_id);
+        // ECC already degraded below identity — skip DOF escalation entirely.
+        // Higher-DOF models starting from a worse-than-identity point would
+        // waste time and risk producing a spurious large transform from a bad
+        // basin.  Use identity directly.
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] 3-DOF ρ already degraded below identity"
+                 " -- skipping DOF escalation, reverting to identity");
+        memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
+        rho_best = rho_id;
+      }
+      else
+      {
+        // 3-DOF improved over identity: attempt higher-DOF refinement.
+        rho_best = _try_dof_escalation(ref_grad, img_grad,
+                                       ref_norm, img_norm,
+                                       lw, lh, H_level);
+
+        // Identity comparison: always check whether the identity transform
+        // (no alignment) correlates at least as well as the best DOF result.
+        // A wrong H — even one with moderate ρ — is worse than no correction
+        // if the images are already well-aligned or escalation wandered to a
+        // wrong local minimum.  This catches both low-ρ catastrophic failures
+        // and medium-ρ wrong solutions.
         dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] identity check: ρ_aligned=%.5f ρ_identity=%.5f",
                  rho_best, rho_id);
@@ -2858,6 +2940,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
   _free_pyramid(&pyr_ref);
   _free_pyramid(&pyr_img);
+#ifdef HAVE_OPENCL
+  dt_opencl_unlock_device(devid);
+#endif
   return TRUE;
 
 error:
@@ -2867,6 +2952,9 @@ error:
   out_align->H[3] = 0.0f; out_align->H[4] = 1.0f; out_align->H[5] = 0.0f;
   out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
   _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
+#ifdef HAVE_OPENCL
+  dt_opencl_unlock_device(devid);
+#endif
   return FALSE;
 }
 
@@ -3042,12 +3130,397 @@ void dt_hdr_align_apply(const float *in_mosaic,
 }
 
 // ---------------------------------------------------------------------------
-// OpenCL global init / cleanup
+// OpenCL ECC iteration and level refinement
 // ---------------------------------------------------------------------------
 
 #ifdef HAVE_OPENCL
 
-#include "common/opencl.h"
+#define HDR_ALIGN_CL_WG_W 16
+#define HDR_ALIGN_CL_WG_H 16
+
+/** One GPU-accelerated ECC iteration.
+ *
+ *  cl_ref and cl_img are pre-uploaded, static per level (gradient images).
+ *  cl_warped, cl_mask, cl_gx, cl_gy are scratch buffers, size npix floats.
+ *  cl_sums_p1 is ngroups*4 floats; cl_sums_p23 is ngroups*9 floats (reused).
+ *  host_p1 and host_p23 are host-side staging buffers of matching sizes.
+ *
+ *  Returns the pixel-equivalent parameter update metric, or -1 on failure.
+ *  H is updated in-place on success. */
+static float _ecc_iteration_cl(const int devid,
+                                const dt_hdr_alignment_cl_global_t *g,
+                                cl_mem cl_ref,
+                                cl_mem cl_img,
+                                cl_mem cl_warped,
+                                cl_mem cl_mask,
+                                cl_mem cl_gx,
+                                cl_mem cl_gy,
+                                cl_mem cl_sums_p1,
+                                cl_mem cl_sums_p23,
+                                float *host_p1,
+                                float *host_p23,
+                                const int w,
+                                const int h,
+                                const int ngroups,
+                                float H[HDR_ALIGN_H_NPARAM])
+{
+  const size_t npix = (size_t)w * h;
+  const double scale = MAX((double)w - 1.0, (double)h - 1.0) * 0.5;
+  const double s = scale > 1.0 ? scale : 1.0;
+  const double cx_d = ((double)w - 1.0) * 0.5;
+  const double cy_d = ((double)h - 1.0) * 0.5;
+  const float cx = (float)cx_d;
+  const float cy = (float)cy_d;
+  const float inv_s = (float)(1.0 / s);
+  const float edge_weight = (float)HDR_ALIGN_ECC_EDGE_WEIGHT;
+
+  const int nwgx = (w + HDR_ALIGN_CL_WG_W - 1) / HDR_ALIGN_CL_WG_W;
+  const int nwgy = (h + HDR_ALIGN_CL_WG_H - 1) / HDR_ALIGN_CL_WG_H;
+  const size_t gsizes[2] = { (size_t)nwgx * HDR_ALIGN_CL_WG_W,
+                              (size_t)nwgy * HDR_ALIGN_CL_WG_H };
+  const size_t lsizes[2]  = { HDR_ALIGN_CL_WG_W, HDR_ALIGN_CL_WG_H };
+  const size_t lmem_p1 = (size_t)HDR_ALIGN_CL_WG_W * HDR_ALIGN_CL_WG_H * 4 * sizeof(float);
+  const size_t lmem_p23 = (size_t)HDR_ALIGN_CL_WG_W * HDR_ALIGN_CL_WG_H * 9 * sizeof(float);
+
+  // --- Warp ---
+  cl_int err = dt_opencl_enqueue_kernel_2d_args(
+      devid, g->kernel_warp_homography, w, h,
+      CLARG(cl_img), CLARG(cl_warped), CLARG(cl_mask),
+      CLARG(w), CLARG(h),
+      CLARGFLOAT(H[0]), CLARGFLOAT(H[1]), CLARGFLOAT(H[2]),
+      CLARGFLOAT(H[3]), CLARGFLOAT(H[4]), CLARGFLOAT(H[5]),
+      CLARGFLOAT(H[6]), CLARGFLOAT(H[7]));
+  if(err != CL_SUCCESS) return -1.0f;
+
+  // --- Gradients of the warped image ---
+  err = dt_opencl_enqueue_kernel_2d_args(
+      devid, g->kernel_compute_gradients, w, h,
+      CLARG(cl_warped), CLARG(cl_gx), CLARG(cl_gy),
+      CLARG(w), CLARG(h));
+  if(err != CL_SUCCESS) return -1.0f;
+
+  // --- Pass 1: weighted means ---
+  err = dt_opencl_enqueue_kernel_2d_local_args(
+      devid, g->kernel_ecc_means, gsizes, lsizes,
+      CLARG(cl_ref), CLARG(cl_warped), CLARG(cl_mask), CLARG(cl_sums_p1),
+      CLARG(w), CLARG(h),
+      CLARGFLOAT(cx), CLARGFLOAT(cy), CLARGFLOAT(inv_s), CLARGFLOAT(edge_weight),
+      CLLOCAL(lmem_p1));
+  if(err != CL_SUCCESS) return -1.0f;
+
+  err = dt_opencl_read_buffer_from_device(devid, (void *)host_p1, cl_sums_p1, 0,
+                                          (size_t)ngroups * 4 * sizeof(float), CL_TRUE);
+  if(err != CL_SUCCESS) return -1.0f;
+
+  double sum_r = 0.0, sum_w_acc = 0.0, sum_weight = 0.0;
+  long nvalid = 0;
+  for(int gi = 0; gi < ngroups; gi++)
+  {
+    sum_r      += (double)host_p1[gi * 4 + 0];
+    sum_w_acc  += (double)host_p1[gi * 4 + 1];
+    sum_weight += (double)host_p1[gi * 4 + 2];
+    nvalid     += (long)host_p1[gi * 4 + 3];
+  }
+
+  if(nvalid < (long)(npix * HDR_ALIGN_ECC_MIN_VALID_FRAC) || sum_weight < 1e-12)
+    return -1.0f;
+
+  const double mean_r = sum_r / sum_weight;
+  const double mean_w_val = sum_w_acc / sum_weight;
+
+  // Extract current angle from the normalised homography.
+  float Hn[HDR_ALIGN_H_NPARAM];
+  _homography_pixel_to_normalized(H, w, h, Hn);
+  const float cos_t = Hn[0];
+  const float sin_t = Hn[1];
+
+  // --- Pass 2: norms, Jacobian sums, sJw projection sums ---
+  err = dt_opencl_enqueue_kernel_2d_local_args(
+      devid, g->kernel_ecc_norms, gsizes, lsizes,
+      CLARG(cl_ref), CLARG(cl_warped), CLARG(cl_mask), CLARG(cl_gx), CLARG(cl_gy),
+      CLARG(cl_sums_p23),
+      CLARG(w), CLARG(h),
+      CLARGFLOAT(cx), CLARGFLOAT(cy), CLARGFLOAT(inv_s), CLARGFLOAT((float)s),
+      CLARGFLOAT(edge_weight),
+      CLARGFLOAT((float)mean_r), CLARGFLOAT((float)mean_w_val),
+      CLARGFLOAT(cos_t), CLARGFLOAT(sin_t),
+      CLLOCAL(lmem_p23));
+  if(err != CL_SUCCESS) return -1.0f;
+
+  err = dt_opencl_read_buffer_from_device(devid, (void *)host_p23, cl_sums_p23, 0,
+                                          (size_t)ngroups * 9 * sizeof(float), CL_TRUE);
+  if(err != CL_SUCCESS) return -1.0f;
+
+  double norm2_r = 0.0, norm2_w = 0.0, dot_rw = 0.0;
+  double sum_J0 = 0.0, sum_J1 = 0.0, sum_J2 = 0.0;
+  double sJw0 = 0.0, sJw1 = 0.0, sJw2 = 0.0;
+  for(int gi = 0; gi < ngroups; gi++)
+  {
+    const float *p = host_p23 + gi * 9;
+    norm2_r += (double)p[0];
+    norm2_w += (double)p[1];
+    dot_rw  += (double)p[2];
+    sum_J0  += (double)p[3];
+    sum_J1  += (double)p[4];
+    sum_J2  += (double)p[5];
+    sJw0    += (double)p[6];
+    sJw1    += (double)p[7];
+    sJw2    += (double)p[8];
+  }
+
+  const double norm_r = sqrt(norm2_r);
+  const double norm_w = sqrt(norm2_w);
+  if(norm_r < 1e-12 || norm_w < 1e-12)
+    return -1.0f;
+
+  const double rho = dot_rw / (norm_r * norm_w);
+  const double mean_J[3] = { sum_J0 / sum_weight,
+                              sum_J1 / sum_weight,
+                              sum_J2 / sum_weight };
+  const double proj_coeff[3] = { sJw0 / norm2_w,
+                                  sJw1 / norm2_w,
+                                  sJw2 / norm2_w };
+  const double scale_rw = norm_w / norm_r;
+
+  // --- Pass 3: Hessian + RHS ---
+  err = dt_opencl_enqueue_kernel_2d_local_args(
+      devid, g->kernel_ecc_hessian_final, gsizes, lsizes,
+      CLARG(cl_ref), CLARG(cl_warped), CLARG(cl_mask), CLARG(cl_gx), CLARG(cl_gy),
+      CLARG(cl_sums_p23),
+      CLARG(w), CLARG(h),
+      CLARGFLOAT(cx), CLARGFLOAT(cy), CLARGFLOAT(inv_s), CLARGFLOAT((float)s),
+      CLARGFLOAT(edge_weight),
+      CLARGFLOAT((float)mean_r), CLARGFLOAT((float)mean_w_val),
+      CLARGFLOAT(cos_t), CLARGFLOAT(sin_t),
+      CLARGFLOAT((float)mean_J[0]), CLARGFLOAT((float)mean_J[1]), CLARGFLOAT((float)mean_J[2]),
+      CLARGFLOAT((float)proj_coeff[0]), CLARGFLOAT((float)proj_coeff[1]), CLARGFLOAT((float)proj_coeff[2]),
+      CLARGFLOAT((float)scale_rw), CLARGFLOAT((float)rho),
+      CLLOCAL(lmem_p23));
+  if(err != CL_SUCCESS) return -1.0f;
+
+  err = dt_opencl_read_buffer_from_device(devid, (void *)host_p23, cl_sums_p23, 0,
+                                          (size_t)ngroups * 9 * sizeof(float), CL_TRUE);
+  if(err != CL_SUCCESS) return -1.0f;
+
+  double H00 = 0.0, H01 = 0.0, H02 = 0.0;
+  double H11 = 0.0, H12 = 0.0, H22 = 0.0;
+  double rhs0 = 0.0, rhs1 = 0.0, rhs2 = 0.0;
+  for(int gi = 0; gi < ngroups; gi++)
+  {
+    const float *p = host_p23 + gi * 9;
+    H00  += (double)p[0];
+    H01  += (double)p[1];
+    H02  += (double)p[2];
+    H11  += (double)p[3];
+    H12  += (double)p[4];
+    H22  += (double)p[5];
+    rhs0 += (double)p[6];
+    rhs1 += (double)p[7];
+    rhs2 += (double)p[8];
+  }
+
+  // Assemble symmetric Hessian, apply Tikhonov regularisation, solve inline.
+  double Hess[3][3] = { { H00, H01, H02 },
+                         { H01, H11, H12 },
+                         { H02, H12, H22 } };
+  {
+    const double trace = Hess[0][0] + Hess[1][1] + Hess[2][2];
+    const double lambda = 0.01 * trace / 3.0;
+    for(int k = 0; k < 3; k++) Hess[k][k] += lambda;
+  }
+
+  double rhs_ecc[3] = { rhs0, rhs1, rhs2 };
+  double dp[3];
+  {
+    double aug[3][4];
+    for(int r = 0; r < 3; r++)
+    {
+      for(int c = 0; c < 3; c++) aug[r][c] = Hess[r][c];
+      aug[r][3] = rhs_ecc[r];
+    }
+    for(int col = 0; col < 3; col++)
+    {
+      int piv = col;
+      double best = fabs(aug[col][col]);
+      for(int r = col + 1; r < 3; r++)
+      {
+        const double v = fabs(aug[r][col]);
+        if(v > best) { best = v; piv = r; }
+      }
+      if(best < 1e-16) return -1.0f;
+      if(piv != col)
+        for(int c = col; c <= 3; c++)
+        {
+          const double tmp = aug[col][c];
+          aug[col][c] = aug[piv][c];
+          aug[piv][c] = tmp;
+        }
+      const double pivot = aug[col][col];
+      for(int c = col; c <= 3; c++) aug[col][c] /= pivot;
+      for(int r = 0; r < 3; r++)
+      {
+        if(r == col) continue;
+        const double f = aug[r][col];
+        if(f == 0.0) continue;
+        for(int c = col; c <= 3; c++) aug[r][c] -= f * aug[col][c];
+      }
+    }
+    for(int r = 0; r < 3; r++) dp[r] = aug[r][3];
+  }
+
+  double dtheta = dp[0];
+  double dtx    = dp[1];
+  double dty    = dp[2];
+
+  const double max_dtheta = 0.01;
+  const double max_shift_n = 0.10;
+  dtheta = CLAMP(dtheta, -max_dtheta, max_dtheta);
+  dtx    = CLAMP(dtx,    -max_shift_n, max_shift_n);
+  dty    = CLAMP(dty,    -max_shift_n, max_shift_n);
+
+  // Apply Euclidean update exactly, preserving any scale encoded in Hn.
+  const double sc = sqrt((double)cos_t * cos_t + (double)sin_t * sin_t);
+  const double theta_old = atan2((double)sin_t, (double)cos_t);
+  const double theta_new = theta_old + dtheta;
+
+  Hn[0] =  (float)(sc * cos(theta_new));
+  Hn[1] =  (float)(sc * sin(theta_new));
+  Hn[2] += (float)dtx;
+  Hn[3] = -(float)(sc * sin(theta_new));
+  Hn[4] =  (float)(sc * cos(theta_new));
+  Hn[5] += (float)dty;
+  Hn[6] = 0.0f;
+  Hn[7] = 0.0f;
+
+  _homography_normalized_to_pixel(Hn, w, h, H);
+
+  const double trans_pix = s * (fabs(dtx) + fabs(dty));
+  const double angle_pix = s * fabs(dtheta);
+
+  return (float)(trans_pix + angle_pix);
+}
+
+/** GPU-accelerated ECC level refinement.
+ *
+ *  Uploads ref_grad and img_grad once, runs the iteration loop on the GPU,
+ *  frees all device/host buffers on exit.
+ *
+ *  Returns TRUE on success.  Returns FALSE on any CL allocation or dispatch
+ *  error; the caller should fall back to the CPU path. */
+static gboolean _ecc_refine_level_cl(const int devid,
+                                      const dt_hdr_alignment_cl_global_t *g,
+                                      const float *ref_grad,
+                                      const float *img_grad,
+                                      const int w,
+                                      const int h,
+                                      float H[HDR_ALIGN_H_NPARAM])
+{
+  const size_t npix = (size_t)w * h;
+  const int nwgx = (w + HDR_ALIGN_CL_WG_W - 1) / HDR_ALIGN_CL_WG_W;
+  const int nwgy = (h + HDR_ALIGN_CL_WG_H - 1) / HDR_ALIGN_CL_WG_H;
+  const int ngroups = nwgx * nwgy;
+
+  // --- Allocate device buffers ---
+  cl_mem cl_ref    = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_img    = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_warped = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_mask   = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_gx     = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_gy     = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
+  cl_mem cl_sums_p1  = dt_opencl_alloc_device_buffer(devid, (size_t)ngroups * 4 * sizeof(float));
+  cl_mem cl_sums_p23 = dt_opencl_alloc_device_buffer(devid, (size_t)ngroups * 9 * sizeof(float));
+
+  gboolean ok = (cl_ref && cl_img && cl_warped && cl_mask
+                 && cl_gx && cl_gy && cl_sums_p1 && cl_sums_p23);
+
+  // --- Allocate host staging buffers ---
+  float *host_p1  = ok ? dt_alloc_align_float((size_t)ngroups * 4) : NULL;
+  float *host_p23 = ok ? dt_alloc_align_float((size_t)ngroups * 9) : NULL;
+  ok = ok && host_p1 && host_p23;
+
+  if(ok)
+  {
+    // Upload static per-level gradient images once.
+    cl_int err;
+    err = dt_opencl_write_buffer_to_device(devid, (void *)ref_grad, cl_ref, 0,
+                                           npix * sizeof(float), CL_TRUE);
+    if(err != CL_SUCCESS) ok = FALSE;
+  }
+  if(ok)
+  {
+    cl_int err;
+    err = dt_opencl_write_buffer_to_device(devid, (void *)img_grad, cl_img, 0,
+                                           npix * sizeof(float), CL_TRUE);
+    if(err != CL_SUCCESS) ok = FALSE;
+  }
+
+  if(ok)
+  {
+    float best_update = FLT_MAX;
+    int stall_count = 0;
+    float H_best[HDR_ALIGN_H_NPARAM];
+    memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
+
+    for(int iter = 0; iter < HDR_ALIGN_ECC_MAX_ITER && ok; iter++)
+    {
+      const float update = _ecc_iteration_cl(devid, g,
+                                              cl_ref, cl_img,
+                                              cl_warped, cl_mask, cl_gx, cl_gy,
+                                              cl_sums_p1, cl_sums_p23,
+                                              host_p1, host_p23,
+                                              w, h, ngroups, H);
+      if(update < 0.0f)
+      {
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] ECC (CL) failed at iteration %d", iter);
+        memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
+        ok = FALSE;
+        break;
+      }
+
+      if(update < HDR_ALIGN_ECC_EPSILON)
+      {
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] ECC (CL) converged at iteration %d (update=%.6f)",
+                 iter, update);
+        break;
+      }
+
+      if(update < best_update)
+      {
+        best_update = update;
+        stall_count = 0;
+        memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
+      }
+      else if(++stall_count >= HDR_ALIGN_ECC_PATIENCE)
+      {
+        memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] ECC (CL) stalled at iteration %d"
+                 " (update=%.6f, best=%.6f)",
+                 iter, update, best_update);
+        break;
+      }
+    }
+  }
+
+  dt_opencl_release_mem_object(cl_ref);
+  dt_opencl_release_mem_object(cl_img);
+  dt_opencl_release_mem_object(cl_warped);
+  dt_opencl_release_mem_object(cl_mask);
+  dt_opencl_release_mem_object(cl_gx);
+  dt_opencl_release_mem_object(cl_gy);
+  dt_opencl_release_mem_object(cl_sums_p1);
+  dt_opencl_release_mem_object(cl_sums_p23);
+  dt_free_align(host_p1);
+  dt_free_align(host_p23);
+
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// OpenCL global init / cleanup
+// ---------------------------------------------------------------------------
 
 dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void)
 {

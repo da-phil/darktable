@@ -153,9 +153,7 @@ hdr_align_compute_gradients(global const float *in,
  *
  * Applied in-place after percentile normalisation and before Sobel gradient
  * computation.  Compresses highlights so that dark and bright exposures
- * produce comparable gradient values: the derivative 1/(1+x) down-weights
- * large intensities so highlight edges do not overwhelm shadow edges after
- * Sobel differentiation.
+ * produce comparable gradient magnitudes.
  */
 kernel void
 hdr_align_log1p(global float *img,
@@ -333,18 +331,18 @@ hdr_align_ecc_means(global const float *ref,
 }
 
 
-/* ---------- ECC Pass 2: Norms, Jacobian sums, projection sums, correlation ----------
+/* ---------- ECC Pass 2: Norms, Jacobian sums, sJw projection sums ----------
  *
  * Computes partial sums for a work-group tile.
- * out_sums layout per work-group:
+ * out_sums layout per work-group (9 floats):
  *   [norm2_r, norm2_w, dot_rw, sum_J0, sum_J1, sum_J2,
- *    sJw0, sJw1, sJw2]  (9 floats)
+ *    sJw0, sJw1, sJw2]
  *
- * sJw[k] = Σ wgt·tw·J[k].  Together with norm2_w this lets the host compute
- * the projection coefficients without a separate image sweep:
- *   proj_coeff[k] = sJw[k] / norm2_w
- * (the mean_J correction term cancels because Σ wgt·tw = 0 by definition
- * of mean_w, matching the CPU sJw optimisation in _ecc_iteration).
+ * The sJw terms (sJw[k] = Σ wgt·tw·J[k]) allow the host to derive
+ * proj_coeff[k] = sJw[k] / norm2_w without a separate image pass,
+ * matching the CPU _ecc_iteration merged-pass-2 optimization.
+ * The mean_J correction term vanishes because Σ wgt·tw = 0 by
+ * definition of mean_w.
  */
 kernel void
 hdr_align_ecc_norms(global const float *ref,
@@ -373,8 +371,7 @@ hdr_align_ecc_norms(global const float *ref,
   const int x = get_global_id(0);
   const int y = get_global_id(1);
 
-  float acc[9];
-  for(int k = 0; k < 9; k++) acc[k] = 0.0f;
+  float acc[9] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
   if(x < width && y < height)
   {
@@ -402,7 +399,7 @@ hdr_align_ecc_norms(global const float *ref,
       acc[3] = wgt * J0;          // sum_J0
       acc[4] = wgt * J1;          // sum_J1
       acc[5] = wgt * J2;          // sum_J2
-      acc[6] = wgt * tw * J0;     // sJw0
+      acc[6] = wgt * tw * J0;     // sJw0 (projection numerator for J0)
       acc[7] = wgt * tw * J1;     // sJw1
       acc[8] = wgt * tw * J2;     // sJw2
     }
@@ -432,17 +429,14 @@ hdr_align_ecc_norms(global const float *ref,
 }
 
 
-/* ---------- ECC Pass 3 (with known proj_coeff): Hessian + RHS ----------
- *
- * The proj_coeff values are derived by the host from the sJw accumulators
- * returned by hdr_align_ecc_norms:
- *   proj_coeff[k] = sJw[k] / norm2_w
- * (the mean_J correction term cancels because Σ wgt·tw = 0).
- * This mirrors the CPU sJw optimisation that eliminated the old separate
- * projection pass.
+/* ---------- ECC Pass 3: Hessian + RHS assembly (given proj_coeff) ----------
  *
  * out_sums layout per work-group:
  *   [H00, H01, H02, H11, H12, H22, rhs0, rhs1, rhs2]  (9 floats)
+ *
+ * The host derives proj_coeff[k] = sJw[k] / norm2_w from the output of
+ * hdr_align_ecc_norms, then passes proj0..proj2 as kernel arguments.
+ * This eliminates the former intermediate hdr_align_ecc_hessian kernel.
  */
 kernel void
 hdr_align_ecc_hessian_final(global const float *ref,
