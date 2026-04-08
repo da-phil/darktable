@@ -41,11 +41,18 @@ typedef struct dt_hdr_alignment_t
  *  Both images must be single-channel float Bayer mosaic data of identical
  *  dimensions (as produced by the rawprepare IOP).
  *
- *  The full Bayer resolution is used for alignment so no downsampling
- *  occurs before the pyramid is built.  Each pixel is first normalised:
+ *  The Bayer pyramid is built directly from full-resolution Bayer data.
+ *  Each 2× downsampling step averages a 2×2 Bayer block (so L1+ are
+ *  grayscale-equivalent); only L0 retains the CFA structure and uses a
+ *  CFA-aware stride-2 Sobel after per-sublattice normalisation.
+ *  Per-pixel normalisation:
  *    normalised = max(pixel - black_level, 0) / (relative_exposure × relative_iso)
  *  Both black levels are typically 0 when rawprepare has already subtracted
  *  them.  The reference image uses relative_exposure = 1 and relative_iso = 1.
+ *
+ *  Gradient images used for ECC are masked to exclude saturated (near white)
+ *  and underexposed (near black) pixels so alignment optimises over valid
+ *  regions only.
  *
  *  @param ref_mosaic        Reference image (first exposure), single-channel float
  *  @param img_mosaic        Candidate image to align, single-channel float

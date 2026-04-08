@@ -50,7 +50,7 @@
 #define HDR_ALIGN_ECC_MAX_ITER 50
 // ECC convergence threshold (pixel-equivalent): stop when parameter update
 // norm (|Δtx| + |Δty| + |Δθ|·corner_dist) is below this value.
-#define HDR_ALIGN_ECC_EPSILON 1e-4f
+#define HDR_ALIGN_ECC_EPSILON 1e-3f
 // Extra weight given to outer image regions during ECC so edge/corner
 // alignment has enough influence over the homography estimate.
 #define HDR_ALIGN_ECC_EDGE_WEIGHT 3.0
@@ -141,13 +141,13 @@
  *  reference image.  For the reference image pass black_level = 0 and
  *  inv_exposure = 1.0f.
  *
- *  Pixels outside the valid range are clamped to zero after black-level
- *  subtraction.  The output is a full-resolution (wd × ht) buffer that
- *  retains the Bayer CFA structure; no channel mixing or downsampling is
- *  performed here.  CFA cross-talk in the gradient domain is prevented
- *  separately by _gradient_bayer_cfa_sobel(), which applies stride-2
- *  same-channel Sobel kernels so that each gradient sample is derived
- *  exclusively from neighbours of the same colour channel.
+ *  The output is a full-resolution (wd × ht) buffer that retains the Bayer
+ *  CFA structure.  At pyramid level 0, _normalize_bayer_per_channel() is
+ *  applied afterwards to independently normalise each CFA sublattice before
+ *  computing CFA-aware gradients.  Higher pyramid levels are built by 2×
+ *  box-filter downsampling from L0; each downsampling step averages a 2×2
+ *  Bayer block into one grayscale-equivalent value, so L1 and above are
+ *  effectively grayscale.
  *  Caller must free the result. */
 static float *_normalize_bayer(const float *mosaic,
                                const int wd,
@@ -163,6 +163,123 @@ static float *_normalize_bayer(const float *mosaic,
   for(size_t i = 0; i < npix; i++)
     out[i] = fmaxf(mosaic[i] - black_level, 0.0f) * inv_exposure;
 
+  return out;
+}
+
+/** Normalise each CFA sublattice of a Bayer mosaic to [0, 1] independently
+ *  using a 99th-percentile stretch.
+ *
+ *  Without per-sublattice normalisation, the G channels (which capture
+ *  roughly twice as much light as R or B in a typical Bayer sensor) have
+ *  approximately twice the gradient amplitude of R/B channels after a
+ *  stride-2 Sobel filter.  This Bayer-frequency amplitude pattern reduces
+ *  the ECC correlation coefficient (ρ) to ≈ 0.28 regardless of alignment
+ *  quality, because the pattern appears in both images and interferes with
+ *  the signal of actual image edges.
+ *
+ *  By processing the four sublattices ((cx,cy) ∈ {(0,0),(0,1),(1,0),(1,1)})
+ *  separately with their own 99th-percentile white-point, all channels fill
+ *  the same [0, 1] range and the gradient amplitudes are equalised.  This
+ *  is the key prerequisite for reliable ECC at L0.
+ *
+ *  NOTE: This must only be called on the full-resolution Bayer L0 data.
+ *  At L1 and above the pyramid data is already grayscale-equivalent (2×2
+ *  box-filter downsampling averages Bayer blocks), so _normalize_image_percentile
+ *  suffices. */
+static void _normalize_bayer_per_channel(float *bayer, const int wd, const int ht)
+{
+  for(int cy = 0; cy < 2; cy++)
+    for(int cx = 0; cx < 2; cx++)
+    {
+      // Count pixels in this sublattice
+      const int sw = (wd - cx + 1) / 2;
+      const int sh = (ht - cy + 1) / 2;
+      const size_t spix = (size_t)sw * sh;
+
+      // Find maximum value in this sublattice
+      float vmax = 0.0f;
+      for(int y = cy; y < ht; y += 2)
+        for(int x = cx; x < wd; x += 2)
+          if(bayer[(size_t)y * wd + x] > vmax) vmax = bayer[(size_t)y * wd + x];
+
+      if(vmax < 1e-12f) continue;
+
+      // Build histogram for 99th-percentile white-point
+      enum { NBINS = 4096 };
+      size_t hist[NBINS] = { 0 };
+      const float inv_vmax = (float)(NBINS - 1) / vmax;
+      for(int y = cy; y < ht; y += 2)
+        for(int x = cx; x < wd; x += 2)
+        {
+          const int bin = (int)(bayer[(size_t)y * wd + x] * inv_vmax);
+          hist[CLAMP(bin, 0, NBINS - 1)]++;
+        }
+
+      const size_t target = (size_t)((double)spix * 0.99);
+      size_t cumul = 0;
+      int p99_bin = NBINS - 1;
+      for(int b = 0; b < NBINS; b++)
+      {
+        cumul += hist[b];
+        if(cumul >= target) { p99_bin = b; break; }
+      }
+      const float wp = (float)(p99_bin + 1) / (float)NBINS * vmax;
+      if(wp < 1e-12f) continue;
+      const float inv_wp = 1.0f / wp;
+
+      DT_OMP_FOR(collapse(2))
+      for(int y = cy; y < ht; y += 2)
+        for(int x = cx; x < wd; x += 2)
+          bayer[(size_t)y * wd + x] = CLAMP(bayer[(size_t)y * wd + x] * inv_wp, 0.0f, 1.0f);
+    }
+}
+
+/** Compute the signed Sobel gradient sum (gx + gy) for a full-resolution
+ *  Bayer mosaic image using CFA-aware stride-2 sampling.
+ *
+ *  At each output pixel (x, y), the Sobel kernel reads only from pixels that
+ *  belong to the same CFA channel (i.e., at stride-2 offsets).  This avoids
+ *  mixing different-channel values and preserves the edge structure within
+ *  each sublattice.
+ *
+ *  This function must be called AFTER _normalize_bayer_per_channel() so that
+ *  all four sublattices have comparable amplitude ranges.  Without that
+ *  pre-normalisation, the G/R/B amplitude difference would corrupt ECC.
+ *
+ *  Border pixels within 2 pixels of the image edge are set to zero because
+ *  the stride-2 stencil reads 2 pixels beyond the current position.
+ *
+ *  Caller must free the result. */
+static float *_gradient_bayer_cfa_sobel(const float *bayer,
+                                        const int wd,
+                                        const int ht)
+{
+  const size_t npix = (size_t)wd * ht;
+  float *out = dt_alloc_align_float(npix);
+  if(!out) return NULL;
+
+  DT_OMP_FOR(collapse(2))
+  for(int y = 0; y < ht; y++)
+    for(int x = 0; x < wd; x++)
+    {
+      if(y < 2 || y >= ht - 2 || x < 2 || x >= wd - 2)
+      {
+        out[(size_t)y * wd + x] = 0.0f;
+        continue;
+      }
+      // stride-2 Sobel: all 9 stencil points share the same CFA channel
+      const float tl = bayer[(size_t)(y - 2) * wd + (x - 2)];
+      const float tc = bayer[(size_t)(y - 2) * wd + x];
+      const float tr = bayer[(size_t)(y - 2) * wd + (x + 2)];
+      const float ml = bayer[(size_t)y * wd + (x - 2)];
+      const float mr = bayer[(size_t)y * wd + (x + 2)];
+      const float bl = bayer[(size_t)(y + 2) * wd + (x - 2)];
+      const float bc = bayer[(size_t)(y + 2) * wd + x];
+      const float br = bayer[(size_t)(y + 2) * wd + (x + 2)];
+      const float gx = (-tl + tr - 2.0f * ml + 2.0f * mr - bl + br) * 0.125f;
+      const float gy = (-tl - 2.0f * tc - tr + bl + 2.0f * bc + br) * 0.125f;
+      out[(size_t)y * wd + x] = gx + gy;
+    }
   return out;
 }
 
@@ -473,20 +590,6 @@ static void _compute_gradients(const float *img,
     }
 }
 
-/** Apply log(1 + x) transform in-place.
- *  Compresses the dynamic range so that dark and bright exposures produce
- *  comparable gradient values.  log(1+x) is chosen because it is monotone,
- *  maps [0,∞) to [0,∞), and its derivative 1/(1+x) down-weights large
- *  intensities so highlight edges do not overwhelm shadow edges after Sobel
- *  differentiation.  Applied after percentile normalisation and before the
- *  Sobel gradient computation. */
-static void _log1p_transform(float *img, const size_t npix)
-{
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npix; i++)
-    img[i] = logf(1.0f + img[i]);
-}
-
 /** Normalise a non-negative image to [0, 1] in-place using a
  *  99th-percentile stretch.
  *
@@ -535,58 +638,6 @@ static void _normalize_image_percentile(float *img, const size_t npix)
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
     img[i] = CLAMP(img[i] * inv_wp, 0.0f, 1.0f);
-}
-
-/** Normalise each of the four Bayer CFA channel positions (R, Gr, Gb, B)
- *  independently to [0, 1] using the same 99th-percentile stretch as
- *  _normalize_image_percentile().
- *
- *  A global stretch of a raw Bayer image places the R and B channels at
- *  roughly 50 % of the G amplitude in a typical daylight scene.  After a
- *  stride-2 CFA-aware Sobel, the gradient image therefore alternates between
- *  strong G-position values (≈ 1.5 ×) and weak R/B-position values (≈ 0.5 ×)
- *  at the Bayer frequency.  The ECC algorithm computes the spatial gradient
- *  of this map internally to build its Jacobian; it sees a dominant
- *  Bayer-frequency square wave rather than real geometric structure, which
- *  reduces the effective correlation coefficient ρ to ≈ 0.28 regardless of
- *  alignment quality.
- *
- *  Per-channel normalisation ensures every sublattice fills [0, 1] so that
- *  all four channel positions produce gradients of comparable amplitude.  The
- *  gradient image then has spatially uniform amplitude and the Jacobian
- *  correctly reflects scene structure. */
-static void _normalize_bayer_per_channel(float *bayer, const int w, const int h)
-{
-  const int hw = w / 2;
-  const int hh = h / 2;
-  if(hw <= 0 || hh <= 0) return;
-
-  // Process each of the 4 CFA sublattice positions separately.
-  // We extract each sublattice into a compact half-resolution buffer,
-  // normalise it with the existing 99th-percentile logic, then write back.
-  for(int cy = 0; cy < 2; cy++)
-  {
-    for(int cx = 0; cx < 2; cx++)
-    {
-      const size_t snpix = (size_t)hw * hh;
-      float *sub = dt_alloc_align_float(snpix);
-      if(!sub) continue;
-
-      DT_OMP_FOR(collapse(2))
-      for(int gy = 0; gy < hh; gy++)
-        for(int gx = 0; gx < hw; gx++)
-          sub[gy * hw + gx] = bayer[(gy * 2 + cy) * w + (gx * 2 + cx)];
-
-      _normalize_image_percentile(sub, snpix);
-
-      DT_OMP_FOR(collapse(2))
-      for(int gy = 0; gy < hh; gy++)
-        for(int gx = 0; gx < hw; gx++)
-          bayer[(gy * 2 + cy) * w + (gx * 2 + cx)] = sub[gy * hw + gx];
-
-      dt_free_align(sub);
-    }
-  }
 }
 
 /** Check whether a homography is plausible for hand-held HDR brackets.
@@ -668,58 +719,50 @@ static float *_gradient_sobel_sum(const float *img, const int w, const int h)
   return gx;
 }
 
-/** Compute a CFA-aware signed-gradient sum (gx + gy) for a full-resolution
- *  raw Bayer mosaic.
- *
- *  Applying a standard stride-1 Sobel kernel to a raw Bayer image produces
- *  large spurious responses at every colour-filter boundary (R/G or G/B
- *  neighbours differ by their colour ratio, not by scene structure).
- *
- *  This function avoids that cross-talk by using a stride-2 Sobel stencil:
- *  every gradient sample is computed from neighbours that lie exactly 2
- *  pixels away in the horizontal and vertical directions.  Because the Bayer
- *  period is 2, those neighbours always belong to the same colour channel as
- *  the centre pixel — R neighbours R, Gr neighbours Gr, Gb neighbours Gb,
- *  and B neighbours B — regardless of which CFA position is being processed.
- *  No explicit channel-mask branching is required.
- *
- *  R, Gr, Gb and B sublattice gradients are computed in a single pass; the
- *  results are placed at each pixel's own position, forming one combined
- *  full-resolution gradient map.
- *
- *  Border pixels (within 2 of any edge) are set to zero.
- *  Output is full-resolution (w × h); caller must free result. */
-static float *_gradient_bayer_cfa_sobel(const float *bayer, const int w, const int h)
+/** Mask a gradient image by zeroing out pixels whose corresponding
+ *  [0,1]-normalised intensity is outside [lo, hi].  Pixels near the
+ *  sensor black level (underexposed) or near saturation (overexposed)
+ *  produce unreliable gradients that would mislead ECC alignment.
+ *  By setting those gradient values to zero they do not contribute to
+ *  the correlation, so ECC optimises over valid regions only. */
+static void _mask_gradient_by_intensity(float *grad,
+                                        const float *mask,
+                                        const size_t npix)
 {
-  const size_t npix = (size_t)w * h;
-  float *out = dt_alloc_align_float(npix);
-  if(!out) return NULL;
-
-  memset(out, 0, sizeof(float) * npix);
-
-  // Stride-2 Sobel: each of the 9 stencil points is 2 pixels away from the
-  // centre, ensuring all stencil pixels share the same Bayer channel as the
-  // centre (adding an even offset preserves (x%2, y%2)).
-  DT_OMP_FOR(collapse(2))
-  for(int y = 2; y < h - 2; y++)
-    for(int x = 2; x < w - 2; x++)
-    {
-      const float tl = bayer[(y - 2) * w + (x - 2)];
-      const float tc = bayer[(y - 2) * w + x];
-      const float tr = bayer[(y - 2) * w + (x + 2)];
-      const float ml = bayer[y * w + (x - 2)];
-      const float mr = bayer[y * w + (x + 2)];
-      const float bl = bayer[(y + 2) * w + (x - 2)];
-      const float bc = bayer[(y + 2) * w + x];
-      const float br = bayer[(y + 2) * w + (x + 2)];
-
-      const float gx = (-tl + tr - 2.0f * ml + 2.0f * mr - bl + br) / 8.0f;
-      const float gy = (-tl - 2.0f * tc - tr + bl + 2.0f * bc + br) / 8.0f;
-      out[y * w + x] = gx + gy;
-    }
-
-  return out;
+  if(!grad || !mask) return;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    grad[i] *= mask[i];
 }
+
+/** Build a validity mask from a [0,1]-normalised image.
+ *  Pixels with norm_01[i] < lo or > hi get mask 0; others get mask 1.
+ *  Also applies log1p() in-place to the normalised image in the same pass
+ *  so the caller does not need a separate _log1p_transform() call.
+ *  Caller must free the returned mask. */
+static float *_build_mask_and_log1p(float *norm_01,
+                                    const size_t npix,
+                                    const float lo,
+                                    const float hi)
+{
+  float *mask = dt_alloc_align_float(npix);
+  if(!mask) return NULL;
+
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+  {
+    mask[i] = (norm_01[i] >= lo && norm_01[i] <= hi) ? 1.0f : 0.0f;
+    norm_01[i] = logf(1.0f + norm_01[i]);
+  }
+  return mask;
+}
+
+// Thresholds for the gradient validity mask.  After percentile
+// normalisation the image is in [0, 1].  Values below MASK_LO are
+// underexposed (essentially black) and values above MASK_HI are
+// saturated / clipped.  Both produce unreliable gradients.
+#define HDR_ALIGN_GRADIENT_MASK_LO 0.01f
+#define HDR_ALIGN_GRADIENT_MASK_HI 0.99f
 
 /** Normalise a signed gradient image in-place by its mean absolute value.
  *  g[i] = g[i] / (mean(|g|) + ε)
@@ -2427,11 +2470,6 @@ static gboolean _ecc_refine_level_cl(const int devid,
                                       const int w,
                                       const int h,
                                       float H[HDR_ALIGN_H_NPARAM]);
-static float *_l0_gradient_cl(const int devid,
-                               const dt_hdr_alignment_cl_global_t *g,
-                               const float *bayer_log1p,
-                               const int w,
-                               const int h);
 #endif
 
 gboolean dt_hdr_align_compute(const float *ref_mosaic,
@@ -2467,50 +2505,58 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     return FALSE;
   }
 
-  // Step 1: Normalise Bayer mosaics.
+  // Step 1: Normalise Bayer mosaics and build full-resolution pyramids.
   //   Subtract the per-image black level and scale the candidate image by
   //   1 / (relative_exposure × relative_iso) so that both images are on the
-  //   same effective photon-count scale before gradient computation.
-  //   The full Bayer resolution is preserved; CFA cross-talk when computing
-  //   gradients is prevented by _gradient_bayer_cfa_sobel() at pyramid
-  //   level 0 (stride-2 same-channel Sobel).  At levels ≥ 1 the 2×2
-  //   box-filter in _downsample_2x() already removes the CFA pattern, so
-  //   standard stride-1 Sobel is used there.
+  //   same effective photon-count scale.
+  //
+  //   The pyramid is built directly from full-resolution Bayer data.  Level 0
+  //   retains the full Bayer CFA structure; each subsequent level is a 2×
+  //   box-filter downsampling of the level below.  Since each 2×2 downsampling
+  //   step averages a Bayer block, levels L1 and above are effectively
+  //   grayscale-equivalent and can be processed with standard stride-1 Sobel.
+  //   Only L0 requires CFA-aware stride-2 Sobel (see _gradient_bayer_cfa_sobel).
   const float img_inv_exposure =
     (relative_exposure > 1e-12f && relative_iso > 1e-12f)
       ? 1.0f / (relative_exposure * relative_iso)
       : 1.0f;
-  float *gray_ref = _normalize_bayer(ref_mosaic, wd, ht, ref_black_level, 1.0f);
-  float *gray_img = _normalize_bayer(img_mosaic, wd, ht, img_black_level, img_inv_exposure);
-  if(!gray_ref || !gray_img) goto error;
 
-  // Step 2: Build pyramids from the full-resolution normalised Bayer images.
-  //   Each pyramid level halves resolution via 2×2 box-filter, progressively
-  //   averaging out the CFA pattern so standard Sobel suffices at levels ≥ 1.
-  _pyramid_t pyr_ref, pyr_img;
-  if(!_build_pyramid(gray_ref, wd, ht, &pyr_ref))
+  float *bayer_ref = _normalize_bayer(ref_mosaic, wd, ht, ref_black_level, 1.0f);
+  float *bayer_img = _normalize_bayer(img_mosaic, wd, ht, img_black_level, img_inv_exposure);
+  if(!bayer_ref || !bayer_img)
   {
-    dt_free_align(gray_ref);
-    dt_free_align(gray_img);
+    dt_free_align(bayer_ref);
+    dt_free_align(bayer_img);
 #ifdef HAVE_OPENCL
     dt_opencl_unlock_device(devid);
 #endif
     return FALSE;
   }
-  if(!_build_pyramid(gray_img, wd, ht, &pyr_img))
+
+  // Step 2: Build pyramids from the full-resolution Bayer images.
+  _pyramid_t pyr_ref, pyr_img;
+  if(!_build_pyramid(bayer_ref, wd, ht, &pyr_ref))
+  {
+    dt_free_align(bayer_ref);
+    dt_free_align(bayer_img);
+#ifdef HAVE_OPENCL
+    dt_opencl_unlock_device(devid);
+#endif
+    return FALSE;
+  }
+  if(!_build_pyramid(bayer_img, wd, ht, &pyr_img))
   {
     _free_pyramid(&pyr_ref);
-    dt_free_align(gray_ref);
-    dt_free_align(gray_img);
+    dt_free_align(bayer_ref);
+    dt_free_align(bayer_img);
 #ifdef HAVE_OPENCL
     dt_opencl_unlock_device(devid);
 #endif
     return FALSE;
   }
 
-  dt_free_align(gray_ref);
-  dt_free_align(gray_img);
-  gray_ref = gray_img = NULL;
+  dt_free_align(bayer_ref);
+  dt_free_align(bayer_img);
 
   // Track whether the finest-level alignment concluded that no correction is
   // needed.  When identity is selected we skip the residual mesh computation:
@@ -2565,15 +2611,24 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Step 1: Percentile normalize raw pixels
       _normalize_image_percentile(tmp_ref, cpix);
       _normalize_image_percentile(tmp_img, cpix);
-      // Step 2: Log transform to compress dynamic range
-      _log1p_transform(tmp_ref, cpix);
-      _log1p_transform(tmp_img, cpix);
+      // Step 2: Build validity masks and apply log1p
+      float *coarse_ref_mask = _build_mask_and_log1p(tmp_ref, cpix,
+                                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                                     HDR_ALIGN_GRADIENT_MASK_HI);
+      float *coarse_img_mask = _build_mask_and_log1p(tmp_img, cpix,
+                                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                                     HDR_ALIGN_GRADIENT_MASK_HI);
       // Step 3: Signed Sobel gradient (gx + gy)
       coarse_ref_grad = _gradient_sobel_sum(tmp_ref, cw, ch);
       coarse_img_grad = _gradient_sobel_sum(tmp_img, cw, ch);
       // Step 4: MAD gradient normalization
       if(coarse_ref_grad) _normalize_gradient_mad(coarse_ref_grad, cpix);
       if(coarse_img_grad) _normalize_gradient_mad(coarse_img_grad, cpix);
+      // Step 5: Mask out saturated/underexposed
+      _mask_gradient_by_intensity(coarse_ref_grad, coarse_ref_mask, cpix);
+      _mask_gradient_by_intensity(coarse_img_grad, coarse_img_mask, cpix);
+      dt_free_align(coarse_ref_mask);
+      dt_free_align(coarse_img_mask);
 
       // Keep the intensity images for gradient-magnitude ρ scoring below.
       if(coarse_ref_grad && coarse_img_grad)
@@ -2734,10 +2789,23 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       continue;
     }
 
-    // Compute signed Sobel gradient images for exposure-invariant ECC.
-    // The signed gradient sum (gx + gy) preserves structure and direction,
-    // which ECC exploits for better convergence than unsigned magnitude.
-    // Pipeline: percentile normalize → log1p → Sobel sum → MAD normalize.
+    // Compute gradient images for exposure-invariant ECC.
+    // The signed gradient sum (gx + gy) preserves structure and direction.
+    //
+    // At L0 the pyramid data is full-resolution Bayer.  Use per-sublattice
+    // normalisation (_normalize_bayer_per_channel) followed by CFA-aware
+    // stride-2 Sobel (_gradient_bayer_cfa_sobel) so that each CFA channel's
+    // gradients have comparable amplitude.  Without per-sublattice
+    // normalisation the G channels (typically ~2× brighter) would produce
+    // ~2× larger gradients than R/B, creating a Bayer-frequency amplitude
+    // pattern that suppresses ECC ρ to ≈ 0.28 regardless of alignment
+    // quality — this was the root cause of the alignment regression.
+    //
+    // At L1 and above the pyramid data is grayscale-equivalent (each 2×2
+    // box-filter downsampling step averages a Bayer block), so standard
+    // global percentile normalisation and stride-1 Sobel are appropriate.
+    //
+    // In both cases: mask → log1p → gradient → MAD normalise → apply mask.
     const size_t lpix = (size_t)lw * lh;
     float *ref_norm = dt_alloc_align_float(lpix);
     float *img_norm = dt_alloc_align_float(lpix);
@@ -2751,75 +2819,54 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     }
     memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
     memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
-    // Step 1: Percentile normalize raw pixels.
-    //   At level 0 the data is still the raw Bayer mosaic; apply
-    //   per-sublattice normalisation so that R, Gr, Gb and B channels all
-    //   fill the [0, 1] range independently.  Without this, the stride-2
-    //   CFA Sobel produces a gradient image with a Bayer-frequency amplitude
-    //   pattern (G ≈ 2× R/B) that corrupts the ECC Jacobian.
-    //   At levels ≥ 1 the data has been box-filtered to near-grayscale by
-    //   the pyramid builder, so a single global stretch is sufficient.
-    if(l == 0)
-    {
-      _normalize_bayer_per_channel(ref_norm, lw, lh);
-      _normalize_bayer_per_channel(img_norm, lw, lh);
-    }
-    else
-    {
-      _normalize_image_percentile(ref_norm, lpix);
-      _normalize_image_percentile(img_norm, lpix);
-    }
-    // Step 2: Log transform
-    _log1p_transform(ref_norm, lpix);
-    _log1p_transform(img_norm, lpix);
 
-    // Step 3: Compute gradient images.
-    //   At pyramid level 0 the data is the full-resolution Bayer mosaic;
-    //   use the CFA-aware stride-2 Sobel to avoid cross-channel contamination.
-    //   When OpenCL is available, the stride-2 Sobel is dispatched to the
-    //   GPU via hdr_align_gradient_bayer_cfa_sobel, which avoids ~500M MAC
-    //   ops on the CPU for large (60+ MP) level-0 images.
-    //   At levels ≥ 1 the mosaic has been box-filtered to near-grayscale by
-    //   the pyramid builder; standard stride-1 Sobel is correct there.
     float *ref_grad = NULL;
     float *img_grad = NULL;
+
     if(l == 0)
     {
-      gboolean l0_cl_ok = FALSE;
-#ifdef HAVE_OPENCL
-      if(use_cl)
-      {
-        ref_grad = _l0_gradient_cl(devid, g_cl, ref_norm, lw, lh);
-        img_grad = _l0_gradient_cl(devid, g_cl, img_norm, lw, lh);
-        l0_cl_ok = (ref_grad != NULL && img_grad != NULL);
-        if(!l0_cl_ok)
-        {
-          dt_free_align(ref_grad);
-          dt_free_align(img_grad);
-          ref_grad = img_grad = NULL;
-        }
-      }
-#endif
-      if(!l0_cl_ok)
-      {
-        ref_grad = _gradient_bayer_cfa_sobel(ref_norm, lw, lh);
-        img_grad = _gradient_bayer_cfa_sobel(img_norm, lw, lh);
-      }
+      // L0: full-resolution Bayer — per-sublattice normalization + CFA Sobel
+      _normalize_bayer_per_channel(ref_norm, lw, lh);
+      _normalize_bayer_per_channel(img_norm, lw, lh);
+      float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
+                                              HDR_ALIGN_GRADIENT_MASK_LO,
+                                              HDR_ALIGN_GRADIENT_MASK_HI);
+      float *img_mask = _build_mask_and_log1p(img_norm, lpix,
+                                              HDR_ALIGN_GRADIENT_MASK_LO,
+                                              HDR_ALIGN_GRADIENT_MASK_HI);
+      ref_grad = _gradient_bayer_cfa_sobel(ref_norm, lw, lh);
+      img_grad = _gradient_bayer_cfa_sobel(img_norm, lw, lh);
+      if(ref_grad) _normalize_gradient_mad(ref_grad, lpix);
+      if(img_grad) _normalize_gradient_mad(img_grad, lpix);
+      _mask_gradient_by_intensity(ref_grad, ref_mask, lpix);
+      _mask_gradient_by_intensity(img_grad, img_mask, lpix);
+      dt_free_align(ref_mask);
+      dt_free_align(img_mask);
+      // Keep ref_norm / img_norm alive: they are needed for ρ scoring in
+      // DOF escalation and the identity check below.
     }
     else
     {
+      // L1+: grayscale-equivalent — global percentile norm + stride-1 Sobel
+      _normalize_image_percentile(ref_norm, lpix);
+      _normalize_image_percentile(img_norm, lpix);
+      float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
+                                              HDR_ALIGN_GRADIENT_MASK_LO,
+                                              HDR_ALIGN_GRADIENT_MASK_HI);
+      float *img_mask = _build_mask_and_log1p(img_norm, lpix,
+                                              HDR_ALIGN_GRADIENT_MASK_LO,
+                                              HDR_ALIGN_GRADIENT_MASK_HI);
       ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
       img_grad = _gradient_sobel_sum(img_norm, lw, lh);
-    }
-
-    // At level 0 we need the intensity images (ref_norm / img_norm) alive
-    // for gradient-magnitude ρ scoring in DOF escalation and identity check.
-    // At other levels they are safe to free immediately.
-    if(l != 0)
-    {
       dt_free_align(ref_norm);
       dt_free_align(img_norm);
       ref_norm = img_norm = NULL;
+      if(ref_grad) _normalize_gradient_mad(ref_grad, lpix);
+      if(img_grad) _normalize_gradient_mad(img_grad, lpix);
+      _mask_gradient_by_intensity(ref_grad, ref_mask, lpix);
+      _mask_gradient_by_intensity(img_grad, img_mask, lpix);
+      dt_free_align(ref_mask);
+      dt_free_align(img_mask);
     }
 
     if(!ref_grad || !img_grad)
@@ -2832,9 +2879,6 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                "[hdr_merge] ECC level %d: gradient alloc failed", l);
       continue;
     }
-    // Step 4: MAD gradient normalization
-    _normalize_gradient_mad(ref_grad, lpix);
-    _normalize_gradient_mad(img_grad, lpix);
 
     // Export gradient images for debugging when DT_DEBUG_VERBOSE is set.
     {
@@ -2844,6 +2888,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       _debug_export_gradient_pfm(ref_grad, lw, lh, label_ref);
       _debug_export_gradient_pfm(img_grad, lw, lh, label_img);
     }
+
 
     dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] ECC level %d (%dx%d): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
@@ -3011,8 +3056,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
             H_level[6], H_level[7]);
   }
 
-      // Level 0 is full-resolution; H_level is already in full-resolution
-      // pixel coordinates — copy it directly.
+      // Level 0 is full-resolution Bayer; H_level is already in full-resolution
+      // Bayer pixel coordinates.  No coordinate conversion is needed.
       memcpy(out_align->H, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
 
       // Only compute the residual mesh when the alignment is not identity.
@@ -3030,33 +3075,37 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
           {
             memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
             memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
-            // Step 1: Per-sublattice normalise (level 0 is raw Bayer)
+            // L0 mesh: same CFA-aware pipeline as ECC level 0.
             _normalize_bayer_per_channel(rn, pyr_ref.width[0], pyr_ref.height[0]);
             _normalize_bayer_per_channel(in, pyr_img.width[0], pyr_img.height[0]);
-            // Step 2: Log transform
-            _log1p_transform(rn, npix0);
-            _log1p_transform(in, npix0);
-            // Step 3: CFA-aware gradient (level 0 is full-resolution Bayer)
+            float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
+                                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                                     HDR_ALIGN_GRADIENT_MASK_HI);
+            float *img_mask0 = _build_mask_and_log1p(in, npix0,
+                                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                                     HDR_ALIGN_GRADIENT_MASK_HI);
             ref_grad0 = _gradient_bayer_cfa_sobel(rn, pyr_ref.width[0], pyr_ref.height[0]);
             img_grad0 = _gradient_bayer_cfa_sobel(in, pyr_img.width[0], pyr_img.height[0]);
-            // Step 4: MAD gradient normalization
             if(ref_grad0) _normalize_gradient_mad(ref_grad0, npix0);
             if(img_grad0) _normalize_gradient_mad(img_grad0, npix0);
+            _mask_gradient_by_intensity(ref_grad0, ref_mask0, npix0);
+            _mask_gradient_by_intensity(img_grad0, img_mask0, npix0);
+            dt_free_align(ref_mask0);
+            dt_free_align(img_mask0);
           }
           dt_free_align(rn);
           dt_free_align(in);
         }
         if(ref_grad0 && img_grad0)
         {
-          float mesh_dx_full[DT_HDR_ALIGN_MESH_NODES];
-          float mesh_dy_full[DT_HDR_ALIGN_MESH_NODES];
+          // L0 is full-resolution Bayer; mesh displacements are already in
+          // full-resolution pixel coordinates — no scaling needed.
           if(_estimate_mesh_residuals(ref_grad0, img_grad0,
                                       pyr_ref.width[0], pyr_ref.height[0],
-                                      H_level, mesh_dx_full, mesh_dy_full))
+                                      H_level, out_align->mesh_dx, out_align->mesh_dy))
           {
-            // Residuals are already in full-resolution pixel coordinates.
-            memcpy(out_align->mesh_dx, mesh_dx_full, sizeof(mesh_dx_full));
-            memcpy(out_align->mesh_dy, mesh_dy_full, sizeof(mesh_dy_full));
+            // mesh_dx / mesh_dy filled by _estimate_mesh_residuals on success;
+            // on failure the arrays remain zeroed from _zero_mesh() earlier.
           }
         }
         dt_free_align(ref_grad0);
@@ -3109,18 +3158,6 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   dt_opencl_unlock_device(devid);
 #endif
   return TRUE;
-
-error:
-  dt_free_align(gray_ref);
-  dt_free_align(gray_img);
-  out_align->H[0] = 1.0f; out_align->H[1] = 0.0f; out_align->H[2] = 0.0f;
-  out_align->H[3] = 0.0f; out_align->H[4] = 1.0f; out_align->H[5] = 0.0f;
-  out_align->H[6] = 0.0f; out_align->H[7] = 0.0f;
-  _zero_mesh(out_align->mesh_dx, out_align->mesh_dy);
-#ifdef HAVE_OPENCL
-  dt_opencl_unlock_device(devid);
-#endif
-  return FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -3681,53 +3718,6 @@ static gboolean _ecc_refine_level_cl(const int devid,
   dt_free_align(host_p23);
 
   return ok;
-}
-
-/** GPU acceleration for level-0 CFA-aware gradient computation.
- *
- *  Input @p bayer_log1p must be the per-sublattice percentile-normalised and
- *  log1p-compressed full-resolution Bayer image (i.e. the same buffer that
- *  would be passed to _gradient_bayer_cfa_sobel() on the CPU path).
- *
- *  The function uploads the image, dispatches hdr_align_gradient_bayer_cfa_sobel
- *  (stride-2 CFA Sobel, no cross-channel contamination), downloads the result
- *  and returns an allocated CPU-side gradient buffer.
- *
- *  MAD normalisation (_normalize_gradient_mad) is the caller's responsibility.
- *
- *  Returns an allocated float buffer on success; NULL on any CL failure.
- *  On failure the caller falls back to the CPU _gradient_bayer_cfa_sobel path. */
-static float *_l0_gradient_cl(const int devid,
-                               const dt_hdr_alignment_cl_global_t *g,
-                               const float *bayer_log1p,
-                               const int w,
-                               const int h)
-{
-  const size_t npix = (size_t)w * h;
-  cl_mem cl_in  = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
-  cl_mem cl_out = dt_opencl_alloc_device_buffer(devid, npix * sizeof(float));
-  float *result = (cl_in && cl_out) ? dt_alloc_align_float(npix) : NULL;
-
-  gboolean ok = (cl_in && cl_out && result);
-  if(ok)
-    ok = (dt_opencl_write_buffer_to_device(devid, (void *)bayer_log1p, cl_in, 0,
-                                           npix * sizeof(float), CL_TRUE) == CL_SUCCESS);
-  if(ok)
-    ok = (dt_opencl_enqueue_kernel_2d_args(
-              devid, g->kernel_gradient_bayer_cfa_sobel, w, h,
-              CLARG(cl_in), CLARG(cl_out), CLARG(w), CLARG(h)) == CL_SUCCESS);
-  if(ok)
-    ok = (dt_opencl_read_buffer_from_device(devid, result, cl_out, 0,
-                                            npix * sizeof(float), CL_TRUE) == CL_SUCCESS);
-
-  dt_opencl_release_mem_object(cl_in);
-  dt_opencl_release_mem_object(cl_out);
-  if(!ok)
-  {
-    dt_free_align(result);
-    return NULL;
-  }
-  return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -22,21 +22,20 @@
  * multi-resolution ECC (Enhanced Correlation Coefficient) alignment
  * pipeline:
  *   - Image warping by a 3×3 homography
- *   - Sobel gradient computation (stride-1 for levels ≥ 1, stride-2 CFA for level 0)
+ *   - Sobel gradient computation
  *   - log(1 + x) dynamic-range compression
  *   - Signed Sobel gradient sum (gx + gy) for exposure-invariant ECC input
  *   - Mean-absolute-deviation gradient normalisation
- *   - CFA-aware stride-2 Sobel for full-resolution Bayer level 0
+ *   - Bayer mosaic to grayscale conversion
  *   - 2× box-filter downsampling
  *   - ECC weighted accumulation passes
  *
  * Gradient preprocessing pipeline (applied before ECC):
  *   1. Percentile normalisation of raw pixels [CPU-only due to histogram pass]
- *   2. hdr_align_log1p                   – log(1 + x) dynamic range compression
- *   3a. hdr_align_compute_gradients       – Sobel gx, gy (levels ≥ 1)
- *   3b. hdr_align_gradient_bayer_cfa_sobel– stride-2 CFA Sobel (level 0)
- *   3c. hdr_align_gradient_sobel_sum      – combine into gx + gy (signed, levels ≥ 1)
- *   4. hdr_align_normalize_mad            – g / (mean(|g|) + ε)
+ *   2. hdr_align_log1p          – log(1 + x) dynamic range compression
+ *   3. hdr_align_compute_gradients – Sobel gx, gy
+ *   4. hdr_align_gradient_sobel_sum – combine into gx + gy (signed)
+ *   5. hdr_align_normalize_mad  – g / (mean(|g|) + ε)
  */
 
 /* ---------- Warp by projective homography ----------
@@ -212,23 +211,16 @@ hdr_align_normalize_mad(global float *g,
 }
 
 
-/* ---------- CFA-aware stride-2 Sobel gradient (level 0 full-resolution Bayer) ----------
+/* ---------- CFA-aware stride-2 Sobel gradient (L0 full-resolution Bayer) ----------
  *
- * At pyramid level 0 the input is the full-resolution raw Bayer mosaic that
- * has already been per-sublattice percentile-normalised and log1p-compressed
- * on the CPU.  A standard stride-1 Sobel kernel would produce large spurious
- * responses at every colour-filter boundary because neighbouring pixels
- * belong to different colour channels.
+ * Computes the signed Sobel gradient sum (gx + gy) for a full-resolution Bayer
+ * mosaic image.  Each output pixel uses only Sobel stencil neighbours from the
+ * same CFA channel (stride-2 offsets), avoiding amplitude-mixing between the
+ * G and R/B sublattices.
  *
- * This kernel avoids cross-channel contamination by using a stride-2 stencil:
- * every one of the 9 sample points is offset by an even number of pixels
- * from the centre, which preserves (x % 2, y % 2) and therefore guarantees
- * that all stencil points share the same CFA channel as the centre.
- * No explicit channel-mask or branching is needed; the loop over all (x, y)
- * simultaneously covers the R, Gr, Gb and B sublattices.
- *
- * Output: gx + gy (stride-2 Sobel sum), full-resolution, same size as input.
- * Border pixels (within 2 pixels of any edge) are set to 0.
+ * Must be called AFTER per-sublattice normalisation (done on CPU via
+ * _normalize_bayer_per_channel) so that all four sublattices have comparable
+ * amplitude ranges.  Border pixels within 2 of the image edge are set to zero.
  */
 kernel void
 hdr_align_gradient_bayer_cfa_sobel(global const float *bayer,
@@ -241,29 +233,25 @@ hdr_align_gradient_bayer_cfa_sobel(global const float *bayer,
   if(x >= width || y >= height) return;
 
   const size_t idx = (size_t)y * width + x;
-
   if(x < 2 || x >= width - 2 || y < 2 || y >= height - 2)
   {
     out[idx] = 0.0f;
     return;
   }
 
-  // Stride-2 Sobel: all 9 stencil points share the same CFA channel position
-  // as (x, y) because each offset is an even number (+/-2).
-  const float tl = bayer[(y - 2) * width + (x - 2)];
-  const float tc = bayer[(y - 2) * width + x];
-  const float tr = bayer[(y - 2) * width + (x + 2)];
-  const float ml = bayer[y * width + (x - 2)];
-  const float mr = bayer[y * width + (x + 2)];
-  const float bl = bayer[(y + 2) * width + (x - 2)];
-  const float bc = bayer[(y + 2) * width + x];
-  const float br = bayer[(y + 2) * width + (x + 2)];
+  const float tl = bayer[(size_t)(y - 2) * width + (x - 2)];
+  const float tc = bayer[(size_t)(y - 2) * width + x];
+  const float tr = bayer[(size_t)(y - 2) * width + (x + 2)];
+  const float ml = bayer[(size_t)y * width + (x - 2)];
+  const float mr = bayer[(size_t)y * width + (x + 2)];
+  const float bl = bayer[(size_t)(y + 2) * width + (x - 2)];
+  const float bc = bayer[(size_t)(y + 2) * width + x];
+  const float br = bayer[(size_t)(y + 2) * width + (x + 2)];
 
-  const float gx = (-tl + tr - 2.0f * ml + 2.0f * mr - bl + br) / 8.0f;
-  const float gy = (-tl - 2.0f * tc - tr + bl + 2.0f * bc + br) / 8.0f;
+  const float gx = (-tl + tr - 2.0f * ml + 2.0f * mr - bl + br) * 0.125f;
+  const float gy = (-tl - 2.0f * tc - tr + bl + 2.0f * bc + br) * 0.125f;
   out[idx] = gx + gy;
 }
-
 
 /* ---------- 2× box-filter downsample ---------- */
 kernel void
