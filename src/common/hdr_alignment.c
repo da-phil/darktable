@@ -31,6 +31,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+// ---------------------------------------------------------------------------
+// CFA mode selection
+// ---------------------------------------------------------------------------
+// When HDR_ALIGN_USE_FULL_CFA_L0 is defined (the default), the pyramid is
+// built from full-resolution Bayer data and the finest level (L0) retains
+// the four-colour CFA pattern.  L0 gradient computation uses a stride-2
+// Sobel filter that only mixes same-channel neighbours, preceded by a
+// per-sublattice normalisation that equalises the G/R/B amplitude
+// difference.  This produces cleaner gradients at full resolution because
+// saturated pixels corrupt only their own CFA channel's edge response
+// instead of contaminating a whole 2×2 block average.
+//
+// When HDR_ALIGN_USE_FULL_CFA_L0 is *undefined*, L0 is converted to
+// half-resolution grayscale by averaging each 2×2 Bayer block before the
+// pyramid is built, exactly as the original implementation did.  This mode
+// is the safe fallback and halves the L0 pixel count.
+//
+// Both modes use identical processing at L1 and above because the 2×
+// box-filter downsample inherently averages a Bayer block into one
+// grayscale value.
+#define HDR_ALIGN_USE_FULL_CFA_L0
+
 // Maximum rotation search range in degrees (for coarse exhaustive search)
 #define HDR_ALIGN_MAX_ANGLE_DEG 10.0f
 // Coarse rotation step in degrees
@@ -166,6 +188,42 @@ static float *_normalize_bayer(const float *mosaic,
   return out;
 }
 
+#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+/** Convert a full-resolution Bayer mosaic to half-resolution grayscale
+ *  by averaging each 2×2 Bayer block.  Output dimensions are (wd/2)×(ht/2).
+ *  This produces a photometrically uniform single-channel image suitable
+ *  for standard stride-1 Sobel filtering at all pyramid levels.
+ *  Caller must free the result. */
+static float *_mosaic_to_grayscale(const float *mosaic,
+                                   const int wd,
+                                   const int ht,
+                                   int *out_w,
+                                   int *out_h)
+{
+  const int gw = wd / 2;
+  const int gh = ht / 2;
+  float *out = dt_alloc_align_float((size_t)gw * gh);
+  if(!out) return NULL;
+
+  DT_OMP_FOR(collapse(2))
+  for(int y = 0; y < gh; y++)
+    for(int x = 0; x < gw; x++)
+    {
+      const int mx = x * 2;
+      const int my = y * 2;
+      out[y * gw + x] = 0.25f * (mosaic[my * wd + mx]
+                                  + mosaic[my * wd + mx + 1]
+                                  + mosaic[(my + 1) * wd + mx]
+                                  + mosaic[(my + 1) * wd + mx + 1]);
+    }
+
+  *out_w = gw;
+  *out_h = gh;
+  return out;
+}
+#endif /* !HDR_ALIGN_USE_FULL_CFA_L0 */
+
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
 /** Normalise each CFA sublattice of a Bayer mosaic to [0, 1] independently
  *  using a 99th-percentile stretch.
  *
@@ -282,6 +340,7 @@ static float *_gradient_bayer_cfa_sobel(const float *bayer,
     }
   return out;
 }
+#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
 
 /** Downsample an image by 2x using a box filter.
  *  Output dimensions are (w/2) x (h/2).  Caller must free the result. */
@@ -403,6 +462,23 @@ static void _homography_scale_to_finer(float H[HDR_ALIGN_H_NPARAM])
   H[6] *= 0.5f;
   H[7] *= 0.5f;
 }
+
+#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+/** Scale a homography from half-resolution local coordinates to
+ *  full-resolution Bayer coordinates.  The rotation/scale/shear components
+ *  (H[0],H[1],H[3],H[4]) are dimensionless and unchanged.  The
+ *  translation (H[2],H[5]) and perspective (H[6],H[7]) scale exactly
+ *  like _homography_scale_to_finer(). */
+static void _homography_local_to_full(const float H_local[HDR_ALIGN_H_NPARAM],
+                                      float H_full[HDR_ALIGN_H_NPARAM])
+{
+  memcpy(H_full, H_local, sizeof(float) * HDR_ALIGN_H_NPARAM);
+  H_full[2] *= 2.0f;  // tx
+  H_full[5] *= 2.0f;  // ty
+  H_full[6] *= 0.5f;  // p1
+  H_full[7] *= 0.5f;  // p2
+}
+#endif /* !HDR_ALIGN_USE_FULL_CFA_L0 */
 
 static void _homography_to_matrix(const float H[HDR_ALIGN_H_NPARAM],
                                   double M[3][3])
@@ -2499,17 +2575,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     return FALSE;
   }
 
-  // Step 1: Normalise Bayer mosaics and build full-resolution pyramids.
+  // Step 1: Normalise Bayer mosaics.
   //   Subtract the per-image black level and scale the candidate image by
   //   1 / (relative_exposure × relative_iso) so that both images are on the
   //   same effective photon-count scale.
-  //
-  //   The pyramid is built directly from full-resolution Bayer data.  Level 0
-  //   retains the full Bayer CFA structure; each subsequent level is a 2×
-  //   box-filter downsampling of the level below.  Since each 2×2 downsampling
-  //   step averages a Bayer block, levels L1 and above are effectively
-  //   grayscale-equivalent and can be processed with standard stride-1 Sobel.
-  //   Only L0 requires CFA-aware stride-2 Sobel (see _gradient_bayer_cfa_sobel).
   const float img_inv_exposure =
     (relative_exposure > 1e-12f && relative_iso > 1e-12f)
       ? 1.0f / (relative_exposure * relative_iso)
@@ -2527,9 +2596,27 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     return FALSE;
   }
 
-  // Step 2: Build pyramids from the full-resolution Bayer images.
+  // Step 2: Build the image pyramid.
+  //
+  // HDR_ALIGN_USE_FULL_CFA_L0 mode (default):
+  //   The pyramid is built directly from full-resolution Bayer data.  Level 0
+  //   retains the full CFA structure; each subsequent level is a 2× box-filter
+  //   downsampling.  Since each 2×2 step averages a Bayer block, L1 and above
+  //   are effectively grayscale.  Only L0 requires CFA-aware stride-2 Sobel
+  //   (see _gradient_bayer_cfa_sobel).
+  //
+  // Averaged Bayer mode (fallback):
+  //   The mosaic is first converted to half-resolution grayscale by averaging
+  //   each 2×2 Bayer block (_mosaic_to_grayscale).  The pyramid is then built
+  //   from grayscale data.  All levels use stride-1 Sobel.  The final
+  //   homography must be scaled from half-res to full-res coordinates.
   _pyramid_t pyr_ref, pyr_img;
-  if(!_build_pyramid(bayer_ref, wd, ht, &pyr_ref))
+  int pyr_w, pyr_h; // dimensions of pyramid level 0
+
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+  pyr_w = wd;
+  pyr_h = ht;
+  if(!_build_pyramid(bayer_ref, pyr_w, pyr_h, &pyr_ref))
   {
     dt_free_align(bayer_ref);
     dt_free_align(bayer_img);
@@ -2538,7 +2625,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 #endif
     return FALSE;
   }
-  if(!_build_pyramid(bayer_img, wd, ht, &pyr_img))
+  if(!_build_pyramid(bayer_img, pyr_w, pyr_h, &pyr_img))
   {
     _free_pyramid(&pyr_ref);
     dt_free_align(bayer_ref);
@@ -2548,9 +2635,46 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 #endif
     return FALSE;
   }
-
   dt_free_align(bayer_ref);
   dt_free_align(bayer_img);
+#else /* averaged Bayer mode */
+  {
+    float *gray_ref = _mosaic_to_grayscale(bayer_ref, wd, ht, &pyr_w, &pyr_h);
+    float *gray_img = _mosaic_to_grayscale(bayer_img, wd, ht, &pyr_w, &pyr_h);
+    dt_free_align(bayer_ref);
+    dt_free_align(bayer_img);
+    if(!gray_ref || !gray_img)
+    {
+      dt_free_align(gray_ref);
+      dt_free_align(gray_img);
+#ifdef HAVE_OPENCL
+      dt_opencl_unlock_device(devid);
+#endif
+      return FALSE;
+    }
+    if(!_build_pyramid(gray_ref, pyr_w, pyr_h, &pyr_ref))
+    {
+      dt_free_align(gray_ref);
+      dt_free_align(gray_img);
+#ifdef HAVE_OPENCL
+      dt_opencl_unlock_device(devid);
+#endif
+      return FALSE;
+    }
+    if(!_build_pyramid(gray_img, pyr_w, pyr_h, &pyr_img))
+    {
+      _free_pyramid(&pyr_ref);
+      dt_free_align(gray_ref);
+      dt_free_align(gray_img);
+#ifdef HAVE_OPENCL
+      dt_opencl_unlock_device(devid);
+#endif
+      return FALSE;
+    }
+    dt_free_align(gray_ref);
+    dt_free_align(gray_img);
+  }
+#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
 
   // Track whether the finest-level alignment concluded that no correction is
   // needed.  When identity is selected we skip the residual mesh computation:
@@ -2786,20 +2910,26 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // Compute gradient images for exposure-invariant ECC.
     // The signed gradient sum (gx + gy) preserves structure and direction.
     //
-    // At L0 the pyramid data is full-resolution Bayer.  Use per-sublattice
-    // normalisation (_normalize_bayer_per_channel) followed by CFA-aware
-    // stride-2 Sobel (_gradient_bayer_cfa_sobel) so that each CFA channel's
-    // gradients have comparable amplitude.  Without per-sublattice
-    // normalisation the G channels (typically ~2× brighter) would produce
-    // ~2× larger gradients than R/B, creating a Bayer-frequency amplitude
-    // pattern that suppresses ECC ρ to ≈ 0.28 regardless of alignment
-    // quality — this was the root cause of the alignment regression.
+    // When HDR_ALIGN_USE_FULL_CFA_L0 is defined (the default):
+    //   At L0 the pyramid data is full-resolution Bayer.  Use per-sublattice
+    //   normalisation (_normalize_bayer_per_channel) followed by CFA-aware
+    //   stride-2 Sobel (_gradient_bayer_cfa_sobel) so that each CFA channel's
+    //   gradients have comparable amplitude.  Without per-sublattice
+    //   normalisation the G channels (typically ~2× brighter) would produce
+    //   ~2× larger gradients than R/B, creating a Bayer-frequency amplitude
+    //   pattern that suppresses ECC ρ to ≈ 0.28 regardless of alignment
+    //   quality — this was the root cause of the alignment regression.
+    //
+    // When HDR_ALIGN_USE_FULL_CFA_L0 is not defined:
+    //   L0 is already half-resolution grayscale (2×2 Bayer block average).
+    //   Standard global percentile normalisation + stride-1 Sobel is used,
+    //   identical to L1 and above.
     //
     // At L1 and above the pyramid data is grayscale-equivalent (each 2×2
     // box-filter downsampling step averages a Bayer block), so standard
     // global percentile normalisation and stride-1 Sobel are appropriate.
     //
-    // In both cases: mask → log1p → gradient → MAD normalise → apply mask.
+    // In both cases: normalise → mask → log1p → gradient → MAD normalise → apply mask.
     const size_t lpix = (size_t)lw * lh;
     float *ref_norm = dt_alloc_align_float(lpix);
     float *img_norm = dt_alloc_align_float(lpix);
@@ -2817,9 +2947,19 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     float *ref_grad = NULL;
     float *img_grad = NULL;
 
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
     if(l == 0)
     {
-      // L0: full-resolution Bayer — per-sublattice normalization + CFA Sobel
+      // L0: full-resolution Bayer — per-sublattice normalization + CFA Sobel.
+      //
+      // The stride-2 Sobel filter reads only from pixels that belong to the
+      // same CFA channel, so it never mixes G and R/B values.  This is both
+      // more robust to saturated pixels (a blown R pixel does not contaminate
+      // the G channel's gradient) and produces sharper edges because no
+      // inter-channel blurring occurs.
+      //
+      // The per-sublattice percentile normalisation ensures all four CFA
+      // sublattices contribute equally to the ECC objective function.
       _normalize_bayer_per_channel(ref_norm, lw, lh);
       _normalize_bayer_per_channel(img_norm, lw, lh);
       float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
@@ -2840,8 +2980,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // DOF escalation and the identity check below.
     }
     else
+#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
     {
-      // L1+: grayscale-equivalent — global percentile norm + stride-1 Sobel
+      // L1+ (or all levels in averaged-Bayer fallback): grayscale-equivalent —
+      // global percentile norm + stride-1 Sobel.
       _normalize_image_percentile(ref_norm, lpix);
       _normalize_image_percentile(img_norm, lpix);
       float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
@@ -2852,9 +2994,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                                               HDR_ALIGN_GRADIENT_MASK_HI);
       ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
       img_grad = _gradient_sobel_sum(img_norm, lw, lh);
-      dt_free_align(ref_norm);
-      dt_free_align(img_norm);
-      ref_norm = img_norm = NULL;
+      // At L0 in CFA mode, ref_norm/img_norm are needed for ρ scoring.
+      // In averaged-Bayer mode L0 is grayscale-equivalent and can also be
+      // used for ρ scoring; keep alive when l==0.
+      if(l > 0)
+      {
+        dt_free_align(ref_norm);
+        dt_free_align(img_norm);
+        ref_norm = img_norm = NULL;
+      }
       if(ref_grad) _normalize_gradient_mad(ref_grad, lpix);
       if(img_grad) _normalize_gradient_mad(img_grad, lpix);
       _mask_gradient_by_intensity(ref_grad, ref_mask, lpix);
@@ -3045,67 +3193,104 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
             H_level[6], H_level[7]);
   }
 
-      // Level 0 is full-resolution Bayer; H_level is already in full-resolution
-      // Bayer pixel coordinates.  No coordinate conversion is needed.
-      memcpy(out_align->H, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
+  // Output the homography in full-resolution Bayer pixel coordinates.
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+  // L0 is already full-resolution — H_level maps directly.
+  memcpy(out_align->H, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
+#else
+  // L0 is half-resolution grayscale — scale H back to full-resolution.
+  _homography_local_to_full(H_level, out_align->H);
+#endif
 
-      // Only compute the residual mesh when the alignment is not identity.
-      // If identity was selected at the finest level the images are already
-      // well-aligned and mesh estimation would only add noise.
-      if(!h_is_identity)
+  // Only compute the residual mesh when the alignment is not identity.
+  // If identity was selected at the finest level the images are already
+  // well-aligned and mesh estimation would only add noise.
+  if(!h_is_identity)
+  {
+    float *ref_grad0 = NULL;
+    float *img_grad0 = NULL;
+    {
+      const int l0w = pyr_ref.width[0];
+      const int l0h = pyr_ref.height[0];
+      const size_t npix0 = (size_t)l0w * l0h;
+      float *rn = dt_alloc_align_float(npix0);
+      float *in = dt_alloc_align_float(npix0);
+      if(rn && in)
       {
-        float *ref_grad0 = NULL;
-        float *img_grad0 = NULL;
-        {
-          const size_t npix0 = (size_t)pyr_ref.width[0] * pyr_ref.height[0];
-          float *rn = dt_alloc_align_float(npix0);
-          float *in = dt_alloc_align_float(npix0);
-          if(rn && in)
-          {
-            memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
-            memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
-            // L0 mesh: same CFA-aware pipeline as ECC level 0.
-            _normalize_bayer_per_channel(rn, pyr_ref.width[0], pyr_ref.height[0]);
-            _normalize_bayer_per_channel(in, pyr_img.width[0], pyr_img.height[0]);
-            float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
-                                                     HDR_ALIGN_GRADIENT_MASK_LO,
-                                                     HDR_ALIGN_GRADIENT_MASK_HI);
-            float *img_mask0 = _build_mask_and_log1p(in, npix0,
-                                                     HDR_ALIGN_GRADIENT_MASK_LO,
-                                                     HDR_ALIGN_GRADIENT_MASK_HI);
-            ref_grad0 = _gradient_bayer_cfa_sobel(rn, pyr_ref.width[0], pyr_ref.height[0]);
-            img_grad0 = _gradient_bayer_cfa_sobel(in, pyr_img.width[0], pyr_img.height[0]);
-            if(ref_grad0) _normalize_gradient_mad(ref_grad0, npix0);
-            if(img_grad0) _normalize_gradient_mad(img_grad0, npix0);
-            _mask_gradient_by_intensity(ref_grad0, ref_mask0, npix0);
-            _mask_gradient_by_intensity(img_grad0, img_mask0, npix0);
-            dt_free_align(ref_mask0);
-            dt_free_align(img_mask0);
-          }
-          dt_free_align(rn);
-          dt_free_align(in);
-        }
-        if(ref_grad0 && img_grad0)
-        {
-          // L0 is full-resolution Bayer; mesh displacements are already in
-          // full-resolution pixel coordinates — no scaling needed.
-          if(_estimate_mesh_residuals(ref_grad0, img_grad0,
-                                      pyr_ref.width[0], pyr_ref.height[0],
-                                      H_level, out_align->mesh_dx, out_align->mesh_dy))
-          {
-            // mesh_dx / mesh_dy filled by _estimate_mesh_residuals on success;
-            // on failure the arrays remain zeroed from _zero_mesh() earlier.
-          }
-        }
-        dt_free_align(ref_grad0);
-        dt_free_align(img_grad0);
+        memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
+        memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+        // L0 mesh: same CFA-aware pipeline as ECC level 0.
+        _normalize_bayer_per_channel(rn, l0w, l0h);
+        _normalize_bayer_per_channel(in, l0w, l0h);
+        float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
+                                                  HDR_ALIGN_GRADIENT_MASK_LO,
+                                                  HDR_ALIGN_GRADIENT_MASK_HI);
+        float *img_mask0 = _build_mask_and_log1p(in, npix0,
+                                                  HDR_ALIGN_GRADIENT_MASK_LO,
+                                                  HDR_ALIGN_GRADIENT_MASK_HI);
+        ref_grad0 = _gradient_bayer_cfa_sobel(rn, l0w, l0h);
+        img_grad0 = _gradient_bayer_cfa_sobel(in, l0w, l0h);
+#else
+        // L0 mesh: same grayscale pipeline as ECC level 0.
+        _normalize_image_percentile(rn, npix0);
+        _normalize_image_percentile(in, npix0);
+        float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
+                                                  HDR_ALIGN_GRADIENT_MASK_LO,
+                                                  HDR_ALIGN_GRADIENT_MASK_HI);
+        float *img_mask0 = _build_mask_and_log1p(in, npix0,
+                                                  HDR_ALIGN_GRADIENT_MASK_LO,
+                                                  HDR_ALIGN_GRADIENT_MASK_HI);
+        ref_grad0 = _gradient_sobel_sum(rn, l0w, l0h);
+        img_grad0 = _gradient_sobel_sum(in, l0w, l0h);
+#endif
+        if(ref_grad0) _normalize_gradient_mad(ref_grad0, npix0);
+        if(img_grad0) _normalize_gradient_mad(img_grad0, npix0);
+        _mask_gradient_by_intensity(ref_grad0, ref_mask0, npix0);
+        _mask_gradient_by_intensity(img_grad0, img_mask0, npix0);
+        dt_free_align(ref_mask0);
+        dt_free_align(img_mask0);
       }
+      dt_free_align(rn);
+      dt_free_align(in);
+    }
+    if(ref_grad0 && img_grad0)
+    {
+      // Mesh operates at pyramid L0 resolution.  Compute the mesh H in L0
+      // coordinates and convert displacements to full-resolution afterwards.
+      float H_mesh[HDR_ALIGN_H_NPARAM];
+#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+      // L0 is full-resolution Bayer — H_level maps directly.
+      memcpy(H_mesh, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
+#else
+      // L0 is half-resolution — use H_level (still in L0 coords).
+      memcpy(H_mesh, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
+#endif
+      if(_estimate_mesh_residuals(ref_grad0, img_grad0,
+                                  pyr_ref.width[0], pyr_ref.height[0],
+                                  H_mesh, out_align->mesh_dx, out_align->mesh_dy))
+      {
+#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+        // Scale mesh displacements from half-resolution to full-resolution.
+        for(int i = 0; i < DT_HDR_ALIGN_MESH_NODES; i++)
+        {
+          out_align->mesh_dx[i] *= 2.0f;
+          out_align->mesh_dy[i] *= 2.0f;
+        }
+#endif
+        // mesh_dx / mesh_dy filled by _estimate_mesh_residuals on success;
+        // on failure the arrays remain zeroed from _zero_mesh() earlier.
+      }
+    }
+    dt_free_align(ref_grad0);
+    dt_free_align(img_grad0);
+  }
 
   dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] final homography: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1]",
-               out_align->H[0], out_align->H[1], out_align->H[2],
-               out_align->H[3], out_align->H[4], out_align->H[5],
-               out_align->H[6], out_align->H[7]);
+           "[hdr_merge] final homography: H=[%.5f %.5f %.2f; %.5f %.5f %.2f; %.7f %.7f 1]",
+           out_align->H[0], out_align->H[1], out_align->H[2],
+           out_align->H[3], out_align->H[4], out_align->H[5],
+           out_align->H[6], out_align->H[7]);
 
   // Named decomposition of the homography elements.
   // H = [ h11  h12  tx  ]   h11≈cos(θ)·sx  h12≈sin(θ)·sy  tx = translation x
@@ -3122,9 +3307,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       ? (out_align->H[0] * out_align->H[1] + out_align->H[3] * out_align->H[4])
         / (sx * sy)
       : 0.0f;
-      const float approx_angle = atan2f(out_align->H[1], out_align->H[0]);
-      const float mesh_max = _mesh_max_abs(out_align->mesh_dx, out_align->mesh_dy);
-      dt_print(DT_DEBUG_HDRMERGE,
+    const float approx_angle = atan2f(out_align->H[1], out_align->H[0]);
+    const float mesh_max = _mesh_max_abs(out_align->mesh_dx, out_align->mesh_dy);
+    dt_print(DT_DEBUG_HDRMERGE,
              "[hdr_merge] final homography decomposed:"
              " tx=%.1f ty=%.1f rotation=%.3f°"
              " scale_x=%.5f scale_y=%.5f shear=%.5f"
