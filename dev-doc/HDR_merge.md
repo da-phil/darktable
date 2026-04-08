@@ -534,7 +534,7 @@ Interpretation:
 
 For one candidate frame the estimator does the following:
 
-1. Build the Bayer pyramid directly from full-resolution Bayer data — **no half-resolution grayscale conversion**.  Each `2×` downsampling step (L0→L1, L1→L2, …) averages a `2×2` Bayer block to one value, so L1 and above are already grayscale-equivalent.  Only L0 retains the full CFA structure.
+1. Build the Bayer pyramid directly from full-resolution Bayer data — **no half-resolution grayscale conversion**.  Each `2×` downsampling step (L0→L1, L1→L2, …) averages a `2×2` Bayer block to one value, so L1 and above are already grayscale-equivalent.  Only L0 retains the full CFA structure.  *(This is the default mode when the `HDR_ALIGN_USE_FULL_CFA_L0` macro is defined.  When undefined, the code falls back to converting L0 to half-resolution grayscale by averaging each `2×2` Bayer block before building the pyramid — all levels then use stride-1 Sobel with global percentile normalisation and the final homography is scaled from half-res to full-res coordinates.)*
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
 3. **Gradient preprocessing (per-level)**:
    - **At L0 (full-resolution Bayer)**: per-sublattice percentile normalisation (`_normalize_bayer_per_channel`, normalises each of the four CFA channels independently to `[0,1]`) → build validity mask → log(1+x) → CFA-aware stride-2 Sobel gradient sum (`_gradient_bayer_cfa_sobel`) → MAD normalisation → apply validity mask.

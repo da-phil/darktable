@@ -41,10 +41,22 @@ typedef struct dt_hdr_alignment_t
  *  Both images must be single-channel float Bayer mosaic data of identical
  *  dimensions (as produced by the rawprepare IOP).
  *
- *  The Bayer pyramid is built directly from full-resolution Bayer data.
- *  Each 2× downsampling step averages a 2×2 Bayer block (so L1+ are
- *  grayscale-equivalent); only L0 retains the CFA structure and uses a
- *  CFA-aware stride-2 Sobel after per-sublattice normalisation.
+ *  Two L0 modes are available, controlled by the HDR_ALIGN_USE_FULL_CFA_L0
+ *  preprocessor macro in hdr_alignment.c:
+ *
+ *    HDR_ALIGN_USE_FULL_CFA_L0 defined (default):
+ *      The pyramid is built from full-resolution Bayer data.  L0 retains
+ *      the CFA structure and uses per-sublattice normalisation followed by
+ *      a CFA-aware stride-2 Sobel filter.  L1+ are grayscale-equivalent
+ *      (each 2× box-filter step averages a Bayer block) and use stride-1
+ *      Sobel.  The final homography is directly in full-resolution coords.
+ *
+ *    HDR_ALIGN_USE_FULL_CFA_L0 not defined (fallback):
+ *      L0 is converted to half-resolution grayscale by averaging each 2×2
+ *      Bayer block.  All levels use stride-1 Sobel with global percentile
+ *      normalisation.  The final homography is converted from half-res to
+ *      full-resolution coordinates.
+ *
  *  Per-pixel normalisation:
  *    normalised = max(pixel - black_level, 0) / (relative_exposure × relative_iso)
  *  Both black levels are typically 0 when rawprepare has already subtracted
