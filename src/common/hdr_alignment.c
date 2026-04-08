@@ -2271,12 +2271,9 @@ static float _try_dof_escalation(const float *ref_grad,
                                  const float *img_intensity,
                                  const int w,
                                  const int h,
+                                 const float rho_3dof,
                                  float H[HDR_ALIGN_H_NPARAM])
 {
-  // Measure current (3-DOF) quality using gradient magnitude PCC.
-  const float rho_3dof = _ecc_compute_rho(ref_intensity, img_intensity, w, h, H);
-  dt_print(DT_DEBUG_HDRMERGE, "[hdr_merge] DOF escalation: 3-DOF ρ=%.5f", rho_3dof);
-
   // Save the 3-DOF result so we can fall back.
   float H_3dof[HDR_ALIGN_H_NPARAM];
   memcpy(H_3dof, H, sizeof(H_3dof));
@@ -2293,7 +2290,7 @@ static float _try_dof_escalation(const float *ref_grad,
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 6-DOF ρ=%.5f (Δρ=%.5f, sane=%d)",
+           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d)",
            rho_6dof, improvement_6, sane_6);
 
   const gboolean accept_6 = sane_6
@@ -2325,7 +2322,7 @@ static float _try_dof_escalation(const float *ref_grad,
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 8-DOF ρ=%.5f (Δρ vs 6-DOF=%.5f, sane=%d)",
+           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d)",
            rho_8dof, improvement_8, sane_8);
 
   const gboolean accept_8 = sane_8
@@ -2336,9 +2333,7 @@ static float _try_dof_escalation(const float *ref_grad,
   if(accept_8)
   {
     memcpy(H, H_8dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
-    dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] DOF escalation: accepted 8-DOF (ρ %.5f → %.5f → %.5f)",
-             rho_3dof, rho_6dof, rho_8dof);
+    dt_print(DT_DEBUG_HDRMERGE, "[hdr_merge] DOF escalation: accepted 8-DOF");
     return rho_8dof;
   }
   else
@@ -2346,8 +2341,7 @@ static float _try_dof_escalation(const float *ref_grad,
     // 8-DOF did not improve — keep 6-DOF result.
     memcpy(H, H_6dof, sizeof(float) * HDR_ALIGN_H_NPARAM);
     dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] DOF escalation: accepted 6-DOF (ρ %.5f → %.5f)",
-             rho_3dof, rho_6dof);
+             "[hdr_merge] DOF escalation: 8-DOF no improvement over 6-DOF, keeping 6-DOF");
     return rho_6dof;
   }
 }
@@ -2995,8 +2989,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       const float rho_3dof = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_level);
 
       dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] pre-escalation: 3-DOF ρ=%.5f identity ρ=%.5f",
-               rho_3dof, rho_id);
+               "[hdr_merge] DOF escalation: identity ρ=%.4f", rho_id);
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] DOF escalation: 3-DOF ρ=%.4f (Δρ=%+.4f vs identity)",
+               rho_3dof, rho_3dof - rho_id);
 
       float rho_best;
       if(rho_3dof <= rho_id)
@@ -3006,8 +3002,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         // waste time and risk producing a spurious large transform from a bad
         // basin.  Use identity directly.
         dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] 3-DOF ρ already degraded below identity"
-                 " -- skipping DOF escalation, reverting to identity");
+                 "[hdr_merge] DOF escalation: 3-DOF below identity -- reverting to identity");
         memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
         rho_best = rho_id;
         h_is_identity = TRUE;
@@ -3017,21 +3012,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         // 3-DOF improved over identity: attempt higher-DOF refinement.
         rho_best = _try_dof_escalation(ref_grad, img_grad,
                                        ref_norm, img_norm,
-                                       lw, lh, H_level);
+                                       lw, lh, rho_3dof, H_level);
 
         // Identity comparison: always check whether the identity transform
         // (no alignment) correlates at least as well as the best DOF result.
-        // A wrong H — even one with moderate ρ — is worse than no correction
-        // if the images are already well-aligned or escalation wandered to a
-        // wrong local minimum.  This catches both low-ρ catastrophic failures
-        // and medium-ρ wrong solutions.
-        dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] identity check: ρ_aligned=%.5f ρ_identity=%.5f",
-                 rho_best, rho_id);
         if(rho_id >= rho_best)
         {
           dt_print(DT_DEBUG_HDRMERGE,
-                   "[hdr_merge] identity ρ >= aligned ρ -- reverting to identity");
+                   "[hdr_merge] DOF escalation: best ρ=%.5f < identity ρ=%.5f -- reverting to identity",
+                   rho_best, rho_id);
           memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
           h_is_identity = TRUE;
         }
