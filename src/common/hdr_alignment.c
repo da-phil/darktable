@@ -259,6 +259,11 @@ static float *_mosaic_to_grayscale(const float *mosaic,
  *  representation because green has the highest quantum efficiency and
  *  there are two samples per block.
  *
+ *  NOTE: This assumes an RGGB Bayer pattern (the standard darktable
+ *  convention for raw mosaic data after rawprepare).  For GRBG, BGGR or
+ *  GBRG patterns the green pixel offsets would differ, but darktable's
+ *  raw pipeline normalises all patterns to RGGB before this stage.
+ *
  *  Unlike _mosaic_to_grayscale (which averages all four RGGB pixels), this
  *  avoids mixing dissimilar spectral channels: a saturated red pixel cannot
  *  contaminate the green-derived luminance.  The result is photometrically
@@ -3154,7 +3159,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       if(delta >  (float)M_PI) delta -= 2.0f * (float)M_PI;
       if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
       // steps_from_coarsest == 0 at the coarsest ECC level, increases toward L0.
-      const int steps_from_coarsest = first_ecc_level - l;
+      // Clamped to HDR_ALIGN_MAX_PYRAMID_LEVELS to prevent bit-shift overflow.
+      const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
       const float angle_limit_deg = fmaxf(
         HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE / (float)(1 << steps_from_coarsest),
         HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN);
@@ -3181,7 +3187,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       const float dtx = H_level[2] - H_backup[2];
       const float dty = H_level[5] - H_backup[5];
-      const int steps_from_coarsest = first_ecc_level - l;
+      const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
       const float trans_limit = fmaxf(
         HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE / (float)(1 << steps_from_coarsest),
         HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN);
