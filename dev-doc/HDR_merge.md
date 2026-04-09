@@ -475,7 +475,7 @@ The alignment pipeline uses different motion models at different stages:
 
 1. **ECC refinement** uses option (b), a native 3-DOF Euclidean model (rotation + translation). The optimizer builds its Hessian and Jacobian entirely in the $(\theta, t_x, t_y)$ parameter space, so no energy can leak into shear, scale, or perspective DOFs.
 
-2. **Adaptive DOF escalation** (at the finest pyramid level only): if the 3-DOF fit is insufficient, the pipeline attempts chain escalation — first to option (d) 6-DOF affine, and only if that improves ρ, then to option (e) 8-DOF projective ECC. Each accepted step must pass improvement, conditioning, and sanity checks. If a step does not improve ρ, escalation stops and reverts to the last accepted model.
+2. **Adaptive DOF escalation** (at an intermediate pyramid level): once the 3-DOF fit has been refined to a mid-resolution level (shortest edge ≥ `HDR_ALIGN_ESCALATION_MIN_DIM` = 512 px), the pipeline attempts chain escalation — first to option (d) 6-DOF affine, and only if that improves ρ, then to option (e) 8-DOF projective ECC. Each accepted step must pass improvement, conditioning, and sanity checks. If a step does not improve ρ, escalation stops and reverts to the last accepted model. Once a higher-DOF model is accepted, it is used for all remaining finer pyramid levels.
 
 3. **Corner refinement** uses option (e), computing a local 4-point homography correction from NCC patches at the four image corners. This absorbs weak perspective and residual scale that the preceding ECC model did not capture.
 
@@ -495,19 +495,19 @@ Projecting the 8-DOF solution back onto 3-DOF after solving is not equivalent to
 
 The native 3-DOF solver eliminates this problem entirely: the 3×3 Hessian only has Euclidean directions, so every update is guaranteed to stay on the rigid-body manifold.
 
-The adaptive DOF escalation then introduces higher-DOF models only at the finest level, using chain escalation: starting from the stable 3-DOF solution, it first tries 6-DOF affine; if that improves ρ, it tries 8-DOF projective from the 6-DOF result; if any step does not improve, escalation stops and keeps the last accepted model. This avoids the instability problems of running higher-DOF ECC throughout the pyramid while still capturing perspective and scale corrections when the data supports them.
+The adaptive DOF escalation then introduces higher-DOF models at an intermediate pyramid level (shortest edge ≥ 512 px), using chain escalation: starting from the stable 3-DOF solution, it first tries 6-DOF affine; if that improves ρ, it tries 8-DOF projective from the 6-DOF result; if any step does not improve, escalation stops and keeps the last accepted model. Once accepted, the higher-DOF model is used for all remaining finer levels, continuously refining the extra parameters (scale, shear, perspective) at increasing resolution. This avoids the instability problems of running higher-DOF ECC from the coarsest levels while still capturing perspective and scale corrections when the data supports them. Moving escalation to mid-pyramid (instead of only at the finest level) significantly reduces computation cost since the escalation solver runs on a smaller image, while still providing enough spatial information to constrain the extra DOFs.
 
-#### Why higher-DOF models are not used during the pyramid
+#### Why higher-DOF models start at an intermediate level
 
-Options (c) through (e) were all tried as ECC models during the multi-resolution pyramid and found to be increasingly unstable under large exposure differences:
+Options (c) through (e) were all tried as ECC models during the full multi-resolution pyramid and found to be increasingly unstable under large exposure differences at coarse levels:
 
 - Similarity (4 DOF): scale DOF absorbed gradient magnitude differences as geometric zoom
 - Affine (6 DOF): shear and anisotropic scale DOFs drifted under noise
 - Projective (8 DOF): perspective terms amplified instability, especially at coarse pyramid levels
 
-The fundamental issue is that ECC on gradient-magnitude images of differently-exposed brackets produces a Hessian with unfavorable condition numbers in the non-rigid directions. Restricting the pyramid solver to 3-DOF avoids this entirely.
+The fundamental issue is that ECC on gradient-magnitude images of differently-exposed brackets produces a Hessian with unfavorable condition numbers in the non-rigid directions at coarse levels. Restricting the coarse pyramid solver to 3-DOF avoids this entirely.
 
-The adaptive escalation at the finest level sidesteps these problems because: (a) it starts from an already-converged 3-DOF solution, (b) it runs only at fine resolution where gradients are well-resolved, and (c) it is gated by conditioning and sanity checks that reject unstable solutions.
+The adaptive escalation at the intermediate level sidesteps these problems because: (a) it starts from an already-converged 3-DOF solution that has been refined through multiple pyramid levels, (b) it runs at a resolution where gradients are well-resolved (shortest edge ≥ 512 px), and (c) it is gated by conditioning and sanity checks that reject unstable solutions. Once accepted, the higher-DOF model is refined at each subsequent finer level, allowing the extra parameters to converge smoothly with increasing resolution rather than being estimated in a single expensive pass at the finest level.
 
 Option (f), a general local warp, would be even more expressive but is too large a jump in complexity and risk for the current raw-domain HDR merge path.
 
@@ -553,8 +553,8 @@ For one candidate frame the estimator does the following:
 5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
 7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with adaptive per-level drift guards (see below).
-8. At the finest level, check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, skip DOF escalation entirely and revert to identity immediately (the ECC pyramid wandered to a wrong local minimum). Otherwise, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
-9. **Identity comparison**: if DOF escalation ran, compare the best aligned ρ against identity ρ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
+8. At the designated escalation level (first level with shortest edge ≥ `HDR_ALIGN_ESCALATION_MIN_DIM` = 512 px), check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, skip DOF escalation. Otherwise, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below). If escalation succeeds, use the higher-DOF model for all remaining finer levels.
+9. Continue refining the accepted motion model (3-DOF, 6-DOF, or 8-DOF) through finer pyramid levels. At L0, perform a **final identity comparison**: compare the best ρ against identity ρ and revert to identity if identity is at least as good (see _Identity Detection_ below).
 10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
 11. Estimate local residual shifts on a small `3x3` grid of patches.
 12. Regularize that residual field with neighbor smoothness.
@@ -595,17 +595,23 @@ flowchart TD
         ECC3 --> DRIFT{angle/trans drift\n> adaptive limit?}
         DRIFT -- Yes --> REVERT[revert to H_level backup]
         DRIFT -- No --> KEEP[keep ECC result]
-        REVERT --> NEXT_LVL
-        KEEP --> NEXT_LVL
+        REVERT --> ESC_CHK
+        KEEP --> ESC_CHK
+        ESC_CHK{escalation level\nreached?}
+        ESC_CHK -- No --> NEXT_LVL
+        ESC_CHK -- Yes --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
+        PRE_ID_CHK -- Yes --> SKIP_ESC[skip DOF escalation\nkeep 3-DOF]
+        PRE_ID_CHK -- No --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
+        DOF --> DOF_OK{escalation\nimproved ρ?}
+        DOF_OK -- Yes --> SET_DOF[set current_dof = 6 or 8\nuse higher-DOF for finer levels]
+        DOF_OK -- No --> SKIP_ESC
+        SKIP_ESC --> NEXT_LVL
+        SET_DOF --> NEXT_LVL
     end
 
-    ECC_LOOP -- level 0 reached --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
-    PRE_ID_CHK -- Yes --> REVERT_PRE[revert to identity\nskip DOF escalation]
-    PRE_ID_CHK -- No --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
-    REVERT_PRE --> CORNER
-    DOF --> ID_CHK{ρ_identity ≥\nρ_aligned?}
-    ID_CHK -- Yes --> REVERT_ID[revert to identity H]
-    ID_CHK -- No --> KEEP_H[keep aligned H]
+    ECC_LOOP -- level 0 reached --> L0_ID{ρ_identity ≥\nρ_current at L0?}
+    L0_ID -- Yes --> REVERT_ID[revert to identity H]
+    L0_ID -- No --> KEEP_H[keep aligned H]
     REVERT_ID --> CORNER
     KEEP_H --> CORNER[corner NCC correction\n4-point local homography]
     CORNER --> MESH[estimate 3×3 residual mesh]
@@ -1115,19 +1121,19 @@ The current layered design (3-DOF ECC + adaptive DOF escalation + 4-point corner
 
 ### Adaptive DOF Escalation
 
-After the 3-DOF Euclidean ECC pyramid converges at the finest level, the alignment pipeline measures the weighted ECC score $\rho$ and decides whether the rigid fit is sufficient or whether higher-DOF models should be attempted.
+At an intermediate pyramid level (the first level whose shortest edge is at least `HDR_ALIGN_ESCALATION_MIN_DIM` = 512 px), the alignment pipeline measures the weighted ECC score $\rho$ and decides whether the rigid fit is sufficient or whether higher-DOF models should be attempted. If escalation succeeds, the higher-DOF model is used for all remaining finer pyramid levels.
 
 #### Motivation
 
 The 3-DOF Euclidean model is maximally stable under large exposure differences, but it can only correct rotation and translation. When the true misalignment includes weak perspective or anisotropic scale (e.g. from a slightly shifted viewpoint between brackets), the rigid model leaves residual blur that the subsequent corner refinement and mesh stages may not fully absorb.
 
-Adaptive DOF escalation addresses this by selectively introducing additional degrees of freedom only when the data supports them.
+Adaptive DOF escalation addresses this by selectively introducing additional degrees of freedom only when the data supports them. By escalating at a mid-resolution level (rather than only at the finest level), the expensive higher-DOF solver runs on a smaller image (≈ 512 px shortest edge), and the accepted model is then refined through all remaining finer levels. This is both cheaper and more robust than a single-level escalation at full resolution.
 
 #### Pipeline
 
-The escalation runs once, at pyramid level 0 (the finest grayscale level), between 3-DOF ECC convergence and corner refinement:
+The escalation runs once, at the designated escalation level (the first level with shortest edge ≥ 512 px), between 3-DOF ECC convergence and the remaining finer levels:
 
-1. **Pre-escalation identity gate**: measure the 3-DOF result ρ and the identity ρ at the finest level. If 3-DOF ρ ≤ identity ρ, the ECC pyramid has already degraded below identity — skip all escalation and revert to identity immediately. This prevents higher-DOF models (which start from a bad basin) from producing spurious large transforms.
+1. **Pre-escalation identity gate**: measure the 3-DOF result ρ and the identity ρ at the escalation level. If 3-DOF ρ ≤ identity ρ, the ECC pyramid has already degraded below identity — skip all escalation. This prevents higher-DOF models (which start from a bad basin) from producing spurious large transforms.
 
 2. **Measure baseline quality**: compute the weighted ECC score $\rho_{3}$ of the converged 3-DOF result on gradient-magnitude images.
 
@@ -1139,6 +1145,8 @@ The escalation runs once, at pyramid level 0 (the finest grayscale level), betwe
 4. **Try 8-DOF projective** (only if 6-DOF improved): starting from the 6-DOF result, run up to `HDR_ALIGN_ESCALATION_MAX_ITER` ECC iterations with the full 8-DOF projective Jacobian. Accept under the same gating criteria. If 6-DOF did not improve, escalation stops here.
 
 5. **Select best**: the pipeline accepts the highest-DOF result that passed all checks. If neither escalation step improved $\rho$, the original 3-DOF result is kept unchanged.
+
+6. **Continue with accepted DOF**: all remaining finer pyramid levels use the accepted motion model (3-DOF, 6-DOF, or 8-DOF) via the `_ecc_refine_level_higher_dof` solver. At L0, a final identity check ensures the result is better than no alignment.
 
 #### Mathematical Formulation
 
@@ -1243,8 +1251,9 @@ No changes to the corner refinement acceptance thresholds were needed.
 | `HDR_ALIGN_ESCALATION_MAX_ITER` | $50$ | Maximum ECC iterations per escalation stage |
 | `HDR_ALIGN_ESCALATION_EPSILON` | $5 \times 10^{-3}$ | Convergence threshold for escalated ECC |
 | `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.50$ | Maximum $|\sqrt{\det(A_{2\times2})} - 1|$ for geometric-mean scale sanity |
+| `HDR_ALIGN_ESCALATION_MIN_DIM` | $512$ | Minimum shortest-edge size (px) for escalation to trigger |
 
-The pre-escalation identity gate (step 1) is the primary safeguard for well-aligned stacks: if 3-DOF ρ ≤ identity ρ (images already well-aligned or ECC wandered), escalation is skipped entirely. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed. The improvement gates ($0.01$ for 6-DOF, $0.005$ for 8-DOF) prevent accepting results that are numerically but not visually better.
+The pre-escalation identity gate (step 1) is the primary safeguard for well-aligned stacks: if 3-DOF ρ ≤ identity ρ (images already well-aligned or ECC wandered), escalation is skipped entirely. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed. The improvement gates ($0.01$ for 6-DOF, $0.005$ for 8-DOF) prevent accepting results that are numerically but not visually better. The `HDR_ALIGN_ESCALATION_MIN_DIM` threshold (512 px) ensures the escalation level has sufficient spatial information to constrain the higher-DOF parameters — at smaller resolutions the gradient image does not contain enough structure to reliably estimate scale, shear, or perspective.
 
 ### Identity Detection
 
@@ -1277,25 +1286,27 @@ By comparing $\rho$ values directly, the early-out participates in the same comp
 
 #### Layer 2: Fine-level identity comparison
 
-At pyramid level 0 (the finest grayscale level), **before** attempting DOF escalation, the pipeline computes the 3-DOF ρ and compares it immediately against the identity ρ. If 3-DOF ρ ≤ identity ρ, the ECC pyramid already degraded below identity and DOF escalation is skipped — the pipeline reverts to identity immediately.
+The pipeline performs identity checks at two points in the pyramid:
 
-If 3-DOF ρ > identity ρ, DOF escalation runs normally. After escalation, the pipeline performs a final identity comparison:
+**At the escalation level** (shortest edge ≥ 512 px), **before** attempting DOF escalation, the pipeline computes the 3-DOF ρ and compares it immediately against the identity ρ. If 3-DOF ρ ≤ identity ρ, the ECC pyramid already degraded below identity and DOF escalation is skipped.
+
+**At L0** (the finest level), a final identity comparison runs regardless of the current DOF model. The pipeline computes:
 
 $$
 \rho_{identity} = \rho(H_{id}, G_{ref}, G_{img}),
 $$
 
-where $H_{id}$ is the $3\times 3$ identity homography. This is compared against the aligned $\rho$:
+where $H_{id}$ is the $3\times 3$ identity homography. This is compared against the current result:
 
 $$
-\text{if} \quad \rho_{identity} \geq \rho_{aligned}, \quad \text{revert to identity.}
+\text{if} \quad \rho_{identity} \geq \rho_{current}, \quad \text{revert to identity.}
 $$
 
-The post-escalation identity comparison runs only when DOF escalation was attempted (3-DOF ρ > identity ρ at the start). Together with the pre-escalation gate, the two-stage check at level 0 catches:
+Together, the escalation-level and L0 identity checks catch:
 
-1. **ECC pyramid drift** (pre-escalation gate): 3-DOF result already below identity → skip escalation, use identity.
-2. **Escalation overshoot** (post-escalation check): escalated result still worse than identity → revert to identity.
-3. **Medium-$\rho$ wrong solutions** (post-escalation check): the optimizer converged to a plausible-looking but incorrect alignment that is still worse than no correction.
+1. **ECC pyramid drift** (escalation-level gate): 3-DOF result already below identity → skip escalation.
+2. **Escalation overshoot** (L0 check): escalated result refined through finer levels is still worse than identity → revert.
+3. **Medium-$\rho$ wrong solutions** (L0 check): the optimizer converged to a plausible-looking but incorrect alignment that is still worse than no correction.
 
 Both the aligned and identity $\rho$ values are always logged for diagnostics:
 
@@ -1410,18 +1421,17 @@ For a typical HDR merge of a 4784×3188 bracket pair:
 | Phase | Before (single-threaded) | After (8-core OMP) |
 |---|---|---|
 | ECC pyramid (levels 7→0) | ~48 s | ~8 s |
-| DOF escalation | ~47 s | ~8 s |
+| DOF escalation (mid-pyramid) | ~12 s | ~3 s |
 | Mesh residuals | ~0.5 s | ~0.5 s |
-| Total alignment | ~96 s | ~17 s |
+| Total alignment | ~61 s | ~12 s |
 
-*Estimates based on the 3-pass × 50-iteration × 8-level worst case.  Actual speedup depends on convergence behavior (many levels stall early) and system configuration.*
+*Estimates based on the 3-pass × 50-iteration × 8-level worst case.  DOF escalation at mid-pyramid (≈512 px) is significantly cheaper than the previous L0-only regime (≈4784 px).  Actual speedup depends on convergence behavior (many levels stall early) and system configuration.*
 
 ## Future Work
 
 Potential refinements to the alignment pipeline:
 
 - **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ for DOF escalation is conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range).
-- **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
 - **Full OpenCL pipeline**: The OpenCL kernels cover all pixel-level operations needed for a full GPU-resident alignment pipeline. The remaining work is pipeline orchestration: building the pyramid on the GPU, running the convergence/drift loops on the GPU, and keeping data in GPU memory across levels to eliminate host↔device transfers.
 

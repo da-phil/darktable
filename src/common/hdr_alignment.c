@@ -202,6 +202,17 @@
 // than real image geometry.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
 
+// Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
+// The escalation runs at the first (coarsest) pyramid level whose shortest
+// edge is at least this value.  At smaller resolutions the gradient image
+// does not contain enough spatial information to constrain 6-/8-DOF models
+// reliably.  Once escalated, the higher-DOF model is kept for all remaining
+// finer levels, so the expensive escalation runs on a relatively small image
+// while finer levels benefit from the better motion model.
+// 512 pixels is chosen as a balance: large enough for perspective / scale
+// to be resolvable (≈ 60 gradient Sobel wavelengths), small enough to
+// avoid the full-resolution cost of the previous L0-only regime.
+#define HDR_ALIGN_ESCALATION_MIN_DIM 512
 
 #define HDR_ALIGN_MESH_INDEX(row, col) ((row) * DT_HDR_ALIGN_MESH_COLS + (col))
 
@@ -2673,7 +2684,7 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
   return TRUE;
 }
 
-/** Attempt adaptive DOF escalation at the finest pyramid level.
+/** Attempt adaptive DOF escalation at the designated escalation level.
  *  Measures the weighted ECC score of the current 3-DOF result and
  *  selectively tries higher-DOF models when the rigid fit is insufficient.
  *
@@ -2685,6 +2696,10 @@ static gboolean _homography_is_sane_escalated(const float H[HDR_ALIGN_H_NPARAM],
  *  If a step does not improve, escalation stops and falls back to
  *  the last accepted model.  Each accepted step must also pass a
  *  Hessian conditioning check and a geometric sanity check.
+ *
+ *  When escalation succeeds, the caller sets current_dof to the
+ *  accepted DOF level and all subsequent finer pyramid levels use
+ *  the higher-DOF solver.
  *
  *  Returns the best ρ achieved (either from the accepted DOF level or the
  *  original 3-DOF result).  Returns -2 on measurement failure. */
@@ -3220,8 +3235,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   _homography_from_similarity(best_tx, best_ty, best_angle, best_scale, cw, ch, H_level);
 
   // Note: the 3-DOF rigid ECC at intermediate pyramid levels will overwrite the
-  // scale component of H (it only optimises rotation + translation).  The 6-DOF
-  // escalation at level 0 will recover scale from the correct translation basin.
+  // scale component of H (it only optimises rotation + translation).  Once DOF
+  // escalation succeeds at the escalation level, the 6-/8-DOF solver will
+  // recover and refine scale for all remaining finer levels.
 
   // Step 4: Multi-resolution ECC refinement.
   //
@@ -3245,6 +3261,30 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       break;
     }
   }
+
+  // Determine the pyramid level at which DOF escalation will be attempted.
+  // This is the coarsest level whose shortest edge is at least
+  // HDR_ALIGN_ESCALATION_MIN_DIM.  If no level qualifies (images too small),
+  // escalation falls back to level 0 (the old behaviour).
+  int escalation_level = 0;
+  for(int l = coarsest; l >= 0; l--)
+  {
+    if(MIN(pyr_ref.width[l], pyr_ref.height[l]) >= HDR_ALIGN_ESCALATION_MIN_DIM)
+    {
+      escalation_level = l;
+      break;
+    }
+  }
+  dt_print(DT_DEBUG_HDRMERGE,
+           "[hdr_merge] DOF escalation target: level %d (%dx%d)",
+           escalation_level,
+           pyr_ref.width[escalation_level],
+           pyr_ref.height[escalation_level]);
+
+  // Track the currently accepted DOF model.  Starts at 3 (Euclidean);
+  // once escalation succeeds this changes to 6 (affine) or 8 (projective)
+  // and all subsequent finer levels use the higher-DOF solver.
+  int current_dof = 3;
 
   for(int l = coarsest; l >= 0; l--)
   {
@@ -3314,8 +3354,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                                          HDR_ALIGN_PREFILTER_SIGMA, NULL);
       img_grad = _compute_level_gradient(img_norm, lw, lh,
                                          HDR_ALIGN_PREFILTER_SIGMA, NULL);
-      // Keep ref_norm/img_norm alive at l==0 for ρ scoring.
-      if(l == 0)
+      // Keep ref_norm/img_norm alive from escalation_level down to L0 for ρ
+      // scoring (DOF escalation at escalation_level, identity check at L0).
+      if(l <= escalation_level)
       {
         // Restore for ρ scoring (the blur modified the data).
         memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
@@ -3353,8 +3394,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
 
     dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] ECC level %d (%dx%d): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
-             l, lw, lh,
+             "[hdr_merge] ECC level %d (%dx%d, %d-DOF): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
+             l, lw, lh, current_dof,
              H_level[0], H_level[1], H_level[2],
              H_level[3], H_level[4], H_level[5],
              H_level[6], H_level[7]);
@@ -3363,159 +3404,222 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     float H_backup[HDR_ALIGN_H_NPARAM];
     memcpy(H_backup, H_level, sizeof(H_backup));
 
-    gboolean ran_cl = FALSE;
-#ifdef HAVE_OPENCL
-    if(use_cl)
-      ran_cl = _ecc_refine_level_cl(devid, g_cl, ref_grad, img_grad, lw, lh, H_level);
-#endif
-    float ecc_update;
-    if(ran_cl)
+    if(current_dof > 3)
     {
-      // GPU path ran; compute the convergence metric for the guard checks.
-      // We don't propagate the per-iteration update from the CL path out of
-      // _ecc_refine_level_cl, so treat a successful CL run as converged for
-      // the drift guards (they compare H_level vs H_backup regardless).
-      ecc_update = 0.0f;
+      // Higher-DOF solver (6 or 8 DOF) — runs on CPU only.
+      // After DOF escalation succeeded at an earlier level, all subsequent
+      // finer levels use the higher-DOF solver so the extra parameters
+      // (scale, shear, perspective) are continuously refined.
+      const float rho = _ecc_refine_level_higher_dof(ref_grad, img_grad,
+                                                      ref_norm, img_norm,
+                                                      lw, lh, H_level,
+                                                      current_dof);
+      (void)rho; // ρ is logged internally; we rely on sanity checks below.
+
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] ECC level %d (%d-DOF): ρ=%.4f", l, current_dof, rho);
+
+      // Sanity check: use the escalated sanity check since we have higher DOF.
+      if(!_homography_is_sane_escalated(H_level, lw, lh, current_dof))
+      {
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] ECC level %d (%d-DOF): result failed sanity check, reverting",
+                 l, current_dof);
+        memcpy(H_level, H_backup, sizeof(H_level));
+      }
     }
     else
     {
-      ecc_update = _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
-    }
-    // ecc_update < HDR_ALIGN_ECC_EPSILON means the optimiser genuinely
-    // converged; stall or max-iteration exits return a larger (or zero) value.
-    const gboolean ecc_converged = (ecc_update >= 0.0f && ecc_update < HDR_ALIGN_ECC_EPSILON);
+      // 3-DOF Euclidean ECC — use CL path if available, else CPU.
+      gboolean ran_cl = FALSE;
+#ifdef HAVE_OPENCL
+      if(use_cl)
+        ran_cl = _ecc_refine_level_cl(devid, g_cl, ref_grad, img_grad, lw, lh, H_level);
+#endif
+      float ecc_update;
+      if(ran_cl)
+      {
+        // GPU path ran; compute the convergence metric for the guard checks.
+        // We don't propagate the per-iteration update from the CL path out of
+        // _ecc_refine_level_cl, so treat a successful CL run as converged for
+        // the drift guards (they compare H_level vs H_backup regardless).
+        ecc_update = 0.0f;
+      }
+      else
+      {
+        ecc_update = _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+      }
+      // ecc_update < HDR_ALIGN_ECC_EPSILON means the optimiser genuinely
+      // converged; stall or max-iteration exits return a larger (or zero) value.
+      const gboolean ecc_converged = (ecc_update >= 0.0f && ecc_update < HDR_ALIGN_ECC_EPSILON);
 
-    // Sanity check: revert if ECC produced a physically implausible
-    // homography (e.g. large scale change or perspective).
-    if(!_homography_is_sane(H_level, lw, lh))
-    {
-      dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] ECC level %d: result failed sanity check, reverting",
-               l);
-      memcpy(H_level, H_backup, sizeof(H_level));
-    }
-
-    // Angle drift guard: if ECC changed the rotation by more than the
-    // per-level tolerance it wandered to a wrong local maximum.  Revert to
-    // the pre-level homography so the error does not cascade to finer levels.
-    //
-    // The tolerance is adaptive: the base value (HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE)
-    // applies at the coarsest ECC level.  For each step toward L0 the
-    // tolerance is halved, because the parent estimate is already refined
-    // and finer levels should only introduce sub-pixel corrections.
-    // The minimum is clamped to HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN.
-    //
-    // Skip the guard when ECC genuinely converged — a converged rotation is
-    // trustworthy even if it moved more than the default tolerance.
-    if(!ecc_converged)
-    {
-      float delta = atan2f(H_level[3], H_level[0])
-                  - atan2f(H_backup[3], H_backup[0]);
-      if(delta >  (float)M_PI) delta -= 2.0f * (float)M_PI;
-      if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
-      // steps_from_coarsest == 0 at the coarsest ECC level, increases toward L0.
-      // Clamped to HDR_ALIGN_MAX_PYRAMID_LEVELS to prevent bit-shift overflow.
-      const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
-      const float angle_limit_deg = fmaxf(
-        HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE / (float)(1 << steps_from_coarsest),
-        HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN);
-      const float max_delta = angle_limit_deg * (float)M_PI / 180.0f;
-      if(fabsf(delta) > max_delta)
+      // Sanity check: revert if ECC produced a physically implausible
+      // homography (e.g. large scale change or perspective).
+      if(!_homography_is_sane(H_level, lw, lh))
       {
         dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
-                 l, delta * 180.0f / (float)M_PI, angle_limit_deg);
+                 "[hdr_merge] ECC level %d: result failed sanity check, reverting",
+                 l);
         memcpy(H_level, H_backup, sizeof(H_level));
       }
-    }
 
-    // Translation drift guard: if ECC shifted the translation by more than
-    // the per-level tolerance, the optimiser has wandered.  Each level
-    // inherits a 2×-scaled estimate from its parent, so the expected
-    // correction is at most a few pixels.  Large shifts at any single level
-    // indicate a wrong local minimum, and the error doubles at every finer
-    // level, producing catastrophically wrong final alignments.
-    //
-    // The tolerance is adaptive (same halving schedule as the angle guard).
-    // Skip the guard when ECC genuinely converged — the result is trusted.
-    if(!ecc_converged)
-    {
-      const float dtx = H_level[2] - H_backup[2];
-      const float dty = H_level[5] - H_backup[5];
-      const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
-      const float trans_limit = fmaxf(
-        HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE / (float)(1 << steps_from_coarsest),
-        HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN);
-      if(fabsf(dtx) > trans_limit
-         || fabsf(dty) > trans_limit)
+      // Angle drift guard: if ECC changed the rotation by more than the
+      // per-level tolerance it wandered to a wrong local maximum.  Revert to
+      // the pre-level homography so the error does not cascade to finer levels.
+      //
+      // The tolerance is adaptive: the base value (HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE)
+      // applies at the coarsest ECC level.  For each step toward L0 the
+      // tolerance is halved, because the parent estimate is already refined
+      // and finer levels should only introduce sub-pixel corrections.
+      // The minimum is clamped to HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN.
+      //
+      // Skip the guard when ECC genuinely converged — a converged rotation is
+      // trustworthy even if it moved more than the default tolerance.
+      if(!ecc_converged)
       {
-        dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] ECC level %d: translation drift (%.2f, %.2f) px"
-                 " > limit %.1f px, reverting",
-                 l, dtx, dty, trans_limit);
-        memcpy(H_level, H_backup, sizeof(H_level));
+        float delta = atan2f(H_level[3], H_level[0])
+                    - atan2f(H_backup[3], H_backup[0]);
+        if(delta >  (float)M_PI) delta -= 2.0f * (float)M_PI;
+        if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
+        // steps_from_coarsest == 0 at the coarsest ECC level, increases toward L0.
+        // Clamped to HDR_ALIGN_MAX_PYRAMID_LEVELS to prevent bit-shift overflow.
+        const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
+        const float angle_limit_deg = fmaxf(
+          HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE / (float)(1 << steps_from_coarsest),
+          HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN);
+        const float max_delta = angle_limit_deg * (float)M_PI / 180.0f;
+        if(fabsf(delta) > max_delta)
+        {
+          dt_print(DT_DEBUG_HDRMERGE,
+                   "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
+                   l, delta * 180.0f / (float)M_PI, angle_limit_deg);
+          memcpy(H_level, H_backup, sizeof(H_level));
+        }
       }
-    }
 
-    // Adaptive DOF escalation at the finest level: if the 3-DOF rigid fit
-    // left significant residual misalignment (low ρ), attempt 6-DOF affine
-    // and then 8-DOF projective refinement gated by improvement and sanity.
-    if(l == 0)
+      // Translation drift guard: if ECC shifted the translation by more than
+      // the per-level tolerance, the optimiser has wandered.  Each level
+      // inherits a 2×-scaled estimate from its parent, so the expected
+      // correction is at most a few pixels.  Large shifts at any single level
+      // indicate a wrong local minimum, and the error doubles at every finer
+      // level, producing catastrophically wrong final alignments.
+      //
+      // The tolerance is adaptive (same halving schedule as the angle guard).
+      // Skip the guard when ECC genuinely converged — the result is trusted.
+      if(!ecc_converged)
+      {
+        const float dtx = H_level[2] - H_backup[2];
+        const float dty = H_level[5] - H_backup[5];
+        const int steps_from_coarsest = MIN(first_ecc_level - l, HDR_ALIGN_MAX_PYRAMID_LEVELS);
+        const float trans_limit = fmaxf(
+          HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE / (float)(1 << steps_from_coarsest),
+          HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN);
+        if(fabsf(dtx) > trans_limit
+           || fabsf(dty) > trans_limit)
+        {
+          dt_print(DT_DEBUG_HDRMERGE,
+                   "[hdr_merge] ECC level %d: translation drift (%.2f, %.2f) px"
+                   " > limit %.1f px, reverting",
+                   l, dtx, dty, trans_limit);
+          memcpy(H_level, H_backup, sizeof(H_level));
+        }
+      }
+    } // end 3-DOF branch
+
+    // --- Adaptive DOF escalation ---
+    // At the designated escalation level, attempt 6-DOF affine and then
+    // 8-DOF projective refinement.  If accepted, all subsequent finer
+    // levels will use the higher-DOF solver.
+    if(l == escalation_level && current_dof == 3 && ref_norm && img_norm)
     {
-      // ref_norm / img_norm are still alive at level 0 for ρ scoring.
-
       // Compute identity ρ first so we can gate DOF escalation correctly.
       // If the 3-DOF result is already worse than identity, the ECC pyramid
       // wandered to a wrong local minimum.  Higher-DOF models starting from
-      // that degraded point will only drift further — skip escalation entirely
-      // and use identity directly, which is the correct result for images that
-      // are already well-aligned.
+      // that degraded point will only drift further — skip escalation entirely.
       const float H_id[HDR_ALIGN_H_NPARAM]
         = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
       const float rho_id = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_id);
       const float rho_3dof = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_level);
 
       dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] DOF escalation: identity ρ=%.4f", rho_id);
+               "[hdr_merge] DOF escalation at level %d: identity ρ=%.4f",
+               l, rho_id);
       dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] DOF escalation: 3-DOF ρ=%.4f (Δρ=%+.4f vs identity)",
-               rho_3dof, rho_3dof - rho_id);
+               "[hdr_merge] DOF escalation at level %d: 3-DOF ρ=%.4f (Δρ=%+.4f vs identity)",
+               l, rho_3dof, rho_3dof - rho_id);
 
-      float rho_best;
       if(rho_3dof <= rho_id)
       {
-        // ECC already degraded below identity — skip DOF escalation entirely.
-        // Higher-DOF models starting from a worse-than-identity point would
-        // waste time and risk producing a spurious large transform from a bad
-        // basin.  Use identity directly.
+        // ECC already degraded below identity — skip DOF escalation.
         dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] DOF escalation: 3-DOF below identity -- reverting to identity");
-        memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
-        rho_best = rho_id;
-        h_is_identity = TRUE;
+                 "[hdr_merge] DOF escalation: 3-DOF below identity -- skipping escalation");
       }
       else
       {
         // 3-DOF improved over identity: attempt higher-DOF refinement.
-        rho_best = _try_dof_escalation(ref_grad, img_grad,
-                                       ref_norm, img_norm,
-                                       lw, lh, rho_3dof, H_level);
+        const float rho_before = rho_3dof;
+        const float rho_best = _try_dof_escalation(ref_grad, img_grad,
+                                                    ref_norm, img_norm,
+                                                    lw, lh, rho_3dof, H_level);
 
-        // Identity comparison: always check whether the identity transform
-        // (no alignment) correlates at least as well as the best DOF result.
-        if(rho_id >= rho_best)
+        // Determine which DOF was accepted by checking H_level parameters:
+        // if perspective terms (H[6],H[7]) are nonzero → 8-DOF;
+        // if off-diagonal/scale terms differ from rigid → 6-DOF.
+        if(rho_best > rho_before)
+        {
+          // Check if perspective terms are set (8-DOF was accepted).
+          if(fabsf(H_level[6]) > 1e-9f || fabsf(H_level[7]) > 1e-9f)
+            current_dof = 8;
+          else
+            current_dof = 6;
+
+          dt_print(DT_DEBUG_HDRMERGE,
+                   "[hdr_merge] DOF escalation: accepted %d-DOF (ρ=%.4f→%.4f), "
+                   "using %d-DOF for remaining levels",
+                   current_dof, rho_before, rho_best, current_dof);
+        }
+        else
         {
           dt_print(DT_DEBUG_HDRMERGE,
-                   "[hdr_merge] DOF escalation: best ρ=%.5f < identity ρ=%.5f -- reverting to identity",
-                   rho_best, rho_id);
-          memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
-          h_is_identity = TRUE;
+                   "[hdr_merge] DOF escalation: no improvement, keeping 3-DOF");
         }
       }
+    }
 
+    // --- Final identity check at L0 ---
+    // Regardless of which DOF model was used, verify at the finest level
+    // that the result is better than identity.  If not, revert.
+    if(l == 0 && ref_norm && img_norm)
+    {
+      const float H_id[HDR_ALIGN_H_NPARAM]
+        = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+      const float rho_id = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_id);
+      const float rho_cur = _ecc_compute_rho(ref_norm, img_norm, lw, lh, H_level);
+
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] L0 identity check: current ρ=%.4f, identity ρ=%.4f",
+               rho_cur, rho_id);
+
+      if(rho_id >= rho_cur)
+      {
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] L0: current ρ=%.5f ≤ identity ρ=%.5f -- reverting to identity",
+                 rho_cur, rho_id);
+        memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
+        h_is_identity = TRUE;
+      }
+    }
+
+    // Free intensity images when done with them.
+    if(ref_norm)
+    {
       dt_free_align(ref_norm);
+      ref_norm = NULL;
+    }
+    if(img_norm)
+    {
       dt_free_align(img_norm);
-      ref_norm = img_norm = NULL;
+      img_norm = NULL;
     }
 
     if(l <= 1)

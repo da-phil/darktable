@@ -37,8 +37,10 @@
  *   5. gx + gy signed sum, MAD normalise, apply mask
  *
  * The Gaussian pre-filter and magnitude-based masking steps run entirely
- * on the CPU.  The CL kernels handle ECC iteration (warp, accumulate,
- * Hessian).  Gradient preprocessing is identical for CPU and CL paths.
+ * on the CPU.  The CL kernels handle 3-DOF ECC iteration (warp,
+ * accumulate, Hessian).  Higher-DOF ECC (6-DOF affine / 8-DOF projective)
+ * after mid-pyramid DOF escalation also runs on the CPU.
+ * Gradient preprocessing is identical for CPU and CL paths.
  */
 
 /* ---------- Warp by projective homography ----------
