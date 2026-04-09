@@ -18,6 +18,7 @@
 
 #include "common/hdr_alignment.h"
 #include "common/darktable.h"
+#include "common/gaussian.h"
 #include "common/interpolation.h"
 #include "common/math.h"
 #include "common/pfm.h"
@@ -138,6 +139,29 @@
 #define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN  2.0f
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
+
+// --- Spatial pre-filtering parameters ---
+// Gaussian blur sigma (in pixels) applied to each pyramid level before
+// gradient extraction.  Suppresses sensor noise and Bayer-residual
+// high-frequency artefacts that would otherwise create spurious gradient
+// energy and degrade ECC convergence.  At coarse pyramid levels (shortest
+// edge < HDR_ALIGN_PREFILTER_MIN_DIM) the blur is skipped because the 2×
+// box-filter downsampling already provides sufficient anti-aliasing.
+#define HDR_ALIGN_PREFILTER_SIGMA 3.0f
+// Minimum shortest-edge dimension for applying the Gaussian pre-filter.
+// Below this size the image is too small for a σ=3 blur to be meaningful.
+#define HDR_ALIGN_PREFILTER_MIN_DIM 64
+
+// --- Gradient magnitude normalization parameters ---
+// Power exponent applied to the percentile-normalised gradient magnitude
+// before mask construction.  Values < 1 compress strong gradients and
+// lift weak ones, giving more uniform weight to texture-rich and smooth
+// regions alike.  0.5 (square root) is a good default.
+#define HDR_ALIGN_GRAD_MAG_POWER 0.5f
+// Threshold applied to the [0,1]-normalised gradient magnitude.
+// Pixels below this fraction of the 99th-percentile magnitude are
+// considered too featureless for reliable ECC alignment and are masked out.
+#define HDR_ALIGN_GRAD_MAG_THRESHOLD 0.02f
 // Number of Jacobi smoothing iterations for the residual mesh.
 #define HDR_ALIGN_MESH_SMOOTH_ITERS 12
 // Smoothness weight used when regularising the residual mesh.
@@ -938,6 +962,298 @@ static void _normalize_gradient_mad(float *g, const size_t npix)
   for(size_t i = 0; i < npix; i++)
     g[i] *= inv_scale;
 }
+
+/** Apply in-place Gaussian pre-filter to a single-channel image.
+ *  Uses darktable's existing IIR Gaussian implementation for efficiency.
+ *  Skipped when the shortest dimension is below HDR_ALIGN_PREFILTER_MIN_DIM
+ *  (at that size the 2× downsampling already provides sufficient smoothing). */
+static void _gaussian_prefilter(float *img, const int w, const int h,
+                                const float sigma)
+{
+  if(!img || sigma <= 0.0f) return;
+  if(MIN(w, h) < HDR_ALIGN_PREFILTER_MIN_DIM) return;
+
+  dt_gaussian_mean_blur(img, w, h, 1, sigma);
+}
+
+/** Normalise gradient magnitude to [0,1] using a 99th-percentile stretch,
+ *  then apply power scaling and a low-end threshold.
+ *
+ *  Steps:
+ *    1. Find the 99th-percentile of the magnitude → white_point
+ *    2. Divide every pixel by white_point, clamp to [0,1]
+ *    3. Apply power scaling: m[i] = m[i]^power  (compresses strong gradients,
+ *       lifts weak ones, giving more uniform weight)
+ *    4. Apply threshold: m[i] < threshold → 0  (featureless regions excluded)
+ *
+ *  This replaces the previous raw-intensity percentile normalisation and
+ *  moves the normalisation to operate on gradient magnitude instead,
+ *  which is more directly related to alignment feature quality. */
+static void _normalize_magnitude_percentile_power(float *mag,
+                                                   const size_t npix,
+                                                   const float power,
+                                                   const float threshold)
+{
+  if(!mag || npix == 0) return;
+
+  // Find the global maximum to set histogram range.
+  float vmax = 0.0f;
+  for(size_t i = 0; i < npix; i++)
+    if(mag[i] > vmax) vmax = mag[i];
+
+  if(vmax < 1e-12f) return;
+
+  // Build a 4096-bin histogram over [0, vmax].
+  enum { NBINS = 4096 };
+  size_t hist[NBINS] = { 0 };
+  const float inv_vmax = (float)(NBINS - 1) / vmax;
+  for(size_t i = 0; i < npix; i++)
+  {
+    const int bin = (int)(mag[i] * inv_vmax);
+    hist[CLAMP(bin, 0, NBINS - 1)]++;
+  }
+
+  // Walk the histogram to find the 99th-percentile bin as white point.
+  const size_t target = (size_t)((double)npix * 0.99);
+  size_t cumul = 0;
+  int p99_bin = NBINS - 1;
+  for(int b = 0; b < NBINS; b++)
+  {
+    cumul += hist[b];
+    if(cumul >= target) { p99_bin = b; break; }
+  }
+  const float white_point = (float)(p99_bin + 1) / (float)NBINS * vmax;
+  if(white_point < 1e-12f) return;
+
+  // Stretch [0, white_point] → [0, 1], apply power scaling, then threshold.
+  const float inv_wp = 1.0f / white_point;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+  {
+    float v = CLAMP(mag[i] * inv_wp, 0.0f, 1.0f);
+    if(power != 1.0f) v = powf(v, power);
+    mag[i] = (v >= threshold) ? v : 0.0f;
+  }
+}
+
+/** Build a gradient-magnitude-based mask for ECC input images.
+ *
+ *  The mask is 1 where the normalised+power-scaled gradient magnitude is
+ *  above zero (i.e., passed the threshold in _normalize_magnitude_percentile_power)
+ *  AND the raw-intensity pixel is not saturated/underexposed.
+ *
+ *  @p mag_norm  Percentile-normalised, power-scaled gradient magnitude
+ *               (modified in-place by _normalize_magnitude_percentile_power).
+ *  @p raw_norm  Raw pixel values normalised to [0,1] by percentile stretch
+ *               (used to detect saturated/underexposed pixels).
+ *  @p lo, @p hi Intensity thresholds for the validity mask.
+ *
+ *  Returns a newly allocated mask buffer. Caller must free. */
+static float *_build_gradient_mask(const float *mag_norm,
+                                   const float *raw_norm,
+                                   const size_t npix,
+                                   const float lo,
+                                   const float hi)
+{
+  float *mask = dt_alloc_align_float(npix);
+  if(!mask) return NULL;
+
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+  {
+    // Gradient magnitude above threshold AND intensity in valid range
+    mask[i] = (mag_norm[i] > 0.0f && raw_norm[i] >= lo && raw_norm[i] <= hi)
+              ? 1.0f : 0.0f;
+  }
+  return mask;
+}
+
+/** Complete per-level gradient pipeline following the restructured order:
+ *
+ *    1. Spatial pre-filtering with Gaussian blur (skip at coarse levels)
+ *    2. Gradient extraction: compute gx, gy and gradient magnitude
+ *    3. Normalize (percentile), threshold and power scaling of magnitude
+ *    4. Mask construction (magnitude-based + saturated pixel removal)
+ *    5. Prepare ECC input: signed sum gx+gy with mask applied
+ *
+ *  The caller provides a copy of the pyramid level data (will be modified
+ *  in-place by the blur).  Returns the masked gradient image suitable for
+ *  ECC.  Also optionally returns the mask via @p out_mask for the caller
+ *  to apply to the warped image gradient.
+ *
+ *  @param level_data  Pyramid level pixel data (modified in-place by blur)
+ *  @param w           Width of the level
+ *  @param h           Height of the level
+ *  @param sigma       Gaussian pre-filter sigma (0 to skip)
+ *  @param out_mask    [out, optional] Returns the validity mask if non-NULL
+ *  @return            Masked, normalised gradient image (caller frees), or NULL
+ */
+static float *_compute_level_gradient(float *level_data,
+                                      const int w,
+                                      const int h,
+                                      const float sigma,
+                                      float **out_mask)
+{
+  const size_t npix = (size_t)w * h;
+
+  // Step 1: Spatial pre-filtering with Gaussian blur.
+  //         Suppresses sensor noise and Bayer-residual high-frequency
+  //         artefacts before gradient extraction.
+  _gaussian_prefilter(level_data, w, h, sigma);
+
+  // Step 2: Gradient extraction — compute Sobel gx, gy.
+  float *gx = dt_alloc_align_float(npix);
+  float *gy = dt_alloc_align_float(npix);
+  if(!gx || !gy)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    return NULL;
+  }
+  _compute_gradients(level_data, w, h, gx, gy);
+
+  // Compute gradient magnitude sqrt(gx² + gy²).
+  float *mag = dt_alloc_align_float(npix);
+  if(!mag)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    return NULL;
+  }
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    mag[i] = sqrtf(gx[i] * gx[i] + gy[i] * gy[i]);
+
+  // Step 3: Normalize (percentile), threshold and power scaling of magnitude.
+  _normalize_magnitude_percentile_power(mag, npix,
+                                        HDR_ALIGN_GRAD_MAG_POWER,
+                                        HDR_ALIGN_GRAD_MAG_THRESHOLD);
+
+  // Step 4: Mask construction.
+  //         Normalize the raw intensity to [0,1] for saturated pixel detection.
+  //         We need a separate copy because the Gaussian blur modified level_data.
+  //         We use the (blurred) level_data for intensity-based mask — the blur
+  //         ensures we don't flag isolated hot pixels, only truly saturated regions.
+  float *raw_norm = dt_alloc_align_float(npix);
+  if(!raw_norm)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    dt_free_align(mag);
+    return NULL;
+  }
+  memcpy(raw_norm, level_data, sizeof(float) * npix);
+  _normalize_image_percentile(raw_norm, npix);
+
+  float *mask = _build_gradient_mask(mag, raw_norm, npix,
+                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                     HDR_ALIGN_GRADIENT_MASK_HI);
+  dt_free_align(raw_norm);
+  dt_free_align(mag);
+
+  if(!mask)
+  {
+    dt_free_align(gx);
+    dt_free_align(gy);
+    return NULL;
+  }
+
+  // Step 5: Prepare ECC input — combine gx+gy (signed sum preserves direction
+  //         information for ECC), then normalise and apply the mask.
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    gx[i] = gx[i] + gy[i];
+  dt_free_align(gy);
+
+  _normalize_gradient_mad(gx, npix);
+  _mask_gradient_by_intensity(gx, mask, npix);
+
+  if(out_mask)
+    *out_mask = mask;
+  else
+    dt_free_align(mask);
+
+  return gx;
+}
+
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
+/** Complete per-level gradient pipeline for full-resolution CFA at L0.
+ *
+ *  Same restructured pipeline as _compute_level_gradient but with
+ *  CFA-aware processing:
+ *    1. Gaussian pre-filter (if dimensions allow)
+ *    2. Per-sublattice percentile normalisation
+ *    3. CFA-aware stride-2 Sobel gradient
+ *    4. MAD normalisation
+ *    5. Mask from gradient magnitude + intensity validity
+ *
+ *  The CFA-aware Sobel already computes gx+gy internally (stride-2),
+ *  so we use gradient magnitude from that output for masking.
+ */
+static float *_compute_level_gradient_cfa(float *level_data,
+                                          const int w,
+                                          const int h,
+                                          const float sigma,
+                                          float **out_mask)
+{
+  const size_t npix = (size_t)w * h;
+
+  // Step 1: Spatial pre-filtering.
+  // For CFA data we apply the Gaussian blur to each sublattice independently
+  // to avoid cross-channel mixing.  However, dt_gaussian_mean_blur operates
+  // on the full image — at full resolution, the Bayer-frequency content is
+  // already suppressed by the stride-2 Sobel.  We still blur the full image
+  // here as a noise reduction step; the per-sublattice normalisation that
+  // follows ensures channel balance is maintained.
+  _gaussian_prefilter(level_data, w, h, sigma);
+
+  // Step 2: Per-sublattice percentile normalisation (CFA-specific).
+  _normalize_bayer_per_channel(level_data, w, h);
+
+  // Step 3: CFA-aware stride-2 Sobel gradient (returns gx+gy).
+  float *grad = _gradient_bayer_cfa_sobel(level_data, w, h);
+  if(!grad) return NULL;
+
+  // For mask construction we need the gradient magnitude.
+  // The CFA Sobel returns gx+gy (signed sum), so we compute the absolute
+  // value as a proxy for magnitude (adequate for masking purposes).
+  float *mag = dt_alloc_align_float(npix);
+  if(!mag) { dt_free_align(grad); return NULL; }
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npix; i++)
+    mag[i] = fabsf(grad[i]);
+
+  // Step 4: Normalize, threshold and power-scale the magnitude.
+  _normalize_magnitude_percentile_power(mag, npix,
+                                        HDR_ALIGN_GRAD_MAG_POWER,
+                                        HDR_ALIGN_GRAD_MAG_THRESHOLD);
+
+  // Step 5: Mask from magnitude + intensity validity.
+  float *raw_norm = dt_alloc_align_float(npix);
+  if(!raw_norm) { dt_free_align(grad); dt_free_align(mag); return NULL; }
+  memcpy(raw_norm, level_data, sizeof(float) * npix);
+  // For CFA, level_data is already per-sublattice normalised to [0,1].
+  // Use it directly for the intensity mask.
+  float *mask = _build_gradient_mask(mag, raw_norm, npix,
+                                     HDR_ALIGN_GRADIENT_MASK_LO,
+                                     HDR_ALIGN_GRADIENT_MASK_HI);
+  dt_free_align(raw_norm);
+  dt_free_align(mag);
+
+  if(!mask) { dt_free_align(grad); return NULL; }
+
+  // Step 6: MAD normalise and apply mask.
+  _normalize_gradient_mad(grad, npix);
+  _mask_gradient_by_intensity(grad, mask, npix);
+
+  if(out_mask)
+    *out_mask = mask;
+  else
+    dt_free_align(mask);
+
+  return grad;
+}
+#endif /* HDR_ALIGN_L0_FULL_CFA */
 
 /** Write a single-channel float image as a grayscale PFM file for debugging.
  *  Only active when the DT_DEBUG_VERBOSE flag is set.
@@ -2786,12 +3102,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   // brackets is very large (clipped highlights, noisy shadows).  Signed
   // gradients preserve structure and direction while removing the intensity
   // DC component so that edges drive the match.
-  // Pipeline: percentile normalize → log1p → Sobel sum (gx+gy) → MAD norm.
+  //
+  // Pipeline (restructured):
+  //   Gaussian blur → Sobel gx,gy → magnitude → percentile+power+threshold
+  //   → mask (magnitude + intensity) → gx+gy + MAD norm + apply mask.
   // This is the same preprocessing that the ECC refinement uses.
   const size_t cpix = (size_t)cw * ch;
   float *coarse_ref_grad = NULL;
   float *coarse_img_grad = NULL;
-  // Also keep the pre-Sobel intensity images alive for gradient-magnitude
+  // Also keep the pre-gradient intensity images alive for gradient-magnitude
   // ρ scoring after the NCC search (see below).
   float *coarse_ref_norm = NULL;
   float *coarse_img_norm = NULL;
@@ -2802,27 +3121,20 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
-      // Step 1: Percentile normalize raw pixels
+
+      // Use the restructured gradient pipeline.
+      coarse_ref_grad = _compute_level_gradient(tmp_ref, cw, ch,
+                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+      // tmp_ref was modified in-place by the blur; keep a pre-Sobel copy
+      // for ρ scoring.  We re-copy from the pyramid since tmp_ref is now blurred.
+      memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
       _normalize_image_percentile(tmp_ref, cpix);
+
+      memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
+      coarse_img_grad = _compute_level_gradient(tmp_img, cw, ch,
+                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+      memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
       _normalize_image_percentile(tmp_img, cpix);
-      // Step 2: Build validity masks and apply log1p
-      float *coarse_ref_mask = _build_mask_and_log1p(tmp_ref, cpix,
-                                                     HDR_ALIGN_GRADIENT_MASK_LO,
-                                                     HDR_ALIGN_GRADIENT_MASK_HI);
-      float *coarse_img_mask = _build_mask_and_log1p(tmp_img, cpix,
-                                                     HDR_ALIGN_GRADIENT_MASK_LO,
-                                                     HDR_ALIGN_GRADIENT_MASK_HI);
-      // Step 3: Signed Sobel gradient (gx + gy)
-      coarse_ref_grad = _gradient_sobel_sum(tmp_ref, cw, ch);
-      coarse_img_grad = _gradient_sobel_sum(tmp_img, cw, ch);
-      // Step 4: MAD gradient normalization
-      if(coarse_ref_grad) _normalize_gradient_mad(coarse_ref_grad, cpix);
-      if(coarse_img_grad) _normalize_gradient_mad(coarse_img_grad, cpix);
-      // Step 5: Mask out saturated/underexposed
-      _mask_gradient_by_intensity(coarse_ref_grad, coarse_ref_mask, cpix);
-      _mask_gradient_by_intensity(coarse_img_grad, coarse_img_mask, cpix);
-      dt_free_align(coarse_ref_mask);
-      dt_free_align(coarse_img_mask);
 
       // Keep the intensity images for gradient-magnitude ρ scoring below.
       if(coarse_ref_grad && coarse_img_grad)
@@ -2835,6 +3147,11 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         dt_free_align(tmp_ref);
         dt_free_align(tmp_img);
       }
+    }
+    else
+    {
+      dt_free_align(tmp_ref);
+      dt_free_align(tmp_img);
     }
     _debug_export_gradient_pfm(coarse_ref_grad, cw, ch, "coarse_ref");
     _debug_export_gradient_pfm(coarse_img_grad, cw, ch, "coarse_img");
@@ -2998,14 +3315,13 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     }
 
     // Compute gradient images for exposure-invariant ECC.
-    // The signed gradient sum (gx + gy) preserves structure and direction.
     //
-    // FULL_CFA at L0: per-sublattice normalization + CFA stride-2 Sobel.
-    // AVG_BAYER / GREEN_ONLY at L0: global percentile + stride-1 Sobel.
-    // L1+ (all modes): global percentile + stride-1 Sobel.
+    // Restructured pipeline (applied identically regardless of L0 mode):
+    //   Gaussian blur → Sobel gx,gy → magnitude → percentile+power+threshold
+    //   → mask (magnitude + intensity) → gx+gy + MAD norm + apply mask
     //
-    // The complete pipeline always runs:
-    //   normalise → build mask & log1p → Sobel gradient → MAD normalise → apply mask
+    // FULL_CFA at L0: CFA-aware variant (per-sublattice norm + stride-2 Sobel).
+    // AVG_BAYER / GREEN_ONLY at L0 and all modes at L1+: standard stride-1 Sobel.
     const size_t lpix = (size_t)lw * lh;
     float *ref_norm = dt_alloc_align_float(lpix);
     float *img_norm = dt_alloc_align_float(lpix);
@@ -3026,54 +3342,40 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 #if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
     if(l == 0)
     {
-      // L0: full-resolution Bayer — per-sublattice normalization + CFA Sobel.
+      // L0: full-resolution Bayer — CFA-aware gradient pipeline.
+      ref_grad = _compute_level_gradient_cfa(ref_norm, lw, lh,
+                                             HDR_ALIGN_PREFILTER_SIGMA, NULL);
+      img_grad = _compute_level_gradient_cfa(img_norm, lw, lh,
+                                             HDR_ALIGN_PREFILTER_SIGMA, NULL);
+      // Restore ref_norm / img_norm for ρ scoring in DOF escalation.
+      memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
+      memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
       _normalize_bayer_per_channel(ref_norm, lw, lh);
       _normalize_bayer_per_channel(img_norm, lw, lh);
-      float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
-                                              HDR_ALIGN_GRADIENT_MASK_LO,
-                                              HDR_ALIGN_GRADIENT_MASK_HI);
-      float *img_mask = _build_mask_and_log1p(img_norm, lpix,
-                                              HDR_ALIGN_GRADIENT_MASK_LO,
-                                              HDR_ALIGN_GRADIENT_MASK_HI);
-      ref_grad = _gradient_bayer_cfa_sobel(ref_norm, lw, lh);
-      img_grad = _gradient_bayer_cfa_sobel(img_norm, lw, lh);
-      if(ref_grad) _normalize_gradient_mad(ref_grad, lpix);
-      if(img_grad) _normalize_gradient_mad(img_grad, lpix);
-      _mask_gradient_by_intensity(ref_grad, ref_mask, lpix);
-      _mask_gradient_by_intensity(img_grad, img_mask, lpix);
-      dt_free_align(ref_mask);
-      dt_free_align(img_mask);
-      // Keep ref_norm / img_norm alive: they are needed for ρ scoring in
-      // DOF escalation and the identity check below.
     }
     else
 #endif /* HDR_ALIGN_L0_FULL_CFA */
     {
-      // L1+ (or L0 in AVG_BAYER / GREEN_ONLY): grayscale-equivalent —
-      // global percentile norm + stride-1 Sobel.
-      _normalize_image_percentile(ref_norm, lpix);
-      _normalize_image_percentile(img_norm, lpix);
-      float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
-                                              HDR_ALIGN_GRADIENT_MASK_LO,
-                                              HDR_ALIGN_GRADIENT_MASK_HI);
-      float *img_mask = _build_mask_and_log1p(img_norm, lpix,
-                                              HDR_ALIGN_GRADIENT_MASK_LO,
-                                              HDR_ALIGN_GRADIENT_MASK_HI);
-      ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
-      img_grad = _gradient_sobel_sum(img_norm, lw, lh);
+      // L1+ (or L0 in AVG_BAYER / GREEN_ONLY): standard gradient pipeline.
+      ref_grad = _compute_level_gradient(ref_norm, lw, lh,
+                                         HDR_ALIGN_PREFILTER_SIGMA, NULL);
+      img_grad = _compute_level_gradient(img_norm, lw, lh,
+                                         HDR_ALIGN_PREFILTER_SIGMA, NULL);
       // Keep ref_norm/img_norm alive at l==0 for ρ scoring.
-      if(l > 0)
+      if(l == 0)
+      {
+        // Restore for ρ scoring (the blur modified the data).
+        memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
+        memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
+        _normalize_image_percentile(ref_norm, lpix);
+        _normalize_image_percentile(img_norm, lpix);
+      }
+      else
       {
         dt_free_align(ref_norm);
         dt_free_align(img_norm);
         ref_norm = img_norm = NULL;
       }
-      if(ref_grad) _normalize_gradient_mad(ref_grad, lpix);
-      if(img_grad) _normalize_gradient_mad(img_grad, lpix);
-      _mask_gradient_by_intensity(ref_grad, ref_mask, lpix);
-      _mask_gradient_by_intensity(img_grad, img_mask, lpix);
-      dt_free_align(ref_mask);
-      dt_free_align(img_mask);
     }
 
     if(!ref_grad || !img_grad)
@@ -3304,36 +3606,18 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
         memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
 #if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
-        // L0 mesh: same CFA-aware pipeline as ECC level 0.
-        _normalize_bayer_per_channel(rn, l0w, l0h);
-        _normalize_bayer_per_channel(in, l0w, l0h);
-        float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
-                                                  HDR_ALIGN_GRADIENT_MASK_LO,
-                                                  HDR_ALIGN_GRADIENT_MASK_HI);
-        float *img_mask0 = _build_mask_and_log1p(in, npix0,
-                                                  HDR_ALIGN_GRADIENT_MASK_LO,
-                                                  HDR_ALIGN_GRADIENT_MASK_HI);
-        ref_grad0 = _gradient_bayer_cfa_sobel(rn, l0w, l0h);
-        img_grad0 = _gradient_bayer_cfa_sobel(in, l0w, l0h);
+        // L0 mesh: CFA-aware gradient pipeline (same as ECC level 0).
+        ref_grad0 = _compute_level_gradient_cfa(rn, l0w, l0h,
+                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+        img_grad0 = _compute_level_gradient_cfa(in, l0w, l0h,
+                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
 #else
-        // L0 mesh: grayscale pipeline (AVG_BAYER or GREEN_ONLY).
-        _normalize_image_percentile(rn, npix0);
-        _normalize_image_percentile(in, npix0);
-        float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
-                                                  HDR_ALIGN_GRADIENT_MASK_LO,
-                                                  HDR_ALIGN_GRADIENT_MASK_HI);
-        float *img_mask0 = _build_mask_and_log1p(in, npix0,
-                                                  HDR_ALIGN_GRADIENT_MASK_LO,
-                                                  HDR_ALIGN_GRADIENT_MASK_HI);
-        ref_grad0 = _gradient_sobel_sum(rn, l0w, l0h);
-        img_grad0 = _gradient_sobel_sum(in, l0w, l0h);
+        // L0 mesh: standard gradient pipeline (AVG_BAYER or GREEN_ONLY).
+        ref_grad0 = _compute_level_gradient(rn, l0w, l0h,
+                                            HDR_ALIGN_PREFILTER_SIGMA, NULL);
+        img_grad0 = _compute_level_gradient(in, l0w, l0h,
+                                            HDR_ALIGN_PREFILTER_SIGMA, NULL);
 #endif
-        if(ref_grad0) _normalize_gradient_mad(ref_grad0, npix0);
-        if(img_grad0) _normalize_gradient_mad(img_grad0, npix0);
-        _mask_gradient_by_intensity(ref_grad0, ref_mask0, npix0);
-        _mask_gradient_by_intensity(img_grad0, img_mask0, npix0);
-        dt_free_align(ref_mask0);
-        dt_free_align(img_mask0);
       }
       dt_free_align(rn);
       dt_free_align(in);
