@@ -3568,6 +3568,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         if(rho_best > rho_before)
         {
           // Check if perspective terms are set (8-DOF was accepted).
+          // The 6-DOF affine model always keeps H[6]=H[7]=0; only the
+          // 8-DOF projective model sets them to nonzero values.
           if(fabsf(H_level[6]) > 1e-9f || fabsf(H_level[7]) > 1e-9f)
             current_dof = 8;
           else
