@@ -534,23 +534,28 @@ Interpretation:
 
 For one candidate frame the estimator does the following:
 
-1. Build the Bayer pyramid directly from full-resolution Bayer data — **no half-resolution grayscale conversion**.  Each `2×` downsampling step (L0→L1, L1→L2, …) averages a `2×2` Bayer block to one value, so L1 and above are already grayscale-equivalent.  Only L0 retains the full CFA structure.  *(This is the default mode when the `HDR_ALIGN_USE_FULL_CFA_L0` macro is defined.  When undefined, the code falls back to converting L0 to half-resolution grayscale by averaging each `2×2` Bayer block before building the pyramid — all levels then use stride-1 Sobel with global percentile normalisation and the final homography is scaled from half-res to full-res coordinates.)*
+1. Build the image pyramid from the raw Bayer mosaic.  Three L0 input modes are available, controlled by the `HDR_ALIGN_L0_MODE` preprocessor macro:
+   - **`HDR_ALIGN_L0_FULL_CFA` (0)**: pyramid built from full-resolution Bayer data; L0 retains CFA.
+   - **`HDR_ALIGN_L0_AVG_BAYER` (1)**: L0 is half-resolution grayscale from averaging each `2×2` Bayer block.
+   - **`HDR_ALIGN_L0_GREEN_ONLY` (2, default)**: L0 is half-resolution grayscale from averaging only the two green pixels per `2×2` block.  Green has the best SNR (highest quantum efficiency, 2 samples per block), introduces no demosaicing artefacts, and is photometrically consistent across exposures.
+   
+   In all modes, each `2×` downsampling step averages a `2×2` block to one value, so L1 and above are always grayscale-equivalent.
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
-3. **Gradient preprocessing (per-level)**:
-   - **At L0 (full-resolution Bayer)**: per-sublattice percentile normalisation (`_normalize_bayer_per_channel`, normalises each of the four CFA channels independently to `[0,1]`) → build validity mask → log(1+x) → CFA-aware stride-2 Sobel gradient sum (`_gradient_bayer_cfa_sobel`) → MAD normalisation → apply validity mask.
-   - **At L1+ (grayscale-equivalent)**: global percentile normalisation → build validity mask → log(1+x) → standard stride-1 signed Sobel gradient sum (gx+gy) → MAD normalisation → apply validity mask.
+3. **Gradient preprocessing (per-level)** — the full pipeline runs identically regardless of L0 mode:
+   - **At L0 in FULL_CFA mode**: per-sublattice percentile normalisation (`_normalize_bayer_per_channel`, normalises each of the four CFA channels independently to `[0,1]`) → build validity mask → log(1+x) → CFA-aware stride-2 Sobel gradient sum (`_gradient_bayer_cfa_sobel`) → MAD normalisation → apply validity mask.
+   - **At L0 in AVG_BAYER / GREEN_ONLY mode** or **at L1+ (all modes)**: global percentile normalisation → build validity mask → log(1+x) → standard stride-1 signed Sobel gradient sum (gx+gy) → MAD normalisation → apply validity mask.
    
    This pipeline brings dark and bright exposures to a comparable scale, removes the intensity DC component so that edges — not absolute brightness — drive alignment, and ensures that clipped highlights and crushed shadows do not corrupt the ECC optimisation.  See _Why CFA-aware Sobel at L0_ below for motivation.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
 5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
-7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with per-level drift guards.
+7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with adaptive per-level drift guards (see below).
 8. At the finest level, check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, skip DOF escalation entirely and revert to identity immediately (the ECC pyramid wandered to a wrong local minimum). Otherwise, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below).
 9. **Identity comparison**: if DOF escalation ran, compare the best aligned ρ against identity ρ at the finest level. If identity is at least as good, revert to identity (see _Identity Detection_ below).
 10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
 11. Estimate local residual shifts on a small `3x3` grid of patches.
 12. Regularize that residual field with neighbor smoothness.
-13. Convert the final L0 homography to full-resolution Bayer output coordinates.  Since L0 is already full-resolution Bayer, this is a direct copy — no coordinate scaling is needed.  (Previously, the estimator used a half-resolution grayscale pyramid and needed a `2×` scale factor here.)
+13. Convert the final L0 homography to full-resolution Bayer output coordinates.  In FULL_CFA mode, L0 is already full-resolution so this is a direct copy.  In AVG_BAYER and GREEN_ONLY modes, the L0 homography is at half-resolution and must be scaled to full-res coordinates (`_homography_local_to_full`).
 
 ### Alignment Pipeline Flow Diagram
 
@@ -558,9 +563,14 @@ For one candidate frame the estimator does the following:
 flowchart TD
     START([dt_hdr_align_compute]) --> MINDIM{wd,ht ≥ MIN_DIM\n64 px?}
     MINDIM -- No --> FAIL([return FALSE])
-    MINDIM -- Yes --> PYR_BAYER[build_pyramid from full-res Bayer\ndownsample until longest side\n≤ COARSEST_SIZE = 64 px]
-    PYR_BAYER --> PREP_C[preprocess coarsest level\npercentile norm → mask → log1p\n→ Sobel sum gx+gy → MAD norm\n→ apply mask]
-    PREP_C --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
+    MINDIM -- Yes --> L0_MODE{L0 mode?}
+    L0_MODE -- FULL_CFA --> PYR_FULL[build_pyramid from full-res Bayer]
+    L0_MODE -- AVG_BAYER --> PYR_AVG[mosaic_to_grayscale\nthen build_pyramid]
+    L0_MODE -- GREEN_ONLY --> PYR_GREEN[mosaic_to_green_only\nthen build_pyramid]
+    PYR_FULL --> PREP_C
+    PYR_AVG --> PREP_C
+    PYR_GREEN --> PREP_C
+    PREP_C[preprocess coarsest level\npercentile norm → mask → log1p\n→ Sobel sum gx+gy → MAD norm\n→ apply mask] --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
     NCC --> RHO_C[compute ECC ρ at coarsest level\nfor identity and NCC winner]
     RHO_C --> EARLY{ρ_identity ≥\nρ_candidate?}
     EARLY -- Yes --> ID_RESET[reset ECC start to identity\ncontinue pyramid from identity]
@@ -573,21 +583,20 @@ flowchart TD
         NEXT_LVL[next pyramid level] --> SKIP{MIN of level dims\n< ECC_MIN_DIM = 64 px?}
         SKIP -- Yes --> NEXT_LVL2[scale H to next level]
         NEXT_LVL2 --> NEXT_LVL
-        SKIP -- No --> PREP_CHOICE{l == 0?}
-        PREP_CHOICE -- Yes --> PREP_L0[L0: per-sublattice norm\n→ mask → log1p → CFA Sobel\n→ MAD norm → apply mask]
-        PREP_CHOICE -- No --> PREP_L1[L1+: global percentile norm\n→ mask → log1p → stride-1 Sobel\n→ MAD norm → apply mask]
+        SKIP -- No --> PREP_CHOICE{l == 0 AND\nFULL_CFA mode?}
+        PREP_CHOICE -- Yes --> PREP_L0[L0 CFA: per-sublattice norm\n→ mask → log1p → stride-2 Sobel\n→ MAD norm → apply mask]
+        PREP_CHOICE -- No --> PREP_L1[global percentile norm\n→ mask → log1p → stride-1 Sobel\n→ MAD norm → apply mask]
         PREP_L0 --> BCK[backup H_level]
         PREP_L1 --> BCK
         BCK --> ECC3[3-DOF Euclidean ECC\nmax 50 iterations\nper-iteration trust region]
-        ECC3 --> DRIFT{angle drift > 5°\nor trans drift > 5 px?}
+        ECC3 --> DRIFT{angle/trans drift\n> adaptive limit?}
         DRIFT -- Yes --> REVERT[revert to H_level backup]
         DRIFT -- No --> KEEP[keep ECC result]
         REVERT --> NEXT_LVL
         KEEP --> NEXT_LVL
     end
 
-    ECC_LOOP -- level 0 reached --> PREP_0[L0 already processed above\nin ECC loop CFA branch]
-    PREP_0 --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
+    ECC_LOOP -- level 0 reached --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
     PRE_ID_CHK -- Yes --> REVERT_PRE[revert to identity\nskip DOF escalation]
     PRE_ID_CHK -- No --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
     REVERT_PRE --> CORNER
@@ -598,27 +607,40 @@ flowchart TD
     KEEP_H --> CORNER[corner NCC correction\n4-point local homography]
     CORNER --> MESH[estimate 3×3 residual mesh]
     MESH --> SMOOTH[regularize mesh\nJacobi smoothing × 12]
-    SMOOTH --> DONE([return H + mesh\n(full-res Bayer coords,\nno scaling needed)])
+    SMOOTH --> HSCALE{FULL_CFA?}
+    HSCALE -- Yes --> DONE_FULL([return H + mesh\nfull-res coords, no scaling])
+    HSCALE -- No --> DONE_HALF([return H + mesh\nscale H and mesh ×2\nfrom half-res to full-res])
 ```
 
 
-### Why CFA-aware Sobel at L0
+### L0 Input Modes
+
+Three input modes for the finest pyramid level (L0) are available, selectable via the `HDR_ALIGN_L0_MODE` preprocessor macro:
+
+#### FULL_CFA (mode 0)
 
 The pyramid is built directly from full-resolution Bayer data.  Downsampling from L0 to L1 averages each `2×2` Bayer block to one grayscale value, so L1 and above are effectively grayscale.  Only L0 retains the four CFA sublattice phases.
 
 **The CFA-aware Sobel** (`_gradient_bayer_cfa_sobel`) uses a stride-2 Sobel stencil: for output pixel `(x,y)`, the nine stencil positions are at `(x±0, x±2)` × `(y±0, y±2)` — all belonging to the same CFA channel.  This avoids mixing green (G) and red/blue (R/B) values, which would otherwise create a Bayer-frequency amplitude artifact in the gradient images.
 
-**Root-cause of the previous alignment regression**: before this fix, the ECC alignment at L0 used a half-resolution grayscale pyramid (averaging each `2×2` Bayer block before building the pyramid).  While this suppressed CFA-phase artifacts, it also lost the benefit of full-resolution gradient detail and, crucially, it could still be undermined by saturated pixels — a single saturated Bayer pixel contaminates the whole `2×2` block average.
+**Per-sublattice normalisation** (`_normalize_bayer_per_channel`) independently normalises each CFA sublattice `(cx,cy) ∈ {(0,0),(0,1),(1,0),(1,1)}` to `[0,1]` using a 99th-percentile white-point before the stride-2 Sobel is computed.  Without it, the G channels (~2× brighter) produce ~2× larger gradient amplitudes, creating a Bayer-frequency pattern that suppresses ECC ρ to ≈0.28 regardless of alignment quality.
 
-An earlier attempt to restore full-res CFA-aware Sobel failed because it omitted the per-sublattice normalization step.  Without it:
-- The G channels (approximately `2×` brighter in a typical Bayer sensor) produce approximately `2×` larger gradient amplitudes than R/B channels after the Sobel filter.
-- This Bayer-frequency amplitude pattern appears in both reference and candidate gradient images identically, regardless of alignment.
-- The ECC correlation coefficient ρ is therefore suppressed to approximately `0.25–0.28` regardless of alignment quality, because the pattern swamps the alignment signal.
-- DOF escalation then selects the wrong model or reverts to identity erroneously.
+**Saturated pixels**: the full-res CFA Sobel approach is also more robust to saturated pixels.  A single blown-out pixel corrupts only the gradient samples within its `2×2` stencil neighbourhood (at most 25 output pixels), compared to the half-res approach where the saturation spreads to the entire `2×2` block average and contaminates every neighboring gradient pixel.
 
-**The fix** adds `_normalize_bayer_per_channel`: it independently normalises each CFA sublattice `(cx,cy) ∈ {(0,0),(0,1),(1,0),(1,1)}` to `[0,1]` using a 99th-percentile white-point before the stride-2 Sobel is computed.  With all channels in `[0, log(2)]` after log(1+x), the gradient amplitudes are equalized and ρ correctly reflects alignment quality.
+#### AVG_BAYER (mode 1)
 
-**Saturated pixels**: the full-res CFA Sobel approach is also more robust to saturated pixels.  A single blown-out pixel corrupts only the gradient samples within its `2×2` stencil neighbourhood (at most 25 output pixels), compared to the half-res approach where the saturation spreads to the entire `2×2` block average and contaminates every neighboring gradient pixel.  The validity mask (`HDR_ALIGN_GRADIENT_MASK_HI = 0.99`) zeroes gradient samples at near-saturated positions before they enter the ECC objective function.
+L0 is converted to half-resolution grayscale by averaging all four pixels in each `2×2` Bayer block (`_mosaic_to_grayscale`).  Standard global percentile normalisation + stride-1 Sobel is used at all levels.  The final homography is scaled from half-res to full-res coordinates.  This is the safe fallback: it halves pixel count and avoids CFA artefacts, but a single saturated R or B pixel contaminates the whole 2×2 block average.
+
+#### GREEN_ONLY (mode 2, default)
+
+L0 is built from the green channel only: the two green pixels (Gr and Gb) in each `2×2` Bayer block are averaged into one half-resolution sample (`_mosaic_to_green_only`).  This provides:
+
+- **Best SNR**: green has the highest quantum efficiency and there are two samples per block.
+- **No demosaicing artefacts**: only same-spectral-channel pixels are combined.
+- **Photometric consistency**: a single spectral response avoids cross-channel contamination.
+- **Saturation isolation**: a saturated red or blue pixel cannot affect the green-derived luminance.
+
+Processing is identical to AVG_BAYER at all levels: global percentile norm + stride-1 Sobel.  The final homography is scaled from half-res to full-res coordinates.
 
 ### Coarse Initialization
 
@@ -758,7 +780,7 @@ $$
 G(x, y) = \frac{1}{4}\sum_{i=0}^{1}\sum_{j=0}^{1} M(2x+i, 2y+j).
 $$
 
-At the end of estimation, grayscale coordinates are mapped back to full-resolution Bayer coordinates with the block-center convention
+At the end of estimation (in AVG_BAYER and GREEN_ONLY modes where L0 is half-resolution), grayscale coordinates are mapped back to full-resolution Bayer coordinates with the block-center convention
 
 $$
 x_f = 2x_g + 0.5,
@@ -929,13 +951,19 @@ $$
 
 The translation clamp is in normalized coordinates, so $0.10$ corresponds to $10\%$ of the image half-diagonal per iteration. No post-hoc parameter clamping is needed because the 3-DOF parameterization cannot produce shear, scale drift, or perspective artifacts.
 
-#### Per-level drift guards
+#### Per-level adaptive drift guards
 
-In addition to the per-iteration trust region clamps, the pipeline applies two per-level drift guards that compare the homography after ECC refinement against the pre-ECC backup:
+In addition to the per-iteration trust region clamps, the pipeline applies two per-level drift guards that compare the homography after ECC refinement against the pre-ECC backup.  The tolerances are **adaptive**: the base values apply at the coarsest ECC level, and they are halved for each finer level (min-clamped):
 
-1. **Angle drift guard**: if the rotation change introduced by a single pyramid level exceeds `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG` ($5°$), ECC is considered to have wandered to a wrong local maximum and the result is reverted to the pre-level homography. The angle change is computed as $\Delta\theta = \mathrm{atan2}(H[3], H[0]) - \mathrm{atan2}(H_{backup}[3], H_{backup}[0])$.
+$$
+\text{limit}(l) = \max\!\bigl(\text{base} / 2^{(\text{first\_ecc\_level} - l)},\; \text{min}\bigr)
+$$
 
-2. **Translation drift guard**: if the translation change at a single level exceeds `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX` ($5.0$ px) in either component, the result is reverted. Each level inherits a $2\times$-scaled estimate from its parent, so the parent's accuracy at the child's scale is $\sim 2$ px. Allowing up to $5$ px gives room for genuine sub-pixel refinement at coarser levels while catching runaway drift.
+1. **Angle drift guard**: base = `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE` ($10°$), min = `HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN` ($1°$).  If the rotation change introduced by a single pyramid level exceeds the adaptive limit, ECC is considered to have wandered to a wrong local maximum and the result is reverted to the pre-level homography.
+
+2. **Translation drift guard**: base = `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE` ($10$ px), min = `HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN` ($2$ px).  If the translation change at a single level exceeds the adaptive limit in either component, the result is reverted.
+
+The halving schedule reflects the fact that coarser levels need more room for initial correction (the coarse NCC estimate may be off by several pixels), while finer levels inherit a refined estimate and should only introduce sub-pixel adjustments.  The generous base values ($10°$, $10$ px) accommodate large hand-held displacements that the coarse NCC search may not fully capture.
 
 These guards prevent small per-level ECC errors from compounding across the pyramid. In well-aligned tripod shots the per-level translation change is typically $<1$ px; hand-held brackets occasionally reach $\sim 2.5$ px at coarser levels.
 
@@ -1354,6 +1382,7 @@ An OpenCL kernel file (`data/kernels/hdr_alignment.cl`, program index 41 in `pro
 | `hdr_align_gradient_sobel_sum` | Signed gradient sum: $g_x + g_y$ (in-place) | High (element-wise) |
 | `hdr_align_normalize_mad` | MAD normalisation: $g / (\text{mean}(\|g\|) + \varepsilon)$; inv\_scale supplied by host | High (element-wise) |
 | `hdr_align_gradient_bayer_cfa_sobel` | CFA-aware stride-2 Sobel gradient sum (gx+gy) for L0 full-resolution Bayer | High (stencil operation) |
+| `hdr_align_mosaic_to_green_only` | Extract and average green-channel pixels from RGGB Bayer to half-res grayscale | Medium (2:1 reduction) |
 | `hdr_align_downsample_2x` | 2× box-filter downsampling | Medium |
 | `hdr_align_ecc_means` | ECC pass 1: weighted mean accumulation with work-group reduction | High at full-res |
 | `hdr_align_ecc_norms` | ECC pass 2: norms, Jacobian sums, sJw projection sums, correlation | High at full-res |
@@ -1392,7 +1421,6 @@ Potential refinements to the alignment pipeline:
 
 - **Empirical threshold tuning**: the current $\rho_{thresh} = 0.85$ for DOF escalation is conservative. Testing on a diverse corpus of HDR stacks could inform better defaults or adaptive thresholds based on stack properties (number of frames, exposure range).
 - **Per-level escalation**: currently DOF escalation runs only at the finest pyramid level. Running it at intermediate levels (gated by the same improvement and conditioning checks) could help stacks where the 3-DOF fine-level result is locally optimal in the wrong basin.
-- **Adaptive drift guard thresholds**: the per-level translation drift limit ($5.0$ px) and angle drift limit ($5°$) are fixed constants. They could be made adaptive based on the pyramid level or the expected accuracy of the parent estimate.
 - **X-Trans support**: alignment is currently Bayer-only. Extending the Bayer-block grayscale reduction and CFA-aware warp to X-Trans patterns would cover the remaining sensor types.
 - **Full OpenCL pipeline**: The OpenCL kernels cover all pixel-level operations needed for a full GPU-resident alignment pipeline. The remaining work is pipeline orchestration: building the pyramid on the GPU, running the convergence/drift loops on the GPU, and keeping data in GPU memory across levels to eliminate host↔device transfers.
 
