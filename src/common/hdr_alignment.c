@@ -202,6 +202,17 @@
 // than real image geometry.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
 
+// Maximum shear magnitude allowed in an escalated homography.
+// Shear is defined as (h12 + h21) / 2 — the symmetric part of the 2×2
+// submatrix.  Physical camera movements produce negligible shear: pure
+// rotation, translation, zoom, and moderate perspective all produce
+// shear < 0.004.  Larger values indicate the higher-DOF model is fitting
+// non-geometric patterns such as exposure gradients, vignetting, or
+// moving scene content (e.g. ocean waves) as spurious affine deformation.
+// 0.006 allows genuine perspective-induced shear while catching the most
+// common false-positive escalations.
+#define HDR_ALIGN_ESCALATION_MAX_SHEAR 0.006f
+
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
 // The escalation runs at the first (coarsest) pyramid level whose shortest
 // edge is at least this value.  At smaller resolutions the gradient image
@@ -2589,6 +2600,18 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
                                             float H[HDR_ALIGN_H_NPARAM],
                                             const int ndof)
 {
+  float best_update = FLT_MAX;
+  int stall_count = 0;
+
+  // Keep a copy of H at the iteration that produced the best update metric
+  // so we can restore it on stall or max-iterations exit.  Without this,
+  // the optimizer can oscillate for all 50 iterations and leave H in a
+  // state that drifts far from the convergence basin (particularly the
+  // perspective parameters which accumulate +/-0.001 per iteration and can
+  // exceed the +/-0.02 sanity limit after ~20+ oscillating steps).
+  float H_best[HDR_ALIGN_H_NPARAM];
+  memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
+
   for(int iter = 0; iter < HDR_ALIGN_ESCALATION_MAX_ITER; iter++)
   {
     double cond_est = 0.0;
@@ -2600,6 +2623,7 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC failed at iteration %d",
                ndof, iter);
+      memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
       return -2.0f;
     }
 
@@ -2609,6 +2633,7 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC rejected: Hessian cond=%.1e > %.1e",
                ndof, cond_est, HDR_ALIGN_ESCALATION_MAX_COND);
+      memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
       return -2.0f;
     }
 
@@ -2617,6 +2642,28 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
       dt_print(DT_DEBUG_HDRMERGE,
                "[hdr_merge]   %d-DOF ECC converged at iteration %d (update=%.6f, cond=%.2f)",
                ndof, iter, update, cond_est);
+      break;
+    }
+
+    // Plateau / stall detection (mirrors the 3-DOF solver).
+    // If the update metric has not improved for HDR_ALIGN_ECC_PATIENCE
+    // consecutive iterations, the optimizer is stuck above the convergence
+    // threshold.  Continuing will only cause parameters (especially the
+    // perspective terms in 8-DOF mode) to oscillate and drift beyond the
+    // sanity-check bounds.  Restore H to the best-seen state and stop.
+    if(update < best_update)
+    {
+      best_update = update;
+      stall_count = 0;
+      memcpy(H_best, H, sizeof(float) * HDR_ALIGN_H_NPARAM);
+    }
+    else if(++stall_count >= HDR_ALIGN_ECC_PATIENCE)
+    {
+      memcpy(H, H_best, sizeof(float) * HDR_ALIGN_H_NPARAM);
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge]   %d-DOF ECC stalled at iteration %d "
+               "(update=%.6f, best=%.6f, cond=%.2f)",
+               ndof, iter, update, best_update, cond_est);
       break;
     }
   }
@@ -2727,11 +2774,21 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_6 = rho_6dof - rho_3dof;
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
+  // Shear check: the symmetric part of the 2×2 submatrix measures pure
+  // shear.  Physical camera movements (rotation, translation, zoom,
+  // moderate perspective) produce negligible shear (< 0.004).  Large
+  // values indicate the optimizer is fitting non-geometric patterns such
+  // as exposure gradients, vignetting, or moving scene content (waves)
+  // as spurious affine deformation.
+  const float shear_6 = 0.5f * fabsf(H_6dof[1] + H_6dof[3]);
+  const gboolean low_shear_6 = shear_6 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
+
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d)",
-           rho_6dof, improvement_6, sane_6);
+           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d, shear=%.4f)",
+           rho_6dof, improvement_6, sane_6, shear_6);
 
   const gboolean accept_6 = sane_6
+                             && low_shear_6
                              && rho_6dof > rho_3dof
                              && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
@@ -2758,12 +2815,15 @@ static float _try_dof_escalation(const float *ref_grad,
 
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
+  const float shear_8 = 0.5f * fabsf(H_8dof[1] + H_8dof[3]);
+  const gboolean low_shear_8 = shear_8 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d)",
-           rho_8dof, improvement_8, sane_8);
+           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d, shear=%.4f)",
+           rho_8dof, improvement_8, sane_8, shear_8);
 
   const gboolean accept_8 = sane_8
+                             && low_shear_8
                              && rho_8dof > rho_6dof
                              && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF;
 
