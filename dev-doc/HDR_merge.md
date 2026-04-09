@@ -553,7 +553,7 @@ For one candidate frame the estimator does the following:
 5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
 7. Refine the Euclidean parameters from coarse to fine using native 3-DOF weighted ECC on signed Sobel gradient (gx+gy) images, with adaptive per-level drift guards (see below).
-8. At the designated escalation level (first level with shortest edge ≥ `HDR_ALIGN_ESCALATION_MIN_DIM` = 512 px), check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, skip DOF escalation. Otherwise, adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below). If escalation succeeds, use the higher-DOF model for all remaining finer levels.
+8. At the designated escalation level (first level with shortest edge ≥ `HDR_ALIGN_ESCALATION_MIN_DIM` = 512 px), check the 3-DOF ρ against the identity ρ before attempting DOF escalation: if 3-DOF ρ has already degraded below identity ρ, the coarse NCC search likely found a false match and the ECC pyramid has been stuck in the wrong basin. In this case the algorithm performs **coarse-estimate recovery**: it resets H to identity, re-runs 3-DOF ECC from scratch at this level, and if the recovered result beats identity ρ, attempts DOF escalation on the recovered transform. This ensures finer levels inherit a clean starting point. Otherwise (3-DOF ρ > identity ρ), adaptively escalate to 6-DOF affine or 8-DOF projective ECC if the 3-DOF fit is insufficient (see _Adaptive DOF Escalation_ below). If escalation succeeds, use the higher-DOF model for all remaining finer levels.
 9. Continue refining the accepted motion model (3-DOF, 6-DOF, or 8-DOF) through finer pyramid levels. At L0, perform a **final identity comparison**: compare the best ρ against identity ρ and revert to identity if identity is at least as good (see _Identity Detection_ below).
 10. At the finest levels, run an additional corner-focused NCC correction pass that fits a local 4-point homography.
 11. Estimate local residual shifts on a small `3x3` grid of patches.
@@ -600,7 +600,13 @@ flowchart TD
         ESC_CHK{escalation level\nreached?}
         ESC_CHK -- No --> NEXT_LVL
         ESC_CHK -- Yes --> PRE_ID_CHK{3-DOF ρ ≤\nidentity ρ?}
-        PRE_ID_CHK -- Yes --> SKIP_ESC[skip DOF escalation\nkeep 3-DOF]
+        PRE_ID_CHK -- Yes --> RECOVERY[reset H to identity\nre-run 3-DOF ECC]
+        RECOVERY --> REC_CHK{recovery ρ >\nidentity ρ?}
+        REC_CHK -- Yes --> DOF_REC[try DOF escalation\non recovered H]
+        REC_CHK -- No --> SKIP_ESC[keep identity H\nfor finer levels]
+        DOF_REC --> DOF_ROK{escalation\nimproved ρ?}
+        DOF_ROK -- Yes --> SET_DOF
+        DOF_ROK -- No --> SKIP_ESC
         PRE_ID_CHK -- No --> DOF[adaptive DOF escalation\ntry 6-DOF affine\nthen 8-DOF projective]
         DOF --> DOF_OK{escalation\nimproved ρ?}
         DOF_OK -- Yes --> SET_DOF[set current_dof = 6 or 8\nuse higher-DOF for finer levels]
@@ -1133,7 +1139,7 @@ Adaptive DOF escalation addresses this by selectively introducing additional deg
 
 The escalation runs once, at the designated escalation level (the first level with shortest edge ≥ 512 px), between 3-DOF ECC convergence and the remaining finer levels:
 
-1. **Pre-escalation identity gate**: measure the 3-DOF result ρ and the identity ρ at the escalation level. If 3-DOF ρ ≤ identity ρ, the ECC pyramid has already degraded below identity — skip all escalation. This prevents higher-DOF models (which start from a bad basin) from producing spurious large transforms.
+1. **Pre-escalation identity gate**: measure the 3-DOF result ρ and the identity ρ at the escalation level. If 3-DOF ρ ≤ identity ρ, the ECC pyramid has already degraded below identity (typically caused by a false coarse NCC match in a wrong scale/rotation basin). The algorithm then performs **coarse-estimate recovery**: reset H to identity, re-run 3-DOF ECC from scratch at this level (using the CL path if available, else CPU), and evaluate the recovered ρ. If recovery ρ > identity ρ, the recovered H is used as the starting point for DOF escalation (steps 2–5 below). If recovery ρ ≤ identity ρ, H stays at identity and finer levels inherit a clean starting point. This recovery prevents the pipeline from propagating a bad coarse estimate all the way to L0 and ultimately reverting to identity at the last moment.
 
 2. **Measure baseline quality**: compute the weighted ECC score $\rho_{3}$ of the converged 3-DOF result on gradient-magnitude images.
 
@@ -1253,7 +1259,7 @@ No changes to the corner refinement acceptance thresholds were needed.
 | `HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION` | $0.50$ | Maximum $|\sqrt{\det(A_{2\times2})} - 1|$ for geometric-mean scale sanity |
 | `HDR_ALIGN_ESCALATION_MIN_DIM` | $512$ | Minimum shortest-edge size (px) for escalation to trigger |
 
-The pre-escalation identity gate (step 1) is the primary safeguard for well-aligned stacks: if 3-DOF ρ ≤ identity ρ (images already well-aligned or ECC wandered), escalation is skipped entirely. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed. The improvement gates ($0.01$ for 6-DOF, $0.005$ for 8-DOF) prevent accepting results that are numerically but not visually better. The `HDR_ALIGN_ESCALATION_MIN_DIM` threshold (512 px) ensures the escalation level has sufficient spatial information to constrain the higher-DOF parameters — at smaller resolutions the gradient image does not contain enough structure to reliably estimate scale, shear, or perspective.
+The pre-escalation identity gate (step 1) is the primary safeguard for well-aligned stacks: if 3-DOF ρ ≤ identity ρ (images already well-aligned or ECC wandered), the coarse-estimate recovery mechanism re-runs ECC from identity to attempt to find the correct alignment basin. This handles the common failure mode where a false NCC match (e.g. wrong scale + rotation combination at the coarsest level) poisons the entire ECC pyramid. The recovery runs on the same CL/CPU path as normal ECC, so it maintains full GPU parity. The chain escalation strategy (only try 8-DOF if 6-DOF improved) avoids wasting computation on projective refinement when affine refinement already failed. The improvement gates ($0.01$ for 6-DOF, $0.005$ for 8-DOF) prevent accepting results that are numerically but not visually better. The `HDR_ALIGN_ESCALATION_MIN_DIM` threshold (512 px) ensures the escalation level has sufficient spatial information to constrain the higher-DOF parameters — at smaller resolutions the gradient image does not contain enough structure to reliably estimate scale, shear, or perspective.
 
 ### Identity Detection
 

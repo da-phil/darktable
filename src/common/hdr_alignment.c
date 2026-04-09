@@ -3550,9 +3550,78 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
       if(rho_3dof <= rho_id)
       {
-        // ECC already degraded below identity — skip DOF escalation.
+        // The 3-DOF result is worse than identity.  This typically means
+        // the coarse NCC search found a false match (wrong scale/rotation
+        // basin) and every ECC level since then has been stuck reverting
+        // to the same bad H.
+        //
+        // Recovery: reset H to identity and re-run 3-DOF ECC from scratch
+        // at this level.  If ECC from identity finds a useful alignment
+        // (ρ > identity ρ), attempt DOF escalation on that result.
+        // Either way, finer levels inherit a clean starting point instead
+        // of the bad coarse H.
         dt_print(DT_DEBUG_HDRMERGE,
-                 "[hdr_merge] DOF escalation: 3-DOF below identity -- skipping escalation");
+                 "[hdr_merge] DOF escalation: 3-DOF below identity"
+                 " -- resetting to identity and re-running ECC at level %d", l);
+
+        memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
+
+        // Re-run 3-DOF ECC from identity at this level.
+        {
+          gboolean ran_cl_recovery = FALSE;
+#ifdef HAVE_OPENCL
+          if(use_cl)
+            ran_cl_recovery = _ecc_refine_level_cl(devid, g_cl, ref_grad, img_grad,
+                                                    lw, lh, H_level);
+#endif
+          if(!ran_cl_recovery)
+            _ecc_refine_level(ref_grad, img_grad, lw, lh, H_level);
+
+          // Sanity-check the recovery result.
+          if(!_homography_is_sane(H_level, lw, lh))
+          {
+            dt_print(DT_DEBUG_HDRMERGE,
+                     "[hdr_merge] DOF recovery: ECC from identity failed sanity"
+                     " -- keeping identity");
+            memcpy(H_level, H_id, sizeof(float) * HDR_ALIGN_H_NPARAM);
+          }
+        }
+
+        const float rho_recovery = _ecc_compute_rho(ref_norm, img_norm,
+                                                     lw, lh, H_level);
+        dt_print(DT_DEBUG_HDRMERGE,
+                 "[hdr_merge] DOF recovery at level %d: ρ=%.4f (identity ρ=%.4f)",
+                 l, rho_recovery, rho_id);
+
+        if(rho_recovery > rho_id)
+        {
+          // Recovery succeeded: ECC from identity found a better alignment.
+          // Try DOF escalation on this recovered result.
+          const float rho_before = rho_recovery;
+          const float rho_best = _try_dof_escalation(ref_grad, img_grad,
+                                                      ref_norm, img_norm,
+                                                      lw, lh, rho_recovery,
+                                                      H_level);
+          if(rho_best > rho_before)
+          {
+            if(fabsf(H_level[6]) > 1e-9f || fabsf(H_level[7]) > 1e-9f)
+              current_dof = 8;
+            else
+              current_dof = 6;
+
+            dt_print(DT_DEBUG_HDRMERGE,
+                     "[hdr_merge] DOF recovery+escalation: accepted %d-DOF"
+                     " (ρ=%.4f→%.4f), using %d-DOF for remaining levels",
+                     current_dof, rho_before, rho_best, current_dof);
+          }
+          else
+          {
+            dt_print(DT_DEBUG_HDRMERGE,
+                     "[hdr_merge] DOF recovery: keeping 3-DOF from identity");
+          }
+        }
+        // else: H_level is identity; finer levels will start from a clean
+        // baseline rather than the wrong coarse estimate.
       }
       else
       {
