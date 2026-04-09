@@ -60,8 +60,9 @@ typedef struct dt_hdr_alignment_t
  *      demosaicing artefacts, photometrically consistent across exposures.
  *      Processing is identical to AVG_BAYER at all levels.
  *
- *  In all three modes the full gradient pipeline runs identically:
- *    normalise → build mask → log1p → Sobel → MAD normalise → apply mask
+ *  In all three modes the restructured gradient pipeline runs identically:
+ *    Gaussian blur → Sobel gx,gy → magnitude → percentile+power+threshold
+ *    → mask (magnitude + intensity) → gx+gy → MAD normalise → apply mask
  *
  *  Per-pixel normalisation:
  *    normalised = max(pixel - black_level, 0) / (relative_exposure × relative_iso)

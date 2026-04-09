@@ -541,11 +541,14 @@ For one candidate frame the estimator does the following:
    
    In all modes, each `2×` downsampling step averages a `2×2` block to one value, so L1 and above are always grayscale-equivalent.
 2. Build a `2x` pyramid down to a coarse image of about `64` pixels on the longest side.
-3. **Gradient preprocessing (per-level)** — the full pipeline runs identically regardless of L0 mode:
-   - **At L0 in FULL_CFA mode**: per-sublattice percentile normalisation (`_normalize_bayer_per_channel`, normalises each of the four CFA channels independently to `[0,1]`) → build validity mask → log(1+x) → CFA-aware stride-2 Sobel gradient sum (`_gradient_bayer_cfa_sobel`) → MAD normalisation → apply validity mask.
-   - **At L0 in AVG_BAYER / GREEN_ONLY mode** or **at L1+ (all modes)**: global percentile normalisation → build validity mask → log(1+x) → standard stride-1 signed Sobel gradient sum (gx+gy) → MAD normalisation → apply validity mask.
+3. **Gradient preprocessing (per-level)** — the restructured pipeline runs identically at every level (with CFA-aware variant at L0 in FULL_CFA mode):
+   1. **Spatial pre-filtering**: Gaussian blur with σ = `HDR_ALIGN_PREFILTER_SIGMA` (default 3 px).  Suppresses sensor noise and Bayer-residual high-frequency artefacts.  Skipped when the shortest edge is below `HDR_ALIGN_PREFILTER_MIN_DIM` (64 px) — at coarse levels the 2× downsampling already provides sufficient anti-aliasing.
+   2. **Gradient extraction**: Sobel 3×3 → separate `gx` and `gy` images (or CFA-aware stride-2 Sobel for FULL_CFA L0).  Gradient magnitude `mag = √(gx² + gy²)` is also computed.
+   3. **Normalize, threshold and power-scale the gradient magnitude**: 99th-percentile stretch to `[0,1]`, then power scaling `mag^γ` with γ = `HDR_ALIGN_GRAD_MAG_POWER` (default 0.5 = √), then threshold at `HDR_ALIGN_GRAD_MAG_THRESHOLD` (default 0.02).  Power scaling compresses strong gradients and lifts weak ones, giving more uniform weight to both texture-rich and smooth regions.
+   4. **Mask construction**: pixels are masked out (set to 0) if the power-scaled magnitude is below threshold OR the raw intensity is near-black (< 1 %) or near-saturated (> 99 %).  This combines gradient feature quality with intensity validity.
+   5. **Prepare ECC input**: combine `gx + gy` (signed sum preserves direction information), MAD-normalise, apply the mask.  This produces the final single-channel feature image for ECC.
    
-   This pipeline brings dark and bright exposures to a comparable scale, removes the intensity DC component so that edges — not absolute brightness — drive alignment, and ensures that clipped highlights and crushed shadows do not corrupt the ECC optimisation.  See _Why CFA-aware Sobel at L0_ below for motivation.
+   This pipeline ensures that edges — not absolute brightness — drive alignment, while the magnitude-based masking focuses ECC on regions with reliable gradient information.  Saturated highlights and crushed shadows are excluded.  See _Why CFA-aware Sobel at L0_ below for motivation of the CFA variant.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
 5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
@@ -570,7 +573,7 @@ flowchart TD
     PYR_FULL --> PREP_C
     PYR_AVG --> PREP_C
     PYR_GREEN --> PREP_C
-    PREP_C[preprocess coarsest level\npercentile norm → mask → log1p\n→ Sobel sum gx+gy → MAD norm\n→ apply mask] --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
+    PREP_C[preprocess coarsest level\nGaussian blur σ=3 → Sobel gx,gy\n→ magnitude → percentile+power+threshold\n→ mask mag+intensity → gx+gy → MAD norm\n→ apply mask] --> NCC[exhaustive NCC search\ntx,ty,θ ∈ ±10° @ 0.5° steps]
     NCC --> RHO_C[compute ECC ρ at coarsest level\nfor identity and NCC winner]
     RHO_C --> EARLY{ρ_identity ≥\nρ_candidate?}
     EARLY -- Yes --> ID_RESET[reset ECC start to identity\ncontinue pyramid from identity]
@@ -584,8 +587,8 @@ flowchart TD
         SKIP -- Yes --> NEXT_LVL2[scale H to next level]
         NEXT_LVL2 --> NEXT_LVL
         SKIP -- No --> PREP_CHOICE{l == 0 AND\nFULL_CFA mode?}
-        PREP_CHOICE -- Yes --> PREP_L0[L0 CFA: per-sublattice norm\n→ mask → log1p → stride-2 Sobel\n→ MAD norm → apply mask]
-        PREP_CHOICE -- No --> PREP_L1[global percentile norm\n→ mask → log1p → stride-1 Sobel\n→ MAD norm → apply mask]
+        PREP_CHOICE -- Yes --> PREP_L0[L0 CFA: Gaussian blur → per-sublattice norm\n→ stride-2 Sobel → magnitude norm+power\n→ mask mag+intensity → MAD norm → apply mask]
+        PREP_CHOICE -- No --> PREP_L1[Gaussian blur → Sobel gx,gy\n→ magnitude → percentile+power+threshold\n→ mask mag+intensity → gx+gy → MAD norm\n→ apply mask]
         PREP_L0 --> BCK[backup H_level]
         PREP_L1 --> BCK
         BCK --> ECC3[3-DOF Euclidean ECC\nmax 50 iterations\nper-iteration trust region]
@@ -693,24 +696,22 @@ Why normalized coordinates are used:
 
 ### Gradient Validity Masking
 
-HDR brackets intentionally span a wide dynamic range.  Some exposures will saturate highlights while others will crush shadows.  After the percentile normalisation step, saturated pixels map to values near 1.0 and underexposed pixels map to values near 0.0.  The Sobel gradient at these extremes is unreliable:
+HDR brackets intentionally span a wide dynamic range.  Some exposures will saturate highlights while others will crush shadows.  The restructured gradient pipeline uses a **dual-criterion mask** that combines gradient feature quality with raw intensity validity:
 
-- **Saturated pixels** are clipped by the sensor; their gradient reflects the clipping boundary, not scene structure.
-- **Underexposed pixels** are dominated by read noise; their gradient is essentially random.
+- **Gradient magnitude criterion**: after computing the Sobel gradient magnitude, percentile normalisation (99th-pct stretch to `[0,1]`), power scaling (`mag^0.5`), and thresholding (`HDR_ALIGN_GRAD_MAG_THRESHOLD = 0.02`), pixels with zero or very weak magnitude are featureless and cannot reliably contribute to alignment.
+- **Intensity criterion**: pixels near the sensor black level (< 1 % of normalised range) or near saturation (> 99 %) produce unreliable gradients — saturated pixels reflect the clipping boundary, underexposed pixels are dominated by read noise.
 
-If these regions contribute to the ECC objective, the optimiser may "lock" onto meaningless structure and converge to a wrong local minimum.  This is particularly damaging at the finest pyramid levels where the images are large and clipped/noisy regions can dominate the sum.
-
-The fix is a per-pixel validity mask.  After percentile normalisation (which maps to $[0,1]$) and **before** `log1p`, the mask is created:
+The combined mask is:
 
 $$
 \text{mask}(i) =
 \begin{cases}
-1 & \text{if } 0.01 \leq \text{norm}(i) \leq 0.99 \\
+1 & \text{if } \text{mag\_norm}(i) > 0 \text{ AND } 0.01 \leq \text{intensity\_norm}(i) \leq 0.99 \\
 0 & \text{otherwise}
 \end{cases}
 $$
 
-The mask is applied **after** MAD normalisation:
+The mask is applied **after** MAD normalisation of the signed gradient sum (gx + gy):
 
 ```
 grad(i) *= mask(i)

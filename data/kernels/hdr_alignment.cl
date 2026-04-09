@@ -22,20 +22,23 @@
  * multi-resolution ECC (Enhanced Correlation Coefficient) alignment
  * pipeline:
  *   - Image warping by a 3×3 homography
- *   - Sobel gradient computation
- *   - log(1 + x) dynamic-range compression
+ *   - Sobel gradient computation (gx, gy separately)
  *   - Signed Sobel gradient sum (gx + gy) for exposure-invariant ECC input
  *   - Mean-absolute-deviation gradient normalisation
- *   - Bayer mosaic to grayscale conversion
+ *   - Bayer mosaic to grayscale conversion (green-only or block-average)
  *   - 2× box-filter downsampling
  *   - ECC weighted accumulation passes
  *
- * Gradient preprocessing pipeline (applied before ECC):
- *   1. Percentile normalisation of raw pixels [CPU-only due to histogram pass]
- *   2. hdr_align_log1p          – log(1 + x) dynamic range compression
- *   3. hdr_align_compute_gradients – Sobel gx, gy
- *   4. hdr_align_gradient_sobel_sum – combine into gx + gy (signed)
- *   5. hdr_align_normalize_mad  – g / (mean(|g|) + ε)
+ * Gradient preprocessing pipeline (applied on CPU before ECC kernels):
+ *   1. Gaussian pre-filter (σ = HDR_ALIGN_PREFILTER_SIGMA, skip at coarse levels)
+ *   2. Sobel gx, gy + gradient magnitude √(gx² + gy²)
+ *   3. Percentile normalisation + power scaling + threshold of magnitude [CPU-only]
+ *   4. Mask: magnitude-based + intensity validity [CPU-only]
+ *   5. gx + gy signed sum, MAD normalise, apply mask
+ *
+ * The Gaussian pre-filter and magnitude-based masking steps run entirely
+ * on the CPU.  The CL kernels handle ECC iteration (warp, accumulate,
+ * Hessian).  Gradient preprocessing is identical for CPU and CL paths.
  */
 
 /* ---------- Warp by projective homography ----------

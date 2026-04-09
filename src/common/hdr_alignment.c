@@ -67,9 +67,10 @@
 // At L1 and above, all modes are identical because the 2× box-filter
 // downsample inherently averages Bayer blocks into grayscale.
 //
-// The full gradient pipeline (percentile normalise → build mask → log1p →
-// Sobel → MAD normalise → apply mask) runs identically regardless of mode;
-// only the input preparation and Sobel stride differ.
+// The restructured gradient pipeline (Gaussian blur → Sobel gx,gy →
+// magnitude → percentile+power+threshold → mask → gx+gy → MAD norm →
+// apply mask) runs identically regardless of mode; only the input
+// preparation and Sobel stride differ.
 
 #define HDR_ALIGN_L0_FULL_CFA   0
 #define HDR_ALIGN_L0_AVG_BAYER  1
@@ -870,32 +871,6 @@ static float *_gradient_sobel_magnitude(const float *img, const int w, const int
   return gx;
 }
 
-/** Compute signed Sobel gradient sum (gx + gy) image.
- *  ECC benefits from signed gradients that preserve structure and direction,
- *  rather than unsigned magnitude.  The sum gx + gy retains sign information
- *  from both axes in a single channel.  Caller must free result. */
-static float *_gradient_sobel_sum(const float *img, const int w, const int h)
-{
-  const size_t npix = (size_t)w * h;
-  float *gx = dt_alloc_align_float(npix);
-  float *gy = dt_alloc_align_float(npix);
-  if(!gx || !gy)
-  {
-    dt_free_align(gx);
-    dt_free_align(gy);
-    return NULL;
-  }
-
-  _compute_gradients(img, w, h, gx, gy);
-
-  // Combine as gx + gy — preserves sign and direction information.
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npix; i++)
-    gx[i] = gx[i] + gy[i];
-
-  dt_free_align(gy);
-  return gx;
-}
 
 /** Mask a gradient image by zeroing out pixels whose corresponding
  *  [0,1]-normalised intensity is outside [lo, hi].  Pixels near the
@@ -911,28 +886,6 @@ static void _mask_gradient_by_intensity(float *grad,
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
     grad[i] *= mask[i];
-}
-
-/** Build a validity mask from a [0,1]-normalised image.
- *  Pixels with norm_01[i] < lo or > hi get mask 0; others get mask 1.
- *  Also applies log1p() in-place to the normalised image in the same pass
- *  so the caller does not need a separate _log1p_transform() call.
- *  Caller must free the returned mask. */
-static float *_build_mask_and_log1p(float *norm_01,
-                                    const size_t npix,
-                                    const float lo,
-                                    const float hi)
-{
-  float *mask = dt_alloc_align_float(npix);
-  if(!mask) return NULL;
-
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npix; i++)
-  {
-    mask[i] = (norm_01[i] >= lo && norm_01[i] <= hi) ? 1.0f : 0.0f;
-    norm_01[i] = logf(1.0f + norm_01[i]);
-  }
-  return mask;
 }
 
 // Thresholds for the gradient validity mask.  After percentile
