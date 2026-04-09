@@ -253,6 +253,37 @@ hdr_align_gradient_bayer_cfa_sobel(global const float *bayer,
   out[idx] = gx + gy;
 }
 
+/* ---------- Green-only Bayer to half-resolution grayscale ----------
+ *
+ * Converts a full-resolution RGGB Bayer mosaic to half-resolution grayscale
+ * by averaging only the two green pixels in each 2×2 block:
+ *   Green_r at (row=0, col=1) and Green_b at (row=1, col=0).
+ *
+ * This gives the best SNR (green has the highest quantum efficiency, 2 samples
+ * per block) and avoids mixing dissimilar spectral channels: a saturated R/B
+ * pixel cannot contaminate the green-only luminance.
+ *
+ * Output dimensions are (in_w/2) × (in_h/2).
+ */
+kernel void
+hdr_align_mosaic_to_green_only(global const float *in,
+                               global float *out,
+                               const int in_w,
+                               const int out_w,
+                               const int out_h)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= out_w || y >= out_h) return;
+
+  const int sx = x * 2;
+  const int sy = y * 2;
+  // RGGB layout: Gr at (sy, sx+1), Gb at (sy+1, sx)
+  const float gr = in[(size_t)sy * in_w + sx + 1];
+  const float gb = in[(size_t)(sy + 1) * in_w + sx];
+  out[(size_t)y * out_w + x] = 0.5f * (gr + gb);
+}
+
 /* ---------- 2× box-filter downsample ---------- */
 kernel void
 hdr_align_downsample_2x(global const float *in,

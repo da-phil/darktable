@@ -41,21 +41,27 @@ typedef struct dt_hdr_alignment_t
  *  Both images must be single-channel float Bayer mosaic data of identical
  *  dimensions (as produced by the rawprepare IOP).
  *
- *  Two L0 modes are available, controlled by the HDR_ALIGN_USE_FULL_CFA_L0
+ *  Three L0 modes are available, controlled by the HDR_ALIGN_L0_MODE
  *  preprocessor macro in hdr_alignment.c:
  *
- *    HDR_ALIGN_USE_FULL_CFA_L0 defined (default):
+ *    HDR_ALIGN_L0_FULL_CFA (0):
  *      The pyramid is built from full-resolution Bayer data.  L0 retains
- *      the CFA structure and uses per-sublattice normalisation followed by
- *      a CFA-aware stride-2 Sobel filter.  L1+ are grayscale-equivalent
- *      (each 2× box-filter step averages a Bayer block) and use stride-1
- *      Sobel.  The final homography is directly in full-resolution coords.
+ *      the CFA structure and uses per-sublattice normalisation + stride-2
+ *      Sobel.  L1+ are grayscale-equivalent.  Final H is in full-res coords.
  *
- *    HDR_ALIGN_USE_FULL_CFA_L0 not defined (fallback):
- *      L0 is converted to half-resolution grayscale by averaging each 2×2
- *      Bayer block.  All levels use stride-1 Sobel with global percentile
- *      normalisation.  The final homography is converted from half-res to
- *      full-resolution coordinates.
+ *    HDR_ALIGN_L0_AVG_BAYER (1):
+ *      L0 is half-resolution grayscale (2×2 Bayer block average).  All levels
+ *      use global percentile + stride-1 Sobel.  Final H is scaled from
+ *      half-res to full-res coordinates.
+ *
+ *    HDR_ALIGN_L0_GREEN_ONLY (2, default):
+ *      L0 is half-resolution grayscale built from the green channel only
+ *      (averaging the two green pixels per Bayer block).  Best SNR, no
+ *      demosaicing artefacts, photometrically consistent across exposures.
+ *      Processing is identical to AVG_BAYER at all levels.
+ *
+ *  In all three modes the full gradient pipeline runs identically:
+ *    normalise → build mask → log1p → Sobel → MAD normalise → apply mask
  *
  *  Per-pixel normalisation:
  *    normalised = max(pixel - black_level, 0) / (relative_exposure × relative_iso)
@@ -122,6 +128,7 @@ typedef struct dt_hdr_alignment_cl_global_t
   int kernel_gradient_sobel_sum;
   int kernel_normalize_mad;
   int kernel_gradient_bayer_cfa_sobel;
+  int kernel_mosaic_to_green_only;
   int kernel_downsample_2x;
   int kernel_ecc_means;
   int kernel_ecc_norms;

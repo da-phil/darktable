@@ -32,26 +32,50 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// CFA mode selection
+// CFA mode selection for pyramid level 0 (finest level)
 // ---------------------------------------------------------------------------
-// When HDR_ALIGN_USE_FULL_CFA_L0 is defined (the default), the pyramid is
-// built from full-resolution Bayer data and the finest level (L0) retains
-// the four-colour CFA pattern.  L0 gradient computation uses a stride-2
-// Sobel filter that only mixes same-channel neighbours, preceded by a
-// per-sublattice normalisation that equalises the G/R/B amplitude
-// difference.  This produces cleaner gradients at full resolution because
-// saturated pixels corrupt only their own CFA channel's edge response
-// instead of contaminating a whole 2×2 block average.
 //
-// When HDR_ALIGN_USE_FULL_CFA_L0 is *undefined*, L0 is converted to
-// half-resolution grayscale by averaging each 2×2 Bayer block before the
-// pyramid is built, exactly as the original implementation did.  This mode
-// is the safe fallback and halves the L0 pixel count.
+// HDR_ALIGN_L0_MODE selects how the Bayer mosaic is converted into
+// the alignment pyramid's finest level:
 //
-// Both modes use identical processing at L1 and above because the 2×
-// box-filter downsample inherently averages a Bayer block into one
-// grayscale value.
-#define HDR_ALIGN_USE_FULL_CFA_L0
+//   HDR_ALIGN_L0_FULL_CFA (0):
+//     The pyramid is built from full-resolution Bayer data.  L0 retains
+//     the CFA pattern and uses per-sublattice 99th-percentile normalisation
+//     followed by a stride-2 Sobel filter so that each CFA channel's
+//     gradients are computed from same-channel neighbours only.  This
+//     produces the sharpest possible gradients and isolates saturated
+//     pixels to their own channel's edge response.
+//
+//   HDR_ALIGN_L0_AVG_BAYER (1):
+//     L0 is converted to half-resolution grayscale by averaging each 2×2
+//     Bayer block.  Standard global percentile normalisation + stride-1
+//     Sobel is used.  This is the safe fallback: it halves the L0 pixel
+//     count and avoids CFA-related artefacts, but averages different
+//     colour channels which can spread a single saturated pixel to a
+//     whole 2×2 block.
+//
+//   HDR_ALIGN_L0_GREEN_ONLY (2):
+//     L0 is built from the green channel only: the two green pixels in
+//     each 2×2 Bayer block are averaged into one half-resolution sample.
+//     Green has the best SNR (highest quantum efficiency, 2 samples per
+//     block) and introduces no demosaicing artefacts.  The resulting
+//     image is photometrically consistent across exposures because the
+//     spectral response is uniform.  Standard global percentile norm +
+//     stride-1 Sobel is used (same as AVG_BAYER).
+//
+// At L1 and above, all modes are identical because the 2× box-filter
+// downsample inherently averages Bayer blocks into grayscale.
+//
+// The full gradient pipeline (percentile normalise → build mask → log1p →
+// Sobel → MAD normalise → apply mask) runs identically regardless of mode;
+// only the input preparation and Sobel stride differ.
+
+#define HDR_ALIGN_L0_FULL_CFA   0
+#define HDR_ALIGN_L0_AVG_BAYER  1
+#define HDR_ALIGN_L0_GREEN_ONLY 2
+
+// Select the active L0 mode here:
+#define HDR_ALIGN_L0_MODE HDR_ALIGN_L0_GREEN_ONLY
 
 // Maximum rotation search range in degrees (for coarse exhaustive search)
 #define HDR_ALIGN_MAX_ANGLE_DEG 10.0f
@@ -99,15 +123,19 @@
 // Maximum rotation change (degrees) that a single ECC pyramid level is allowed
 // to introduce.  If ECC drifts the angle further than this it has wandered to
 // a wrong local maximum; the result is reverted to the pre-level homography.
-#define HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG 5.0f
+// This is the base value at the coarsest ECC level; it is halved for each
+// finer level (see _adaptive_max_angle_delta and _adaptive_max_trans_delta).
+#define HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE 10.0f
+// Minimum per-level angle drift limit (degrees) after adaptive halving.
+#define HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN  1.0f
 // Maximum translation change (pixels at the current level) that a single ECC
 // pyramid level may introduce.  Each level inherits a 2×-scaled estimate from
 // its parent, so the parent's accuracy at the child's scale is ~2 px.
-// Allowing up to 3 px gives sufficient room for genuine sub-pixel refinement
-// while catching runaway ECC drift that would compound across levels.
-// In well-aligned tripod shots the per-level change is typically <1 px;
-// hand-held brackets occasionally reach ~2.5 px at coarser levels.
-#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX 5.0f
+// This is the base value at the coarsest ECC level; it is halved for each
+// finer level (same schedule as angle).
+#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE 10.0f
+// Minimum per-level translation drift limit after adaptive halving.
+#define HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN  2.0f
 // Number of free parameters in projective homography (h22 fixed to 1)
 #define HDR_ALIGN_H_NPARAM 8
 // Number of Jacobi smoothing iterations for the residual mesh.
@@ -188,7 +216,7 @@ static float *_normalize_bayer(const float *mosaic,
   return out;
 }
 
-#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_AVG_BAYER
 /** Convert a full-resolution Bayer mosaic to half-resolution grayscale
  *  by averaging each 2×2 Bayer block.  Output dimensions are (wd/2)×(ht/2).
  *  This produces a photometrically uniform single-channel image suitable
@@ -221,9 +249,53 @@ static float *_mosaic_to_grayscale(const float *mosaic,
   *out_h = gh;
   return out;
 }
-#endif /* !HDR_ALIGN_USE_FULL_CFA_L0 */
+#endif /* HDR_ALIGN_L0_AVG_BAYER */
 
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_GREEN_ONLY
+/** Convert a full-resolution Bayer mosaic to half-resolution grayscale
+ *  using only the green channel.  In a standard RGGB Bayer pattern the
+ *  green pixels sit at positions (0,1) and (1,0) within each 2×2 block.
+ *  Averaging these two samples gives the best-SNR single-channel
+ *  representation because green has the highest quantum efficiency and
+ *  there are two samples per block.
+ *
+ *  Unlike _mosaic_to_grayscale (which averages all four RGGB pixels), this
+ *  avoids mixing dissimilar spectral channels: a saturated red pixel cannot
+ *  contaminate the green-derived luminance.  The result is photometrically
+ *  consistent across exposures and free of demosaicing artefacts.
+ *
+ *  Output dimensions are (wd/2) × (ht/2).  Caller must free the result. */
+static float *_mosaic_to_green_only(const float *mosaic,
+                                    const int wd,
+                                    const int ht,
+                                    int *out_w,
+                                    int *out_h)
+{
+  const int gw = wd / 2;
+  const int gh = ht / 2;
+  float *out = dt_alloc_align_float((size_t)gw * gh);
+  if(!out) return NULL;
+
+  // In an RGGB Bayer pattern the two green pixels in each 2×2 block
+  // are at offsets (row=0,col=1) = Gr and (row=1,col=0) = Gb.
+  DT_OMP_FOR(collapse(2))
+  for(int y = 0; y < gh; y++)
+    for(int x = 0; x < gw; x++)
+    {
+      const int mx = x * 2;
+      const int my = y * 2;
+      const float gr = mosaic[my * wd + mx + 1];        // row 0, col 1
+      const float gb = mosaic[(my + 1) * wd + mx];      // row 1, col 0
+      out[y * gw + x] = 0.5f * (gr + gb);
+    }
+
+  *out_w = gw;
+  *out_h = gh;
+  return out;
+}
+#endif /* HDR_ALIGN_L0_GREEN_ONLY */
+
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
 /** Normalise each CFA sublattice of a Bayer mosaic to [0, 1] independently
  *  using a 99th-percentile stretch.
  *
@@ -340,7 +412,7 @@ static float *_gradient_bayer_cfa_sobel(const float *bayer,
     }
   return out;
 }
-#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
+#endif /* HDR_ALIGN_L0_FULL_CFA */
 
 /** Downsample an image by 2x using a box filter.
  *  Output dimensions are (w/2) x (h/2).  Caller must free the result. */
@@ -463,9 +535,10 @@ static void _homography_scale_to_finer(float H[HDR_ALIGN_H_NPARAM])
   H[7] *= 0.5f;
 }
 
-#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE != HDR_ALIGN_L0_FULL_CFA
 /** Scale a homography from half-resolution local coordinates to
- *  full-resolution Bayer coordinates.  The rotation/scale/shear components
+ *  full-resolution Bayer coordinates.  Used by AVG_BAYER and GREEN_ONLY
+ *  modes where L0 is half-resolution.  The rotation/scale/shear components
  *  (H[0],H[1],H[3],H[4]) are dimensionless and unchanged.  The
  *  translation (H[2],H[5]) and perspective (H[6],H[7]) scale exactly
  *  like _homography_scale_to_finer(). */
@@ -478,7 +551,7 @@ static void _homography_local_to_full(const float H_local[HDR_ALIGN_H_NPARAM],
   H_full[6] *= 0.5f;  // p1
   H_full[7] *= 0.5f;  // p2
 }
-#endif /* !HDR_ALIGN_USE_FULL_CFA_L0 */
+#endif /* HDR_ALIGN_L0_MODE != HDR_ALIGN_L0_FULL_CFA */
 
 static void _homography_to_matrix(const float H[HDR_ALIGN_H_NPARAM],
                                   double M[3][3])
@@ -2598,22 +2671,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
   // Step 2: Build the image pyramid.
   //
-  // HDR_ALIGN_USE_FULL_CFA_L0 mode (default):
-  //   The pyramid is built directly from full-resolution Bayer data.  Level 0
-  //   retains the full CFA structure; each subsequent level is a 2× box-filter
-  //   downsampling.  Since each 2×2 step averages a Bayer block, L1 and above
-  //   are effectively grayscale.  Only L0 requires CFA-aware stride-2 Sobel
-  //   (see _gradient_bayer_cfa_sobel).
-  //
-  // Averaged Bayer mode (fallback):
-  //   The mosaic is first converted to half-resolution grayscale by averaging
-  //   each 2×2 Bayer block (_mosaic_to_grayscale).  The pyramid is then built
-  //   from grayscale data.  All levels use stride-1 Sobel.  The final
-  //   homography must be scaled from half-res to full-res coordinates.
+  // FULL_CFA:     pyramid built directly from full-resolution Bayer data.
+  //               L0 retains CFA; L1+ are grayscale via 2× box downsample.
+  // AVG_BAYER:    L0 = half-resolution grayscale from 2×2 block average.
+  // GREEN_ONLY:   L0 = half-resolution grayscale from green channel average.
+  // In AVG_BAYER and GREEN_ONLY the final H is scaled from half-res to full-res.
   _pyramid_t pyr_ref, pyr_img;
   int pyr_w, pyr_h; // dimensions of pyramid level 0
 
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
   pyr_w = wd;
   pyr_h = ht;
   if(!_build_pyramid(bayer_ref, pyr_w, pyr_h, &pyr_ref))
@@ -2637,10 +2703,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   }
   dt_free_align(bayer_ref);
   dt_free_align(bayer_img);
-#else /* averaged Bayer mode */
+#else /* AVG_BAYER or GREEN_ONLY: convert to half-res grayscale first */
   {
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_GREEN_ONLY
+    float *gray_ref = _mosaic_to_green_only(bayer_ref, wd, ht, &pyr_w, &pyr_h);
+    float *gray_img = _mosaic_to_green_only(bayer_img, wd, ht, &pyr_w, &pyr_h);
+#else /* HDR_ALIGN_L0_AVG_BAYER */
     float *gray_ref = _mosaic_to_grayscale(bayer_ref, wd, ht, &pyr_w, &pyr_h);
     float *gray_img = _mosaic_to_grayscale(bayer_img, wd, ht, &pyr_w, &pyr_h);
+#endif
     dt_free_align(bayer_ref);
     dt_free_align(bayer_img);
     if(!gray_ref || !gray_img)
@@ -2674,7 +2745,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     dt_free_align(gray_ref);
     dt_free_align(gray_img);
   }
-#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
+#endif /* HDR_ALIGN_L0_MODE */
 
   // Track whether the finest-level alignment concluded that no correction is
   // needed.  When identity is selected we skip the residual mesh computation:
@@ -2886,6 +2957,20 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   // transforms — exactly what we need for HDR brackets with different
   // exposures.  Parameters are scaled by 2× when transitioning to
   // each finer level.
+
+  // Determine the coarsest level that meets the ECC_MIN_DIM threshold.
+  // This is used by the adaptive drift guards to scale tolerances: the
+  // coarsest ECC level gets the base tolerance, each finer step halves it.
+  int first_ecc_level = 0;
+  for(int l = coarsest; l >= 0; l--)
+  {
+    if(MIN(pyr_ref.width[l], pyr_ref.height[l]) >= HDR_ALIGN_ECC_MIN_DIM)
+    {
+      first_ecc_level = l;
+      break;
+    }
+  }
+
   for(int l = coarsest; l >= 0; l--)
   {
     const int lw = pyr_ref.width[l];
@@ -2910,26 +2995,12 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // Compute gradient images for exposure-invariant ECC.
     // The signed gradient sum (gx + gy) preserves structure and direction.
     //
-    // When HDR_ALIGN_USE_FULL_CFA_L0 is defined (the default):
-    //   At L0 the pyramid data is full-resolution Bayer.  Use per-sublattice
-    //   normalisation (_normalize_bayer_per_channel) followed by CFA-aware
-    //   stride-2 Sobel (_gradient_bayer_cfa_sobel) so that each CFA channel's
-    //   gradients have comparable amplitude.  Without per-sublattice
-    //   normalisation the G channels (typically ~2× brighter) would produce
-    //   ~2× larger gradients than R/B, creating a Bayer-frequency amplitude
-    //   pattern that suppresses ECC ρ to ≈ 0.28 regardless of alignment
-    //   quality — this was the root cause of the alignment regression.
+    // FULL_CFA at L0: per-sublattice normalization + CFA stride-2 Sobel.
+    // AVG_BAYER / GREEN_ONLY at L0: global percentile + stride-1 Sobel.
+    // L1+ (all modes): global percentile + stride-1 Sobel.
     //
-    // When HDR_ALIGN_USE_FULL_CFA_L0 is not defined:
-    //   L0 is already half-resolution grayscale (2×2 Bayer block average).
-    //   Standard global percentile normalisation + stride-1 Sobel is used,
-    //   identical to L1 and above.
-    //
-    // At L1 and above the pyramid data is grayscale-equivalent (each 2×2
-    // box-filter downsampling step averages a Bayer block), so standard
-    // global percentile normalisation and stride-1 Sobel are appropriate.
-    //
-    // In both cases: normalise → mask → log1p → gradient → MAD normalise → apply mask.
+    // The complete pipeline always runs:
+    //   normalise → build mask & log1p → Sobel gradient → MAD normalise → apply mask
     const size_t lpix = (size_t)lw * lh;
     float *ref_norm = dt_alloc_align_float(lpix);
     float *img_norm = dt_alloc_align_float(lpix);
@@ -2947,19 +3018,10 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     float *ref_grad = NULL;
     float *img_grad = NULL;
 
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
     if(l == 0)
     {
       // L0: full-resolution Bayer — per-sublattice normalization + CFA Sobel.
-      //
-      // The stride-2 Sobel filter reads only from pixels that belong to the
-      // same CFA channel, so it never mixes G and R/B values.  This is both
-      // more robust to saturated pixels (a blown R pixel does not contaminate
-      // the G channel's gradient) and produces sharper edges because no
-      // inter-channel blurring occurs.
-      //
-      // The per-sublattice percentile normalisation ensures all four CFA
-      // sublattices contribute equally to the ECC objective function.
       _normalize_bayer_per_channel(ref_norm, lw, lh);
       _normalize_bayer_per_channel(img_norm, lw, lh);
       float *ref_mask = _build_mask_and_log1p(ref_norm, lpix,
@@ -2980,9 +3042,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // DOF escalation and the identity check below.
     }
     else
-#endif /* HDR_ALIGN_USE_FULL_CFA_L0 */
+#endif /* HDR_ALIGN_L0_FULL_CFA */
     {
-      // L1+ (or all levels in averaged-Bayer fallback): grayscale-equivalent —
+      // L1+ (or L0 in AVG_BAYER / GREEN_ONLY): grayscale-equivalent —
       // global percentile norm + stride-1 Sobel.
       _normalize_image_percentile(ref_norm, lpix);
       _normalize_image_percentile(img_norm, lpix);
@@ -2994,9 +3056,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                                               HDR_ALIGN_GRADIENT_MASK_HI);
       ref_grad = _gradient_sobel_sum(ref_norm, lw, lh);
       img_grad = _gradient_sobel_sum(img_norm, lw, lh);
-      // At L0 in CFA mode, ref_norm/img_norm are needed for ρ scoring.
-      // In averaged-Bayer mode L0 is grayscale-equivalent and can also be
-      // used for ρ scoring; keep alive when l==0.
+      // Keep ref_norm/img_norm alive at l==0 for ρ scoring.
       if(l > 0)
       {
         dt_free_align(ref_norm);
@@ -3078,6 +3138,13 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // Angle drift guard: if ECC changed the rotation by more than the
     // per-level tolerance it wandered to a wrong local maximum.  Revert to
     // the pre-level homography so the error does not cascade to finer levels.
+    //
+    // The tolerance is adaptive: the base value (HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE)
+    // applies at the coarsest ECC level.  For each step toward L0 the
+    // tolerance is halved, because the parent estimate is already refined
+    // and finer levels should only introduce sub-pixel corrections.
+    // The minimum is clamped to HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN.
+    //
     // Skip the guard when ECC genuinely converged — a converged rotation is
     // trustworthy even if it moved more than the default tolerance.
     if(!ecc_converged)
@@ -3086,12 +3153,17 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                   - atan2f(H_backup[3], H_backup[0]);
       if(delta >  (float)M_PI) delta -= 2.0f * (float)M_PI;
       if(delta < -(float)M_PI) delta += 2.0f * (float)M_PI;
-      const float max_delta = HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG * (float)M_PI / 180.0f;
+      // steps_from_coarsest == 0 at the coarsest ECC level, increases toward L0.
+      const int steps_from_coarsest = first_ecc_level - l;
+      const float angle_limit_deg = fmaxf(
+        HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_BASE / (float)(1 << steps_from_coarsest),
+        HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG_MIN);
+      const float max_delta = angle_limit_deg * (float)M_PI / 180.0f;
       if(fabsf(delta) > max_delta)
       {
         dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] ECC level %d: angle drift %.2f° > limit %.1f°, reverting",
-                 l, delta * 180.0f / (float)M_PI, HDR_ALIGN_ECC_MAX_ANGLE_DELTA_DEG);
+                 l, delta * 180.0f / (float)M_PI, angle_limit_deg);
         memcpy(H_level, H_backup, sizeof(H_level));
       }
     }
@@ -3102,18 +3174,24 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     // correction is at most a few pixels.  Large shifts at any single level
     // indicate a wrong local minimum, and the error doubles at every finer
     // level, producing catastrophically wrong final alignments.
+    //
+    // The tolerance is adaptive (same halving schedule as the angle guard).
     // Skip the guard when ECC genuinely converged — the result is trusted.
     if(!ecc_converged)
     {
       const float dtx = H_level[2] - H_backup[2];
       const float dty = H_level[5] - H_backup[5];
-      if(fabsf(dtx) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX
-         || fabsf(dty) > HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX)
+      const int steps_from_coarsest = first_ecc_level - l;
+      const float trans_limit = fmaxf(
+        HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_BASE / (float)(1 << steps_from_coarsest),
+        HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX_MIN);
+      if(fabsf(dtx) > trans_limit
+         || fabsf(dty) > trans_limit)
       {
         dt_print(DT_DEBUG_HDRMERGE,
                  "[hdr_merge] ECC level %d: translation drift (%.2f, %.2f) px"
                  " > limit %.1f px, reverting",
-                 l, dtx, dty, HDR_ALIGN_ECC_MAX_TRANS_DELTA_PX);
+                 l, dtx, dty, trans_limit);
         memcpy(H_level, H_backup, sizeof(H_level));
       }
     }
@@ -3194,11 +3272,11 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   }
 
   // Output the homography in full-resolution Bayer pixel coordinates.
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
   // L0 is already full-resolution — H_level maps directly.
   memcpy(out_align->H, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
 #else
-  // L0 is half-resolution grayscale — scale H back to full-resolution.
+  // L0 is half-resolution (AVG_BAYER or GREEN_ONLY) — scale H back to full-resolution.
   _homography_local_to_full(H_level, out_align->H);
 #endif
 
@@ -3219,7 +3297,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       {
         memcpy(rn, pyr_ref.data[0], sizeof(float) * npix0);
         memcpy(in, pyr_img.data[0], sizeof(float) * npix0);
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
         // L0 mesh: same CFA-aware pipeline as ECC level 0.
         _normalize_bayer_per_channel(rn, l0w, l0h);
         _normalize_bayer_per_channel(in, l0w, l0h);
@@ -3232,7 +3310,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
         ref_grad0 = _gradient_bayer_cfa_sobel(rn, l0w, l0h);
         img_grad0 = _gradient_bayer_cfa_sobel(in, l0w, l0h);
 #else
-        // L0 mesh: same grayscale pipeline as ECC level 0.
+        // L0 mesh: grayscale pipeline (AVG_BAYER or GREEN_ONLY).
         _normalize_image_percentile(rn, npix0);
         _normalize_image_percentile(in, npix0);
         float *ref_mask0 = _build_mask_and_log1p(rn, npix0,
@@ -3259,18 +3337,12 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Mesh operates at pyramid L0 resolution.  Compute the mesh H in L0
       // coordinates and convert displacements to full-resolution afterwards.
       float H_mesh[HDR_ALIGN_H_NPARAM];
-#ifdef HDR_ALIGN_USE_FULL_CFA_L0
-      // L0 is full-resolution Bayer — H_level maps directly.
       memcpy(H_mesh, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
-#else
-      // L0 is half-resolution — use H_level (still in L0 coords).
-      memcpy(H_mesh, H_level, sizeof(float) * HDR_ALIGN_H_NPARAM);
-#endif
       if(_estimate_mesh_residuals(ref_grad0, img_grad0,
                                   pyr_ref.width[0], pyr_ref.height[0],
                                   H_mesh, out_align->mesh_dx, out_align->mesh_dy))
       {
-#ifndef HDR_ALIGN_USE_FULL_CFA_L0
+#if HDR_ALIGN_L0_MODE != HDR_ALIGN_L0_FULL_CFA
         // Scale mesh displacements from half-resolution to full-resolution.
         for(int i = 0; i < DT_HDR_ALIGN_MESH_NODES; i++)
         {
@@ -3911,6 +3983,7 @@ dt_hdr_alignment_cl_global_t *dt_hdr_alignment_init_cl_global(void)
   g->kernel_gradient_sobel_sum = dt_opencl_create_kernel(program, "hdr_align_gradient_sobel_sum");
   g->kernel_normalize_mad    = dt_opencl_create_kernel(program, "hdr_align_normalize_mad");
   g->kernel_gradient_bayer_cfa_sobel = dt_opencl_create_kernel(program, "hdr_align_gradient_bayer_cfa_sobel");
+  g->kernel_mosaic_to_green_only = dt_opencl_create_kernel(program, "hdr_align_mosaic_to_green_only");
   g->kernel_downsample_2x    = dt_opencl_create_kernel(program, "hdr_align_downsample_2x");
   g->kernel_ecc_means        = dt_opencl_create_kernel(program, "hdr_align_ecc_means");
   g->kernel_ecc_norms        = dt_opencl_create_kernel(program, "hdr_align_ecc_norms");
@@ -3928,6 +4001,7 @@ void dt_hdr_alignment_free_cl_global(dt_hdr_alignment_cl_global_t *g)
   dt_opencl_free_kernel(g->kernel_gradient_sobel_sum);
   dt_opencl_free_kernel(g->kernel_normalize_mad);
   dt_opencl_free_kernel(g->kernel_gradient_bayer_cfa_sobel);
+  dt_opencl_free_kernel(g->kernel_mosaic_to_green_only);
   dt_opencl_free_kernel(g->kernel_downsample_2x);
   dt_opencl_free_kernel(g->kernel_ecc_means);
   dt_opencl_free_kernel(g->kernel_ecc_norms);
