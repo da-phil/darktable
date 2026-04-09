@@ -206,11 +206,12 @@
 // Shear is defined as (h12 + h21) / 2 — the symmetric part of the 2×2
 // submatrix.  Physical camera movements produce negligible shear: pure
 // rotation, translation, zoom, and moderate perspective all produce
-// shear < 0.004.  Larger values indicate the higher-DOF model is fitting
-// non-geometric patterns such as exposure gradients, vignetting, or
-// moving scene content (e.g. ocean waves) as spurious affine deformation.
-// 0.006 allows genuine perspective-induced shear while catching the most
-// common false-positive escalations.
+// shear < 0.004.  The threshold is set 50% above the empirical physical
+// maximum to provide a safety margin for unusual lens/camera combinations
+// and extreme perspective, while still reliably catching non-geometric
+// patterns such as exposure gradients, vignetting, or moving scene
+// content (e.g. ocean waves, shear typically > 0.008) that the optimizer
+// can fit as spurious affine deformation.
 #define HDR_ALIGN_ESCALATION_MAX_SHEAR 0.006f
 
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
