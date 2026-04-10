@@ -227,6 +227,20 @@
 // than real image geometry.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
 
+// Maximum shear magnitude allowed in an escalated homography.
+// Shear is defined as |(h12 + h21) / 2| — the symmetric part of the 2×2
+// submatrix.  Physical camera movements (rotation, translation, zoom,
+// moderate perspective) produce negligible shear (< 0.004).  Larger
+// values indicate the higher-DOF model is fitting non-geometric patterns
+// such as exposure gradients, vignetting, or moving scene content
+// (e.g. ocean waves) as spurious affine deformation.
+// 0.006 allows genuine perspective-induced shear while catching the most
+// common false-positive escalations.  This check complements the adaptive
+// Gaussian pre-filter sigma (which prevents ECC convergence to local
+// minima) by rejecting geometrically implausible results that happen to
+// achieve higher ρ by fitting dynamic content.
+#define HDR_ALIGN_ESCALATION_MAX_SHEAR 0.006f
+
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
 // The escalation runs at the first (coarsest) pyramid level whose shortest
 // edge is at least this value.  At smaller resolutions the gradient image
@@ -2189,11 +2203,10 @@ static float _ecc_refine_level(const float *ref,
 /** Compute the weighted ECC alignment score ρ from *intensity* images.
  *
  *  Both @p ref_intensity and @p img_intensity must be preprocessed intensity
- *  images (percentile-normalised and Gaussian pre-filtered with the same
- *  adaptive sigma used by the ECC gradient pipeline).  Applying the
- *  pre-filter before ρ scoring ensures the Sobel magnitudes capture the
- *  same spatial-frequency band that ECC optimised on, preventing
- *  high-frequency dynamic content from inflating or deflating the score.
+ *  images (at minimum percentile-normalised).  Callers may optionally apply
+ *  a Gaussian pre-filter for consistency with the ECC gradient pipeline;
+ *  at the DOF escalation level the pre-filter is omitted to avoid biasing
+ *  the ρ comparison against non-uniform transforms (scale, perspective).
  *
  *  Using gradient magnitude (always ≥ 0, rotation-invariant) instead of the
  *  signed gx+gy sum avoids the sign-cancellation artefact that drives the PCC
@@ -2802,11 +2815,21 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_6 = rho_6dof - rho_3dof;
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
+  // Shear check: the symmetric part of the 2×2 submatrix measures pure
+  // shear.  Physical camera movements (rotation, translation, zoom,
+  // moderate perspective) produce negligible shear (< 0.004).  Large
+  // values indicate the optimizer is fitting non-geometric patterns such
+  // as exposure gradients, vignetting, or moving scene content (waves)
+  // as spurious affine deformation.
+  const float shear_6 = 0.5f * fabsf(H_6dof[1] + H_6dof[3]);
+  const gboolean low_shear_6 = shear_6 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
+
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d)",
-           rho_6dof, improvement_6, sane_6);
+           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d, shear=%.4f)",
+           rho_6dof, improvement_6, sane_6, shear_6);
 
   const gboolean accept_6 = sane_6
+                             && low_shear_6
                              && rho_6dof > rho_3dof
                              && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
@@ -2833,12 +2856,15 @@ static float _try_dof_escalation(const float *ref_grad,
 
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
+  const float shear_8 = 0.5f * fabsf(H_8dof[1] + H_8dof[3]);
+  const gboolean low_shear_8 = shear_8 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d)",
-           rho_8dof, improvement_8, sane_8);
+           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d, shear=%.4f)",
+           rho_8dof, improvement_8, sane_8, shear_8);
 
   const gboolean accept_8 = sane_8
+                             && low_shear_8
                              && rho_8dof > rho_6dof
                              && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF;
 
@@ -3312,6 +3338,30 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
   dt_free_align(coarse_ref_grad);
   dt_free_align(coarse_img_grad);
 
+  // Additional sanity check: if the coarse similarity produces a homography
+  // that fails _homography_is_sane (scale far from 1.0 or rotation too large),
+  // the 3-DOF ECC at finer levels cannot correct the scale component and
+  // will propagate the error unchanged through the entire pyramid.  Fall
+  // back to identity and let the ECC pyramid + DOF escalation handle the
+  // alignment from scratch.  This catches false matches from the coarse
+  // NCC search which can occur at tiny resolutions (e.g. 74×49) when
+  // the scale search range is wide.
+  {
+    float H_test[HDR_ALIGN_H_NPARAM];
+    _homography_from_similarity(best_tx, best_ty, best_angle, best_scale,
+                                cw, ch, H_test);
+    if(!_homography_is_sane(H_test, cw, ch))
+    {
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] coarse similarity fails rigid sanity check"
+               " -- falling back to identity");
+      best_tx = 0.0f;
+      best_ty = 0.0f;
+      best_angle = 0.0f;
+      best_scale = 1.0f;
+    }
+  }
+
   // Initialise projective model from coarse similarity estimate.
   float H_level[HDR_ALIGN_H_NPARAM];
   _homography_from_similarity(best_tx, best_ty, best_angle, best_scale, cw, ch, H_level);
@@ -3445,20 +3495,31 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                                          _compute_adaptive_sigma(lw, lh), NULL);
       // Prepare fresh intensity copies from the pyramid for ρ scoring
       // (DOF escalation at escalation_level, identity check at L0).
-      // Apply the same Gaussian pre-filter that the ECC gradient pipeline
-      // uses.  _ecc_compute_rho computes Sobel magnitudes on these
-      // intensity images; without the blur the Sobel picks up
-      // high-frequency dynamic content (ocean waves, foliage motion)
-      // that the ECC solver never saw, causing unreliable ρ scores
-      // and spurious DOF escalation at fine levels.
+      //
+      // At levels below the escalation level (typically L1 and L0), apply the
+      // Gaussian pre-filter so that the L0 identity check uses Sobel magnitudes
+      // that match the spatial-frequency band seen by the ECC solver —
+      // suppressing high-frequency dynamic content (ocean waves, foliage)
+      // that the solver never optimised against.
+      //
+      // At the escalation level itself, leave the intensity images unblurred:
+      // the pre-filter suppresses features at scales comparable to the scale
+      // and perspective corrections the 6-/8-DOF model introduces, which
+      // biases the ρ comparison against legitimate non-rigid transforms and
+      // can reject correct DOF escalation on scenes with dynamic content.
+      // The shear consistency check (HDR_ALIGN_ESCALATION_MAX_SHEAR) guards
+      // against spurious escalation fitting dynamic content.
       if(l <= escalation_level)
       {
         memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
         memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
         _normalize_image_percentile(ref_norm, lpix);
         _normalize_image_percentile(img_norm, lpix);
-        _gaussian_prefilter(ref_norm, lw, lh, level_sigma);
-        _gaussian_prefilter(img_norm, lw, lh, level_sigma);
+        if(l < escalation_level)
+        {
+          _gaussian_prefilter(ref_norm, lw, lh, level_sigma);
+          _gaussian_prefilter(img_norm, lw, lh, level_sigma);
+        }
       }
       else
       {
