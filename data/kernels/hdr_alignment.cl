@@ -30,7 +30,8 @@
  *   - ECC weighted accumulation passes
  *
  * Gradient preprocessing pipeline (applied on CPU before ECC kernels):
- *   1. Gaussian pre-filter (σ = HDR_ALIGN_PREFILTER_SIGMA, skip at coarse levels)
+ *   1. Resolution-adaptive Gaussian pre-filter (σ scales with image size,
+ *      see _compute_adaptive_sigma(); skip at coarse levels)
  *   2. Sobel gx, gy + gradient magnitude √(gx² + gy²)
  *   3. Percentile normalisation + power scaling + threshold of magnitude [CPU-only]
  *   4. Mask: magnitude-based + intensity validity [CPU-only]

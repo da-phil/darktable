@@ -142,15 +142,35 @@
 #define HDR_ALIGN_H_NPARAM 8
 
 // --- Spatial pre-filtering parameters ---
-// Gaussian blur sigma (in pixels) applied to each pyramid level before
-// gradient extraction.  Suppresses sensor noise and Bayer-residual
-// high-frequency artefacts that would otherwise create spurious gradient
-// energy and degrade ECC convergence.  At coarse pyramid levels (shortest
-// edge < HDR_ALIGN_PREFILTER_MIN_DIM) the blur is skipped because the 2×
-// box-filter downsampling already provides sufficient anti-aliasing.
-#define HDR_ALIGN_PREFILTER_SIGMA 3.0f
+// Resolution-adaptive Gaussian blur applied to each pyramid level before
+// gradient extraction.  The sigma scales with the shortest image dimension
+// so that each pyramid level sees a comparable spatial-frequency band:
+//
+//   sigma(w, h) = max(SIGMA_BASE, min(w, h) * SIGMA_FRAC)
+//
+// At coarse levels the minimum (SIGMA_BASE) dominates; at fine levels the
+// sigma grows proportionally, suppressing high-frequency dynamic content
+// (ocean waves, tree foliage, moving objects) that would otherwise create
+// spurious gradient energy and pull the ECC optimiser into local minima.
+// This is the primary defence against fitting non-geometric image variation
+// as spurious affine or projective deformation — it addresses the problem
+// systemically rather than relying on per-parameter threshold checks.
+//
+// Typical values for a 4784×3188 sensor:
+//   L6 (74×49):   sigma =  3.0  (base)
+//   L5 (149×99):  sigma =  3.0  (base)
+//   L4 (299×199): sigma =  3.0  (base)
+//   L3 (598×398): sigma =  3.2
+//   L2 (1196×797): sigma =  6.4
+//   L1 (2392×1594): sigma = 12.8
+//   L0 (4784×3188): sigma = 25.5
+//
+// Base sigma: minimum blur applied at any level (noise/Bayer suppression).
+#define HDR_ALIGN_PREFILTER_SIGMA_BASE 3.0f
+// Fraction of the shortest edge used as sigma at fine levels.
+#define HDR_ALIGN_PREFILTER_SIGMA_FRAC 0.008f
 // Minimum shortest-edge dimension for applying the Gaussian pre-filter.
-// Below this size the image is too small for a σ=3 blur to be meaningful.
+// Below this size the image is too small for the blur to be meaningful.
 #define HDR_ALIGN_PREFILTER_MIN_DIM 64
 
 // --- Gradient magnitude normalization parameters ---
@@ -201,18 +221,6 @@
 // are fitting non-geometric variation (exposure gradients, vignetting) rather
 // than real image geometry.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
-
-// Maximum shear magnitude allowed in an escalated homography.
-// Shear is defined as (h12 + h21) / 2 — the symmetric part of the 2×2
-// submatrix.  Physical camera movements produce negligible shear: pure
-// rotation, translation, zoom, and moderate perspective all produce
-// shear < 0.004.  The threshold is set 50% above the empirical physical
-// maximum to provide a safety margin for unusual lens/camera combinations
-// and extreme perspective, while still reliably catching non-geometric
-// patterns such as exposure gradients, vignetting, or moving scene
-// content (e.g. ocean waves, shear typically > 0.008) that the optimizer
-// can fit as spurious affine deformation.
-#define HDR_ALIGN_ESCALATION_MAX_SHEAR 0.006f
 
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
 // The escalation runs at the first (coarsest) pyramid level whose shortest
@@ -937,6 +945,18 @@ static void _normalize_gradient_mad(float *g, const size_t npix)
   DT_OMP_FOR()
   for(size_t i = 0; i < npix; i++)
     g[i] *= inv_scale;
+}
+
+/** Compute the resolution-adaptive Gaussian pre-filter sigma.
+ *  Returns max(SIGMA_BASE, min(w,h) * SIGMA_FRAC) so that each pyramid level
+ *  sees a comparable spatial-frequency band.  At coarse levels the base sigma
+ *  dominates; at fine levels the sigma grows proportionally, suppressing
+ *  high-frequency dynamic scene content (ocean waves, foliage, moving objects)
+ *  that would otherwise pull the ECC optimiser into local minima. */
+static float _compute_adaptive_sigma(const int w, const int h)
+{
+  return fmaxf(HDR_ALIGN_PREFILTER_SIGMA_BASE,
+               (float)MIN(w, h) * HDR_ALIGN_PREFILTER_SIGMA_FRAC);
 }
 
 /** Apply in-place Gaussian pre-filter to a single-channel image.
@@ -2775,21 +2795,11 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_6 = rho_6dof - rho_3dof;
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
-  // Shear check: the symmetric part of the 2×2 submatrix measures pure
-  // shear.  Physical camera movements (rotation, translation, zoom,
-  // moderate perspective) produce negligible shear (< 0.004).  Large
-  // values indicate the optimizer is fitting non-geometric patterns such
-  // as exposure gradients, vignetting, or moving scene content (waves)
-  // as spurious affine deformation.
-  const float shear_6 = 0.5f * fabsf(H_6dof[1] + H_6dof[3]);
-  const gboolean low_shear_6 = shear_6 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
-
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d, shear=%.4f)",
-           rho_6dof, improvement_6, sane_6, shear_6);
+           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d)",
+           rho_6dof, improvement_6, sane_6);
 
   const gboolean accept_6 = sane_6
-                             && low_shear_6
                              && rho_6dof > rho_3dof
                              && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
@@ -2816,15 +2826,12 @@ static float _try_dof_escalation(const float *ref_grad,
 
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
-  const float shear_8 = 0.5f * fabsf(H_8dof[1] + H_8dof[3]);
-  const gboolean low_shear_8 = shear_8 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d, shear=%.4f)",
-           rho_8dof, improvement_8, sane_8, shear_8);
+           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d)",
+           rho_8dof, improvement_8, sane_8);
 
   const gboolean accept_8 = sane_8
-                             && low_shear_8
                              && rho_8dof > rho_6dof
                              && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF;
 
@@ -3153,7 +3160,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
       // Use the restructured gradient pipeline.
       coarse_ref_grad = _compute_level_gradient(tmp_ref, cw, ch,
-                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                                _compute_adaptive_sigma(cw, ch), NULL);
       // tmp_ref was modified in-place by the blur; keep a pre-Sobel copy
       // for ρ scoring.  We re-copy from the pyramid since tmp_ref is now blurred.
       memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
@@ -3161,7 +3168,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
       coarse_img_grad = _compute_level_gradient(tmp_img, cw, ch,
-                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                                _compute_adaptive_sigma(cw, ch), NULL);
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
       _normalize_image_percentile(tmp_img, cpix);
 
@@ -3392,15 +3399,16 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
     float *ref_grad = NULL;
     float *img_grad = NULL;
+    const float level_sigma = _compute_adaptive_sigma(lw, lh);
 
 #if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
     if(l == 0)
     {
       // L0: full-resolution Bayer — CFA-aware gradient pipeline.
       ref_grad = _compute_level_gradient_cfa(ref_norm, lw, lh,
-                                             HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                             _compute_adaptive_sigma(lw, lh), NULL);
       img_grad = _compute_level_gradient_cfa(img_norm, lw, lh,
-                                             HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                             _compute_adaptive_sigma(lw, lh), NULL);
       // Restore ref_norm / img_norm for ρ scoring in DOF escalation.
       memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
       memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
@@ -3412,9 +3420,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
     {
       // L1+ (or L0 in AVG_BAYER / GREEN_ONLY): standard gradient pipeline.
       ref_grad = _compute_level_gradient(ref_norm, lw, lh,
-                                         HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                         _compute_adaptive_sigma(lw, lh), NULL);
       img_grad = _compute_level_gradient(img_norm, lw, lh,
-                                         HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                         _compute_adaptive_sigma(lw, lh), NULL);
       // Keep ref_norm/img_norm alive from escalation_level down to L0 for ρ
       // scoring (DOF escalation at escalation_level, identity check at L0).
       if(l <= escalation_level)
@@ -3455,8 +3463,8 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
 
     dt_print(DT_DEBUG_HDRMERGE,
-             "[hdr_merge] ECC level %d (%dx%d, %d-DOF): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
-             l, lw, lh, current_dof,
+             "[hdr_merge] ECC level %d (%dx%d, %d-DOF, σ=%.1f): initial H=[%.4f %.4f %.2f; %.4f %.4f %.2f; %.6f %.6f 1]",
+             l, lw, lh, current_dof, level_sigma,
              H_level[0], H_level[1], H_level[2],
              H_level[3], H_level[4], H_level[5],
              H_level[6], H_level[7]);
@@ -3797,15 +3805,15 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 #if HDR_ALIGN_L0_MODE == HDR_ALIGN_L0_FULL_CFA
         // L0 mesh: CFA-aware gradient pipeline (same as ECC level 0).
         ref_grad0 = _compute_level_gradient_cfa(rn, l0w, l0h,
-                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                                _compute_adaptive_sigma(l0w, l0h), NULL);
         img_grad0 = _compute_level_gradient_cfa(in, l0w, l0h,
-                                                HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                                _compute_adaptive_sigma(l0w, l0h), NULL);
 #else
         // L0 mesh: standard gradient pipeline (AVG_BAYER or GREEN_ONLY).
         ref_grad0 = _compute_level_gradient(rn, l0w, l0h,
-                                            HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                            _compute_adaptive_sigma(l0w, l0h), NULL);
         img_grad0 = _compute_level_gradient(in, l0w, l0h,
-                                            HDR_ALIGN_PREFILTER_SIGMA, NULL);
+                                            _compute_adaptive_sigma(l0w, l0h), NULL);
 #endif
       }
       dt_free_align(rn);
