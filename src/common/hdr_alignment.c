@@ -168,6 +168,11 @@
 // Base sigma: minimum blur applied at any level (noise/Bayer suppression).
 #define HDR_ALIGN_PREFILTER_SIGMA_BASE 3.0f
 // Fraction of the shortest edge used as sigma at fine levels.
+// 0.008 yields σ ≈ 25 px at a typical 24 MP sensor (4784×3188), giving a
+// Gaussian FWHM of ~59 px.  This suppresses dynamic scene content (ocean
+// ripples, foliage motion — typically 20–50 px features) while preserving
+// coarse structural edges (horizon lines, building contours, rock outlines)
+// that are the reliable geometric features for alignment.
 #define HDR_ALIGN_PREFILTER_SIGMA_FRAC 0.008f
 // Minimum shortest-edge dimension for applying the Gaussian pre-filter.
 // Below this size the image is too small for the blur to be meaningful.
