@@ -3166,16 +3166,14 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
 
       // Use the restructured gradient pipeline.
-      coarse_ref_grad = _compute_level_gradient(tmp_ref, cw, ch,
-                                                _compute_adaptive_sigma(cw, ch), NULL);
-      // tmp_ref was modified in-place by the blur; keep a pre-Sobel copy
-      // for ρ scoring.  We re-copy from the pyramid since tmp_ref is now blurred.
-      // Apply the same Gaussian pre-filter so that ρ scoring (which internally
-      // computes Sobel magnitudes) sees the same spatial-frequency band as the
-      // ECC gradient pipeline.  Without this, ρ at fine levels would include
-      // high-frequency dynamic content that the ECC solver was never exposed to,
-      // producing unreliable quality scores and spurious DOF escalation.
       const float coarse_sigma = _compute_adaptive_sigma(cw, ch);
+      coarse_ref_grad = _compute_level_gradient(tmp_ref, cw, ch,
+                                                coarse_sigma, NULL);
+      // tmp_ref was modified in-place by the gradient pipeline; prepare a
+      // fresh copy from the pyramid for ρ scoring.  Apply percentile
+      // normalisation + the same Gaussian pre-filter so that ρ scoring
+      // (which internally computes Sobel magnitudes) sees the same
+      // spatial-frequency band as the ECC gradient pipeline.
       memcpy(tmp_ref, pyr_ref.data[coarsest], sizeof(float) * cpix);
       _normalize_image_percentile(tmp_ref, cpix);
       _gaussian_prefilter(tmp_ref, cw, ch, coarse_sigma);
@@ -3183,6 +3181,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
       coarse_img_grad = _compute_level_gradient(tmp_img, cw, ch,
                                                 coarse_sigma, NULL);
+      // Same fresh copy + normalise + blur for the img ρ scoring image.
       memcpy(tmp_img, pyr_img.data[coarsest], sizeof(float) * cpix);
       _normalize_image_percentile(tmp_img, cpix);
       _gaussian_prefilter(tmp_img, cw, ch, coarse_sigma);
@@ -3444,17 +3443,16 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
                                          _compute_adaptive_sigma(lw, lh), NULL);
       img_grad = _compute_level_gradient(img_norm, lw, lh,
                                          _compute_adaptive_sigma(lw, lh), NULL);
-      // Keep ref_norm/img_norm alive from escalation_level down to L0 for ρ
-      // scoring (DOF escalation at escalation_level, identity check at L0).
+      // Prepare fresh intensity copies from the pyramid for ρ scoring
+      // (DOF escalation at escalation_level, identity check at L0).
+      // Apply the same Gaussian pre-filter that the ECC gradient pipeline
+      // uses.  _ecc_compute_rho computes Sobel magnitudes on these
+      // intensity images; without the blur the Sobel picks up
+      // high-frequency dynamic content (ocean waves, foliage motion)
+      // that the ECC solver never saw, causing unreliable ρ scores
+      // and spurious DOF escalation at fine levels.
       if(l <= escalation_level)
       {
-        // Restore for ρ scoring (the blur modified the data).
-        // Apply the same Gaussian pre-filter that the ECC gradient pipeline
-        // uses.  _ecc_compute_rho computes Sobel magnitudes on these
-        // intensity images; without the blur the Sobel picks up
-        // high-frequency dynamic content (ocean waves, foliage motion)
-        // that the ECC solver never saw, causing unreliable ρ scores
-        // and spurious DOF escalation at fine levels.
         memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
         memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
         _normalize_image_percentile(ref_norm, lpix);
