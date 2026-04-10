@@ -549,6 +549,8 @@ For one candidate frame the estimator does the following:
    5. **Prepare ECC input**: combine `gx + gy` (signed sum preserves direction information), MAD-normalise, apply the mask.  This produces the final single-channel feature image for ECC.
    
    This pipeline ensures that edges — not absolute brightness — drive alignment, while the magnitude-based masking focuses ECC on regions with reliable gradient information.  Saturated highlights and crushed shadows are excluded.  The resolution-adaptive pre-filtering ensures that fine-level ECC is driven by coarse structural features (horizon lines, building outlines, rock formations) rather than high-frequency noise and dynamic content.  See _Why CFA-aware Sobel at L0_ below for motivation of the CFA variant.
+
+   **ρ scoring consistency**: the alignment quality metric ρ (gradient-magnitude Pearson correlation, `_ecc_compute_rho`) internally computes Sobel magnitude on the intensity images it receives.  To ensure ρ measures the same spatial-frequency band that ECC optimised on, the intensity images are **pre-blurred with the same adaptive sigma** before being passed to ρ scoring.  Without this, ρ at fine levels would include high-frequency dynamic content (ocean waves, foliage motion) that the ECC solver never saw, producing unreliable quality scores: the ρ might drop dramatically from the escalation level to L0 even though the alignment is correct, or a spurious DOF escalation might be accepted because the high-frequency content happens to correlate slightly better with a sheared transform.  Pre-blurring the intensity images aligns the ρ metric with the optimisation target — a systemic consistency fix that avoids the need for additional per-parameter threshold checks.
 4. Run an exhaustive Euclidean search for translation and roll using NCC at the coarsest level. Also compute the identity NCC baseline.
 5. **Coarse identity check**: compute the weighted ECC $\rho$ at the coarsest level for both the identity transform and the NCC-winning candidate. If $\rho_{identity} \geq \rho_{candidate}$, the NCC winner is no better than identity — reset the ECC starting point to identity and continue the pyramid from there rather than using the NCC candidate. There may be fine-level misalignment invisible at coarse resolution, so the full ECC pyramid still runs.
 6. Convert the coarse Euclidean result into a backward homography.
@@ -1364,6 +1366,8 @@ The homography is identity, but the mesh residuals are non-zero (max 15.14 px). 
 #### Configuration Constants
 
 The identity detection at Layer 1 uses the same `_ecc_compute_rho` function as Layer 2, with no separate threshold constant. The decision is purely comparative: identity wins if and only if its $\rho$ is at least as good as the candidate's.
+
+**ρ scoring consistency**: all identity comparisons and DOF escalation decisions use ρ scored on intensity images that have been pre-blurred with the same resolution-adaptive Gaussian sigma as the ECC gradient pipeline.  This ensures ρ measures quality on the same spatial-frequency band that ECC optimised on.  Without the pre-blur, ρ at fine levels would include high-frequency dynamic content (ocean waves, tree canopies, water surfaces) that ECC never saw, producing artificially low scores that cause valid alignments to be rejected and spurious DOF escalation to be accepted.
 
 ## Performance Optimization
 

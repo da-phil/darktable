@@ -42,6 +42,11 @@
  * accumulate, Hessian).  Higher-DOF ECC (6-DOF affine / 8-DOF projective)
  * after mid-pyramid DOF escalation also runs on the CPU.
  * Gradient preprocessing is identical for CPU and CL paths.
+ *
+ * ρ scoring (gradient-magnitude PCC via _ecc_compute_rho) uses intensity
+ * images that have been pre-blurred with the same adaptive sigma,
+ * ensuring the quality metric sees the same spatial-frequency band as
+ * the ECC gradient pipeline.  This runs on the CPU for both paths.
  */
 
 /* ---------- Warp by projective homography ----------
