@@ -2880,6 +2880,8 @@ static float _try_dof_escalation(const float *ref_grad,
   // The 6-DOF solver already applies per-iteration similarity projection
   // (HDR_ALIGN_SIMILARITY_LAMBDA), so residual shear is reported for
   // diagnostics but is no longer used as a hard acceptance gate.
+  // Shear = ½·|h₁₂ + h₂₁| is the symmetric off-diagonal component
+  // (pure shear, absent in rotation/scale/translation).
   const float shear_6 = 0.5f * fabsf(H_6dof[1] + H_6dof[3]);
 
   dt_print(DT_DEBUG_HDRMERGE,
@@ -2917,6 +2919,7 @@ static float _try_dof_escalation(const float *ref_grad,
 
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
+  // Symmetric off-diagonal shear component (same formula as 6-DOF above).
   const float shear_8 = 0.5f * fabsf(H_8dof[1] + H_8dof[3]);
 
   dt_print(DT_DEBUG_HDRMERGE,
