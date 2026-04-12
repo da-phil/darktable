@@ -227,19 +227,25 @@
 // than real image geometry.
 #define HDR_ALIGN_ESCALATION_MAX_SCALE_DEVIATION 0.50f
 
-// Maximum shear magnitude allowed in an escalated homography.
-// Shear is defined as |(h12 + h21) / 2| — the symmetric part of the 2×2
-// submatrix.  Physical camera movements (rotation, translation, zoom,
-// moderate perspective) produce negligible shear (< 0.004).  Larger
-// values indicate the higher-DOF model is fitting non-geometric patterns
-// such as exposure gradients, vignetting, or moving scene content
-// (e.g. ocean waves) as spurious affine deformation.
-// 0.006 allows genuine perspective-induced shear while catching the most
-// common false-positive escalations.  This check complements the adaptive
-// Gaussian pre-filter sigma (which prevents ECC convergence to local
-// minima) by rejecting geometrically implausible results that happen to
-// achieve higher ρ by fitting dynamic content.
-#define HDR_ALIGN_ESCALATION_MAX_SHEAR 0.006f
+// Similarity-projection blend factor for 6-DOF ECC.
+// After every iteration of the 6-DOF affine solver the 2×2 linear part of
+// the homography is softly projected back toward the nearest
+// rotation+uniform-scale (similarity) transform:
+//
+//   A ← (1 − λ) · A  +  λ · s · R(θ)
+//
+// where s = (||col₁||+||col₂||)/2 is the average column-norm scale and
+//       θ = ½ · (atan2(c,a) + atan2(−b,d)) is the average rotation.
+//
+// This replaces the previous hard HDR_ALIGN_ESCALATION_MAX_SHEAR threshold
+// with a principled, continuously-active regulariser:
+//   λ = 0 → no constraint (pure ECC)
+//   λ = 1 → pure similarity (rotation + scale, zero shear)
+//   λ = 0.2 → soft constraint that suppresses spurious shear induced by
+//             fitting non-geometric content (exposure gradients, vignetting,
+//             wave motion) while still allowing the optimizer to refine
+//             genuine lens-breathing scale and slight perspective asymmetry.
+#define HDR_ALIGN_SIMILARITY_LAMBDA 0.2f
 
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
 // The escalation runs at the first (coarsest) pyramid level whose shortest
@@ -2621,9 +2627,53 @@ static float _ecc_iteration_higher_dof(const float *ref,
   return (float)update_metric;
 }
 
-/** Run iterative higher-DOF ECC at a single pyramid level.
- *  @p ndof must be 6 (affine) or 8 (projective).
- *  Returns the final ρ after refinement, or -2 on failure. */
+/** Project the 2×2 linear part of H toward the nearest similarity transform
+ *  (rotation + uniform scale, zero shear) using soft blending.
+ *
+ *  For an affine homography H = [a b tx; c d ty; 0 0 1]:
+ *    s = (||col₁|| + ||col₂||) / 2                 (average column-norm scale)
+ *    θ = ½ · (atan2(c,a) + atan2(−b,d))            (average rotation angle)
+ *    A_sim = s · [[cosθ, −sinθ], [sinθ, cosθ]]     (nearest similarity)
+ *    A_new  = (1−λ)·A + λ·A_sim                    (soft blend)
+ *
+ *  Applied after each 6-DOF ECC iteration to suppress spurious shear that
+ *  arises when the optimizer fits non-geometric content (exposure gradients,
+ *  vignetting, wave motion) as affine deformation.
+ *
+ *  λ = HDR_ALIGN_SIMILARITY_LAMBDA controls blend strength (0 = unconstrained,
+ *  1 = pure similarity).  Only H[0], H[1], H[3], H[4] are modified. */
+static void _project_to_similarity(float H[HDR_ALIGN_H_NPARAM], const float lambda)
+{
+  const float a = H[0], b = H[1], c = H[3], d = H[4];
+
+  /* Average column norm gives the uniform scale factor of the nearest
+   * similarity transform, regardless of rotation or shear:
+   *   s₁ = ||(a, c)||  (first column)
+   *   s₂ = ||(b, d)||  (second column)
+   *   s  = (s₁ + s₂) / 2
+   * This is more accurate than (a+d)/2, which underestimates scale for
+   * matrices with non-zero rotation (giving cos(θ) instead of 1 for a
+   * pure unit rotation). */
+  const float s1 = sqrtf(a * a + c * c);
+  const float s2 = sqrtf(b * b + d * d);
+  const float s = 0.5f * (s1 + s2);
+  if(s < 1e-6f) return;
+
+  /* Average rotation angle from two independent estimates:
+   *   θ₁ = atan2(c, a)   — from the first column (a, c) = s·(cosθ, sinθ)
+   *   θ₂ = atan2(−b, d)  — from the second column (−b, d) = s·(sinθ, cosθ)
+   * For a true similarity both equal θ, so the average is unbiased.  */
+  const float theta = 0.5f * (atan2f(c, a) + atan2f(-b, d));
+  const float ct = cosf(theta);
+  const float st = sinf(theta);
+
+  /* Blend linear part toward similarity. */
+  H[0] = (1.0f - lambda) * a + lambda * s * ct;
+  H[1] = (1.0f - lambda) * b - lambda * s * st;
+  H[3] = (1.0f - lambda) * c + lambda * s * st;
+  H[4] = (1.0f - lambda) * d + lambda * s * ct;
+}
+
 /** Run iterative higher-DOF ECC at a single pyramid level.
  *  @p ref_grad and @p img_grad are the signed-gradient images used for
  *  the ECC optimisation.  @p ref_intensity and @p img_intensity are the
@@ -2685,6 +2735,18 @@ static float _ecc_refine_level_higher_dof(const float *ref_grad,
                ndof, iter, update, cond_est);
       break;
     }
+
+    /* For 6-DOF affine, softly project the linear part of H toward the nearest
+     * similarity transform (rotation + uniform scale, zero shear) after each
+     * iteration.  This prevents spurious shear from accumulating when the
+     * optimizer fits non-geometric content (exposure gradients, vignetting,
+     * moving scene objects) as affine deformation.  The blend factor λ is small
+     * enough to leave the ECC convergence mostly undisturbed while preventing
+     * the h12/h21 off-diagonal parameters from drifting into unphysical values.
+     * The projection is not applied in 8-DOF mode because the 6-DOF stage that
+     * precedes it already provides a near-similarity starting point. */
+    if(ndof == 6)
+      _project_to_similarity(H, HDR_ALIGN_SIMILARITY_LAMBDA);
 
     // Plateau / stall detection (mirrors the 3-DOF solver).
     // If the update metric has not improved for HDR_ALIGN_ECC_PATIENCE
@@ -2815,21 +2877,20 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_6 = rho_6dof - rho_3dof;
   const gboolean sane_6 = _homography_is_sane_escalated(H_6dof, w, h, 6);
 
-  // Shear check: the symmetric part of the 2×2 submatrix measures pure
-  // shear.  Physical camera movements (rotation, translation, zoom,
-  // moderate perspective) produce negligible shear (< 0.004).  Large
-  // values indicate the optimizer is fitting non-geometric patterns such
-  // as exposure gradients, vignetting, or moving scene content (waves)
-  // as spurious affine deformation.
+  // The 6-DOF solver already applies per-iteration similarity projection
+  // (HDR_ALIGN_SIMILARITY_LAMBDA), so residual shear is reported for
+  // diagnostics but is no longer used as a hard acceptance gate.
   const float shear_6 = 0.5f * fabsf(H_6dof[1] + H_6dof[3]);
-  const gboolean low_shear_6 = shear_6 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d, shear=%.4f)",
-           rho_6dof, improvement_6, sane_6, shear_6);
+           "[hdr_merge] DOF escalation: 6-DOF ρ=%.4f (Δρ=%+.4f vs 3-DOF, sane=%d)",
+           rho_6dof, improvement_6, sane_6);
+  if(shear_6 > 0.004f)
+    dt_print(DT_DEBUG_HDRMERGE,
+             "[hdr_merge] DOF escalation: 6-DOF residual shear=%.4f (informational)",
+             shear_6);
 
   const gboolean accept_6 = sane_6
-                             && low_shear_6
                              && rho_6dof > rho_3dof
                              && improvement_6 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT;
 
@@ -2857,14 +2918,16 @@ static float _try_dof_escalation(const float *ref_grad,
   const float improvement_8 = rho_8dof - rho_6dof;
   const gboolean sane_8 = _homography_is_sane_escalated(H_8dof, w, h, 8);
   const float shear_8 = 0.5f * fabsf(H_8dof[1] + H_8dof[3]);
-  const gboolean low_shear_8 = shear_8 <= HDR_ALIGN_ESCALATION_MAX_SHEAR;
 
   dt_print(DT_DEBUG_HDRMERGE,
-           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d, shear=%.4f)",
-           rho_8dof, improvement_8, sane_8, shear_8);
+           "[hdr_merge] DOF escalation: 8-DOF ρ=%.4f (Δρ=%+.4f vs 6-DOF, sane=%d)",
+           rho_8dof, improvement_8, sane_8);
+  if(shear_8 > 0.004f)
+    dt_print(DT_DEBUG_HDRMERGE,
+             "[hdr_merge] DOF escalation: 8-DOF residual shear=%.4f (informational)",
+             shear_8);
 
   const gboolean accept_8 = sane_8
-                             && low_shear_8
                              && rho_8dof > rho_6dof
                              && improvement_8 >= HDR_ALIGN_ESCALATION_MIN_IMPROVEMENT_8DOF;
 
@@ -3507,8 +3570,9 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // and perspective corrections the 6-/8-DOF model introduces, which
       // biases the ρ comparison against legitimate non-rigid transforms and
       // can reject correct DOF escalation on scenes with dynamic content.
-      // The shear consistency check (HDR_ALIGN_ESCALATION_MAX_SHEAR) guards
-      // against spurious escalation fitting dynamic content.
+      // Per-iteration similarity projection (HDR_ALIGN_SIMILARITY_LAMBDA) in
+      // the 6-DOF solver guards against spurious escalation fitting dynamic
+      // content as shear.
       if(l <= escalation_level)
       {
         memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
