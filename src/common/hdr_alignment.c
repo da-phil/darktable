@@ -241,11 +241,14 @@
 // with a principled, continuously-active regulariser:
 //   λ = 0 → no constraint (pure ECC)
 //   λ = 1 → pure similarity (rotation + scale, zero shear)
-//   λ = 0.2 → soft constraint that suppresses spurious shear induced by
+//   λ = 0.1 → soft constraint that suppresses spurious shear induced by
 //             fitting non-geometric content (exposure gradients, vignetting,
 //             wave motion) while still allowing the optimizer to refine
 //             genuine lens-breathing scale and slight perspective asymmetry.
-#define HDR_ALIGN_SIMILARITY_LAMBDA 0.2f
+//             A value of 0.2 was found to prevent 6-DOF convergence for scenes
+//             that genuinely need affine correction; 0.1 provides adequate
+//             shear suppression with less interference to ECC convergence.
+#define HDR_ALIGN_SIMILARITY_LAMBDA 0.1f
 
 // Minimum shortest-edge dimension (pixels) for DOF escalation to trigger.
 // The escalation runs at the first (coarsest) pyramid level whose shortest
@@ -3355,6 +3358,39 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
            best_tx, best_ty, best_angle * 180.0f / (float)M_PI, best_ncc,
            ncc_identity);
 
+  // Sanity check: run BEFORE the ECC ρ check to prevent the coarse-level
+  // ρ comparison from "validating" a geometrically implausible candidate.
+  // At the coarsest level (typically 74×49) the image is too small for
+  // reliable ECC ρ scoring — a single false NCC match can produce a
+  // spuriously high ρ purely by statistical chance.
+  //
+  // If the coarse similarity produces a homography that fails
+  // _homography_is_sane (scale far from 1.0 or rotation too large), the
+  // 3-DOF ECC cannot correct the scale component and will carry the error
+  // through the entire pyramid.  Reset to identity and release the coarse
+  // intensity images so the ECC ρ check is skipped (comparing identity
+  // against identity is uninformative).
+  {
+    float H_test[HDR_ALIGN_H_NPARAM];
+    _homography_from_similarity(best_tx, best_ty, best_angle, best_scale,
+                                cw, ch, H_test);
+    if(!_homography_is_sane(H_test, cw, ch))
+    {
+      dt_print(DT_DEBUG_HDRMERGE,
+               "[hdr_merge] coarse similarity fails rigid sanity check"
+               " -- falling back to identity");
+      best_tx = 0.0f;
+      best_ty = 0.0f;
+      best_angle = 0.0f;
+      best_scale = 1.0f;
+      // Skip the ECC ρ check: the candidate is now identity, so the
+      // comparison is trivially equal and provides no useful information.
+      dt_free_align(coarse_ref_norm);
+      dt_free_align(coarse_img_norm);
+      coarse_ref_norm = coarse_img_norm = NULL;
+    }
+  }
+
   // Early-out using ECC ρ: compute the weighted gradient-magnitude
   // correlation coefficient at the coarsest level for both the identity
   // transform and the NCC-winning candidate.  If identity ρ >= candidate ρ,
@@ -3403,30 +3439,6 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
 
   dt_free_align(coarse_ref_grad);
   dt_free_align(coarse_img_grad);
-
-  // Additional sanity check: if the coarse similarity produces a homography
-  // that fails _homography_is_sane (scale far from 1.0 or rotation too large),
-  // the 3-DOF ECC at finer levels cannot correct the scale component and
-  // will propagate the error unchanged through the entire pyramid.  Fall
-  // back to identity and let the ECC pyramid + DOF escalation handle the
-  // alignment from scratch.  This catches false matches from the coarse
-  // NCC search which can occur at tiny resolutions (e.g. 74×49) when
-  // the scale search range is wide.
-  {
-    float H_test[HDR_ALIGN_H_NPARAM];
-    _homography_from_similarity(best_tx, best_ty, best_angle, best_scale,
-                                cw, ch, H_test);
-    if(!_homography_is_sane(H_test, cw, ch))
-    {
-      dt_print(DT_DEBUG_HDRMERGE,
-               "[hdr_merge] coarse similarity fails rigid sanity check"
-               " -- falling back to identity");
-      best_tx = 0.0f;
-      best_ty = 0.0f;
-      best_angle = 0.0f;
-      best_scale = 1.0f;
-    }
-  }
 
   // Initialise projective model from coarse similarity estimate.
   float H_level[HDR_ALIGN_H_NPARAM];
@@ -3562,31 +3574,30 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Prepare fresh intensity copies from the pyramid for ρ scoring
       // (DOF escalation at escalation_level, identity check at L0).
       //
-      // At levels below the escalation level (typically L1 and L0), apply the
-      // Gaussian pre-filter so that the L0 identity check uses Sobel magnitudes
-      // that match the spatial-frequency band seen by the ECC solver —
-      // suppressing high-frequency dynamic content (ocean waves, foliage)
-      // that the solver never optimised against.
+      // Use percentile-normalised images WITHOUT Gaussian pre-filter at all
+      // levels, including L0.  This makes the L0 identity check consistent
+      // with the DOF-escalation ρ check at escalation_level (which also uses
+      // unblurred images).
       //
-      // At the escalation level itself, leave the intensity images unblurred:
-      // the pre-filter suppresses features at scales comparable to the scale
-      // and perspective corrections the 6-/8-DOF model introduces, which
-      // biases the ρ comparison against legitimate non-rigid transforms and
-      // can reject correct DOF escalation on scenes with dynamic content.
-      // Per-iteration similarity projection (HDR_ALIGN_SIMILARITY_LAMBDA) in
-      // the 6-DOF solver guards against spurious escalation fitting dynamic
-      // content as shear.
+      // The earlier approach applied a large Gaussian (up to σ≈25 px at L0)
+      // to the ρ-scoring images, matching the ECC gradient pipeline.  This
+      // caused the L0 identity check to prefer small shifts — and even
+      // identity — over the true alignment because the heavy blur made the ρ
+      // metric insensitive to any shift smaller than ~σ px.  In practice this
+      // reversed valid alignments confirmed by the unblurred DOF-escalation ρ
+      // at L2 (e.g. DOF-escalation shows 3-DOF ρ=0.67 >> identity ρ=0.48 but
+      // L0 with σ=25 px shows ρ=0.27 < 0.34 — a contradiction).
+      //
+      // Spurious 6-DOF fits driven by dynamic content (waves, foliage) are
+      // already suppressed by the per-iteration similarity projection
+      // (HDR_ALIGN_SIMILARITY_LAMBDA) and the ρ improvement gate in
+      // _try_dof_escalation.
       if(l <= escalation_level)
       {
         memcpy(ref_norm, pyr_ref.data[l], sizeof(float) * lpix);
         memcpy(img_norm, pyr_img.data[l], sizeof(float) * lpix);
         _normalize_image_percentile(ref_norm, lpix);
         _normalize_image_percentile(img_norm, lpix);
-        if(l < escalation_level)
-        {
-          _gaussian_prefilter(ref_norm, lw, lh, level_sigma);
-          _gaussian_prefilter(img_norm, lw, lh, level_sigma);
-        }
       }
       else
       {
