@@ -3574,13 +3574,21 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // Prepare fresh intensity copies from the pyramid for ρ scoring
       // (DOF escalation at escalation_level, identity check at L0).
       //
-      // Use percentile-normalised images WITHOUT Gaussian pre-filter at all
-      // levels, including L0.  This makes the L0 identity check consistent
-      // with the DOF-escalation ρ check at escalation_level (which also uses
-      // unblurred images).
+      // Use percentile-normalised images WITHOUT Gaussian pre-filter.  This
+      // makes the L0 identity check consistent with the DOF-escalation ρ
+      // check at escalation_level (which also uses unblurred images).
+      //
+      // Note: the coarse NCC ρ check (at the 74×49 level) uses a
+      // Gaussian-blurred coarse_ref_norm / coarse_img_norm set up during the
+      // NCC search.  That is a separate code path and is unchanged.
+      //
+      // Note: in FULL_CFA mode the L0 branch above applies a Gaussian to
+      // ref_norm/img_norm to blend Bayer sublattices into a grayscale-
+      // equivalent before Sobel scoring; that is a sublattice-merging
+      // operation, not a dynamic-content filter, and is intentionally kept.
       //
       // The earlier approach applied a large Gaussian (up to σ≈25 px at L0)
-      // to the ρ-scoring images, matching the ECC gradient pipeline.  This
+      // in this non-CFA path, matching the ECC gradient pipeline.  This
       // caused the L0 identity check to prefer small shifts — and even
       // identity — over the true alignment because the heavy blur made the ρ
       // metric insensitive to any shift smaller than ~σ px.  In practice this
@@ -3589,7 +3597,7 @@ gboolean dt_hdr_align_compute(const float *ref_mosaic,
       // L0 with σ=25 px shows ρ=0.27 < 0.34 — a contradiction).
       //
       // Spurious 6-DOF fits driven by dynamic content (waves, foliage) are
-      // already suppressed by the per-iteration similarity projection
+      // suppressed by the per-iteration similarity projection
       // (HDR_ALIGN_SIMILARITY_LAMBDA) and the ρ improvement gate in
       // _try_dof_escalation.
       if(l <= escalation_level)
