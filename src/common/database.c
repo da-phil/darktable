@@ -63,6 +63,10 @@ typedef struct dt_database_t
 {
   gboolean lock_acquired;
 
+  /* when TRUE the library is opened for reading only (CLI mode with a real library
+     file).  No metadata write-backs, no maintenance, no snapshots. */
+  gboolean readonly;
+
   /* data database filename */
   gchar *dbfilename_data, *lockfile_data;
 
@@ -94,6 +98,11 @@ static void _database_delete_mipmaps_files();
 int32_t dt_database_last_insert_rowid(const dt_database_t *db)
 {
   return (int32_t)sqlite3_last_insert_rowid(db->handle);
+}
+
+gboolean dt_database_is_readonly(const struct dt_database_t *db)
+{
+  return db ? db->readonly : FALSE;
 }
 
 /* migrate from the legacy db format (with the 'settings' blob) to the
@@ -4318,8 +4327,12 @@ start:
   // from a backup or snapshot. Running darktable with a database that cannot
   // be written to may result in incorrect operation, the cause of which will
   // be difficult to diagnose. Let's check if we can continue.
-  if((access(dbfilename_library, F_OK) == 0 && access(dbfilename_library, W_OK) != 0)
-     || (access(dbfilename_data, F_OK) == 0 && access(dbfilename_data, W_OK) != 0))
+  // Skip this check in read-only mode (CLI with a real library file) because
+  // we intentionally avoid all writes in that scenario.
+  const gboolean will_be_readonly = (!has_gui && g_strcmp0(dbfilename_library, ":memory:") != 0);
+  if(!will_be_readonly
+     && ((access(dbfilename_library, F_OK) == 0 && access(dbfilename_library, W_OK) != 0)
+         || (access(dbfilename_data, F_OK) == 0 && access(dbfilename_data, W_OK) != 0)))
   {
     dt_print(DT_DEBUG_ALWAYS, "at least one of the dt databases (%s, %s) is not writeable",
                                dbfilename_library, dbfilename_data);
@@ -4351,6 +4364,12 @@ start:
   db->dbfilename_data = g_strdup(dbfilename_data);
   db->dbfilename_library = g_strdup(dbfilename_library);
 
+  /* In CLI mode (no GUI) with a real library file we treat the database as
+     read-only: no write-backs, no maintenance, no snapshots, no backups.
+     This prevents unintended modifications to the user's library during
+     batch export jobs (darktable-cli --library ...). */
+  db->readonly = will_be_readonly;
+
   dt_atomic_set_int(&_trxid, 0);
 
   /* make sure the folder exists. this might not be the case for new databases */
@@ -4360,14 +4379,14 @@ start:
     char *data_path = g_path_get_dirname(dbfilename_data);
     g_mkdir_with_parents(data_path, 0750);
     g_free(data_path);
-    dt_database_backup(dbfilename_data);
+    if(!db->readonly) dt_database_backup(dbfilename_data);
   }
   if(g_strcmp0(dbfilename_library, ":memory:"))
   {
     char *library_path = g_path_get_dirname(dbfilename_library);
     g_mkdir_with_parents(library_path, 0750);
     g_free(library_path);
-    dt_database_backup(dbfilename_library);
+    if(!db->readonly) dt_database_backup(dbfilename_library);
   }
 
   dt_print(DT_DEBUG_SQL, "[init sql] library: %s, data: %s",
@@ -5065,7 +5084,7 @@ static inline gboolean _is_mem_db(const dt_database_t *db)
 
 gboolean dt_database_maybe_maintenance(const dt_database_t *db)
 {
-  if(_is_mem_db(db))
+  if(_is_mem_db(db) || db->readonly)
     return FALSE;
 
   // checking free pages
@@ -5111,7 +5130,7 @@ gboolean dt_database_maybe_maintenance(const dt_database_t *db)
 
 void dt_database_optimize(const dt_database_t *db)
 {
-  if(_is_mem_db(db))
+  if(_is_mem_db(db) || db->readonly)
     return;
   // optimize should in most cases be no-op and have no noticeable downsides
   // this should be ran on every exit
@@ -5224,7 +5243,7 @@ gboolean dt_database_snapshot(const dt_database_t *db)
 
 gboolean dt_database_maybe_snapshot(const dt_database_t *db)
 {
-  if(_is_mem_db(db))
+  if(_is_mem_db(db) || db->readonly)
     return FALSE;
 
   const char *config = dt_conf_get_string_const("database/create_snapshot");

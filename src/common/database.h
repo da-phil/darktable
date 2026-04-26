@@ -59,6 +59,11 @@ gchar *dt_database_get_most_recent_snap(const char* db_filename);
 int32_t dt_database_last_insert_rowid(const struct dt_database_t *);
 // nested transactions support
 
+/** Returns TRUE when the database is in read-only mode (CLI mode with a real
+    library file). In this mode no write-backs, maintenance, snapshots or
+    backups are performed so the user's library is not modified. */
+gboolean dt_database_is_readonly(const struct dt_database_t *db);
+
 void dt_database_start_transaction(const struct dt_database_t *db);
 void dt_database_release_transaction(const struct dt_database_t *db);
 void dt_database_rollback_transaction(const struct dt_database_t *db);

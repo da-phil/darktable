@@ -1870,12 +1870,17 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
   if(dt_is_valid_imgid(id))
   {
     g_free(imgfname);
-    dt_image_t *img = dt_image_cache_get(id, 'w');
-    if(img)
-      img->flags &= ~DT_IMAGE_REMOVE;
-    dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
-    _image_read_duplicates(id, normalized_filename, raise_signals);
-    dt_image_synch_all_xmp(normalized_filename);
+    // In read-only mode skip all write-back operations so the library is not
+    // modified during a batch CLI export.
+    if(!dt_database_is_readonly(darktable.db))
+    {
+      dt_image_t *img = dt_image_cache_get(id, 'w');
+      if(img)
+        img->flags &= ~DT_IMAGE_REMOVE;
+      dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
+      _image_read_duplicates(id, normalized_filename, raise_signals);
+      dt_image_synch_all_xmp(normalized_filename);
+    }
     g_free(ext);
     g_free(normalized_filename);
     if(raise_signals)
@@ -1905,6 +1910,18 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
   {
     flags |= DT_IMAGE_HAS_TXT;
     g_free(extra_file);
+  }
+
+  // In read-only mode the image is not in the library so we cannot import it
+  // without writing to the database – bail out cleanly.
+  if(dt_database_is_readonly(darktable.db))
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[image_import] `%s' not found in read-only library, skipping", filename);
+    g_free(imgfname);
+    g_free(ext);
+    g_free(normalized_filename);
+    return NO_IMGID;
   }
 
   //insert a v0 record (which may be updated later if no v0 xmp exists)

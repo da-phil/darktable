@@ -222,6 +222,11 @@ dt_filmid_t dt_film_new(dt_film_t *film, const char *directory)
   /* if we didn't find an id, lets instantiate a new filmroll */
   if(!dt_is_valid_filmid(film->id))
   {
+    // In read-only mode refuse to create a new film roll so the library is
+    // not modified during a batch CLI export.
+    if(dt_database_is_readonly(darktable.db))
+      return NO_FILMID;
+
     // create a new filmroll
     /* insert a new film roll into database */
     // clang-format off

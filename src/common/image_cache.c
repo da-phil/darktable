@@ -315,6 +315,14 @@ void dt_image_cache_write_release_info(dt_image_t *img,
     return;
   }
 
+  // In read-only mode (CLI with a real library file) skip all DB write-backs
+  // to avoid modifying the user's library during batch exports.
+  if(dt_database_is_readonly(darktable.db))
+  {
+    dt_cache_release(&cache->cache, img->cache_entry);
+    return;
+  }
+
   const double start = dt_get_debug_wtime();
   union {
       struct dt_image_raw_parameters_t s;
