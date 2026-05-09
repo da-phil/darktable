@@ -364,9 +364,23 @@ static inline void hsl2rgb(dt_aligned_pixel_t rgb,
 
 
 /** trigger updating the display profile from the system settings (x
- * atom, colord, ...) */
+ * atom, colord, ...). The toolkit-specific bits (resolving the
+ * monitor for the current window, reading the X atom, kicking off a
+ * colord async lookup, querying the win32 ICM API) are delegated to
+ * src/gui/colorspaces_display.c via the small port declared in
+ * gui/colorspaces_display.h. This function (and the rest of
+ * common/colorspaces.c) stays free of any GTK header. */
 void dt_colorspaces_set_display_profile
   (const dt_colorspaces_color_profile_type_t profile_type);
+
+/** Async colord result delivery. Called by the GUI-side colord
+ * completion callback (in src/gui/colorspaces_display.c) once it has
+ * a profile filename for the given display. Reads the file under the
+ * xprofile lock, replaces the cached display profile if the bytes
+ * actually changed and raises DT_SIGNAL_CONTROL_PROFILE_CHANGED. */
+void dt_colorspaces_install_profile_from_colord_file
+  (const dt_colorspaces_color_profile_type_t profile_type,
+   const char *filename);
 
 /** get the profile described by type & filename. this doesn't
  *  support image specifics like embedded profiles or camera

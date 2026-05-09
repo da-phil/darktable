@@ -147,6 +147,7 @@ FILE(GLOB SOURCE_FILES
   "gui/about.c"
   "gui/accelerators.c"
   "gui/color_picker_proxy.c"
+  "gui/colorspaces_display.c"
   "gui/workspace.c"
   "gui/gtk.c"
   "gui/gtkentry.c"
