@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2025 darktable developers.
+    Copyright (C) 2011-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,6 +15,18 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
+// The modulegroups lib has no business logic: its job is to let the
+// user organise, search and apply IOP modules, which is entirely
+// GUI work — the bauhaus widget tree, the basic-widgets panel, the
+// search entry, the layout editor dialog, the preset
+// (de)serialisation of said layout, and the toolkit-side hooks the
+// framework calls (name / views / container / expandable / position
+// / gui_init / gui_cleanup / view_enter / view_leave / init_presets
+// / legacy_params / get_params / set_params). All of that lives
+// here in src/gui/. The modulegroups plugin .so is built directly
+// from this single translation unit (see src/libs/CMakeLists.txt);
+// there is no business-side counterpart.
 
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
@@ -57,7 +69,7 @@ DT_MODULE(1)
 
 #define PADDING 2
 
-#include "modulegroups.h"
+#include "libs/modulegroups.h"
 
 typedef enum dt_lib_modulegroups_basic_item_position_t
 {
