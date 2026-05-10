@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2011-2025 darktable developers.
+    Copyright (C) 2011-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -16,6 +16,11 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+// Toolkit-free entry point of the filmstrip lib. The widget container
+// itself, its draw callback, and the second-window toggle live in
+// src/gui/lib_filmstrip_gui.c, which is compiled into the same module
+// .so (see src/libs/CMakeLists.txt).
+
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/image_cache.h"
@@ -25,12 +30,10 @@
 #include "develop/develop.h"
 #include "dtgtk/thumbtable.h"
 #include "gui/accelerators.h"
-#include "gui/gtk.h"
+#include "gui/lib_filmstrip_gui.h"
 #include "libs/lib.h"
 #include "libs/lib_api.h"
 #include "views/view.h"
-
-#include <gdk/gdkkeysyms.h>
 
 /**
  * This module is merely just a simple container
@@ -70,22 +73,6 @@ int position(const dt_lib_module_t *self)
   return 1001;
 }
 
-static gboolean _lib_filmstrip_draw_callback(GtkWidget *widget,
-                                             cairo_t *wcr,
-                                             gpointer user_data)
-{
-  // we only ensure that the thumbtable is inside our container
-  if(!gtk_bin_get_child(GTK_BIN(widget)))
-  {
-    dt_thumbtable_t *tt = dt_ui_thumbtable(darktable.gui->ui);
-    dt_thumbtable_set_parent(tt, widget, DT_THUMBTABLE_MODE_FILMSTRIP);
-    gtk_widget_show(widget);
-    gtk_widget_show(tt->widget);
-    gtk_widget_queue_draw(tt->widget);
-  }
-  return FALSE;
-}
-
 static void _filmstrip_center(dt_action_t *action)
 {
   if(!darktable.view_manager->active_images) return;
@@ -119,9 +106,10 @@ static void _filmstrip_pin_in_second_window(dt_action_t *action)
     imgid = dev->image_storage.id;
   if(!dt_is_valid_imgid(imgid)) return;
 
-  // Open the 2nd window if it is not already visible
-  if(!dev->second_wnd && dev->second_wnd_button)
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), TRUE);
+  // Open the 2nd window if it is not already visible (toggling the
+  // matching button is handled in src/gui/lib_filmstrip_gui.c so that
+  // we don't need to depend on GtkToggleButton here).
+  dt_lib_filmstrip_gui_ensure_second_window(dev);
 
   dt_dev_pin_image(dev, imgid);
   const dt_image_t *img = dt_image_cache_get(imgid, 'r');
@@ -131,16 +119,11 @@ static void _filmstrip_pin_in_second_window(dt_action_t *action)
 
 void gui_init(dt_lib_module_t *self)
 {
-  /* creating container area */
-  self->widget = gtk_event_box_new();
-
-  /* connect callbacks */
-  g_signal_connect(G_OBJECT(self->widget), "draw",
-                   G_CALLBACK(_lib_filmstrip_draw_callback), self);
+  /* delegate widget creation to the GUI module */
+  dt_lib_filmstrip_gui_init(self);
 
   /* initialize view manager proxy */
   darktable.view_manager->proxy.filmstrip.module = self;
-
 
   /* register action and attach it to self->widget so the quick-shortcut
      button can discover it by hovering anywhere over the filmstrip */
@@ -159,6 +142,8 @@ void gui_cleanup(dt_lib_module_t *self)
 {
   /* unset viewmanager proxy */
   darktable.view_manager->proxy.filmstrip.module = NULL;
+
+  dt_lib_filmstrip_gui_cleanup(self);
 
   /* cleanup */
   free(self->data);
