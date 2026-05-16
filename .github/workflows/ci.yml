@@ -77,6 +77,17 @@ jobs:
             target: skiptest
             generator: Ninja
             eco: -DDONT_USE_INTERNAL_LIBRAW=OFF
+          # Build (and smoke-run) the Vulkan compute proof-of-concept so we
+          # notice if the new HAL-prototype code under tools/vulkan_compute_poc
+          # rots. We use mesa-vulkan-drivers (lavapipe) as a software ICD,
+          # which is enough to exercise the SPIR-V load / dispatch path.
+          - distro: "ubuntu:26.04"
+            btype: Release
+            compiler: { compiler: GNU16, CC: gcc-16, CXX: g++-16, packages: gcc-16 g++-16 }
+            target: skiptest
+            generator: Ninja
+            eco: -DDONT_USE_INTERNAL_LIBRAW=ON -DBUILD_VULKAN_COMPUTE_POC=ON
+            vulkan_poc: true
     env:
       DISTRO: ${{ matrix.distro }}
       CC: ${{ matrix.compiler.CC }}
@@ -168,6 +179,23 @@ jobs:
             python3-jsonschema \
             xsltproc \
             zlib1g-dev;
+      - name: Install Vulkan compute PoC Dependencies
+        if: matrix.vulkan_poc
+        # Build deps: libvulkan-dev + headers, glslang-tools + spirv-tools for
+        # the kernel-build path (fallback when clspv isn't packaged), and
+        # spirv-cross for occasional debug inspection.
+        # Runtime: mesa-vulkan-drivers exposes lavapipe so vkCreateInstance
+        # succeeds in the headless CI container.
+        # Package set is identical on Ubuntu 24.04 LTS and Ubuntu 26.04;
+        # see dev-doc/gpu_acceleration_clspv_vulkan.md for the full list.
+        run: |
+          eatmydata apt-get --yes install \
+            libvulkan-dev \
+            vulkan-tools \
+            mesa-vulkan-drivers \
+            glslang-tools \
+            spirv-tools \
+            spirv-cross;
       - uses: actions/checkout@v7
         with:
           submodules: false
@@ -185,6 +213,26 @@ jobs:
           cmake -E make_directory "${BUILD_DIR}";
           cmake -E make_directory "${INSTALL_PREFIX}";
           ./src/.ci/ci-script.sh;
+      - name: Smoke-test Vulkan compute PoC
+        if: matrix.vulkan_poc
+        # The PoC exits 77 ("skip") if vkCreateInstance fails on the runner.
+        # That's tolerated — we still get the build-clean signal. A bit-equal
+        # comparison against a CPU reference happens inside the binary; exit
+        # 0 means the SPIR-V dispatched and produced the expected pixels.
+        run: |
+          export XDG_RUNTIME_DIR=/tmp
+          set +e
+          "${BUILD_DIR}/tools/vulkan_compute_poc/dt_vk_compute_poc" \
+              --spv "${BUILD_DIR}/tools/vulkan_compute_poc/basicadj_min.spv"
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "vulkan-poc: dispatched OK on the CI runner"
+          elif [ "$rc" -eq 77 ]; then
+            echo "vulkan-poc: no Vulkan device available, skipping (build still validated)"
+          else
+            echo "vulkan-poc: FAILED with exit code $rc"
+            exit 1
+          fi
       - name: Check if it runs
         run: |
           ${INSTALL_PREFIX}/bin/darktable --version || true

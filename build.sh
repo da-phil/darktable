@@ -33,6 +33,10 @@ DO_INSTALL=0
 SUDO=""
 CMAKE_OPTIONS_FROM_CMDLINE=""
 
+# Extra non-feature build switches (cmake BUILD_* options).
+# -1 means "let cmake decide" (use the option's default); 0/1 force off/on.
+BUILD_VULKAN_COMPUTE_POC=-1
+
 PRINT_HELP=0
 
 FEATURES="AI CAMERA COLORD GMIC GRAPHICSMAGICK IMAGEMAGICK JXL KWALLET LIBSECRET LUA MAC_INTEGRATION MAP OPENCL OPENEXR OPENMP UNITY WEBP"
@@ -94,6 +98,12 @@ parse_args()
 		-j|--jobs)
 			MAKE_TASKS=$(printf "%d" "$2" >/dev/null 2>&1 && printf "$2" || printf "$MAKE_TASKS")
 			shift
+			;;
+		--vulkan-compute-poc)
+			BUILD_VULKAN_COMPUTE_POC=1
+			;;
+		--no-vulkan-compute-poc)
+			BUILD_VULKAN_COMPUTE_POC=0
 			;;
 		--enable-*)
 			feature=${option#--enable-}
@@ -184,6 +194,12 @@ By default cmake will enable the features it autodetects on the build machine.
 Specifying the option on the command line forces the feature on or off.
 All these options have a --disable-* equivalent.
 $(for i in $FEATURES_ ; do printf "    --enable-$i\n"; done)
+
+Developer / experimental targets (off by default):
+   --vulkan-compute-poc       Build the clspv/Vulkan compute proof-of-concept
+                              (tools/vulkan_compute_poc). Requires libvulkan-dev
+                              plus either clspv or glslang-tools at configure time.
+                              Use --no-vulkan-compute-poc to force it off.
 
 Extra:
 -h --help                Print help message
@@ -315,6 +331,8 @@ CMAKE_MORE_OPTIONS=""
 for i in $FEATURES; do
 	eval cmake_boolean_option USE_$i \$FEAT_$i
 done
+
+cmake_boolean_option BUILD_VULKAN_COMPUTE_POC $BUILD_VULKAN_COMPUTE_POC
 
 # Some people might need this, but ignore if unset in environment
 CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}
