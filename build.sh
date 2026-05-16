@@ -33,16 +33,14 @@ DO_INSTALL=0
 SUDO=""
 CMAKE_OPTIONS_FROM_CMDLINE=""
 
-# Extra non-feature build switches (cmake BUILD_* options).
-# -1 means "let cmake decide" (use the option's default); 0/1 force off/on.
-BUILD_VULKAN_COMPUTE_POC=-1
-
 PRINT_HELP=0
 
-FEATURES="AI CAMERA COLORD GMIC GRAPHICSMAGICK IMAGEMAGICK JXL KWALLET LIBSECRET LUA MAC_INTEGRATION MAP OPENCL OPENEXR OPENMP UNITY WEBP"
+FEATURES="AI CAMERA COLORD GMIC GRAPHICSMAGICK IMAGEMAGICK JXL KWALLET LIBSECRET LUA MAC_INTEGRATION MAP OPENCL OPENEXR OPENMP UNITY VULKAN VULKAN_POC WEBP"
 
 # prepare a lowercase version with a space before and after
 # it's very important for parse_feature, has no impact in for loop expansions
+# Underscores are kept so that multi-word feature names match what the user
+# typed on the command line (e.g. "--enable-vulkan-poc" -> "vulkan_poc").
 FEATURES_=$(for i in $FEATURES ; do printf " $(printf $i|tr A-Z a-z) "; done)
 
 # ---------------------------------------------------------------------------
@@ -99,18 +97,14 @@ parse_args()
 			MAKE_TASKS=$(printf "%d" "$2" >/dev/null 2>&1 && printf "$2" || printf "$MAKE_TASKS")
 			shift
 			;;
-		--vulkan-compute-poc)
-			BUILD_VULKAN_COMPUTE_POC=1
-			;;
-		--no-vulkan-compute-poc)
-			BUILD_VULKAN_COMPUTE_POC=0
-			;;
 		--enable-*)
-			feature=${option#--enable-}
+			# Hyphens in the CLI map to underscores in feature names,
+			# e.g. --enable-vulkan-poc -> the VULKAN_POC feature.
+			feature=$(printf '%s' "${option#--enable-}" | tr '-' '_')
 			parse_feature "$feature" 1
 			;;
 		--disable-*)
-			feature=${option#--disable-}
+			feature=$(printf '%s' "${option#--disable-}" | tr '-' '_')
 			parse_feature "$feature" 0
 			;;
 		--asan)
@@ -193,13 +187,16 @@ Features:
 By default cmake will enable the features it autodetects on the build machine.
 Specifying the option on the command line forces the feature on or off.
 All these options have a --disable-* equivalent.
-$(for i in $FEATURES_ ; do printf "    --enable-$i\n"; done)
+Hyphens in the CLI map to underscores in the feature name (so
+"--enable-vulkan-poc" toggles the VULKAN_POC feature).
+$(for i in $FEATURES_ ; do printf "    --enable-$(printf $i | tr '_' '-')\n"; done)
 
-Developer / experimental targets (off by default):
-   --vulkan-compute-poc       Build the clspv/Vulkan compute proof-of-concept
-                              (tools/vulkan_compute_poc). Requires libvulkan-dev
-                              plus either clspv or glslang-tools at configure time.
-                              Use --no-vulkan-compute-poc to force it off.
+Notes on selected features:
+   vulkan       Enable the Vulkan (clspv/SPIR-V) GPU backend.
+                Requires libvulkan-dev + Vulkan headers at configure time.
+   vulkan-poc   Build the clspv/Vulkan compute proof-of-concept tool under
+                tools/vulkan_compute_poc. Useful for testing the SPIR-V
+                pipeline in isolation; off by default.
 
 Extra:
 -h --help                Print help message
@@ -329,10 +326,19 @@ fi
 
 CMAKE_MORE_OPTIONS=""
 for i in $FEATURES; do
-	eval cmake_boolean_option USE_$i \$FEAT_$i
+	# Features map to USE_* cmake options by default; the few exceptions
+	# below use a different cmake variable name and are handled
+	# explicitly. Keep this list short and prefer renaming the cmake
+	# option to match the feature name when introducing new ones.
+	case $i in
+		VULKAN_POC)
+			eval cmake_boolean_option BUILD_VULKAN_COMPUTE_POC \$FEAT_$i
+			;;
+		*)
+			eval cmake_boolean_option USE_$i \$FEAT_$i
+			;;
+	esac
 done
-
-cmake_boolean_option BUILD_VULKAN_COMPUTE_POC $BUILD_VULKAN_COMPUTE_POC
 
 # Some people might need this, but ignore if unset in environment
 CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}

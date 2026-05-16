@@ -387,6 +387,23 @@ else()
 	SET(HAVE_OPENCL 0)
 endif(USE_OPENCL)
 
+# Vulkan compute backend (experimental, opt-in). Without Vulkan headers
+# we silently drop USE_VULKAN to OFF and continue — same coexistence
+# story as OpenCL.
+if(USE_VULKAN)
+	find_package(Vulkan)
+	if(Vulkan_FOUND)
+		SET(HAVE_VULKAN 1)
+		message(STATUS "Vulkan compute backend enabled (libvulkan=${Vulkan_LIBRARIES})")
+	else()
+		message(WARNING "USE_VULKAN=ON but Vulkan SDK not found; disabling Vulkan backend.")
+		SET(USE_VULKAN OFF)
+		SET(HAVE_VULKAN 0)
+	endif()
+else()
+	SET(HAVE_VULKAN 0)
+endif(USE_VULKAN)
+
 if(NOT SOURCE_PACKAGE AND NOT (CMAKE_VERSION VERSION_LESS 3.3) AND DEFINED ENV{_DO_IWYU})
   find_program(iwyu_path NAMES include-what-you-use iwyu)
 

@@ -96,6 +96,7 @@ FILE(GLOB SOURCE_FILES
   "common/usermanual_url.c"
   "common/utility.c"
   "common/variables.c"
+  "common/vulkan.c"
   "common/wb_presets.c"
   "control/conf.c"
   "control/control.c"
@@ -681,6 +682,11 @@ if(USE_OPENCL)
   add_definitions("-DHAVE_OPENCL")
 endif(USE_OPENCL)
 
+if(USE_VULKAN AND HAVE_VULKAN)
+  add_definitions("-DHAVE_VULKAN")
+  include_directories(${Vulkan_INCLUDE_DIRS})
+endif()
+
 
 # Check for __builtin_cpu_supports here due to a bug in clang/llvm. LLVM uses
 # libgcc to provide the symbols, so if clang wasn't compiled with libgcc, the
@@ -1050,6 +1056,10 @@ endif()
 target_link_libraries(lib_darktable PUBLIC ${STATIC_LIBS})
 target_link_libraries(lib_darktable PRIVATE whereami)
 target_link_libraries(lib_darktable PUBLIC ${LIBS})
+
+if(USE_VULKAN AND HAVE_VULKAN)
+  target_link_libraries(lib_darktable PUBLIC Vulkan::Vulkan)
+endif()
 
 unset(LIBS)
 unset(STATIC_LIBS)
