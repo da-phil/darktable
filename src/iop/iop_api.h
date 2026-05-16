@@ -32,6 +32,10 @@
 #include <CL/cl.h>
 #endif
 
+// dt_vk_mem_t comes from common/vulkan.h, which must be included by
+// the file that pulls in iop_api.h (the same pattern as <CL/cl.h>
+// above). See src/develop/imageop.h for the canonical include order.
+
 #if defined(__cplusplus) && !defined(INCLUDE_API_FROM_MODULE_H)
 extern "C" {
 #endif
@@ -289,6 +293,22 @@ DEFAULT(int, process_tiling_cl, struct dt_iop_module_t *self,
                                 const struct dt_iop_roi_t *const roi_in,
                                 const struct dt_iop_roi_t *const roi_out,
                                 const int bpp);
+#endif
+
+#ifdef HAVE_VULKAN
+/** the Vulkan-compute equivalent of process().
+ *  Returns 0 on success, non-zero on failure (mirroring process_cl's
+ *  CL_SUCCESS=0 convention). Modules that implement this should treat
+ *  the dev_in/dev_out as opaque dt_vk_mem_t* (storage buffers), not
+ *  image2d_t equivalents — Vulkan storage images would be a separate
+ *  later port.
+ */
+OPTIONAL(int, process_vk, struct dt_iop_module_t *self,
+                          struct dt_dev_pixelpipe_iop_t *piece,
+                          dt_vk_mem_t *dev_in,
+                          dt_vk_mem_t *dev_out,
+                          const struct dt_iop_roi_t *const roi_in,
+                          const struct dt_iop_roi_t *const roi_out);
 #endif
 
 /** this functions are used for distort iop

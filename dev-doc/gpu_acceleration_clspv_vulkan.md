@@ -90,10 +90,18 @@ host-side disruption for the first release.
   clspv as its compiler. Useful as a transition layer that exposes the
   OpenCL ICD API to existing OpenCL host code.
 
-## 4. What's in the proof-of-concept (this PR)
+## 4. What's in the proof-of-concept and integration (this PR)
 
-`tools/vulkan_compute_poc/` adds a minimal, self-contained Vulkan
-compute runtime that demonstrates the full pipeline end-to-end:
+Two layers of code land together.
+
+### 4.1 Standalone PoC (`tools/vulkan_compute_poc/`)
+
+A self-contained Vulkan compute runtime that demonstrates the SPIR-V
+pipeline end-to-end without touching darktable's main build graph.
+Useful for iterating on the toolchain (clspv ↔ glslang ↔ MoltenVK)
+without rebuilding darktable. Off by default; enable with
+`--enable-vulkan-poc` (build.sh) or `-DBUILD_VULKAN_COMPUTE_POC=ON`
+(cmake).
 
 - `kernels/basicadj_min.cl` — a pared-down version of darktable's
   exposure/black-point step, written against the clspv-supported subset
@@ -129,6 +137,67 @@ build:
 
 Those are the next milestones (§8), not blockers for evaluating the
 approach.
+
+### 4.2 In-tree pipeline integration
+
+The Vulkan backend is wired into darktable's pixelpipe as a real
+parallel GPU path, behind the `USE_VULKAN` CMake option (default
+`OFF`) and the `opencl_use_vulkan` runtime preference (default
+`true`).
+
+**Backend (`src/common/vulkan.{c,h}`)** — a focused subset of the
+opencl.c surface (~600 lines total):
+
+- `dt_vulkan_init`/`dt_vulkan_cleanup` — instance, device enumeration,
+  per-device compute queue + command pool + descriptor pool.
+- `dt_vulkan_load_program` — read a SPIR-V file produced at build time
+  by clspv (or glslang in fallback mode) into a host-side cache.
+- `dt_vulkan_create_kernel` — build a `VkPipeline` from a SPIR-V
+  module plus the binding shape (number of storage buffers, push-
+  constant size, local workgroup dimensions).
+- `dt_vulkan_alloc_buffer` / `dt_vulkan_free_buffer` — device-local
+  storage buffers wrapped in opaque `dt_vk_mem_t*` handles, the
+  analogue of `cl_mem`.
+- `dt_vulkan_write_to_device` / `dt_vulkan_read_from_device` —
+  blocking host-stage copies via temporary host-visible buffers.
+- `dt_vulkan_enqueue_kernel_2d` — bind buffers + push constants, build
+  a one-shot command buffer, submit on the compute queue, wait.
+
+**Pixelpipe hook (`src/develop/pixelpipe_hb.c`)** — added inside the
+CPU dispatch arm. When a module exposes `process_vk` and Vulkan is
+running, the pipeline:
+
+1. Allocates VK input/output buffers sized to the ROI.
+2. Uploads the host input buffer to the VK input.
+3. Calls `module->process_vk(self, piece, vk_in, vk_out, roi_in, roi_out)`.
+4. Downloads the VK output back into the host output buffer.
+5. Frees the VK buffers.
+
+If any step fails the pipeline falls through to the CPU `process()`
+unchanged. Modules without `process_vk` are unaffected.
+
+This sits *inside* the CPU arm rather than replacing the OpenCL
+arm: the OpenCL `cl_mem` chain between modules is preserved, and
+Vulkan handles only modules that have a port. The host-stage copies
+at each Vulkan boundary make this slower per-module than a unified
+GPU chain — that optimisation (skip staging when both ends are
+Vulkan) is the next-but-one milestone (§8.6).
+
+**Per-module ports**: this PR ships `process_vk` for three modules,
+in order of port difficulty.
+
+| Module | Status | Notes |
+|---|---|---|
+| `src/iop/exposure.c` | **Equivalent** to the OpenCL kernel. | The maths is one subtract + multiply per channel; the .cl/.comp source pair under data/kernels/vulkan/exposure.{cl,comp} compiles to the same SPIR-V shape via clspv or glslang. |
+| `src/iop/channelmixerrgb.c` | **Linear-Bradford path only.** | The OpenCL kernel covers five adaptation modes (CAT16, linear/non-linear Bradford, XYZ, RGB) plus gamut mapping and per-channel saturation/lightness. The Vulkan port covers the linear-Bradford path with scalar saturation/lightness — the most common case in practice. `process_vk` returns -1 for the other modes and the pipeline falls back to OpenCL/CPU automatically. |
+| `src/iop/diffuse.c` | **Single-pass approximation** of sharpen. | The full diffuse pipeline runs an à-trous wavelet decomposition and applies anisotropic diffusion per scale; that's a multi-kernel, multi-buffer dance that's out of scope for the first port. The Vulkan path runs one unsharp-mask pass against a 3×3 box-blur low-pass, which gives a visible sharpen but is NOT bit-equal to the OpenCL/CPU output. When precise diffuse output is required, returning -1 from `process_vk` (e.g. when amount ≤ 0 or the SPIR-V module didn't load) flips the dispatch back to OpenCL/CPU. |
+
+**Verified in this container:** all module files and the new backend
+compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
+combinations (syntax-only check). The full darktable build needs
+upstream dependencies (intltool-merge, etc.) that aren't installed
+in the remote execution environment, so end-to-end pipeline runs
+against a real RAW are deferred to CI.
 
 ## 5. Architecture of a full port
 
@@ -361,48 +430,76 @@ matrix entry.
 
 ### Developer convenience
 
-`build.sh` exposes the new option as `--vulkan-compute-poc` (and
-`--no-vulkan-compute-poc` to force it off). When omitted, the CMake
-default (`OFF`) wins. Example:
+`build.sh` exposes the new options through the standard `--enable-X`
+/ `--disable-X` mechanism, so they read like any other feature flag:
 
 ```sh
-./build.sh --vulkan-compute-poc --skip-build
-# ... or, with everything else default:
-cmake -S . -B build -DBUILD_VULKAN_COMPUTE_POC=ON
-cmake --build build --target dt_vk_compute_poc
+# Enable the Vulkan backend integration:
+./build.sh --enable-vulkan
+
+# Also build the standalone PoC tool:
+./build.sh --enable-vulkan --enable-vulkan-poc
+
+# Same thing in plain cmake:
+cmake -S . -B build -DUSE_VULKAN=ON -DBUILD_VULKAN_COMPUTE_POC=ON
+cmake --build build
 ```
+
+Hyphens in the CLI map to underscores in the underlying feature
+name, so `--enable-vulkan-poc` toggles the `VULKAN_POC` feature
+which is wired to the `BUILD_VULKAN_COMPUTE_POC` cmake variable
+(the only feature in build.sh that maps to a `BUILD_*` rather than
+a `USE_*` option; see the inline `case` in `build.sh`).
 
 ## 8. Migration milestones
 
-1. **PoC (this PR).** Buffer-only kernel proves the round-trip works.
-2. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
-   `dt_opencl_write_image_*` to Vulkan storage / sampled images. Choose
-   image format mapping table (the OpenCL `cl_image_format` enum vs
-   `VkFormat`).
-3. **`dt_gpu` HAL.** Introduce the abstraction and rewrite a single
-   simple module (`basicadj`) on top of it. Both backends compile;
-   `USE_OPENCL` and `USE_VULKAN` are mutually compatible.
-4. **Port the easy half.** Modules that use only image2d + scalar args
-   (filmic, basecurve, channelmixer, sigmoid, ~30 others). Verified
+1. ✅ **Standalone PoC** (landed). Buffer-only kernel proves the
+   round-trip works without touching darktable's main build.
+2. ✅ **In-tree Vulkan backend** (landed). `src/common/vulkan.{c,h}`,
+   `USE_VULKAN` CMake option, `HAVE_VULKAN` define, runtime init
+   alongside OpenCL.
+3. ✅ **`process_vk` API surface** (landed). `OPTIONAL(int,
+   process_vk, ...)` in `src/iop/iop_api.h`, `process_vk_ready` flag
+   on `dt_dev_pixelpipe_iop_t`, dispatch hook in
+   `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
+   module has a port.
+4. ✅ **Three module ports** (landed, with scope caveats noted in §4.2):
+   exposure (equivalent), channelmixerrgb (linear-Bradford only),
+   diffuse (single-pass approximation).
+5. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
+   `dt_opencl_write_image_*` to Vulkan storage / sampled images.
+   Choose image format mapping table (the OpenCL `cl_image_format`
+   enum vs `VkFormat`). Today's integration uses storage buffers
+   only; once images land we can drop the per-module host-staging.
+6. **Skip host-staging when both ends are Vulkan.** Track which
+   buffer type holds the live pipeline data; when consecutive
+   modules both have `process_vk`, pass the `dt_vk_mem_t*` directly
+   between them instead of round-tripping through host memory.
+7. **Port the easy half.** Other modules that use only image2d +
+   scalar args (filmic, basecurve, sigmoid, ~30 others). Verified
    pixel-equal against the OpenCL output.
-5. **Atomics and local memory.** clspv supports atomics and
+8. **Full channelmixerrgb + diffuse.** Port the remaining adaptation
+   modes and the wavelet pipeline so the current scope caveats go
+   away.
+9. **Atomics and local memory.** clspv supports atomics and
    `barrier()`; the bilateral and colour-reconstruction reductions
    port with minor tweaks (the inline-asm fast path for NVIDIA in
    `common.h` becomes plain OpenCL atomics; clspv compiles those to
    SPIR-V atomics).
-6. **Demosaicers and local-laplacian.** The hardest kernels (Markesteijn
-   especially) make heavy use of local memory and workgroup
-   synchronisation. Verify clspv's local-memory ABI works at the
-   workgroup sizes we currently use.
-7. **Tiling and headroom.** Rewrite the host-side memory accounting on
-   `VK_EXT_memory_budget`; preserve the existing `factor_cl`/`overlap`
-   semantics.
-8. **Binary cache.** Today's MD5-on-source binary cache (lines
-   2242-2289 of `src/common/opencl.c`) becomes a `VkPipelineCache`
-   keyed on `(SPIR-V hash, physical device UUID, driver version)`.
-9. **Deprecate OpenCL build path.** When all modules ship on the new
-   HAL and per-module pixel-equality tests pass, default
-   `USE_OPENCL=OFF` and announce a deprecation window of one release.
+10. **Demosaicers and local-laplacian.** The hardest kernels
+    (Markesteijn especially) make heavy use of local memory and
+    workgroup synchronisation. Verify clspv's local-memory ABI works
+    at the workgroup sizes we currently use.
+11. **Tiling and headroom.** Rewrite the host-side memory accounting
+    on `VK_EXT_memory_budget`; preserve the existing
+    `factor_cl`/`overlap` semantics.
+12. **Binary cache.** Today's MD5-on-source binary cache (lines
+    2242-2289 of `src/common/opencl.c`) becomes a `VkPipelineCache`
+    keyed on `(SPIR-V hash, physical device UUID, driver version)`.
+13. **Deprecate OpenCL build path.** When all modules ship on the new
+    HAL and per-module pixel-equality tests pass, default
+    `USE_OPENCL=OFF` and announce a deprecation window of one
+    release.
 
 ## 9. clspv subset risks
 

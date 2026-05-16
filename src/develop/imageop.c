@@ -2191,6 +2191,11 @@ void dt_iop_commit_params(dt_iop_module_t *module,
     piece->process_cl_ready = TRUE;
 #endif
 
+#ifdef HAVE_VULKAN
+  if(module->process_vk)
+    piece->process_vk_ready = TRUE;
+#endif
+
   // register if module allows tiling, commit_params can overwrite this.
   if(module->flags() & IOP_FLAGS_ALLOW_TILING)
     piece->process_tiling_ready = TRUE;

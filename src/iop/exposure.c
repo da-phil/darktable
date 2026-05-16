@@ -26,7 +26,9 @@
 #include "common/histogram.h"
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
+#include "common/file_location.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -112,6 +114,10 @@ typedef struct dt_iop_exposure_data_t
 typedef struct dt_iop_exposure_global_data_t
 {
   int kernel_exposure;
+#ifdef HAVE_VULKAN
+  int vk_program_exposure;
+  int vk_kernel_exposure;
+#endif
 } dt_iop_exposure_global_data_t;
 
 #define EXPOSURE_CORRECTION_UNDEFINED (-FLT_MAX)
@@ -538,6 +544,39 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               struct dt_vk_mem_t *dev_in,
+               struct dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_exposure_data_t *d = piece->data;
+  dt_iop_exposure_global_data_t *gd = self->global_data;
+  if(gd->vk_kernel_exposure < 0) return -1;
+
+  _process_common_setup(self, piece);
+
+  const int devid = 0;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  // Push-constant layout matches the .cl/.comp twins exactly:
+  // (int width, int height, float black, float scale).
+  struct { int w; int h; float black; float scale; } pc
+    = { width, height, d->black, d->scale };
+
+  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
+  const int rc = dt_vulkan_enqueue_kernel_2d(devid, gd->vk_kernel_exposure,
+                                             (size_t)width, (size_t)height,
+                                             bufs, 2, &pc, sizeof(pc));
+  if(rc == 0)
+    for(int k = 0; k < 3; k++) piece->pipe->dsc.processed_maximum[k] *= d->scale;
+  return rc;
+}
+#endif
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const i,
@@ -750,12 +789,37 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_exposure_global_data_t *gd = calloc(1,sizeof(dt_iop_exposure_global_data_t));
   self->data = gd;
   gd->kernel_exposure = dt_opencl_create_kernel(program, "exposure");
+
+#ifdef HAVE_VULKAN
+  gd->vk_program_exposure = -1;
+  gd->vk_kernel_exposure  = -1;
+  if(dt_vulkan_running())
+  {
+    char path[PATH_MAX] = { 0 };
+    dt_loc_get_datadir(path, sizeof(path));
+    g_strlcat(path, "/kernels/vulkan/exposure.spv", sizeof(path));
+    gd->vk_program_exposure = dt_vulkan_load_program("exposure", path);
+    if(gd->vk_program_exposure >= 0)
+    {
+      // Two storage buffers (in, out), push constants = (w, h, black, scale),
+      // local size matches the GLSL twin so dispatch rounding is consistent.
+      gd->vk_kernel_exposure = dt_vulkan_create_kernel(gd->vk_program_exposure,
+                                                       "exposure",
+                                                       /*buffers*/   2,
+                                                       /*pushsize*/  sizeof(int) * 2 + sizeof(float) * 2,
+                                                       /*lx*/ 16, /*ly*/ 16, /*lz*/ 1);
+    }
+  }
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_exposure_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_exposure);
+#ifdef HAVE_VULKAN
+  if(gd->vk_kernel_exposure >= 0) dt_vulkan_free_kernel(gd->vk_kernel_exposure);
+#endif
   free(self->data);
   self->data = NULL;
 }

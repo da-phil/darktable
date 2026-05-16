@@ -455,6 +455,7 @@ typedef struct darktable_t
   struct dt_points_t *points;
   struct dt_imageio_t *imageio;
   struct dt_opencl_t *opencl;
+  struct dt_vulkan_t *vulkan;
   struct dt_dbus_t *dbus;
   struct dt_undo_t *undo;
   struct dt_colorspaces_t *color_profiles;

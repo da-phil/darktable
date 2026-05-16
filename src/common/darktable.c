@@ -48,6 +48,7 @@
 #include "common/mipmap_cache.h"
 #include "common/noiseprofiles.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/points.h"
 #include "common/resource_limits.h"
 #include "common/undo.h"
@@ -1896,6 +1897,15 @@ int dt_init(int argc,
   else
     dt_opencl_init(darktable.opencl, exclude_opencl, print_statistics);
 
+#ifdef HAVE_VULKAN
+  // Bring up Vulkan compute alongside OpenCL. Both can coexist; the
+  // pixelpipe prefers Vulkan when both are available and a module has
+  // a process_vk implementation. The init function honours the
+  // 'opencl_use_vulkan' preference for runtime opt-out.
+  darktable.vulkan = (dt_vulkan_t *)calloc(1, sizeof(dt_vulkan_t));
+  dt_vulkan_init(darktable.vulkan);
+#endif
+
   // must come before mipmap_cache, because that one will need to access image dimensions stored in here:
   dt_image_cache_init();
 
@@ -2246,6 +2256,12 @@ void dt_cleanup()
   dt_opencl_cleanup(darktable.opencl);
   free(darktable.opencl);
   darktable.opencl = NULL;
+
+#ifdef HAVE_VULKAN
+  dt_vulkan_cleanup(darktable.vulkan);
+  free(darktable.vulkan);
+  darktable.vulkan = NULL;
+#endif
 #ifdef HAVE_GPHOTO2
   dt_camctl_destroy((dt_camctl_t *)darktable.camctl);
   darktable.camctl = NULL;

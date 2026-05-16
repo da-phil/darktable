@@ -68,6 +68,7 @@ typedef struct dt_dev_pixelpipe_iop_t
   dt_iop_roi_t processed_roi_in;  // the actual roi that was used for processing the piece
   dt_iop_roi_t processed_roi_out;
   gboolean process_cl_ready;      // set this to FALSE in commit_params to temporarily disable the use of process_cl
+  gboolean process_vk_ready;      // set this to FALSE in commit_params to temporarily disable the use of process_vk
   gboolean process_tiling_ready;  // set this to FALSE in commit_params to temporarily disable tiling
 
   // the following are used internally for caching:

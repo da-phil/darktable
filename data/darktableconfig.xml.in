@@ -486,6 +486,13 @@
     <shortdescription>tuned GPU memory</shortdescription>
     <longdescription>if enabled on a system with multiple OpenCL devices you may specify a safety margin per device (headroom, default is 600MB)</longdescription>
   </dtconfig>
+  <dtconfig prefs="processing" section="opencl" capability="opencl" restart="true">
+    <name>opencl_use_vulkan</name>
+    <type>bool</type>
+    <default>true</default>
+    <shortdescription>use Vulkan compute backend</shortdescription>
+    <longdescription>if enabled and the Vulkan backend was compiled in (USE_VULKAN), pixelpipe modules with a process_vk implementation are dispatched via Vulkan compute (clspv/SPIR-V) in preference to OpenCL. Only a small set of modules currently support Vulkan; others fall back to OpenCL or CPU transparently.</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="platform" capability="nonapple" restart="true">
     <name>clplatform_intelropenclhdgraphics</name>
     <type>bool</type>

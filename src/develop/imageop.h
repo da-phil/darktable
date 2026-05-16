@@ -26,6 +26,7 @@
 #include "common/darktable.h"
 #include "common/introspection.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/action.h"
 #include "control/settings.h"
 

@@ -20,6 +20,7 @@
 #include "common/colorspaces.h"
 #include "common/histogram.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/iop_order.h"
 #include "common/imagebuf.h"
 #include "control/control.h"
@@ -507,6 +508,7 @@ void dt_dev_pixelpipe_create_nodes(dt_dev_pixelpipe_t *pipe,
     piece->data = NULL;
     piece->hash = DT_INVALID_HASH;
     piece->process_cl_ready = FALSE;
+    piece->process_vk_ready = FALSE;
     piece->process_tiling_ready = FALSE;
     piece->raster_masks = g_hash_table_new_full(g_direct_hash,
                                                 g_direct_equal, NULL, dt_free_align_ptr);
@@ -1503,10 +1505,50 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     }
     else
     {
-      if(darktable.bench_module && _is_debug_pipe(pipe) && dt_str_commasubstring(darktable.bench_module, module->op))
-        _cpu_benchmark(pipe, module, piece, input, *output, roi_out, roi_in);
+      gboolean processed = FALSE;
+#ifdef HAVE_VULKAN
+      // If the module exposes a Vulkan path and Vulkan is enabled,
+      // route through it via host staging. This sits inside the CPU
+      // dispatch arm so modules with both process_vk and process_cl
+      // still defer to OpenCL on the GPU chain; Vulkan only kicks in
+      // when we'd otherwise be running on the CPU (i.e. OpenCL is
+      // off/unavailable, or this specific module fell back).
+      if(module->process_vk
+         && piece->process_vk_ready
+         && dt_vulkan_running())
+      {
+        const size_t in_size  = (size_t)roi_in->width  * roi_in->height  * in_bpp;
+        const size_t out_size = (size_t)roi_out->width * roi_out->height * bpp;
+        const int devid = dt_vulkan_lock_device();
+        if(devid >= 0)
+        {
+          dt_vk_mem_t *vin  = dt_vulkan_alloc_buffer(devid, in_size);
+          dt_vk_mem_t *vout = dt_vulkan_alloc_buffer(devid, out_size);
+          if(vin && vout
+             && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0
+             && module->process_vk(module, piece, vin, vout, roi_in, roi_out) == 0
+             && dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
+          {
+            processed = TRUE;
+            *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
+            *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
+          }
+          dt_vulkan_free_buffer(devid, vin);
+          dt_vulkan_free_buffer(devid, vout);
+          dt_vulkan_unlock_device(devid);
+        }
+        if(!processed)
+          dt_print_pipe(DT_DEBUG_OPENCL, "vulkan fallback to CPU",
+                        pipe, module, DT_DEVICE_CPU, roi_in, roi_out, "");
+      }
+#endif
+      if(!processed)
+      {
+        if(darktable.bench_module && _is_debug_pipe(pipe) && dt_str_commasubstring(darktable.bench_module, module->op))
+          _cpu_benchmark(pipe, module, piece, input, *output, roi_out, roi_in);
 
-      module->process(module, piece, input, *output, roi_in, roi_out);
+        module->process(module, piece, input, *output, roi_in, roi_out);
+      }
       if(want_bcache)
       {
         if(dt_pipe_no_mask_display(pipe))
@@ -1519,9 +1561,14 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
       }
     }
 
-    *pixelpipe_flow |= (PIXELPIPE_FLOW_PROCESSED_ON_CPU);
-    *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_GPU
-                         | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+#ifdef HAVE_VULKAN
+    if(!(*pixelpipe_flow & PIXELPIPE_FLOW_PROCESSED_ON_GPU))
+#endif
+    {
+      *pixelpipe_flow |= (PIXELPIPE_FLOW_PROCESSED_ON_CPU);
+      *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_GPU
+                           | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+    }
   }
 
   if(pfm_dump)
