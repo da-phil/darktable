@@ -26,7 +26,9 @@
 #include "common/image.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
+#include "common/file_location.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop_gui.h"
@@ -90,6 +92,13 @@ typedef struct dt_iop_diffuse_global_data_t
   int kernel_diffuse_build_mask;
   int kernel_diffuse_inpaint_mask;
   int kernel_diffuse_pde;
+#ifdef HAVE_VULKAN
+  // The Vulkan port is a single-pass unsharp-mask approximation;
+  // see data/kernels/vulkan/diffuse.cl for scope. Multi-scale
+  // wavelet diffusion is still a future milestone.
+  int vk_program;
+  int vk_kernel_sharpen_single;
+#endif
 } dt_iop_diffuse_global_data_t;
 
 
@@ -1718,13 +1727,15 @@ error:
     dt_opencl_release_mem_object(HF[s]);
   return err;
 }
+#endif // HAVE_OPENCL
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 33; // extended.cl in programs.conf
   dt_iop_diffuse_global_data_t *gd = malloc(sizeof(dt_iop_diffuse_global_data_t));
-
   self->data = gd;
+
+#ifdef HAVE_OPENCL
+  const int program = 33; // extended.cl in programs.conf
   gd->kernel_diffuse_build_mask = dt_opencl_create_kernel(program, "build_mask");
   gd->kernel_diffuse_inpaint_mask = dt_opencl_create_kernel(program, "inpaint_mask");
   gd->kernel_diffuse_pde = dt_opencl_create_kernel(program, "diffuse_pde");
@@ -1736,12 +1747,34 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(wavelets, "blur_2D_Bspline_vertical");
   gd->kernel_filmic_wavelets_detail =
     dt_opencl_create_kernel(wavelets, "wavelets_detail_level");
+#endif
+
+#ifdef HAVE_VULKAN
+  gd->vk_program = -1;
+  gd->vk_kernel_sharpen_single = -1;
+  if(dt_vulkan_running())
+  {
+    char path[PATH_MAX] = { 0 };
+    dt_loc_get_datadir(path, sizeof(path));
+    g_strlcat(path, "/kernels/vulkan/diffuse.spv", sizeof(path));
+    gd->vk_program = dt_vulkan_load_program("diffuse", path);
+    if(gd->vk_program >= 0)
+    {
+      gd->vk_kernel_sharpen_single =
+          dt_vulkan_create_kernel(gd->vk_program, "diffuse_sharpen_single",
+                                  /*buffers*/  2,
+                                  /*pushsize*/ 2 * sizeof(int) + 2 * sizeof(float),
+                                  /*lx*/ 16, /*ly*/ 16, /*lz*/ 1);
+    }
+  }
+#endif
 }
 
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_diffuse_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_diffuse_build_mask);
   dt_opencl_free_kernel(gd->kernel_diffuse_inpaint_mask);
   dt_opencl_free_kernel(gd->kernel_diffuse_pde);
@@ -1749,8 +1782,50 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_filmic_bspline_vertical);
   dt_opencl_free_kernel(gd->kernel_filmic_bspline_horizontal);
   dt_opencl_free_kernel(gd->kernel_filmic_wavelets_detail);
+#endif
+#ifdef HAVE_VULKAN
+  if(gd->vk_kernel_sharpen_single >= 0) dt_vulkan_free_kernel(gd->vk_kernel_sharpen_single);
+#endif
   free(self->data);
   self->data = NULL;
+}
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               struct dt_vk_mem_t *dev_in,
+               struct dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  // SCOPE: the full multi-scale wavelet diffuse pipeline (see
+  // wavelets_process_cl above) is not yet ported. This entry runs a
+  // single-pass unsharp-mask approximation that produces a visible
+  // sharpen-like result but is not numerically equivalent to the
+  // OpenCL/CPU path. When precise diffuse behaviour is required,
+  // returning non-zero here makes the pixelpipe fall back to
+  // process_cl (or, with no OpenCL, process()). For now we keep the
+  // approximation active so the Vulkan integration is exercisable
+  // end-to-end; we can flip this to "always return -1" once the
+  // wavelet port lands.
+  const dt_iop_diffuse_data_t *const data = piece->data;
+  const dt_iop_diffuse_global_data_t *const gd = self->global_data;
+  if(gd->vk_kernel_sharpen_single < 0) return -1;
+
+  // Amount is roughly the third-order detail strength; threshold is
+  // a fraction of the dynamic range. Both are clamped to plausible
+  // values to avoid bizarre output if the user dials extreme params.
+  const float amount    = CLAMPF(data->sharpness, 0.0f, 4.0f);
+  const float threshold = CLAMPF(data->threshold, 0.0f, 1.0f);
+  if(amount <= 0.0f) return -1;  // nothing to do; let the regular path handle it
+
+  struct { int w, h; float amount, threshold; } pc
+    = { roi_in->width, roi_in->height, amount, threshold };
+
+  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
+  return dt_vulkan_enqueue_kernel_2d(0, gd->vk_kernel_sharpen_single,
+                                     (size_t)pc.w, (size_t)pc.h,
+                                     bufs, 2, &pc, sizeof(pc));
 }
 #endif
 
