@@ -1,0 +1,35 @@
+// Shadow GLSL compute shader for the basicadj_min PoC kernel.
+//
+// In production this shader does NOT exist: clspv compiles
+// kernels/basicadj_min.cl directly to SPIR-V. We carry this hand-written
+// GLSL twin only so the PoC build is exercisable in environments where
+// clspv is not installed (it falls back to glslangValidator).
+//
+// The two paths must stay behaviour-equivalent. If you change basicadj_min.cl
+// to add or remove a parameter, mirror the change here, otherwise the
+// fallback PoC will silently diverge from the OpenCL source.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    float black_point;
+    float scale;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    int idx = y * pc.width + x;
+    vec4 pixel = in_buf.data[idx];
+    pixel.rgb = (pixel.rgb - vec3(pc.black_point)) * pc.scale;
+    out_buf.data[idx] = pixel;
+}
