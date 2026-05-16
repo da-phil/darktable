@@ -68,7 +68,7 @@ to "Vulkan everywhere", which is one host runtime instead of two.
 | **clvk** (OpenCL ICD on top of Vulkan, uses clspv internally) | Even smaller host-side change — keep the OpenCL host API. | Extra runtime layer; MoltenVK underneath on macOS still has the same constraints; ties dt to clvk's lifecycle. |
 
 The leading candidate is the clspv path. A clvk fallback is feasible
-and is sketched in §10 as an intermediate option that minimises
+and is sketched in §11 as an intermediate option that minimises
 host-side disruption for the first release.
 
 ## 3. Component glossary
@@ -127,7 +127,7 @@ build:
 - Single dispatch per pipeline, no async pipelines or events.
 - No tiling, no headroom logic, no device priority.
 
-Those are the next milestones (§7), not blockers for evaluating the
+Those are the next milestones (§8), not blockers for evaluating the
 approach.
 
 ## 5. Architecture of a full port
@@ -229,9 +229,9 @@ needs per output pixel. They port literally.
 
 - Vulkan loader and one ICD per vendor: Mesa RADV (AMD), Mesa ANV
   (Intel), NVIDIA proprietary, AMDVLK.
-- Build dep: `libvulkan-dev` (already in distro repos), `clspv` (must
-  be obtained as a binary or built from source — no Debian package
-  yet; we will document a pinned-version build script).
+- Build deps: `libvulkan-dev` (in distro repos), `clspv` (must be
+  obtained as a binary or built from source — no Debian package yet).
+  Full per-distro lists in §7.
 - No regression for users with current OpenCL setups: the existing
   OpenCL path continues to coexist behind `USE_OPENCL` until removed.
 
@@ -265,7 +265,114 @@ For older macOS releases (pre-10.13) or installations where MoltenVK
 is unavailable, we fall back to the CPU path — same behaviour darktable
 already has for systems without OpenCL.
 
-## 7. Migration milestones
+## 7. Build and developer dependencies
+
+The PoC in `tools/vulkan_compute_poc/` and (later) the full Vulkan path
+need a small set of extra packages on top of darktable's normal build
+deps. Versions are the ones we've verified during PoC bring-up; older
+versions probably work but we have not pinned a hard minimum yet.
+
+### Ubuntu 24.04 LTS (and 26.04)
+
+All packages are in the stock archive — no PPAs required. Tested
+combination:
+
+| Package | Role | Notes |
+|---|---|---|
+| `libvulkan-dev` | Vulkan headers + loader | provides `find_package(Vulkan)` |
+| `vulkan-tools` | `vulkaninfo`, debug utilities | optional, useful for triage |
+| `mesa-vulkan-drivers` | lavapipe software ICD | required to *run* the PoC on headless CI; on dev machines the vendor driver is used instead |
+| `glslang-tools` | `glslangValidator` | fallback shader compiler when `clspv` isn't installed |
+| `spirv-tools` | `spirv-val`, `spirv-dis` | optional, the CMake target uses them if present |
+| `spirv-cross` | `spirv-cross` CLI | optional, handy for inspecting what MoltenVK will see |
+| `clang-18` (or newer) | clspv build-from-source dep | only needed if you build clspv yourself |
+
+One-liner:
+
+```sh
+sudo apt-get install -y \
+    libvulkan-dev vulkan-tools mesa-vulkan-drivers \
+    glslang-tools spirv-tools spirv-cross
+```
+
+`clspv` is **not** packaged in Ubuntu 24.04 or 26.04. Until that
+changes, contributors who want the production-path build either:
+
+- pull a prebuilt binary from the project's CI artefacts
+  (`https://github.com/google/clspv`), or
+- build it in-tree against system LLVM. A pinned build script will
+  live in `tools/vulkan_compute_poc/scripts/` once the PoC graduates.
+
+Without `clspv`, the PoC CMake falls back to compiling the GLSL twin
+(`kernels/basicadj_min.comp`) with `glslangValidator` — same SPIR-V
+output shape, same dispatch, kept behaviour-equivalent by hand. Useful
+for getting the host-side runtime working in environments where
+installing clspv is impractical (CI, fresh dev containers).
+
+### Fedora 40+ / RHEL-likes
+
+Equivalent packages: `vulkan-loader-devel`, `vulkan-tools`,
+`mesa-vulkan-drivers`, `glslang`, `spirv-tools`, `spirv-cross-devel`.
+`clspv` is not packaged; the same in-tree-build story applies.
+
+### Arch / Manjaro
+
+`vulkan-devel` (meta), `vulkan-tools`, `vulkan-mesa-layers` (or
+the vendor driver of choice), `glslang`, `spirv-tools`,
+`spirv-cross`. `clspv` is in AUR.
+
+### macOS (Homebrew)
+
+The PoC build hasn't been exercised on macOS in this PR (no CI hosts
+yet), but the dependency surface is small:
+
+```sh
+brew install vulkan-headers molten-vk glslang spirv-tools spirv-cross
+```
+
+`molten-vk` provides both the Vulkan loader shim (`libvulkan.dylib`)
+and the Metal-backed ICD; `vulkan-headers` is what `find_package(Vulkan)`
+picks up. The LunarG SDK is an alternative one-shot install that
+bundles all of these plus `vulkaninfo`.
+
+### Windows (MSYS2 UCRT64)
+
+The CI's MSYS2 environment can install everything needed via:
+
+```
+pacboy -S vulkan-headers:p vulkan-validation-layers:p \
+          glslang:p spirv-tools:p
+```
+
+`molten-vk` does not apply on Windows; the Vulkan loader is installed
+with the GPU driver. For developer machines the LunarG SDK installer
+is the simplest option.
+
+### CI
+
+The Linux job in `.github/workflows/ci.yml` adds a dedicated matrix
+entry that installs the package set above and builds the PoC with
+`-DBUILD_VULKAN_COMPUTE_POC=ON`. The entry also smoke-runs the PoC
+binary against the lavapipe software ICD; exit code `77` means "no
+Vulkan device on this runner, skipping the dispatch test" and is
+treated as success (the build-clean signal is still the main thing
+we care about at this stage). Non-zero, non-77 exit codes fail the
+matrix entry.
+
+### Developer convenience
+
+`build.sh` exposes the new option as `--vulkan-compute-poc` (and
+`--no-vulkan-compute-poc` to force it off). When omitted, the CMake
+default (`OFF`) wins. Example:
+
+```sh
+./build.sh --vulkan-compute-poc --skip-build
+# ... or, with everything else default:
+cmake -S . -B build -DBUILD_VULKAN_COMPUTE_POC=ON
+cmake --build build --target dt_vk_compute_poc
+```
+
+## 8. Migration milestones
 
 1. **PoC (this PR).** Buffer-only kernel proves the round-trip works.
 2. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
@@ -297,7 +404,7 @@ already has for systems without OpenCL.
    HAL and per-module pixel-equality tests pass, default
    `USE_OPENCL=OFF` and announce a deprecation window of one release.
 
-## 8. clspv subset risks
+## 9. clspv subset risks
 
 `clspv` supports the subset of OpenCL C 1.2 that maps cleanly to
 SPIR-V. The kernels in `data/kernels/` were surveyed for the
@@ -338,7 +445,7 @@ Other risks to watch as we port more kernels:
   values we use today or use Vulkan specialisation constants to make
   them adjustable post-compile.
 
-## 9. Performance expectations
+## 10. Performance expectations
 
 For native Vulkan on Linux/Windows: should be within noise of the
 current OpenCL on the same hardware. SPIR-V is a similar IR to the
@@ -355,7 +462,7 @@ For workloads where MoltenVK overhead matters (sub-millisecond
 dispatches with tiny buffers), we already batch on the host. Image
 modules are millisecond-scale or longer; the overhead is irrelevant.
 
-## 10. Optional intermediate: clvk
+## 11. Optional intermediate: clvk
 
 A way to de-risk the host-side rewrite is to keep the OpenCL ICD
 boundary and replace the *driver* underneath: clvk exposes a fully-
@@ -372,7 +479,7 @@ The cost is that we keep the OpenCL host-API for longer and lose the
 chance to clean up `dlopencl.{c,h}` and friends. It's a useful
 intermediate test, not the long-term destination.
 
-## 11. Open questions
+## 12. Open questions
 
 - **clspv versioning policy.** clspv has no tagged release schedule.
   We need a vendoring or pinned-build script and a CI job that bumps
@@ -392,7 +499,7 @@ intermediate test, not the long-term destination.
   filmic+lut3d export) on at least one Intel Mac and one M-series Mac
   comparing today's Apple-OpenCL path against MoltenVK.
 
-## 12. Summary
+## 13. Summary
 
 - The image-processing maths in `data/kernels/*.cl` is the asset; the
   host-side OpenCL plumbing is replaceable.
