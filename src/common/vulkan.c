@@ -1,0 +1,609 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+*/
+
+#include "common/vulkan.h"
+
+#ifdef HAVE_VULKAN
+
+#include "common/darktable.h"
+#include "common/dtpthread.h"
+#include "control/conf.h"
+
+#include <glib/gstdio.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// One global lock; mirrors the per-device mutex pattern in opencl.c but
+// since our backend currently exposes a single physical device we keep
+// it simple and lock the whole subsystem on the dispatch path.
+static dt_pthread_mutex_t g_vk_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// ---- helpers ---------------------------------------------------------
+
+static const char *_vkerr(VkResult r)
+{
+  switch(r)
+  {
+    case VK_SUCCESS:                       return "VK_SUCCESS";
+    case VK_ERROR_OUT_OF_HOST_MEMORY:      return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:    return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED:   return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_LAYER_NOT_PRESENT:       return "VK_ERROR_LAYER_NOT_PRESENT";
+    case VK_ERROR_EXTENSION_NOT_PRESENT:   return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case VK_ERROR_FEATURE_NOT_PRESENT:     return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case VK_ERROR_INCOMPATIBLE_DRIVER:     return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case VK_ERROR_DEVICE_LOST:             return "VK_ERROR_DEVICE_LOST";
+    default: break;
+  }
+  return "VK_<unknown>";
+}
+
+#define VKCHECK(call) do {                                       \
+    VkResult _r = (call);                                        \
+    if(_r != VK_SUCCESS) {                                       \
+      dt_print(DT_DEBUG_OPENCL,                                  \
+               "[vulkan] %s failed: %s", #call, _vkerr(_r));     \
+      goto error;                                                \
+    }                                                            \
+  } while(0)
+
+static uint32_t _find_memtype(const dt_vk_device_t *d,
+                              uint32_t type_filter,
+                              VkMemoryPropertyFlags props)
+{
+  for(uint32_t i = 0; i < d->mem_props.memoryTypeCount; ++i)
+  {
+    if((type_filter & (1u << i)) &&
+       (d->mem_props.memoryTypes[i].propertyFlags & props) == props)
+      return i;
+  }
+  return UINT32_MAX;
+}
+
+// ---- init / cleanup --------------------------------------------------
+
+static gboolean _create_device(dt_vk_device_t *d, VkPhysicalDevice phys)
+{
+  d->phys = phys;
+  VkPhysicalDeviceProperties pp;
+  vkGetPhysicalDeviceProperties(phys, &pp);
+  snprintf(d->name, sizeof(d->name), "%s", pp.deviceName);
+
+  uint32_t qn = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, &qn, NULL);
+  if(qn == 0) return FALSE;
+  VkQueueFamilyProperties *qprops = calloc(qn, sizeof(*qprops));
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, &qn, qprops);
+
+  d->queue_family_index = UINT32_MAX;
+  for(uint32_t i = 0; i < qn; ++i)
+  {
+    if(qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+    {
+      d->queue_family_index = i;
+      break;
+    }
+  }
+  free(qprops);
+  if(d->queue_family_index == UINT32_MAX) return FALSE;
+
+  const float prio = 1.0f;
+  VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                  .queueFamilyIndex = d->queue_family_index,
+                                  .queueCount = 1, .pQueuePriorities = &prio };
+  VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                             .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
+  VKCHECK(vkCreateDevice(phys, &dci, NULL, &d->device));
+
+  vkGetDeviceQueue(d->device, d->queue_family_index, 0, &d->queue);
+  vkGetPhysicalDeviceMemoryProperties(phys, &d->mem_props);
+
+  VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                   .queueFamilyIndex = d->queue_family_index,
+                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
+  VKCHECK(vkCreateCommandPool(d->device, &cpci, NULL, &d->cmd_pool));
+
+  // Pre-size a descriptor pool big enough for all kernels we register
+  // up front. This grows lazily if exhausted in future revisions.
+  VkDescriptorPoolSize psz = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                               .descriptorCount = DT_VULKAN_MAX_BINDINGS * DT_VULKAN_MAX_KERNELS };
+  VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                      .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                                      .maxSets = DT_VULKAN_MAX_KERNELS,
+                                      .poolSizeCount = 1, .pPoolSizes = &psz };
+  VKCHECK(vkCreateDescriptorPool(d->device, &dpci, NULL, &d->dset_pool));
+  return TRUE;
+
+error:
+  if(d->cmd_pool) vkDestroyCommandPool(d->device, d->cmd_pool, NULL);
+  if(d->device)   vkDestroyDevice(d->device, NULL);
+  memset(d, 0, sizeof(*d));
+  return FALSE;
+}
+
+void dt_vulkan_init(dt_vulkan_t *vk)
+{
+  if(!vk) return;
+  memset(vk, 0, sizeof(*vk));
+
+  // Honour the runtime preference: even if compiled in, allow opt-out.
+  vk->enabled = dt_conf_get_bool("opencl_use_vulkan");
+
+  if(!vk->enabled)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[vulkan] disabled via preferences");
+    return;
+  }
+
+  VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                            .pApplicationName = "darktable",
+                            .applicationVersion = VK_MAKE_VERSION(5, 0, 0),
+                            .pEngineName = "darktable",
+                            .engineVersion = VK_MAKE_VERSION(5, 0, 0),
+                            .apiVersion = VK_API_VERSION_1_2 };
+  VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                               .pApplicationInfo = &app };
+  VKCHECK(vkCreateInstance(&ici, NULL, &vk->instance));
+
+  uint32_t n = 0;
+  VKCHECK(vkEnumeratePhysicalDevices(vk->instance, &n, NULL));
+  if(n == 0)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[vulkan] no physical devices");
+    goto error;
+  }
+  VkPhysicalDevice *phys = calloc(n, sizeof(*phys));
+  VKCHECK(vkEnumeratePhysicalDevices(vk->instance, &n, phys));
+
+  vk->dev = calloc(n, sizeof(*vk->dev));
+  for(uint32_t i = 0; i < n; ++i)
+  {
+    if(_create_device(&vk->dev[vk->num_devs], phys[i]))
+    {
+      dt_print(DT_DEBUG_OPENCL, "[vulkan] device %d: %s",
+               vk->num_devs, vk->dev[vk->num_devs].name);
+      vk->num_devs++;
+    }
+  }
+  free(phys);
+
+  if(vk->num_devs == 0)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[vulkan] no compute-capable devices");
+    goto error;
+  }
+
+  vk->inited = TRUE;
+  return;
+
+error:
+  dt_vulkan_cleanup(vk);
+}
+
+void dt_vulkan_cleanup(dt_vulkan_t *vk)
+{
+  if(!vk) return;
+  for(int i = 0; i < vk->num_devs; ++i)
+  {
+    dt_vk_device_t *d = &vk->dev[i];
+    if(d->device) vkDeviceWaitIdle(d->device);
+    for(int k = 0; k < DT_VULKAN_MAX_KERNELS; ++k) dt_vulkan_free_kernel(k);
+    for(int p = 0; p < DT_VULKAN_MAX_PROGRAMS; ++p)
+    {
+      if(d->programs[p].used) free(d->programs[p].spirv);
+    }
+    if(d->dset_pool) vkDestroyDescriptorPool(d->device, d->dset_pool, NULL);
+    if(d->cmd_pool)  vkDestroyCommandPool(d->device, d->cmd_pool, NULL);
+    if(d->device)    vkDestroyDevice(d->device, NULL);
+  }
+  free(vk->dev);
+  if(vk->instance) vkDestroyInstance(vk->instance, NULL);
+  memset(vk, 0, sizeof(*vk));
+}
+
+gboolean dt_vulkan_running(void)
+{
+  if(!darktable.vulkan) return FALSE;
+  return darktable.vulkan->inited && darktable.vulkan->enabled
+         && darktable.vulkan->num_devs > 0;
+}
+
+int dt_vulkan_lock_device(void)
+{
+  if(!dt_vulkan_running()) return -1;
+  dt_pthread_mutex_lock(&g_vk_lock);
+  return 0; // single-device for now
+}
+
+void dt_vulkan_unlock_device(int devid)
+{
+  (void)devid;
+  dt_pthread_mutex_unlock(&g_vk_lock);
+}
+
+// ---- programs --------------------------------------------------------
+
+static uint32_t *_load_spv(const char *path, size_t *out_words)
+{
+  // g_fopen rather than fopen for Windows wide-path correctness; same
+  // pattern as src/common/opencl.c.
+  FILE *f = g_fopen(path, "rb");
+  if(!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if(sz <= 0 || (sz % 4) != 0) { fclose(f); return NULL; }
+  uint32_t *buf = malloc((size_t)sz);
+  if(!buf) { fclose(f); return NULL; }
+  size_t r = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  if(r != (size_t)sz) { free(buf); return NULL; }
+  *out_words = (size_t)sz / 4;
+  return buf;
+}
+
+int dt_vulkan_load_program(const char *name, const char *path)
+{
+  if(!dt_vulkan_running()) return -1;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+
+  // Find a free slot.
+  int slot = -1;
+  for(int i = 0; i < DT_VULKAN_MAX_PROGRAMS; ++i)
+    if(!d->programs[i].used) { slot = i; break; }
+  if(slot < 0) return -1;
+
+  size_t words = 0;
+  uint32_t *spv = _load_spv(path, &words);
+  if(!spv)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[vulkan] cannot load SPIR-V from %s", path);
+    return -1;
+  }
+
+  d->programs[slot].used        = TRUE;
+  d->programs[slot].spirv       = spv;
+  d->programs[slot].spirv_words = words;
+  snprintf(d->programs[slot].name, sizeof(d->programs[slot].name), "%s", name);
+  return slot;
+}
+
+// ---- kernels ---------------------------------------------------------
+
+int dt_vulkan_create_kernel(int program,
+                            const char *entry,
+                            uint32_t num_storage_buffer_bindings,
+                            uint32_t push_constant_size,
+                            uint32_t local_size_x,
+                            uint32_t local_size_y,
+                            uint32_t local_size_z)
+{
+  if(!dt_vulkan_running()) return -1;
+  if(num_storage_buffer_bindings > DT_VULKAN_MAX_BINDINGS) return -1;
+  if(push_constant_size > DT_VULKAN_MAX_PUSH_CONSTANTS)    return -1;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  if(program < 0 || program >= DT_VULKAN_MAX_PROGRAMS || !d->programs[program].used)
+    return -1;
+
+  int slot = -1;
+  for(int i = 0; i < DT_VULKAN_MAX_KERNELS; ++i)
+    if(!d->kernels[i].used) { slot = i; break; }
+  if(slot < 0) return -1;
+  dt_vk_kernel_t *k = &d->kernels[slot];
+  memset(k, 0, sizeof(*k));
+
+  VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = d->programs[program].spirv_words * sizeof(uint32_t),
+                                    .pCode = d->programs[program].spirv };
+  VKCHECK(vkCreateShaderModule(d->device, &smci, NULL, &k->shader_module));
+
+  VkDescriptorSetLayoutBinding bindings[DT_VULKAN_MAX_BINDINGS];
+  for(uint32_t i = 0; i < num_storage_buffer_bindings; ++i)
+  {
+    bindings[i] = (VkDescriptorSetLayoutBinding){ .binding = i,
+                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                  .descriptorCount = 1,
+                                                  .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
+  }
+  VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = num_storage_buffer_bindings,
+                                            .pBindings = bindings };
+  VKCHECK(vkCreateDescriptorSetLayout(d->device, &dslci, NULL, &k->dset_layout));
+
+  VkPushConstantRange pc = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                             .offset = 0, .size = push_constant_size };
+  VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                      .setLayoutCount = 1, .pSetLayouts = &k->dset_layout,
+                                      .pushConstantRangeCount = push_constant_size ? 1 : 0,
+                                      .pPushConstantRanges    = push_constant_size ? &pc : NULL };
+  VKCHECK(vkCreatePipelineLayout(d->device, &plci, NULL, &k->pipeline_layout));
+
+  VkPipelineShaderStageCreateInfo ssci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                           .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .module = k->shader_module,
+                                           .pName = entry };
+  VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                       .stage = ssci, .layout = k->pipeline_layout };
+  VKCHECK(vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &cpci, NULL, &k->pipeline));
+
+  k->used = TRUE;
+  k->program = program;
+  snprintf(k->name, sizeof(k->name), "%s", entry);
+  k->num_storage_buffer_bindings = num_storage_buffer_bindings;
+  k->push_constant_size = push_constant_size;
+  k->local_size_x = local_size_x;
+  k->local_size_y = local_size_y;
+  k->local_size_z = local_size_z;
+  return slot;
+
+error:
+  if(k->pipeline)        vkDestroyPipeline(d->device, k->pipeline, NULL);
+  if(k->pipeline_layout) vkDestroyPipelineLayout(d->device, k->pipeline_layout, NULL);
+  if(k->dset_layout)     vkDestroyDescriptorSetLayout(d->device, k->dset_layout, NULL);
+  if(k->shader_module)   vkDestroyShaderModule(d->device, k->shader_module, NULL);
+  memset(k, 0, sizeof(*k));
+  return -1;
+}
+
+void dt_vulkan_free_kernel(int kernel)
+{
+  if(!dt_vulkan_running()) return;
+  if(kernel < 0 || kernel >= DT_VULKAN_MAX_KERNELS) return;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  dt_vk_kernel_t *k = &d->kernels[kernel];
+  if(!k->used) return;
+  if(k->pipeline)        vkDestroyPipeline(d->device, k->pipeline, NULL);
+  if(k->pipeline_layout) vkDestroyPipelineLayout(d->device, k->pipeline_layout, NULL);
+  if(k->dset_layout)     vkDestroyDescriptorSetLayout(d->device, k->dset_layout, NULL);
+  if(k->shader_module)   vkDestroyShaderModule(d->device, k->shader_module, NULL);
+  memset(k, 0, sizeof(*k));
+}
+
+// ---- memory ----------------------------------------------------------
+
+static dt_vk_mem_t *_alloc(dt_vk_device_t *d, VkDeviceSize size,
+                           VkBufferUsageFlags usage, bool host_visible)
+{
+  dt_vk_mem_t *m = calloc(1, sizeof(*m));
+  if(!m) return NULL;
+  m->size = size;
+  m->host_visible = host_visible;
+
+  VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                             .size = size, .usage = usage,
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+  VKCHECK(vkCreateBuffer(d->device, &bci, NULL, &m->buffer));
+
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(d->device, m->buffer, &req);
+
+  VkMemoryPropertyFlags props = host_visible
+      ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  uint32_t mt = _find_memtype(d, req.memoryTypeBits, props);
+  if(mt == UINT32_MAX) goto error;
+
+  VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                              .allocationSize = req.size, .memoryTypeIndex = mt };
+  VKCHECK(vkAllocateMemory(d->device, &ai, NULL, &m->memory));
+  VKCHECK(vkBindBufferMemory(d->device, m->buffer, m->memory, 0));
+  return m;
+
+error:
+  if(m->buffer) vkDestroyBuffer(d->device, m->buffer, NULL);
+  if(m->memory) vkFreeMemory(d->device, m->memory, NULL);
+  free(m);
+  return NULL;
+}
+
+dt_vk_mem_t *dt_vulkan_alloc_buffer(int devid, size_t size)
+{
+  if(!dt_vulkan_running()) return NULL;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  return _alloc(d, (VkDeviceSize)size,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+              | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+              | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                false);
+}
+
+void dt_vulkan_free_buffer(int devid, dt_vk_mem_t *mem)
+{
+  if(!mem || !dt_vulkan_running()) return;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  if(mem->buffer) vkDestroyBuffer(d->device, mem->buffer, NULL);
+  if(mem->memory) vkFreeMemory(d->device, mem->memory, NULL);
+  free(mem);
+}
+
+// Generic one-shot command-buffer helper: alloc, begin, fill via cb,
+// end, submit, wait, free. Used by upload/download/dispatch.
+typedef int (*_record_cb)(VkCommandBuffer, void *);
+
+static int _submit_one_shot(dt_vk_device_t *d, _record_cb fn, void *user)
+{
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  int rc = -1;
+
+  VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                       .commandPool = d->cmd_pool,
+                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                       .commandBufferCount = 1 };
+  VKCHECK(vkAllocateCommandBuffers(d->device, &cbai, &cmd));
+
+  VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+  VKCHECK(vkBeginCommandBuffer(cmd, &bi));
+  if(fn(cmd, user) != 0) goto error;
+  VKCHECK(vkEndCommandBuffer(cmd));
+
+  VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+  VKCHECK(vkCreateFence(d->device, &fci, NULL, &fence));
+
+  VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                      .commandBufferCount = 1, .pCommandBuffers = &cmd };
+  VKCHECK(vkQueueSubmit(d->queue, 1, &si, fence));
+  VKCHECK(vkWaitForFences(d->device, 1, &fence, VK_TRUE, UINT64_MAX));
+  rc = 0;
+
+error:
+  if(fence) vkDestroyFence(d->device, fence, NULL);
+  if(cmd)   vkFreeCommandBuffers(d->device, d->cmd_pool, 1, &cmd);
+  return rc;
+}
+
+typedef struct { VkBuffer src, dst; VkDeviceSize sz; } _copy_args_t;
+
+static int _record_copy(VkCommandBuffer cmd, void *u)
+{
+  _copy_args_t *a = u;
+  VkBufferCopy r = { 0, 0, a->sz };
+  vkCmdCopyBuffer(cmd, a->src, a->dst, 1, &r);
+  return 0;
+}
+
+int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
+                              const void *host, size_t size)
+{
+  if(!dt_vulkan_running() || !dst) return -1;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+
+  dt_vk_mem_t *staging = _alloc(d, (VkDeviceSize)size,
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+  if(!staging) return -1;
+
+  void *p = NULL;
+  if(vkMapMemory(d->device, staging->memory, 0, size, 0, &p) != VK_SUCCESS)
+  {
+    dt_vulkan_free_buffer(devid, staging);
+    return -1;
+  }
+  memcpy(p, host, size);
+  vkUnmapMemory(d->device, staging->memory);
+
+  _copy_args_t a = { staging->buffer, dst->buffer, (VkDeviceSize)size };
+  int rc = _submit_one_shot(d, _record_copy, &a);
+  dt_vulkan_free_buffer(devid, staging);
+  return rc;
+}
+
+int dt_vulkan_read_from_device(int devid, void *host,
+                               const dt_vk_mem_t *src, size_t size)
+{
+  if(!dt_vulkan_running() || !src) return -1;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+
+  dt_vk_mem_t *staging = _alloc(d, (VkDeviceSize)size,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  if(!staging) return -1;
+
+  _copy_args_t a = { src->buffer, staging->buffer, (VkDeviceSize)size };
+  int rc = _submit_one_shot(d, _record_copy, &a);
+  if(rc != 0) { dt_vulkan_free_buffer(devid, staging); return rc; }
+
+  void *p = NULL;
+  if(vkMapMemory(d->device, staging->memory, 0, size, 0, &p) != VK_SUCCESS)
+  {
+    dt_vulkan_free_buffer(devid, staging);
+    return -1;
+  }
+  memcpy(host, p, size);
+  vkUnmapMemory(d->device, staging->memory);
+
+  dt_vulkan_free_buffer(devid, staging);
+  return 0;
+}
+
+// ---- dispatch --------------------------------------------------------
+
+typedef struct
+{
+  dt_vk_kernel_t *k;
+  VkDescriptorSet dset;
+  uint32_t        gx, gy, gz;
+  const void     *push;
+  size_t          push_size;
+} _dispatch_args_t;
+
+static int _record_dispatch(VkCommandBuffer cmd, void *u)
+{
+  _dispatch_args_t *a = u;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->k->pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          a->k->pipeline_layout, 0, 1, &a->dset, 0, NULL);
+  if(a->push_size && a->push)
+  {
+    vkCmdPushConstants(cmd, a->k->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, (uint32_t)a->push_size, a->push);
+  }
+  vkCmdDispatch(cmd, a->gx, a->gy, a->gz);
+  return 0;
+}
+
+int dt_vulkan_enqueue_kernel_2d(int devid, int kernel,
+                                size_t global_w, size_t global_h,
+                                dt_vk_mem_t *const *buffers,
+                                size_t buffer_count,
+                                const void *push_constants,
+                                size_t push_constant_size)
+{
+  if(!dt_vulkan_running() || kernel < 0 || kernel >= DT_VULKAN_MAX_KERNELS) return -1;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  dt_vk_kernel_t *k = &d->kernels[kernel];
+  if(!k->used) return -1;
+  if(buffer_count != k->num_storage_buffer_bindings) return -1;
+  if(push_constant_size != k->push_constant_size)    return -1;
+
+  // Allocate a descriptor set from the device pool.
+  VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                       .descriptorPool = d->dset_pool,
+                                       .descriptorSetCount = 1,
+                                       .pSetLayouts = &k->dset_layout };
+  VkDescriptorSet dset = VK_NULL_HANDLE;
+  if(vkAllocateDescriptorSets(d->device, &dsai, &dset) != VK_SUCCESS) return -1;
+
+  // Wire buffers into the descriptor set.
+  VkDescriptorBufferInfo bi[DT_VULKAN_MAX_BINDINGS];
+  VkWriteDescriptorSet   ws[DT_VULKAN_MAX_BINDINGS];
+  for(size_t i = 0; i < buffer_count; ++i)
+  {
+    bi[i] = (VkDescriptorBufferInfo){ .buffer = buffers[i]->buffer,
+                                      .offset = 0, .range = buffers[i]->size };
+    ws[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstSet = dset, .dstBinding = (uint32_t)i,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                    .pBufferInfo = &bi[i] };
+  }
+  vkUpdateDescriptorSets(d->device, (uint32_t)buffer_count, ws, 0, NULL);
+
+  _dispatch_args_t da = {
+    .k = k, .dset = dset,
+    .gx = (uint32_t)((global_w + k->local_size_x - 1) / k->local_size_x),
+    .gy = (uint32_t)((global_h + k->local_size_y - 1) / k->local_size_y),
+    .gz = 1,
+    .push = push_constants, .push_size = push_constant_size,
+  };
+  int rc = _submit_one_shot(d, _record_dispatch, &da);
+
+  // Return the descriptor set to the pool so the next dispatch can reuse it.
+  vkFreeDescriptorSets(d->device, d->dset_pool, 1, &dset);
+  return rc;
+}
+
+#endif // HAVE_VULKAN

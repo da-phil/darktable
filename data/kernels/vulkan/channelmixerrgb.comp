@@ -1,0 +1,42 @@
+// GLSL twin of channelmixerrgb.cl. See the header in the .cl for
+// scope notes — both files port only the linear-Bradford adaptation
+// path. Keep behaviour-equivalent.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    float saturation;
+    float lightness;
+    // 12 floats (3x4 matrix, last column padding)
+    vec4  mix0;
+    vec4  mix1;
+    vec4  mix2;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 pixel = in_buf.data[idx];
+
+    float r = pc.mix0.x * pixel.x + pc.mix0.y * pixel.y + pc.mix0.z * pixel.z;
+    float g = pc.mix1.x * pixel.x + pc.mix1.y * pixel.y + pc.mix1.z * pixel.z;
+    float b = pc.mix2.x * pixel.x + pc.mix2.y * pixel.y + pc.mix2.z * pixel.z;
+    pixel.x = r; pixel.y = g; pixel.z = b;
+
+    if (pc.saturation != 0.0 || pc.lightness != 0.0) {
+        float mean = (pixel.x + pixel.y + pixel.z) * (1.0/3.0);
+        pixel.rgb = mix(vec3(mean), pixel.rgb, vec3(1.0 + pc.saturation))
+                  + vec3(pc.lightness);
+    }
+
+    out_buf.data[idx] = pixel;
+}

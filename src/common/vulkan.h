@@ -1,0 +1,196 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/*
+    Vulkan compute backend for darktable's pixelpipe (experimental).
+
+    This is the API surface that IOP modules use to dispatch GPU work
+    via Vulkan. It is intentionally a subset of the OpenCL host API in
+    src/common/opencl.h — only the operations needed by modules that
+    have been ported to Vulkan are exposed.
+
+    Versus OpenCL:
+      - kernels are loaded as pre-compiled SPIR-V modules (one per .cl
+        source, produced by clspv at build time)
+      - device buffers are explicit (no image2d_t — modules pass
+        VkBuffer handles wrapped in dt_vk_mem_t)
+      - dispatch is synchronous (single dispatch per kernel call);
+        async batching is an optimisation for later
+*/
+
+#pragma once
+
+#include "common/darktable.h"
+
+#ifdef HAVE_VULKAN
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+
+#define DT_VULKAN_MAX_PROGRAMS 64
+#define DT_VULKAN_MAX_KERNELS  256
+#define DT_VULKAN_MAX_BINDINGS 16
+#define DT_VULKAN_MAX_PUSH_CONSTANTS 128
+
+G_BEGIN_DECLS
+
+// Opaque buffer handle. Kept by-pointer so callers can null-check
+// in the same idiom as cl_mem. The tag-and-typedef split lets
+// iop_api.h forward-declare just `typedef struct dt_vk_mem_t dt_vk_mem_t;`
+// without pulling in <vulkan/vulkan.h>.
+typedef struct dt_vk_mem_t dt_vk_mem_t;
+struct dt_vk_mem_t
+{
+  VkBuffer       buffer;
+  VkDeviceMemory memory;
+  VkDeviceSize   size;
+  bool           host_visible;
+};
+
+typedef struct dt_vk_kernel_t
+{
+  bool                  used;
+  char                  name[64];
+  int                   program; // index into device->programs
+  VkShaderModule        shader_module;
+  VkDescriptorSetLayout dset_layout;
+  VkPipelineLayout      pipeline_layout;
+  VkPipeline            pipeline;
+  // Layout discovered at kernel-create time from the kernel signature
+  // the IOP module registered (see dt_vulkan_create_kernel).
+  uint32_t              num_storage_buffer_bindings;
+  uint32_t              push_constant_size;
+  uint32_t              local_size_x;
+  uint32_t              local_size_y;
+  uint32_t              local_size_z;
+} dt_vk_kernel_t;
+
+typedef struct dt_vk_program_t
+{
+  bool      used;
+  char      name[128];
+  uint32_t *spirv;     // owned
+  size_t    spirv_words;
+} dt_vk_program_t;
+
+typedef struct dt_vk_device_t
+{
+  VkPhysicalDevice phys;
+  VkDevice         device;
+  VkQueue          queue;
+  uint32_t         queue_family_index;
+  VkCommandPool    cmd_pool;
+  VkDescriptorPool dset_pool;
+  char             name[256];
+  VkPhysicalDeviceMemoryProperties mem_props;
+
+  dt_vk_program_t  programs[DT_VULKAN_MAX_PROGRAMS];
+  dt_vk_kernel_t   kernels [DT_VULKAN_MAX_KERNELS];
+} dt_vk_device_t;
+
+typedef struct dt_vulkan_t
+{
+  gboolean         inited;
+  gboolean         enabled;       // mirror of USE_VULKAN/runtime toggle
+  VkInstance       instance;
+  int              num_devs;
+  dt_vk_device_t  *dev;           // dev[0..num_devs-1]
+} dt_vulkan_t;
+
+// ---- lifecycle --------------------------------------------------------
+
+/** Initialise the Vulkan subsystem. After this call, dt_vulkan_running()
+ *  returns TRUE iff at least one compute-capable device was found. */
+void dt_vulkan_init(dt_vulkan_t *vk);
+
+/** Tear down the subsystem. Safe to call on an un-inited or partially
+ *  inited dt_vulkan_t. */
+void dt_vulkan_cleanup(dt_vulkan_t *vk);
+
+/** TRUE iff Vulkan is initialised, enabled in prefs, and has ≥1
+ *  device. */
+gboolean dt_vulkan_running(void);
+
+/** Locks a device for the calling thread. Returns the device id, or -1
+ *  if none is available. Mirrors dt_opencl_lock_device. */
+int dt_vulkan_lock_device(void);
+void dt_vulkan_unlock_device(int devid);
+
+// ---- programs and kernels --------------------------------------------
+
+/** Load a SPIR-V program from disk and register it under name. Returns
+ *  a program index ≥0 on success, -1 on failure. */
+int dt_vulkan_load_program(const char *name, const char *path);
+
+/** Create a kernel handle. The Vulkan model needs the binding shape up
+ *  front (descriptor set layout); pass it here. Returns kernel index
+ *  ≥0, or -1 on failure. */
+int dt_vulkan_create_kernel(int program,
+                            const char *entry,
+                            uint32_t num_storage_buffer_bindings,
+                            uint32_t push_constant_size,
+                            uint32_t local_size_x,
+                            uint32_t local_size_y,
+                            uint32_t local_size_z);
+
+void dt_vulkan_free_kernel(int kernel);
+
+// ---- memory ----------------------------------------------------------
+
+/** Allocate a device-local buffer of size bytes, usable as storage. */
+dt_vk_mem_t *dt_vulkan_alloc_buffer(int devid, size_t size);
+
+/** Free a buffer; safe on NULL. */
+void dt_vulkan_free_buffer(int devid, dt_vk_mem_t *mem);
+
+/** Copy size bytes from host memory into a device buffer, blocking. */
+int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
+                              const void *host, size_t size);
+
+/** Copy size bytes from a device buffer into host memory, blocking. */
+int dt_vulkan_read_from_device(int devid, void *host,
+                               const dt_vk_mem_t *src, size_t size);
+
+// ---- dispatch --------------------------------------------------------
+
+/** Bind storage buffers (count must match the kernel's registered
+ *  binding count) and dispatch with the given push-constant blob and
+ *  global work size. Synchronous: returns after the queue idles. */
+int dt_vulkan_enqueue_kernel_2d(int devid, int kernel,
+                                size_t global_w, size_t global_h,
+                                dt_vk_mem_t *const *buffers,
+                                size_t buffer_count,
+                                const void *push_constants,
+                                size_t push_constant_size);
+
+G_END_DECLS
+
+#else // HAVE_VULKAN
+
+// Stub types so callers that include vulkan.h unconditionally still
+// compile when USE_VULKAN=OFF. The real definitions live above.
+struct dt_vk_mem_t;
+typedef struct dt_vk_mem_t dt_vk_mem_t;
+typedef struct dt_vulkan_t dt_vulkan_t;
+
+static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
+static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }
+static inline gboolean dt_vulkan_running(void)        { return FALSE; }
+
+#endif // HAVE_VULKAN

@@ -5,6 +5,10 @@ if(USE_OPENCL)
 	add_subdirectory(kernels ${DARKTABLE_DATADIR}/kernels)
 endif(USE_OPENCL)
 
+if(USE_VULKAN AND HAVE_VULKAN)
+	add_subdirectory(kernels/vulkan ${DARKTABLE_DATADIR}/kernels/vulkan)
+endif()
+
 FILE(GLOB THEME_FILES "themes/*.css")
 FILE(COPY ${THEME_FILES} DESTINATION "${DARKTABLE_DATADIR}/themes")
 install(FILES ${THEME_FILES} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable/themes COMPONENT DTApplication)
