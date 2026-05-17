@@ -1,0 +1,44 @@
+// GLSL fallback for profile_gamma.cl.
+//
+// Binding 0/1: in/out vec4 buffers (as usual).
+// Binding 2: a 65536-entry float storage buffer (the in-gamut LUT).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; }    in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; }    out_buf;
+layout(std430, binding = 2) readonly  buffer Lut { float data[]; }   lut_buf;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float ta0;
+    float ta1;
+    float ta2;
+} pc;
+
+const int VK_LUT_SIZE = 0x10000;
+
+float vk_lookup_unbounded(float x, float c0, float c1, float c2) {
+    if (c0 < 0.0) return x;
+    if (x < 1.0) {
+        int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+        return lut_buf.data[xi];
+    }
+    return c1 * pow(x * c0, c2);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 i = in_buf.data[idx];
+
+    vec4 o;
+    o.x = vk_lookup_unbounded(i.x, pc.ta0, pc.ta1, pc.ta2);
+    o.y = vk_lookup_unbounded(i.y, pc.ta0, pc.ta1, pc.ta2);
+    o.z = vk_lookup_unbounded(i.z, pc.ta0, pc.ta1, pc.ta2);
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}
