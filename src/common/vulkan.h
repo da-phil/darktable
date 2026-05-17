@@ -178,6 +178,22 @@ void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *out,
                                   uint32_t local_y,
                                   uint32_t local_z);
 
+/** Same as kernel_load above but reuses an already-loaded program
+ *  instead of loading a fresh one. Useful for multi-kernel modules
+ *  (channelmixerrgb's 5 adaptation modes, future demosaicers, …)
+ *  where all kernels live in one .spv with multiple entry points.
+ *  Returns 0 on success or -1 if Vulkan isn't running / pipeline
+ *  build failed (typical reason: entry point not present, e.g. the
+ *  GLSL fallback .spv only carries one of the kernels). */
+void dt_vulkan_module_kernel_create_from(dt_vk_module_kernel_t *out,
+                                         int program,
+                                         const char *entry,
+                                         uint32_t num_storage_buffers,
+                                         uint32_t push_constant_size,
+                                         uint32_t local_x,
+                                         uint32_t local_y,
+                                         uint32_t local_z);
+
 /** Tear down the pipeline. Safe on an un-loaded slot. */
 void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k);
 
@@ -275,6 +291,11 @@ static inline void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *o,
                                                 uint32_t a, uint32_t b,
                                                 uint32_t c, uint32_t d, uint32_t f)
 { (void)o; (void)n; (void)e; (void)a; (void)b; (void)c; (void)d; (void)f; }
+static inline void dt_vulkan_module_kernel_create_from(dt_vk_module_kernel_t *o,
+                                                       int p, const char *e,
+                                                       uint32_t a, uint32_t b,
+                                                       uint32_t c, uint32_t d, uint32_t f)
+{ (void)o; (void)p; (void)e; (void)a; (void)b; (void)c; (void)d; (void)f; }
 static inline void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k) { (void)k; }
 static inline int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
                                            dt_vk_mem_t *i, dt_vk_mem_t *o,

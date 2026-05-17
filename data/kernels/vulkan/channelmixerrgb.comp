@@ -1,42 +1,173 @@
-// GLSL twin of channelmixerrgb.cl. See the header in the .cl for
-// scope notes — both files port only the linear-Bradford adaptation
-// path. Keep behaviour-equivalent.
+// GLSL fallback for channelmixerrgb.cl::channelmixerrgb_bradford_linear.
+//
+// The other 4 adaptation entry points are clspv-only; their kernel
+// slots will fail to create on glslang-only builds and the module
+// falls back to OpenCL for those modes. See channelmixerrgb.cl
+// header for the full design rationale.
+//
+// This kernel implements ONLY the linear-Bradford path. It mirrors
+// the full Vulkan kernel push-constant layout so the host-side code
+// is uniform across the two compilation paths.
 
 #version 450
-
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[];  } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[];  } out_buf;
+layout(std430, binding = 2) readonly buffer Mat { float data[]; } mat_buf;
 
-layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
-layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
-
-layout(push_constant) uniform Params {
-    int   width;
-    int   height;
-    float saturation;
-    float lightness;
-    // 12 floats (3x4 matrix, last column padding)
-    vec4  mix0;
-    vec4  mix1;
-    vec4  mix2;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int version;
+    int clip;
+    int apply_grey;
+    float p;
+    float gamut;
+    vec4 illuminant;
+    vec4 saturation;
+    vec4 lightness;
+    vec4 grey;
 } pc;
+
+const float NORM_MIN       = 1.52587890625e-05;
+const float INVERSE_SQRT_3 = 0.5773502691896258;
+
+float sqf(float x) { return x * x; }
+float euclidean_norm4(vec4 v) {
+    return max(sqrt(sqf(v.x) + sqf(v.y) + sqf(v.z)), NORM_MIN);
+}
+
+vec4 matmul_padded(vec4 v, int off) {
+    return vec4(mat_buf.data[off+0] * v.x + mat_buf.data[off+1]  * v.y + mat_buf.data[off+2]  * v.z,
+                mat_buf.data[off+4] * v.x + mat_buf.data[off+5]  * v.y + mat_buf.data[off+6]  * v.z,
+                mat_buf.data[off+8] * v.x + mat_buf.data[off+9]  * v.y + mat_buf.data[off+10] * v.z,
+                v.w);
+}
+
+vec4 XYZ_to_bradford_LMS(vec4 v) {
+    return vec4( 0.8951 * v.x + 0.2664 * v.y - 0.1614 * v.z,
+                -0.7502 * v.x + 1.7135 * v.y + 0.0367 * v.z,
+                 0.0389 * v.x - 0.0685 * v.y + 1.0296 * v.z,
+                 v.w);
+}
+vec4 bradford_LMS_to_XYZ(vec4 v) {
+    return vec4( 0.9870 * v.x - 0.1471 * v.y + 0.1600 * v.z,
+                 0.4323 * v.x + 0.5184 * v.y + 0.0493 * v.z,
+                -0.0085 * v.x + 0.0400 * v.y + 0.9685 * v.z,
+                 v.w);
+}
+
+vec4 bradford_adapt_D50(vec4 lms, vec4 origin, float p, bool full) {
+    vec4 D50 = vec4(0.996078, 1.020646, 0.818155, 0.0);
+    if (full) {
+        vec4 t = lms / origin;
+        t.z = (t.z > 0.0) ? pow(t.z, p) : t.z;
+        return D50 * t;
+    }
+    return lms * (D50 / origin);
+}
+
+vec4 chroma_adapt_bradford(vec4 RGB, vec4 illuminant, float p, bool full) {
+    vec4 XYZ = matmul_padded(RGB, 0);
+    float Y = XYZ.y;
+    vec4 LMS = XYZ_to_bradford_LMS(XYZ);
+    float s = (Y > NORM_MIN && !isnan(Y)) ? (Y + NORM_MIN) : NORM_MIN;
+    LMS /= s;
+    LMS = bradford_adapt_D50(LMS, illuminant, p, full);
+    LMS *= s;
+    vec4 LMS_mixed = matmul_padded(LMS, 24);
+    return bradford_LMS_to_XYZ(LMS_mixed);
+}
+
+vec4 xyY_to_uvY(vec4 xyY) {
+    float den = -2.0 * xyY.x + 12.0 * xyY.y + 3.0;
+    return vec4(4.0 * xyY.x / den, 9.0 * xyY.y / den, xyY.z, xyY.w);
+}
+vec4 uvY_to_xyY(vec4 uvY) {
+    float den = 6.0 * uvY.x - 16.0 * uvY.y + 12.0;
+    return vec4(9.0 * uvY.x / den, 4.0 * uvY.y / den, uvY.z, uvY.w);
+}
+vec4 xyY_to_XYZ(vec4 xyY) {
+    vec4 XYZ = vec4(0.0, 0.0, 0.0, xyY.w);
+    if (xyY.y != 0.0) {
+        XYZ.x = xyY.z * xyY.x / xyY.y;
+        XYZ.y = xyY.z;
+        XYZ.z = xyY.z * (1.0 - xyY.x - xyY.y) / xyY.y;
+    }
+    return XYZ;
+}
+
+vec4 gamut_mapping(vec4 input_v, float compression, bool clip) {
+    float sum = input_v.x + input_v.y + input_v.z;
+    float Y = input_v.y;
+    vec4 xyY = vec4(sum > 0.0 ? input_v.x / sum : 0.34567,
+                    sum > 0.0 ? input_v.y / sum : 0.35850,
+                    Y, 0.0);
+    vec4 uvY = xyY_to_uvY(xyY);
+    vec2 D50 = vec2(0.20915914598542354, 0.488075320769787);
+    vec2 delta = D50 - uvY.xy;
+    float Delta = Y * (sqf(delta.x) + sqf(delta.y));
+    float correction = (compression == 0.0) ? 0.0 : pow(Delta, compression);
+    vec2 tmp = correction * delta + uvY.xy;
+    bvec2 gt = greaterThan(uvY.xy, D50);
+    uvY.xy = mix(min(tmp, D50), max(tmp, D50), gt);
+    xyY = uvY_to_xyY(uvY);
+    if (clip) xyY.xy = max(xyY.xy, vec2(0.0));
+    xyY.y = max(xyY.y, NORM_MIN);
+    float scale = xyY.x + xyY.y;
+    if (scale >= 1.0) xyY.xy /= scale;
+    return xyY_to_XYZ(xyY);
+}
+
+vec4 luma_chroma(vec4 input_v, vec4 saturation, vec4 lightness, int version) {
+    float norm = euclidean_norm4(input_v);
+    float avg = max((input_v.x + input_v.y + input_v.z) / 3.0, NORM_MIN);
+    if (!(norm > 0.0 && avg > 0.0)) return input_v;
+
+    float mixv = dot(input_v, lightness);
+    if (version == 2) norm *= INVERSE_SQRT_3;
+    vec4 output_v = input_v / vec4(norm);
+    float coeff_ratio = (version == 0)
+                        ? dot(vec4(1.0) - output_v, saturation)
+                        : dot(output_v, saturation) / 3.0;
+    vec4 min_ratio = mix(vec4(0.0), output_v, lessThan(output_v, vec4(0.0)));
+    vec4 output_inv = vec4(1.0) - output_v;
+    output_v = max(output_inv * coeff_ratio + output_v, min_ratio);
+    if (version == 2) norm /= euclidean_norm4(output_v) * INVERSE_SQRT_3;
+    norm *= max(1.0 + mixv / avg, 0.0);
+    return output_v * vec4(norm);
+}
 
 void main() {
     int x = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
     if (x >= pc.width || y >= pc.height) return;
     int idx = y * pc.width + x;
-    vec4 pixel = in_buf.data[idx];
 
-    float r = pc.mix0.x * pixel.x + pc.mix0.y * pixel.y + pc.mix0.z * pixel.z;
-    float g = pc.mix1.x * pixel.x + pc.mix1.y * pixel.y + pc.mix1.z * pixel.z;
-    float b = pc.mix2.x * pixel.x + pc.mix2.y * pixel.y + pc.mix2.z * pixel.z;
-    pixel.x = r; pixel.y = g; pixel.z = b;
+    vec4 pix_in = in_buf.data[idx];
+    vec4 RGB = pix_in;
+    RGB.w = 0.0;
+    if (pc.clip != 0) RGB = max(RGB, vec4(0.0));
 
-    if (pc.saturation != 0.0 || pc.lightness != 0.0) {
-        float mean = (pixel.x + pixel.y + pixel.z) * (1.0/3.0);
-        pixel.rgb = mix(vec3(mean), pixel.rgb, vec3(1.0 + pc.saturation))
-                  + vec3(pc.lightness);
+    vec4 XYZ = chroma_adapt_bradford(RGB, pc.illuminant, pc.p, false);
+    if (pc.clip != 0) XYZ = max(XYZ, vec4(0.0));
+    XYZ = gamut_mapping(XYZ, pc.gamut, pc.clip != 0);
+
+    vec4 LMS = XYZ_to_bradford_LMS(XYZ);
+    if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
+    LMS = luma_chroma(LMS, pc.saturation, pc.lightness, pc.version);
+    if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
+
+    vec4 RGB_out;
+    if (pc.apply_grey != 0) {
+        float grey_mix = max(dot(LMS, pc.grey), 0.0);
+        RGB_out = vec4(grey_mix, grey_mix, grey_mix, pix_in.w);
+    } else {
+        XYZ = bradford_LMS_to_XYZ(LMS);
+        if (pc.clip != 0) XYZ = max(XYZ, vec4(0.0));
+        RGB_out = matmul_padded(XYZ, 12);  // XYZ_to_RGB
+        if (pc.clip != 0) RGB_out = max(RGB_out, vec4(0.0));
+        RGB_out.w = pix_in.w;
     }
-
-    out_buf.data[idx] = pixel;
+    out_buf.data[idx] = RGB_out;
 }
