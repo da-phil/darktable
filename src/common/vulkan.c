@@ -598,6 +598,28 @@ void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *out,
              "[vulkan] kernel '%s' from '%s' failed to create", entry, spv_name);
 }
 
+void dt_vulkan_module_kernel_create_from(dt_vk_module_kernel_t *out,
+                                         int program,
+                                         const char *entry,
+                                         uint32_t num_storage_buffers,
+                                         uint32_t push_constant_size,
+                                         uint32_t local_x,
+                                         uint32_t local_y,
+                                         uint32_t local_z)
+{
+  out->program = program;
+  out->kernel  = -1;
+  if(!dt_vulkan_running() || program < 0) return;
+  out->kernel = dt_vulkan_create_kernel(program, entry,
+                                        num_storage_buffers,
+                                        push_constant_size,
+                                        local_x, local_y, local_z);
+  if(out->kernel < 0)
+    dt_print(DT_DEBUG_OPENCL,
+             "[vulkan] kernel '%s' failed to create (entry point likely absent in .spv)",
+             entry);
+}
+
 void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k)
 {
   if(!k) return;
