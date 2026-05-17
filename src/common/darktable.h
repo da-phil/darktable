@@ -177,6 +177,11 @@ typedef int32_t dt_filmid_t;
 
 #define DT_DEVICE_CPU -1
 #define DT_DEVICE_NONE -2
+#define DT_DEVICE_VK  -3   // Vulkan compute backend (used as a device
+                           // tag for dt_print_pipe logging so traces
+                           // distinguish "ran on Vulkan" from "ran on
+                           // CPU" — the Vulkan dispatch lives inside
+                           // the CPU dispatch arm of pixelpipe_hb.c).
 
 // We have several bitmask opencl start options passed to dt_opencl_init()
 #define DT_OPENCL_OPTION_NONE 0         // default
