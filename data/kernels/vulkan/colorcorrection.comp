@@ -1,0 +1,29 @@
+// GLSL fallback for colorcorrection.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float saturation;
+    float a_scale;
+    float a_base;
+    float b_scale;
+    float b_base;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int i = y * pc.width + x;
+    vec4 p = in_buf.data[i];
+    vec4 o;
+    o.x = p.x;
+    o.y = pc.saturation * (p.y + p.x * pc.a_scale + pc.a_base);
+    o.z = pc.saturation * (p.z + p.x * pc.b_scale + pc.b_base);
+    o.w = p.w;
+    out_buf.data[i] = o;
+}

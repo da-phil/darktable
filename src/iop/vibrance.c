@@ -22,6 +22,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -52,6 +53,10 @@ typedef struct dt_iop_vibrance_data_t
 typedef struct dt_iop_vibrance_global_data_t
 {
   int kernel_vibrance;
+#ifdef HAVE_VULKAN
+  int vk_program;
+  int vk_kernel_vibrance;
+#endif
 } dt_iop_vibrance_global_data_t;
 
 const char *deprecated_msg()
@@ -146,20 +151,58 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
  }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_vibrance_data_t *data = piece->data;
+  dt_iop_vibrance_global_data_t *gd = self->global_data;
+  if(gd->vk_kernel_vibrance < 0) return -1;
 
+  struct { int w, h; float amount; } pc
+    = { roi_in->width, roi_in->height, data->amount * 0.01f };
+
+  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
+  return dt_vulkan_enqueue_kernel_2d(0, gd->vk_kernel_vibrance,
+                                     (size_t)pc.w, (size_t)pc.h,
+                                     bufs, 2, &pc, sizeof(pc));
+}
+#endif
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 8; // extended.cl, from programs.conf
   dt_iop_vibrance_global_data_t *gd = malloc(sizeof(dt_iop_vibrance_global_data_t));
   self->data = gd;
+
+#ifdef HAVE_OPENCL
+  const int program = 8; // extended.cl, from programs.conf
   gd->kernel_vibrance = dt_opencl_create_kernel(program, "vibrance");
+#endif
+
+#ifdef HAVE_VULKAN
+  gd->vk_program = -1;
+  gd->vk_kernel_vibrance = -1;
+  if(dt_vulkan_running())
+  {
+    gd->vk_program = dt_vulkan_load_program_by_name("vibrance");
+    if(gd->vk_program >= 0)
+      gd->vk_kernel_vibrance = dt_vulkan_create_kernel(gd->vk_program, "vibrance",
+                                                       2, 2 * sizeof(int) + 1 * sizeof(float),
+                                                       16, 16, 1);
+  }
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_vibrance_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_vibrance);
+#endif
+#ifdef HAVE_VULKAN
+  if(gd->vk_kernel_vibrance >= 0) dt_vulkan_free_kernel(gd->vk_kernel_vibrance);
+#endif
   free(self->data);
   self->data = NULL;
 }

@@ -138,6 +138,11 @@ void dt_vulkan_unlock_device(int devid);
  *  a program index ≥0 on success, -1 on failure. */
 int dt_vulkan_load_program(const char *name, const char *path);
 
+/** Convenience: build the canonical kernel path
+ *  `<datadir>/kernels/vulkan/<name>.spv` and call dt_vulkan_load_program.
+ *  Returns -1 if Vulkan isn't running or the file is missing. */
+int dt_vulkan_load_program_by_name(const char *name);
+
 /** Create a kernel handle. The Vulkan model needs the binding shape up
  *  front (descriptor set layout); pass it here. Returns kernel index
  *  ≥0, or -1 on failure. */
