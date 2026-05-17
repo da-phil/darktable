@@ -36,7 +36,8 @@ set(VK_KERNELS
     colorize:colorize
     flip:flip
     negadoctor:negadoctor
-    primaries:primaries)
+    primaries:primaries
+    temperature:whitebalance_4f)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

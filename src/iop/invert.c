@@ -50,10 +50,7 @@ typedef struct dt_iop_invert_global_data_t
 {
   int kernel_invert_1f;
   int kernel_invert_4f;
-#ifdef HAVE_VULKAN
-  int vk_program;
-  int vk_kernel_invert_4f;  // 1f Bayer variant stays on OpenCL
-#endif
+  dt_vk_module_kernel_t vk;  // 1f Bayer variant stays on OpenCL
 } dt_iop_invert_global_data_t;
 
 typedef struct dt_iop_invert_data_t
@@ -412,16 +409,12 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   // The 1f Bayer variant operates on single-channel RAW data and
   // isn't covered by the Vulkan port; fall back to OpenCL/CPU for it.
-  if(piece->pipe->dsc.filters)        return -1;
-  if(gd->vk_kernel_invert_4f < 0)     return -1;
+  if(piece->pipe->dsc.filters) return -1;
 
   struct { int w, h; float r, g, b; } pc
     = { roi_in->width, roi_in->height, d->color[0], d->color[1], d->color[2] };
-
-  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
-  const int rc = dt_vulkan_enqueue_kernel_2d(0, gd->vk_kernel_invert_4f,
-                                             (size_t)pc.w, (size_t)pc.h,
-                                             bufs, 2, &pc, sizeof(pc));
+  const int rc = dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                          pc.w, pc.h, &pc, sizeof(pc));
   if(rc == 0)
     for(int k = 0; k < 4; k++) piece->pipe->dsc.processed_maximum[k] = 1.0f;
   return rc;
@@ -464,25 +457,13 @@ void init_global(dt_iop_module_so_t *self)
 {
   self->data = malloc(sizeof(dt_iop_invert_global_data_t));
   dt_iop_invert_global_data_t *gd = self->data;
-
 #ifdef HAVE_OPENCL
-  const int program = 2; // basic.cl, from programs.conf
-  gd->kernel_invert_1f = dt_opencl_create_kernel(program, "invert_1f");
-  gd->kernel_invert_4f = dt_opencl_create_kernel(program, "invert_4f");
+  gd->kernel_invert_1f = dt_opencl_create_kernel(/*basic.cl*/ 2, "invert_1f");
+  gd->kernel_invert_4f = dt_opencl_create_kernel(/*basic.cl*/ 2, "invert_4f");
 #endif
-
-#ifdef HAVE_VULKAN
-  gd->vk_program = -1;
-  gd->vk_kernel_invert_4f = -1;
-  if(dt_vulkan_running())
-  {
-    gd->vk_program = dt_vulkan_load_program_by_name("invert");
-    if(gd->vk_program >= 0)
-      gd->vk_kernel_invert_4f = dt_vulkan_create_kernel(gd->vk_program, "invert_4f",
-                                                        2, 2 * sizeof(int) + 3 * sizeof(float),
-                                                        16, 16, 1);
-  }
-#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "invert", "invert_4f",
+                               2, 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -492,9 +473,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_invert_4f);
   dt_opencl_free_kernel(gd->kernel_invert_1f);
 #endif
-#ifdef HAVE_VULKAN
-  if(gd->vk_kernel_invert_4f >= 0) dt_vulkan_free_kernel(gd->vk_kernel_invert_4f);
-#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
