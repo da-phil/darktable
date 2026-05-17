@@ -3222,6 +3222,15 @@ void commit_params(dt_iop_module_t *self,
     }
   }
 
+#ifdef HAVE_VULKAN
+  // Only linear-Bradford adaptation is ported to Vulkan. For other
+  // modes process_vk would return -1 after the pipeline already paid
+  // host-staging cost; declaring the path unsupported up front lets
+  // the pipeline jump straight to OpenCL/CPU.
+  if(d->adaptation != DT_ADAPTATION_LINEAR_BRADFORD)
+    piece->process_vk_ready = FALSE;
+#endif
+
   // if this module has some mask applied we assume it's safe so give no warning
   const dt_develop_blend_params_t *b = (const dt_develop_blend_params_t *)piece->blendop_data;
   const dt_develop_mask_mode_t mask_mode = b ? b->mask_mode : DEVELOP_MASK_DISABLED;

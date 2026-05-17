@@ -741,6 +741,16 @@ void commit_params(dt_iop_module_t *self,
   if(self->dev->image_storage.flags & DT_IMAGE_4BAYER)
     piece->process_cl_ready = FALSE;
 
+#ifdef HAVE_VULKAN
+  // The Vulkan kernel covers only the post-demosaic (filters==0) 4f
+  // path. For RAW Bayer / Xtrans inputs we'd just return -1 from
+  // process_vk after the pixelpipe paid host-staging cost; declaring
+  // the path unsupported up front lets the pipeline jump straight to
+  // OpenCL/CPU.
+  if(piece->filters)
+    piece->process_vk_ready = FALSE;
+#endif
+
   d->preset = p->preset;
 
   /* Make sure the chroma information stuff is valid
