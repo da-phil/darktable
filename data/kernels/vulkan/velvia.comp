@@ -1,0 +1,40 @@
+// GLSL fallback for velvia.cl. Built only when clspv isn't available.
+// glslang renames the entry point to "velvia" via --source-entrypoint
+// main + -e velvia at build time.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float strength;
+    float bias;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int i = y * pc.width + x;
+    vec4 p = in_buf.data[i];
+
+    float pmax = max(p.x, max(p.y, p.z));
+    float pmin = min(p.x, min(p.y, p.z));
+    float plum = (pmax + pmin) * 0.5;
+    float psat = (plum <= 0.5)
+                 ? (pmax - pmin) / (1e-5 + pmax + pmin)
+                 : (pmax - pmin) / (1e-5 + max(0.0, 2.0 - pmax - pmin));
+    float pw = clamp(((1.0 - 1.5 * psat)
+                   + ((1.0 + abs(plum - 0.5) * 2.0) * (1.0 - pc.bias)))
+                   / (1.0 + (1.0 - pc.bias)), 0.0, 1.0);
+    float sat = pc.strength * pw;
+
+    vec4 o;
+    o.x = clamp(p.x + sat * (p.x - 0.5 * (p.y + p.z)), 0.0, 1.0);
+    o.y = clamp(p.y + sat * (p.y - 0.5 * (p.z + p.x)), 0.0, 1.0);
+    o.z = clamp(p.z + sat * (p.z - 0.5 * (p.x + p.y)), 0.0, 1.0);
+    o.w = p.w;
+    out_buf.data[i] = o;
+}

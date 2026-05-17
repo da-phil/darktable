@@ -1,0 +1,28 @@
+// GLSL fallback for primaries.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float m00; float m01; float m02; float m03;
+    float m10; float m11; float m12; float m13;
+    float m20; float m21; float m22; float m23;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 i = in_buf.data[idx];
+
+    vec4 o;
+    o.x = pc.m00 * i.x + pc.m01 * i.y + pc.m02 * i.z;
+    o.y = pc.m10 * i.x + pc.m11 * i.y + pc.m12 * i.z;
+    o.z = pc.m20 * i.x + pc.m21 * i.y + pc.m22 * i.z;
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}
