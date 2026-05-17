@@ -42,7 +42,9 @@ set(VK_KERNELS
     profile_gamma:profilegamma
     splittoning:splittoning
     zonesystem:zonesystem
-    levels:levels)
+    levels:levels
+    whitebalance_1f:whitebalance_1f
+    whitebalance_1f_xtrans:whitebalance_1f_xtrans)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

@@ -53,6 +53,25 @@ static inline int idx2d(const int x, const int y, const int width)
   return y * width + x;
 }
 
+// Bayer filter-color-at helper. Matches data/kernels/common.h::FC
+// byte-for-byte; the `filters` bitmask comes from the camera RAW
+// metadata. Returns one of {0=R, 1=G, 2=B}.
+static inline int vk_FC(const int row, const int col, const uint filters)
+{
+  return (filters >> ((((row) << 1 & 14) + ((col) & 1)) << 1)) & 3u;
+}
+
+// X-Trans pattern lookup. Matches FCxtrans in common.h. The pattern
+// is a 6x6 byte matrix; we pass it as a flat 36-element uint storage
+// buffer (one byte value per uint slot) to keep std430 layout simple.
+// The +600 guard mirrors the OpenCL helper's handling of negative
+// row/col values (used by demosaic algorithms that read past edges).
+static inline int vk_FCxtrans(const int row, const int col,
+                              global const uint *xtrans_flat)
+{
+  return (int)xtrans_flat[((row + 600) % 6) * 6 + ((col + 600) % 6)];
+}
+
 // Read with edge-clamped coords (saves writing the clamp+idx pair on
 // every kernel that does spatial neighbourhoods).
 static inline float4 read_clamped(global const float4 *buf,
