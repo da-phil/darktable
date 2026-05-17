@@ -91,9 +91,18 @@ typedef struct dt_iop_diffuse_global_data_t
   int kernel_diffuse_build_mask;
   int kernel_diffuse_inpaint_mask;
   int kernel_diffuse_pde;
-  // Single-pass unsharp-mask approximation; multi-scale wavelet
-  // diffusion is still a future milestone.
-  dt_vk_module_kernel_t vk_sharpen_single;
+  // No Vulkan kernel slot. The diffuse module dispatches a multi-
+  // scale à-trous wavelet pipeline (6 kernels + intermediate buffer
+  // management + N iterations × M scales of dispatches). Porting it
+  // faithfully needs the full kernel set (build_mask, inpaint_mask,
+  // bspline_horizontal, bspline_vertical, wavelets_detail_level,
+  // diffuse_pde — the last is ~125 lines of anisotropic PDE math)
+  // plus a multi-dispatch orchestration loop in process_vk. The
+  // previous single-pass unsharp-mask approximation that lived here
+  // produced visibly different output than the OpenCL path; rather
+  // than ship the silent correctness bug, the module now falls back
+  // to OpenCL for the diffuse path until the full port lands. See
+  // dev-doc/gpu_acceleration_clspv_vulkan.md §8 for the milestone.
 } dt_iop_diffuse_global_data_t;
 
 
@@ -1743,11 +1752,8 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_filmic_wavelets_detail =
     dt_opencl_create_kernel(wavelets, "wavelets_detail_level");
 #endif
-
-  dt_vulkan_module_kernel_load(&gd->vk_sharpen_single,
-                               "diffuse", "diffuse_sharpen_single",
-                               2, 2 * sizeof(int) + 2 * sizeof(float),
-                               16, 16, 1);
+  // No Vulkan kernels for diffuse yet — see the global_data comment
+  // above. The OpenCL path handles the dispatch.
 }
 
 
@@ -1763,56 +1769,23 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_filmic_bspline_horizontal);
   dt_opencl_free_kernel(gd->kernel_filmic_wavelets_detail);
 #endif
-  dt_vulkan_module_kernel_unload(&gd->vk_sharpen_single);
   free(self->data);
   self->data = NULL;
 }
 
-#ifdef HAVE_VULKAN
-void commit_params(dt_iop_module_t *self,
-                   dt_iop_params_t *p1,
-                   dt_dev_pixelpipe_t *pipe,
-                   dt_dev_pixelpipe_iop_t *piece)
-{
-  // The default commit_params just memcpys params to piece->data; we
-  // mirror that, plus gate the Vulkan path on params that the
-  // single-pass approximation actually supports. Skipping the gate
-  // here means the pixelpipe would pay host-staging cost on every
-  // dispatch just to discover the kernel returns -1.
-  memcpy(piece->data, p1, sizeof(dt_iop_diffuse_params_t));
-  const dt_iop_diffuse_params_t *p = (const dt_iop_diffuse_params_t *)p1;
-  if(p->sharpness <= 0.0f)
-    piece->process_vk_ready = FALSE;
-}
-
-int process_vk(dt_iop_module_t *self,
-               dt_dev_pixelpipe_iop_t *piece,
-               dt_vk_mem_t *dev_in,
-               dt_vk_mem_t *dev_out,
-               const dt_iop_roi_t *const roi_in,
-               const dt_iop_roi_t *const roi_out)
-{
-  // SCOPE: the full multi-scale wavelet diffuse pipeline (see
-  // wavelets_process_cl above) is not yet ported. This entry runs a
-  // single-pass unsharp-mask approximation — not numerically
-  // equivalent to the OpenCL/CPU path. When precise diffuse output
-  // is required, return -1 to flip the dispatch back to OpenCL/CPU.
-  const dt_iop_diffuse_data_t *const data = piece->data;
-  const dt_iop_diffuse_global_data_t *const gd = self->global_data;
-
-  // Amount is roughly the third-order detail strength; threshold is
-  // a fraction of the dynamic range. Both are clamped to plausible
-  // values to avoid bizarre output if the user dials extreme params.
-  const float amount    = CLAMPF(data->sharpness, 0.0f, 4.0f);
-  const float threshold = CLAMPF(data->threshold, 0.0f, 1.0f);
-  if(amount <= 0.0f) return -1;  // nothing to do; let the regular path handle it
-
-  struct { int w, h; float amount, threshold; } pc
-    = { roi_in->width, roi_in->height, amount, threshold };
-  return dt_vulkan_dispatch_inout(&gd->vk_sharpen_single, dev_in, dev_out,
-                                  pc.w, pc.h, &pc, sizeof(pc));
-}
-#endif
+// process_vk and commit_params for the Vulkan path are intentionally
+// not provided. The OpenCL implementation (wavelets_process_cl above)
+// dispatches 4-6 different kernels per scale across up to 10 scales
+// per iteration, with 13+ intermediate buffers. A faithful Vulkan
+// port needs:
+//   1. data/kernels/vulkan/{bspline_horizontal,bspline_vertical,
+//      wavelets_detail_level,build_mask,inpaint_mask,diffuse_pde}.cl
+//   2. host-side multi-dispatch orchestration matching the OpenCL
+//      structure in wavelets_process_cl
+//   3. A way to allocate temporary VK buffers across the dispatch
+//      chain (already available via dt_vulkan_alloc_buffer)
+// Until that lands, diffuse runs on OpenCL — which is the same
+// behaviour the user got before the Vulkan integration started.
 
 
 void gui_init(dt_iop_module_t *self)
