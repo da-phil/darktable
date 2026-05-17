@@ -1,11 +1,11 @@
 # Build-time compilation of the Vulkan-targeted kernels to SPIR-V.
 #
-# Production path: clspv compiles the .cl sources to .spv (single
-# source of truth, same as the OpenCL kernels under data/kernels/).
-#
-# Fallback path: if clspv isn't installed, glslangValidator compiles
-# the .comp GLSL twins instead. Both produce equivalent .spv modules;
-# the C++ host loads them by the same .spv filename.
+# Production path: clspv compiles each .cl source to a .spv module
+# with an entry point named after the OpenCL kernel function (e.g.
+# "velvia"). When clspv isn't installed, we fall back to glslang on
+# the matching .comp twin, using --source-entrypoint + -e to give
+# the output module the same entry-point name as the clspv path.
+# This keeps the runtime kernel-lookup uniform.
 #
 # Only built when USE_VULKAN=ON.
 
@@ -20,10 +20,30 @@ if(NOT CLSPV_BIN AND NOT GLSLANG_BIN)
           "Vulkan kernels under data/kernels/vulkan/.")
 endif()
 
-set(VK_KERNELS exposure channelmixerrgb diffuse)
+# Each entry is "kernel_filename:entry_point". For most kernels the
+# .cl filename matches the kernel function name; flip and a few
+# others diverge if they had multiple kernels per file (none currently
+# do).
+set(VK_KERNELS
+    exposure:exposure
+    channelmixerrgb:channelmixerrgb_bradford_linear
+    diffuse:diffuse_sharpen_single
+    velvia:velvia
+    invert:invert_4f
+    vibrance:vibrance
+    colorcorrection:colorcorrection
+    colorcontrast:colorcontrast
+    colorize:colorize
+    flip:flip
+    negadoctor:negadoctor
+    primaries:primaries)
 
 set(VK_SPV_FILES "")
-foreach(K IN LISTS VK_KERNELS)
+foreach(SPEC IN LISTS VK_KERNELS)
+  string(REPLACE ":" ";" SPEC_LIST "${SPEC}")
+  list(GET SPEC_LIST 0 K)
+  list(GET SPEC_LIST 1 ENTRY)
+
   set(CL_SRC   "${CMAKE_CURRENT_SOURCE_DIR}/${K}.cl")
   set(COMP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/${K}.comp")
   set(SPV_OUT  "${CMAKE_CURRENT_BINARY_DIR}/${K}.spv")
@@ -35,17 +55,23 @@ foreach(K IN LISTS VK_KERNELS)
               "-cl-std=CL1.2"
               "--inline-entry-points"
               "--cl-kernel-arg-info"
+              -I "${CMAKE_CURRENT_SOURCE_DIR}"
               -o "${SPV_OUT}"
               "${CL_SRC}"
-      DEPENDS "${CL_SRC}"
-      COMMENT "clspv: ${K}.cl -> ${K}.spv"
+      DEPENDS "${CL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/dt_vulkan_common.h"
+      COMMENT "clspv: ${K}.cl -> ${K}.spv  (entry: ${ENTRY})"
     )
   else()
+    # glslang renames its GLSL "main" entry to the kernel's actual
+    # entry-point name so the runtime can address it identically to
+    # the clspv output.
     add_custom_command(
       OUTPUT  "${SPV_OUT}"
-      COMMAND "${GLSLANG_BIN}" -V "${COMP_SRC}" -o "${SPV_OUT}"
+      COMMAND "${GLSLANG_BIN}"
+              -V --source-entrypoint main -e "${ENTRY}"
+              "${COMP_SRC}" -o "${SPV_OUT}"
       DEPENDS "${COMP_SRC}"
-      COMMENT "glslang: ${K}.comp -> ${K}.spv"
+      COMMENT "glslang: ${K}.comp -> ${K}.spv  (entry: ${ENTRY})"
     )
   endif()
 
@@ -62,15 +88,14 @@ endforeach()
 
 add_custom_target(build_vulkan_kernels ALL DEPENDS ${VK_SPV_FILES})
 
-# Install alongside the OpenCL kernels under a `vulkan/` subdirectory.
-# Runtime kernel loading uses the same DARKTABLE_DATADIR/kernels root.
 install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/"
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/darktable/kernels/vulkan"
         COMPONENT DTApplication
         FILES_MATCHING PATTERN "*.spv")
 
-# Also copy to the in-tree datadir so an uninstalled run finds them.
-foreach(K IN LISTS VK_KERNELS)
+foreach(SPEC IN LISTS VK_KERNELS)
+  string(REPLACE ":" ";" SPEC_LIST "${SPEC}")
+  list(GET SPEC_LIST 0 K)
   add_custom_command(TARGET build_vulkan_kernels POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${DARKTABLE_DATADIR}/kernels/vulkan"

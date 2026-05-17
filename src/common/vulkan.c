@@ -14,7 +14,10 @@
 
 #include "common/darktable.h"
 #include "common/dtpthread.h"
+#include "common/file_location.h"
 #include "control/conf.h"
+
+#include <limits.h>  // PATH_MAX
 
 #include <glib/gstdio.h>
 #include <stdint.h>
@@ -249,6 +252,17 @@ static uint32_t *_load_spv(const char *path, size_t *out_words)
   if(r != (size_t)sz) { free(buf); return NULL; }
   *out_words = (size_t)sz / 4;
   return buf;
+}
+
+int dt_vulkan_load_program_by_name(const char *name)
+{
+  if(!dt_vulkan_running()) return -1;
+  char path[PATH_MAX] = { 0 };
+  dt_loc_get_datadir(path, sizeof(path));
+  g_strlcat(path, "/kernels/vulkan/", sizeof(path));
+  g_strlcat(path, name, sizeof(path));
+  g_strlcat(path, ".spv", sizeof(path));
+  return dt_vulkan_load_program(name, path);
 }
 
 int dt_vulkan_load_program(const char *name, const char *path)
