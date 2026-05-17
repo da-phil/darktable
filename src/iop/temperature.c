@@ -110,9 +110,13 @@ typedef struct dt_iop_temperature_global_data_t
   int kernel_whitebalance_4f;
   int kernel_whitebalance_1f;
   int kernel_whitebalance_1f_xtrans;
-  // Only the 4f (post-demosaic) path has a Vulkan port; RAW paths
-  // stay on OpenCL because they don't use the float4 convention.
+  // All three OpenCL paths now have Vulkan equivalents. The 1f and
+  // 1f_xtrans variants operate on single-channel float buffers
+  // (pre-demosaic RAW data); 4f operates on the usual float4
+  // buffer.
   dt_vk_module_kernel_t vk_4f;
+  dt_vk_module_kernel_t vk_1f;
+  dt_vk_module_kernel_t vk_1f_xtrans;
 } dt_iop_temperature_global_data_t;
 
 typedef struct dt_iop_temperature_preset_data_t
@@ -696,17 +700,53 @@ int process_vk(dt_iop_module_t *self,
                const dt_iop_roi_t *const roi_in,
                const dt_iop_roi_t *const roi_out)
 {
-  // Only the post-demosaic (filters == 0) path has a Vulkan kernel.
-  if(piece->filters) return -1;
-
   dt_iop_temperature_data_t *d = piece->data;
   const dt_iop_temperature_global_data_t *gd = self->global_data;
+  const uint32_t filters = piece->filters;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
 
+  if(filters == 9u)
+  {
+    // X-Trans 6x6 pattern. Pack the pattern bytes into a uint
+    // storage buffer (one byte value per slot — std430 layout
+    // doesn't accept tightly-packed uint8 arrays without an
+    // extension).
+    uint32_t xtrans_flat[36];
+    for(int i = 0; i < 6; i++)
+      for(int j = 0; j < 6; j++)
+        xtrans_flat[i * 6 + j] = (uint32_t)piece->xtrans[i][j];
+
+    dt_vk_mem_t *dev_xtrans = dt_vulkan_alloc_buffer(0, sizeof(xtrans_flat));
+    if(!dev_xtrans) return -1;
+    int rc = -1;
+    if(dt_vulkan_write_to_device(0, dev_xtrans, xtrans_flat, sizeof(xtrans_flat)) == 0)
+    {
+      struct { int w, h; float c0, c1, c2, c3; } pc
+        = { width, height,
+            d->coeffs[0], d->coeffs[1], d->coeffs[2], d->coeffs[3] };
+      rc = dt_vulkan_dispatch_inout_lut(&gd->vk_1f_xtrans, dev_in, dev_out, dev_xtrans,
+                                        width, height, &pc, sizeof(pc));
+    }
+    dt_vulkan_free_buffer(0, dev_xtrans);
+    return rc;
+  }
+
+  if(filters)
+  {
+    // Bayer pattern: 4 coefficients selected by FC(row, col, filters).
+    struct { int w, h; uint32_t filters; float c0, c1, c2, c3; } pc
+      = { width, height, filters,
+          d->coeffs[0], d->coeffs[1], d->coeffs[2], d->coeffs[3] };
+    return dt_vulkan_dispatch_inout(&gd->vk_1f, dev_in, dev_out,
+                                    width, height, &pc, sizeof(pc));
+  }
+
+  // 4f path: post-demosaic 4-channel data.
   struct { int w, h; float c0, c1, c2; } pc
-    = { roi_in->width, roi_in->height,
-        d->coeffs[0], d->coeffs[1], d->coeffs[2] };
+    = { width, height, d->coeffs[0], d->coeffs[1], d->coeffs[2] };
   return dt_vulkan_dispatch_inout(&gd->vk_4f, dev_in, dev_out,
-                                  pc.w, pc.h, &pc, sizeof(pc));
+                                  width, height, &pc, sizeof(pc));
 }
 #endif
 
@@ -740,16 +780,6 @@ void commit_params(dt_iop_module_t *self,
   // 4Bayer images not implemented in OpenCL yet
   if(self->dev->image_storage.flags & DT_IMAGE_4BAYER)
     piece->process_cl_ready = FALSE;
-
-#ifdef HAVE_VULKAN
-  // The Vulkan kernel covers only the post-demosaic (filters==0) 4f
-  // path. For RAW Bayer / Xtrans inputs we'd just return -1 from
-  // process_vk after the pixelpipe paid host-staging cost; declaring
-  // the path unsupported up front lets the pipeline jump straight to
-  // OpenCL/CPU.
-  if(piece->filters)
-    piece->process_vk_ready = FALSE;
-#endif
 
   d->preset = p->preset;
 
@@ -1735,8 +1765,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_whitebalance_1f_xtrans =
     dt_opencl_create_kernel(program, "whitebalance_1f_xtrans");
 #endif
+  // 4f variant: float4 buffer, 3 coeffs in push constants.
   dt_vulkan_module_kernel_load(&gd->vk_4f, "temperature", "whitebalance_4f",
                                2, 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
+  // 1f Bayer: float buffer, filters bitmask + 4 coeffs.
+  dt_vulkan_module_kernel_load(&gd->vk_1f, "whitebalance_1f", "whitebalance_1f",
+                               2, 2 * sizeof(int) + sizeof(uint32_t) + 4 * sizeof(float),
+                               16, 16, 1);
+  // 1f X-Trans: float buffer + 36-uint pattern buffer + 4 coeffs.
+  dt_vulkan_module_kernel_load(&gd->vk_1f_xtrans, "whitebalance_1f_xtrans",
+                               "whitebalance_1f_xtrans",
+                               3, 2 * sizeof(int) + 4 * sizeof(float),
                                16, 16, 1);
 }
 
@@ -1749,6 +1789,8 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_whitebalance_1f_xtrans);
 #endif
   dt_vulkan_module_kernel_unload(&gd->vk_4f);
+  dt_vulkan_module_kernel_unload(&gd->vk_1f);
+  dt_vulkan_module_kernel_unload(&gd->vk_1f_xtrans);
   free(self->data);
   self->data = NULL;
 }
