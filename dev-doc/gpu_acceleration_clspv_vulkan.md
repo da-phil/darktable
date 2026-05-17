@@ -200,19 +200,19 @@ in three categories.
 | `src/iop/flip.c` | Coordinate-remap kernel (orientation flag). |
 | `src/iop/negadoctor.c` | Analogue-film inversion + gamma in a single pass. |
 | `src/iop/primaries.c` | 3×4 ICC matrix transform applied per pixel. |
-| `src/iop/temperature.c` | The 4f (post-demosaic) white-balance path only; the 1f Bayer / xtrans paths operate on RAW and stay on OpenCL. |
+| `src/iop/temperature.c` | All 3 paths ported: 4f (post-demosaic), 1f Bayer, 1f X-Trans. RAW pre-demosaic is single-channel; we dispatch a `float`-buffer kernel for those and a `float4`-buffer kernel for the 4f variant. |
 
-*Partial (covers the common case; falls back to OpenCL/CPU otherwise):*
-
-| Module | Status |
-|---|---|
-| `src/iop/channelmixerrgb.c` | **Linear-Bradford path only.** The OpenCL kernel covers five adaptation modes (CAT16, linear/non-linear Bradford, XYZ, RGB) plus gamut mapping and per-channel saturation/lightness. The Vulkan port covers the linear-Bradford path with scalar saturation/lightness — the most common case in practice. `process_vk` returns -1 for the other modes and the pipeline falls back to OpenCL/CPU automatically. |
-
-*Approximation (functional but not bit-equal):*
+*Partial (clspv: full; glslang fallback: one mode only):*
 
 | Module | Status |
 |---|---|
-| `src/iop/diffuse.c` | **Single-pass unsharp-mask approximation** of sharpen. The full diffuse pipeline runs an à-trous wavelet decomposition and applies anisotropic diffusion per scale; that's a multi-kernel, multi-buffer dance that's out of scope for this batch. The Vulkan path runs one unsharp-mask pass against a 3×3 box-blur low-pass. Returns -1 from `process_vk` (e.g. when amount ≤ 0 or the SPIR-V module didn't load) to flip the dispatch back to OpenCL/CPU when precision is required. |
+| `src/iop/channelmixerrgb.c` | All 5 adaptation modes ported (linear Bradford, full Bradford, CAT16, XYZ, RGB) with full gamut mapping and per-channel saturation / lightness. clspv emits all 5 entry points into one `.spv`; the host loads the program once and creates 5 kernel slots via `dt_vulkan_module_kernel_create_from`. On glslang-only builds only the linear-Bradford entry exists (GLSL doesn't support multi-entry `.spv`); other modes fall back to OpenCL transparently. |
+
+*Pending Vulkan port (currently OpenCL/CPU only):*
+
+| Module | Status |
+|---|---|
+| `src/iop/diffuse.c` | The à-trous wavelet diffuse pipeline runs 6 different kernels (build_mask, inpaint_mask, blur_2D_Bspline_horizontal / vertical, wavelets_detail_level, diffuse_pde) across up to 10 scales × N iterations, with ~13 intermediate buffers managed by the host. The earlier integration shipped a single-pass unsharp-mask approximation that *looked* like sharpen but produced visibly different output than the OpenCL path — we've removed it so users get correct OpenCL output instead of silent drift. A full port is the next major milestone (§8.9); it needs (a) the 6 kernel translations [`diffuse_pde` alone is ~125 lines of anisotropic PDE math], (b) a multi-dispatch orchestration loop in `process_vk` mirroring `wavelets_process_cl`, and (c) a multi-dispatch batching mode in the HAL so we don't pay queue-submit + fence-wait per dispatch. |
 
 **Toolchain convention** for the per-module kernels under
 `data/kernels/vulkan/`: each kernel is a paired `.cl` (clspv) and
@@ -622,14 +622,23 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    on `dt_dev_pixelpipe_iop_t`, dispatch hook in
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
-4. ✅ **Thirteen module ports** (landed, with scope caveats noted in §4.2):
-   exposure, velvia, invert, vibrance, colorcorrection,
-   colorcontrast, colorize, flip, negadoctor, primaries, temperature
-   (all bit-equal for their supported paths); channelmixerrgb
-   (linear-Bradford only); diffuse (single-pass approximation).
+4. ✅ **Module ports** (landed; see the §4.2 tables for which paths
+   each module covers): exposure, velvia, invert, vibrance,
+   colorcorrection, colorcontrast, colorize, flip, negadoctor,
+   primaries, temperature (4f + 1f Bayer + 1f X-Trans),
+   profile_gamma (LOG + GAMMA), splittoning, zonesystem, levels,
+   whitebalance_1f / 1f_xtrans, channelmixerrgb (all 5 adaptation
+   modes under clspv). All ports are bit-equal to their OpenCL
+   counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
+4b. ⏳ **diffuse multi-scale wavelet pipeline** (§8.9 below) —
+    pending. The OpenCL kernel chain (6 kernels × up to 10 scales ×
+    N iterations) needs (a) the 6 kernel translations, (b) a
+    multi-dispatch orchestration in process_vk, and (c) a batched-
+    submit mode in the HAL so we don't pay one queue-submit + fence
+    per dispatch (~300+ dispatches per call would be untenable).
 5. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
    `dt_opencl_write_image_*` to Vulkan storage / sampled images.
    Choose image format mapping table (the OpenCL `cl_image_format`
