@@ -52,10 +52,7 @@ typedef struct dt_iop_flip_params_t dt_iop_flip_data_t;
 typedef struct dt_iop_flip_global_data_t
 {
   int kernel_flip;
-#ifdef HAVE_VULKAN
-  int vk_program;
-  int vk_kernel_flip;
-#endif
+  dt_vk_module_kernel_t vk;
 } dt_iop_flip_global_data_t;
 
 // helper to count corners in for loops:
@@ -403,16 +400,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 {
   const dt_iop_flip_data_t *data = piece->data;
   const dt_iop_flip_global_data_t *gd = self->global_data;
-  if(gd->vk_kernel_flip < 0) return -1;
-
   struct { int w, h, ow, oh, orient; } pc
     = { roi_in->width, roi_in->height,
         roi_out->width, roi_out->height, data->orientation };
-
-  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
-  return dt_vulkan_enqueue_kernel_2d(0, gd->vk_kernel_flip,
-                                     (size_t)pc.w, (size_t)pc.h,
-                                     bufs, 2, &pc, sizeof(pc));
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  pc.w, pc.h, &pc, sizeof(pc));
 }
 #endif
 
@@ -420,24 +412,11 @@ void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_flip_global_data_t *gd = malloc(sizeof(dt_iop_flip_global_data_t));
   self->data = gd;
-
 #ifdef HAVE_OPENCL
-  const int program = 2; // basic.cl, from programs.conf
-  gd->kernel_flip = dt_opencl_create_kernel(program, "flip");
+  gd->kernel_flip = dt_opencl_create_kernel(/*basic.cl*/ 2, "flip");
 #endif
-
-#ifdef HAVE_VULKAN
-  gd->vk_program = -1;
-  gd->vk_kernel_flip = -1;
-  if(dt_vulkan_running())
-  {
-    gd->vk_program = dt_vulkan_load_program_by_name("flip");
-    if(gd->vk_program >= 0)
-      gd->vk_kernel_flip = dt_vulkan_create_kernel(gd->vk_program, "flip",
-                                                   2, 5 * sizeof(int),
-                                                   16, 16, 1);
-  }
-#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "flip", "flip",
+                               2, 5 * sizeof(int), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -446,9 +425,8 @@ void cleanup_global(dt_iop_module_so_t *self)
 #ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_flip);
 #endif
-#ifdef HAVE_VULKAN
-  if(gd->vk_kernel_flip >= 0) dt_vulkan_free_kernel(gd->vk_kernel_flip);
-#endif
+  // cast away const for the unload helper; the slot is mutable wrt VK
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk);
   free(self->data);
   self->data = NULL;
 }

@@ -1,0 +1,22 @@
+// GLSL fallback for temperature.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float c0;
+    float c1;
+    float c2;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int i = y * pc.width + x;
+    vec4 p = in_buf.data[i];
+    out_buf.data[i] = vec4(p.x * pc.c0, p.y * pc.c1, p.z * pc.c2, p.w);
+}

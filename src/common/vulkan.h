@@ -37,10 +37,12 @@
 
 #include "common/darktable.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef HAVE_VULKAN
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <vulkan/vulkan.h>
 
 #define DT_VULKAN_MAX_PROGRAMS 64
@@ -143,6 +145,64 @@ int dt_vulkan_load_program(const char *name, const char *path);
  *  Returns -1 if Vulkan isn't running or the file is missing. */
 int dt_vulkan_load_program_by_name(const char *name);
 
+// ---- module helpers --------------------------------------------------
+//
+// Per-module wiring boilerplate (load .spv, create pipeline, free both)
+// collapses to one helper call. Modules keep a `dt_vk_module_kernel_t`
+// field per kernel slot in their global_data; init_global passes it to
+// dt_vulkan_module_kernel_load; cleanup_global passes it to
+// dt_vulkan_module_kernel_unload; process_vk dispatches via
+// dt_vulkan_dispatch_inout.
+//
+// All helpers tolerate "Vulkan not running" — they zero-init the slot
+// (kernel = -1) so a later dt_vulkan_dispatch_inout returns failure
+// and the pixelpipe falls back to OpenCL/CPU transparently.
+
+typedef struct dt_vk_module_kernel_t
+{
+  int program;  // -1 if not loaded
+  int kernel;   // -1 if not loaded
+} dt_vk_module_kernel_t;
+
+#define DT_VK_MODULE_KERNEL_INIT { -1, -1 }
+
+/** Load `<datadir>/kernels/vulkan/<spv_name>.spv` and create the kernel
+ *  whose entry point is named `entry`. For the common case where the
+ *  .spv file is named after the kernel, `spv_name == entry`. */
+void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *out,
+                                  const char *spv_name,
+                                  const char *entry,
+                                  uint32_t num_storage_buffers,
+                                  uint32_t push_constant_size,
+                                  uint32_t local_x,
+                                  uint32_t local_y,
+                                  uint32_t local_z);
+
+/** Tear down the pipeline. Safe on an un-loaded slot. */
+void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k);
+
+/** Dispatch the common 2-buffer (in, out) shape with a push-constant
+ *  blob. Returns 0 on success or -1 if Vulkan isn't running / the
+ *  kernel isn't loaded / dispatch failed. */
+int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
+                             dt_vk_mem_t *dev_in,
+                             dt_vk_mem_t *dev_out,
+                             size_t global_w,
+                             size_t global_h,
+                             const void *push_constants,
+                             size_t push_constant_size);
+
+/** Dispatch with an extra constant-data buffer bound at binding 2
+ *  (e.g. a tone-curve LUT). The caller owns the buffer's lifetime. */
+int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
+                                 dt_vk_mem_t *dev_in,
+                                 dt_vk_mem_t *dev_out,
+                                 dt_vk_mem_t *dev_lut,
+                                 size_t global_w,
+                                 size_t global_h,
+                                 const void *push_constants,
+                                 size_t push_constant_size);
+
 /** Create a kernel handle. The Vulkan model needs the binding shape up
  *  front (descriptor set layout); pass it here. Returns kernel index
  *  ≥0, or -1 on failure. */
@@ -193,6 +253,29 @@ G_END_DECLS
 struct dt_vk_mem_t;
 typedef struct dt_vk_mem_t dt_vk_mem_t;
 typedef struct dt_vulkan_t dt_vulkan_t;
+// Modules always have `dt_vk_module_kernel_t vk_*` fields in their
+// global_data structs (no preprocessor stunts there). When the
+// backend is compiled out we just give them empty slots; the helpers
+// below resolve to no-ops or constant-fail returns.
+typedef struct dt_vk_module_kernel_t { int _unused; } dt_vk_module_kernel_t;
+#define DT_VK_MODULE_KERNEL_INIT { 0 }
+static inline void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *o,
+                                                const char *n, const char *e,
+                                                uint32_t a, uint32_t b,
+                                                uint32_t c, uint32_t d, uint32_t f)
+{ (void)o; (void)n; (void)e; (void)a; (void)b; (void)c; (void)d; (void)f; }
+static inline void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k) { (void)k; }
+static inline int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
+                                           dt_vk_mem_t *i, dt_vk_mem_t *o,
+                                           size_t w, size_t h,
+                                           const void *pc, size_t pcs)
+{ (void)k; (void)i; (void)o; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
+static inline int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
+                                               dt_vk_mem_t *i, dt_vk_mem_t *o,
+                                               dt_vk_mem_t *l,
+                                               size_t w, size_t h,
+                                               const void *pc, size_t pcs)
+{ (void)k; (void)i; (void)o; (void)l; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
 
 static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
 static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }

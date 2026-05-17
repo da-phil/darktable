@@ -26,6 +26,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/darktable.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/wb_presets.h"
 #include "control/control.h"
 #include "control/conf.h"
@@ -109,6 +110,9 @@ typedef struct dt_iop_temperature_global_data_t
   int kernel_whitebalance_4f;
   int kernel_whitebalance_1f;
   int kernel_whitebalance_1f_xtrans;
+  // Only the 4f (post-demosaic) path has a Vulkan port; RAW paths
+  // stay on OpenCL because they don't use the float4 convention.
+  dt_vk_module_kernel_t vk_4f;
 } dt_iop_temperature_global_data_t;
 
 typedef struct dt_iop_temperature_preset_data_t
@@ -681,6 +685,28 @@ error:
   dt_opencl_release_mem_object(dev_coeffs);
   dt_opencl_release_mem_object(dev_xtrans);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  // Only the post-demosaic (filters == 0) path has a Vulkan kernel.
+  if(piece->filters) return -1;
+
+  dt_iop_temperature_data_t *d = piece->data;
+  const dt_iop_temperature_global_data_t *gd = self->global_data;
+
+  struct { int w, h; float c0, c1, c2; } pc
+    = { roi_in->width, roi_in->height,
+        d->coeffs[0], d->coeffs[1], d->coeffs[2] };
+  return dt_vulkan_dispatch_inout(&gd->vk_4f, dev_in, dev_out,
+                                  pc.w, pc.h, &pc, sizeof(pc));
 }
 #endif
 
@@ -1690,21 +1716,29 @@ void reload_defaults(dt_iop_module_t *self)
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 2; // basic.cl, from programs.conf
   dt_iop_temperature_global_data_t *gd = malloc(sizeof(dt_iop_temperature_global_data_t));
   self->data = gd;
+#ifdef HAVE_OPENCL
+  const int program = 2; // basic.cl, from programs.conf
   gd->kernel_whitebalance_4f = dt_opencl_create_kernel(program, "whitebalance_4f");
   gd->kernel_whitebalance_1f = dt_opencl_create_kernel(program, "whitebalance_1f");
   gd->kernel_whitebalance_1f_xtrans =
     dt_opencl_create_kernel(program, "whitebalance_1f_xtrans");
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk_4f, "temperature", "whitebalance_4f",
+                               2, 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_temperature_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_whitebalance_4f);
   dt_opencl_free_kernel(gd->kernel_whitebalance_1f);
   dt_opencl_free_kernel(gd->kernel_whitebalance_1f_xtrans);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk_4f);
   free(self->data);
   self->data = NULL;
 }
