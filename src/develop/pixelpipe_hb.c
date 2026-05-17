@@ -1785,6 +1785,9 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             processed = TRUE;
             *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
             *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
+            dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
+                          pipe, module, DT_DEVICE_CPU, roi_in, roi_out,
+                          "%dx%d", roi_in->width, roi_in->height);
           }
           dt_vulkan_free_buffer(devid, vin);
           dt_vulkan_free_buffer(devid, vout);
@@ -2484,6 +2487,24 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
         && piece->process_cl_ready
         && !(dt_pipe_is_preview(pipe) && (module->flags() & IOP_FLAGS_PREVIEW_NON_OPENCL))
         && !_avoid_cl_module(piece);
+
+#ifdef HAVE_VULKAN
+    /* if the module has a Vulkan path and Vulkan is the active
+       preference, skip the OpenCL arm so the CPU-dispatch arm picks
+       up the module via process_vk (with host-staging at the
+       boundary). Without this, OpenCL would grab every module that
+       has process_cl, leaving the Vulkan code dead on systems where
+       both backends are available. */
+    if(possible_cl
+       && module->process_vk
+       && piece->process_vk_ready
+       && dt_vulkan_running())
+    {
+      dt_print_pipe(DT_DEBUG_OPENCL, "prefer-vulkan",
+                    pipe, module, DT_DEVICE_CPU, &roi_in, roi_out, "");
+      possible_cl = FALSE;
+    }
+#endif
 
     /* A colorspace conversion of the input is done before the module runs, into a second
        image that replaces the original, so one extra full-size buffer is live while it
