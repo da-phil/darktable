@@ -32,7 +32,6 @@ endif()
 set(VK_KERNELS
     exposure:exposure
     channelmixerrgb:channelmixerrgb_bradford_linear
-    diffuse:diffuse_sharpen_single
     velvia:velvia
     invert:invert_4f
     vibrance:vibrance
