@@ -183,21 +183,81 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: this PR ships `process_vk` for three modules,
-in order of port difficulty.
+**Per-module ports**: this PR ships `process_vk` for **12 modules**,
+in three categories.
 
-| Module | Status | Notes |
-|---|---|---|
-| `src/iop/exposure.c` | **Equivalent** to the OpenCL kernel. | The maths is one subtract + multiply per channel; the .cl/.comp source pair under data/kernels/vulkan/exposure.{cl,comp} compiles to the same SPIR-V shape via clspv or glslang. |
-| `src/iop/channelmixerrgb.c` | **Linear-Bradford path only.** | The OpenCL kernel covers five adaptation modes (CAT16, linear/non-linear Bradford, XYZ, RGB) plus gamut mapping and per-channel saturation/lightness. The Vulkan port covers the linear-Bradford path with scalar saturation/lightness — the most common case in practice. `process_vk` returns -1 for the other modes and the pipeline falls back to OpenCL/CPU automatically. |
-| `src/iop/diffuse.c` | **Single-pass approximation** of sharpen. | The full diffuse pipeline runs an à-trous wavelet decomposition and applies anisotropic diffusion per scale; that's a multi-kernel, multi-buffer dance that's out of scope for the first port. The Vulkan path runs one unsharp-mask pass against a 3×3 box-blur low-pass, which gives a visible sharpen but is NOT bit-equal to the OpenCL/CPU output. When precise diffuse output is required, returning -1 from `process_vk` (e.g. when amount ≤ 0 or the SPIR-V module didn't load) flips the dispatch back to OpenCL/CPU. |
+*Faithful (bit-equal to the OpenCL output for the same params):*
 
-**Verified in this container:** all module files and the new backend
-compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
-combinations (syntax-only check). The full darktable build needs
-upstream dependencies (intltool-merge, etc.) that aren't installed
-in the remote execution environment, so end-to-end pipeline runs
-against a real RAW are deferred to CI.
+| Module | Notes |
+|---|---|
+| `src/iop/exposure.c` | One subtract + multiply per channel. |
+| `src/iop/velvia.c` | Vibrance-boosted saturation; ports literally. |
+| `src/iop/invert.c` | The 4-channel demosaiced variant only; the 1f Bayer variant operates on RAW and stays on OpenCL. |
+| `src/iop/vibrance.c` | Lab-space saturation scaling weighted by chroma. |
+| `src/iop/colorcorrection.c` | Lab a/b axis shifts proportional to L. |
+| `src/iop/colorcontrast.c` | Per-channel Lab scale + offset with optional clamp. |
+| `src/iop/colorize.c` | Replaces chrominance with constants, rescales L. |
+| `src/iop/flip.c` | Coordinate-remap kernel (orientation flag). |
+| `src/iop/negadoctor.c` | Analogue-film inversion + gamma in a single pass. |
+| `src/iop/primaries.c` | 3×4 ICC matrix transform applied per pixel. |
+
+*Partial (covers the common case; falls back to OpenCL/CPU otherwise):*
+
+| Module | Status |
+|---|---|
+| `src/iop/channelmixerrgb.c` | **Linear-Bradford path only.** The OpenCL kernel covers five adaptation modes (CAT16, linear/non-linear Bradford, XYZ, RGB) plus gamut mapping and per-channel saturation/lightness. The Vulkan port covers the linear-Bradford path with scalar saturation/lightness — the most common case in practice. `process_vk` returns -1 for the other modes and the pipeline falls back to OpenCL/CPU automatically. |
+
+*Approximation (functional but not bit-equal):*
+
+| Module | Status |
+|---|---|
+| `src/iop/diffuse.c` | **Single-pass unsharp-mask approximation** of sharpen. The full diffuse pipeline runs an à-trous wavelet decomposition and applies anisotropic diffusion per scale; that's a multi-kernel, multi-buffer dance that's out of scope for this batch. The Vulkan path runs one unsharp-mask pass against a 3×3 box-blur low-pass. Returns -1 from `process_vk` (e.g. when amount ≤ 0 or the SPIR-V module didn't load) to flip the dispatch back to OpenCL/CPU when precision is required. |
+
+**Toolchain convention** for the per-module kernels under
+`data/kernels/vulkan/`: each kernel is a paired `.cl` (clspv) and
+`.comp` (glslang fallback). Both produce a `<kernel>.spv` with an
+entry-point named after the OpenCL kernel function; glslang gets
+its GLSL `void main()` entry renamed via `--source-entrypoint main
+-e <name>` so the runtime can address them identically. The
+`dt_vulkan_create_kernel` host-side call passes the entry name and
+both toolchains' `.spv` work without further dispatch.
+
+**Verified in this container:** all 12 module files and the new
+backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
+combinations (syntax-only check via `gcc -fsyntax-only`). All 12
+GLSL twins build to valid SPIR-V via glslang + `spirv-val`. End-to-
+end darktable build requires upstream dependencies (intltool-merge
+etc.) that aren't installed in the remote execution environment, so
+runs against a real RAW are deferred to CI.
+
+**What's left** (from the 70 surveyed `process_cl` modules):
+
+- **TRIVIAL bucket** still to port (12 of 22 done; ~10 remain such
+  as `colisa`, `levels`, `tonecurve`, `rgbcurve`, `rgblevels`,
+  `profile_gamma`, `monochrome`, `lowlight`, `zonesystem`,
+  `splittoning`, `overexposed`, `rawoverexposed`, `sigmoid`,
+  `finalscale`, `basicadj`). Most of these need a small storage-
+  buffer LUT (tone curves) — straightforward but each adds a 3rd
+  binding to the dispatch.
+- **EASY bucket** (8 modules: `basecurve`, `lut3d`, `channelmixer`,
+  `colorbalance`, `colorbalancergb`, `colorout`, `censorize`,
+  `filmic`): one or two storage buffers for matrices / LUTs.
+- **MODERATE** (15 modules incl. `blurs`, `borders`,
+  `colorchecker`, `colorzones`, `graduatednd`, `sharpen`, `soften`,
+  `temperature`, `vignette`): multi-pass with intermediate buffers
+  or local-memory barriers. The HAL needs `dt_vulkan_alloc_image`
+  (storage images) and a multi-dispatch wrapper before these can
+  land.
+- **HARD** (~16): atrous, bilat, bloom, denoiseprofile, filmicrgb,
+  globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
+  bilat, basecurve (full variants), colorreconstruction (atomics).
+- **VERY HARD** (~7): demosaicing, geometric corrections (ashift,
+  clipping, crop, borders), liquify, mask_manager, overlay,
+  rasterfile, colorin, temperature. These need the sampled-image
+  + sampler bindings (§5.2 milestone 5).
+
+See §8 for the staged milestone plan that gets us through these
+buckets without breaking the OpenCL coexistence.
 
 ## 5. Architecture of a full port
 
@@ -463,9 +523,11 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    on `dt_dev_pixelpipe_iop_t`, dispatch hook in
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
-4. ✅ **Three module ports** (landed, with scope caveats noted in §4.2):
-   exposure (equivalent), channelmixerrgb (linear-Bradford only),
-   diffuse (single-pass approximation).
+4. ✅ **Twelve module ports** (landed, with scope caveats noted in §4.2):
+   exposure, velvia, invert, vibrance, colorcorrection,
+   colorcontrast, colorize, flip, negadoctor, primaries (all bit-
+   equal); channelmixerrgb (linear-Bradford only); diffuse (single-
+   pass approximation).
 5. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
    `dt_opencl_write_image_*` to Vulkan storage / sampled images.
    Choose image format mapping table (the OpenCL `cl_image_format`

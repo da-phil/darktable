@@ -1,0 +1,29 @@
+// GLSL fallback for flip.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int owidth;
+    int oheight;
+    int orientation;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    int ox = ((pc.orientation & 2) != 0) ? pc.width  - x - 1 : x;
+    int oy = ((pc.orientation & 1) != 0) ? pc.height - y - 1 : y;
+    if ((pc.orientation & 4) != 0) {
+        int tmp = ox; ox = oy; oy = tmp;
+    }
+
+    if (ox >= 0 && oy >= 0 && ox < pc.owidth && oy < pc.oheight) {
+        out_buf.data[oy * pc.owidth + ox] = in_buf.data[y * pc.width + x];
+    }
+}

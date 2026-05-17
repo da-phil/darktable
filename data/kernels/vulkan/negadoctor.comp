@@ -1,0 +1,45 @@
+// GLSL fallback for negadoctor.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float Dmin_r, Dmin_g, Dmin_b;
+    float wb_high_r, wb_high_g, wb_high_b;
+    float offset_r, offset_g, offset_b;
+    float exposure;
+    float black;
+    float gamma;
+    float soft_clip;
+    float soft_clip_comp;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 i = in_buf.data[idx];
+
+    vec3 Dmin    = vec3(pc.Dmin_r, pc.Dmin_g, pc.Dmin_b);
+    vec3 wb_high = vec3(pc.wb_high_r, pc.wb_high_g, pc.wb_high_b);
+    vec3 offset  = vec3(pc.offset_r, pc.offset_g, pc.offset_b);
+
+    vec4 o;
+    o.rgb = -log(Dmin / max(i.rgb, vec3(2.3283064365386963e-10))) / log(10.0);
+    o.rgb = wb_high * o.rgb + offset;
+    o.rgb = -(pc.exposure * pow(vec3(10.0), o.rgb) + vec3(pc.black));
+    o.rgb = pow(max(o.rgb, vec3(0.0)), vec3(pc.gamma));
+
+    vec3 sc  = vec3(pc.soft_clip);
+    vec3 scc = vec3(pc.soft_clip_comp);
+    bvec3 hi = greaterThan(o.rgb, sc);
+    vec3 hi_v = sc + (vec3(1.0) - exp(-(o.rgb - sc) / scc)) * scc;
+    o.rgb = mix(o.rgb, hi_v, vec3(hi));
+
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}
