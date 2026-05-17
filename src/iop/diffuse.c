@@ -1769,6 +1769,22 @@ void cleanup_global(dt_iop_module_so_t *self)
 }
 
 #ifdef HAVE_VULKAN
+void commit_params(dt_iop_module_t *self,
+                   dt_iop_params_t *p1,
+                   dt_dev_pixelpipe_t *pipe,
+                   dt_dev_pixelpipe_iop_t *piece)
+{
+  // The default commit_params just memcpys params to piece->data; we
+  // mirror that, plus gate the Vulkan path on params that the
+  // single-pass approximation actually supports. Skipping the gate
+  // here means the pixelpipe would pay host-staging cost on every
+  // dispatch just to discover the kernel returns -1.
+  memcpy(piece->data, p1, sizeof(dt_iop_diffuse_params_t));
+  const dt_iop_diffuse_params_t *p = (const dt_iop_diffuse_params_t *)p1;
+  if(p->sharpness <= 0.0f)
+    piece->process_vk_ready = FALSE;
+}
+
 int process_vk(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
                dt_vk_mem_t *dev_in,
