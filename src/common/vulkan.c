@@ -568,6 +568,77 @@ static int _record_dispatch(VkCommandBuffer cmd, void *u)
   return 0;
 }
 
+// ---- module helpers --------------------------------------------------
+//
+// Reduce the per-module wiring boilerplate to ~3 lines. See the
+// header for the contract.
+
+void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *out,
+                                  const char *spv_name,
+                                  const char *entry,
+                                  uint32_t num_storage_buffers,
+                                  uint32_t push_constant_size,
+                                  uint32_t local_x,
+                                  uint32_t local_y,
+                                  uint32_t local_z)
+{
+  out->program = -1;
+  out->kernel  = -1;
+  if(!dt_vulkan_running()) return;
+
+  out->program = dt_vulkan_load_program_by_name(spv_name);
+  if(out->program < 0) return;
+
+  out->kernel = dt_vulkan_create_kernel(out->program, entry,
+                                        num_storage_buffers,
+                                        push_constant_size,
+                                        local_x, local_y, local_z);
+  if(out->kernel < 0)
+    dt_print(DT_DEBUG_OPENCL,
+             "[vulkan] kernel '%s' from '%s' failed to create", entry, spv_name);
+}
+
+void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k)
+{
+  if(!k) return;
+  if(k->kernel >= 0) dt_vulkan_free_kernel(k->kernel);
+  // Program memory is reclaimed wholesale at dt_vulkan_cleanup; we
+  // don't have a per-program unload yet (and modules typically own
+  // exactly one kernel per program, so the program slot is freed at
+  // cleanup time too).
+  k->program = -1;
+  k->kernel  = -1;
+}
+
+int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
+                             dt_vk_mem_t *dev_in,
+                             dt_vk_mem_t *dev_out,
+                             size_t global_w,
+                             size_t global_h,
+                             const void *push_constants,
+                             size_t push_constant_size)
+{
+  if(!k || k->kernel < 0) return -1;
+  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
+  return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
+                                     bufs, 2, push_constants, push_constant_size);
+}
+
+int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
+                                 dt_vk_mem_t *dev_in,
+                                 dt_vk_mem_t *dev_out,
+                                 dt_vk_mem_t *dev_lut,
+                                 size_t global_w,
+                                 size_t global_h,
+                                 const void *push_constants,
+                                 size_t push_constant_size)
+{
+  if(!k || k->kernel < 0) return -1;
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_lut };
+  return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
+                                     bufs, 3, push_constants, push_constant_size);
+}
+
 int dt_vulkan_enqueue_kernel_2d(int devid, int kernel,
                                 size_t global_w, size_t global_h,
                                 dt_vk_mem_t *const *buffers,

@@ -61,10 +61,7 @@ typedef struct dt_iop_velvia_data_t
 typedef struct dt_iop_velvia_global_data_t
 {
   int kernel_velvia;
-#ifdef HAVE_VULKAN
-  int vk_program;
-  int vk_kernel_velvia;
-#endif
+  dt_vk_module_kernel_t vk;
 } dt_iop_velvia_global_data_t;
 
 
@@ -240,18 +237,14 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 {
   dt_iop_velvia_data_t *data = piece->data;
   dt_iop_velvia_global_data_t *gd = self->global_data;
-  if(gd->vk_kernel_velvia < 0) return -1;
 
   const float strength = data->strength / 100.0f;
   if(strength <= 0.0f) return -1;  // pass-through; OpenCL/CPU does an image copy
 
   struct { int w, h; float strength, bias; } pc
     = { roi_in->width, roi_in->height, strength, data->bias };
-
-  dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
-  return dt_vulkan_enqueue_kernel_2d(0, gd->vk_kernel_velvia,
-                                     (size_t)pc.w, (size_t)pc.h,
-                                     bufs, 2, &pc, sizeof(pc));
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  pc.w, pc.h, &pc, sizeof(pc));
 }
 #endif
 
@@ -259,24 +252,13 @@ void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_velvia_global_data_t *gd = malloc(sizeof(dt_iop_velvia_global_data_t));
   self->data = gd;
-
 #ifdef HAVE_OPENCL
-  const int program = 8; // extended.cl, from programs.conf
-  gd->kernel_velvia = dt_opencl_create_kernel(program, "velvia");
+  gd->kernel_velvia = dt_opencl_create_kernel(/*extended.cl*/ 8, "velvia");
 #endif
-
-#ifdef HAVE_VULKAN
-  gd->vk_program = -1;
-  gd->vk_kernel_velvia = -1;
-  if(dt_vulkan_running())
-  {
-    gd->vk_program = dt_vulkan_load_program_by_name("velvia");
-    if(gd->vk_program >= 0)
-      gd->vk_kernel_velvia = dt_vulkan_create_kernel(gd->vk_program, "velvia",
-                                                     2, 2 * sizeof(int) + 2 * sizeof(float),
-                                                     16, 16, 1);
-  }
-#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "velvia", "velvia",
+                               /*buffers*/ 2,
+                               /*pushsize*/ 2 * sizeof(int) + 2 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -285,9 +267,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 #ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_velvia);
 #endif
-#ifdef HAVE_VULKAN
-  if(gd->vk_kernel_velvia >= 0) dt_vulkan_free_kernel(gd->vk_kernel_velvia);
-#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
