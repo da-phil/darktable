@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: this PR ships `process_vk` for **12 modules**,
+**Per-module ports**: this PR ships `process_vk` for **13 modules**,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -200,6 +200,7 @@ in three categories.
 | `src/iop/flip.c` | Coordinate-remap kernel (orientation flag). |
 | `src/iop/negadoctor.c` | Analogue-film inversion + gamma in a single pass. |
 | `src/iop/primaries.c` | 3×4 ICC matrix transform applied per pixel. |
+| `src/iop/temperature.c` | The 4f (post-demosaic) white-balance path only; the 1f Bayer / xtrans paths operate on RAW and stay on OpenCL. |
 
 *Partial (covers the common case; falls back to OpenCL/CPU otherwise):*
 
@@ -232,29 +233,36 @@ runs against a real RAW are deferred to CI.
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
-- **TRIVIAL bucket** still to port (12 of 22 done; ~10 remain such
-  as `colisa`, `levels`, `tonecurve`, `rgbcurve`, `rgblevels`,
-  `profile_gamma`, `monochrome`, `lowlight`, `zonesystem`,
-  `splittoning`, `overexposed`, `rawoverexposed`, `sigmoid`,
-  `finalscale`, `basicadj`). Most of these need a small storage-
-  buffer LUT (tone curves) — straightforward but each adds a 3rd
-  binding to the dispatch.
-- **EASY bucket** (8 modules: `basecurve`, `lut3d`, `channelmixer`,
-  `colorbalance`, `colorbalancergb`, `colorout`, `censorize`,
-  `filmic`): one or two storage buffers for matrices / LUTs.
-- **MODERATE** (15 modules incl. `blurs`, `borders`,
-  `colorchecker`, `colorzones`, `graduatednd`, `sharpen`, `soften`,
-  `temperature`, `vignette`): multi-pass with intermediate buffers
-  or local-memory barriers. The HAL needs `dt_vulkan_alloc_image`
-  (storage images) and a multi-dispatch wrapper before these can
-  land.
-- **HARD** (~16): atrous, bilat, bloom, denoiseprofile, filmicrgb,
+- **TRIVIAL bucket** still to port. Examples that need only a
+  storage-buffer LUT (3rd binding, covered by
+  `dt_vulkan_dispatch_inout_lut`): `tonecurve`, `rgbcurve`,
+  `rgblevels`, `levels`, `profile_gamma`, `colisa`, `lowlight`,
+  `monochrome` (multi-input — needs separate work),
+  `zonesystem`, `splittoning` (needs RGB↔HSL helpers added to
+  `dt_vulkan_common.h`), `overexposed` (needs ICC profile lookups —
+  storage buffer plus the multi-mode kernel selection),
+  `rawoverexposed` (RAW-only — likely stays on OpenCL).
+- **EASY bucket** — one or two storage buffers for matrices /
+  LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
+  sampled image), `channelmixer` (legacy), `colorbalance` (3
+  variants, push-constant-only), `colorbalancergb`, `colorout` (3
+  LUTs), `censorize`, `filmic` (1 LUT + scalars). Each is ~50 LOC
+  module + ~80 LOC kernel.
+- **MODERATE** — multi-pass with intermediate buffers or
+  local-memory barriers: `blurs`, `borders`, `colorchecker`,
+  `colorzones`, `graduatednd`, `sharpen`, `soften`, `vignette`,
+  `highpass`, `highlights`, `shadhi`, `relight`. The HAL needs
+  `dt_vulkan_alloc_image` (storage images) and a multi-dispatch
+  wrapper before these can land — that's milestone §8.5.
+- **HARD** — atrous, bilat, bloom, denoiseprofile, filmicrgb,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
-  bilat, basecurve (full variants), colorreconstruction (atomics).
-- **VERY HARD** (~7): demosaicing, geometric corrections (ashift,
+  basecurve (full variants), colorreconstruction (atomics). Multi-
+  kernel pipelines or per-warp reductions.
+- **VERY HARD** — demosaicing, geometric corrections (ashift,
   clipping, crop, borders), liquify, mask_manager, overlay,
-  rasterfile, colorin, temperature. These need the sampled-image
-  + sampler bindings (§5.2 milestone 5).
+  rasterfile, colorin. These need the sampled-image + sampler
+  bindings (§5.2 milestone 5) and in some cases full distort
+  pipelines.
 
 See §8 for the staged milestone plan that gets us through these
 buckets without breaking the OpenCL coexistence.
@@ -351,6 +359,97 @@ extensions (`VK_EXT_memory_budget`).
 `dt_develop_tiling_t.factor_cl` and friends are independent of the
 backend — they describe how many bytes of working memory the kernel
 needs per output pixel. They port literally.
+
+### 5.6 Module-side abstraction: `dt_vk_module_kernel_t`
+
+The first batch of module ports each ran ~35 lines of per-module
+plumbing (open-coded `vk_program`/`vk_kernel_X` fields,
+`if(dt_vulkan_running()) { load … create … }` in `init_global`,
+guard-and-free in `cleanup_global`, manual buffer-array setup in
+`process_vk`). That much boilerplate is impossible to keep
+consistent across 70+ modules — different authors will guard things
+differently, forget to null-init, leak slots on partial failure.
+
+To keep duplication low and the surface uniform, the host-side API
+now exposes a slim module helper in `src/common/vulkan.h`:
+
+```c
+typedef struct dt_vk_module_kernel_t { int program, kernel; } dt_vk_module_kernel_t;
+#define DT_VK_MODULE_KERNEL_INIT { -1, -1 }
+
+void dt_vulkan_module_kernel_load(dt_vk_module_kernel_t *out,
+                                  const char *spv_name,
+                                  const char *entry,
+                                  uint32_t num_storage_buffers,
+                                  uint32_t push_constant_size,
+                                  uint32_t local_x, local_y, local_z);
+void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k);
+
+int  dt_vulkan_dispatch_inout    (const dt_vk_module_kernel_t *k,
+                                  dt_vk_mem_t *in, dt_vk_mem_t *out,
+                                  size_t w, size_t h,
+                                  const void *pc, size_t pcs);
+int  dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
+                                  dt_vk_mem_t *in, dt_vk_mem_t *out,
+                                  dt_vk_mem_t *lut,
+                                  size_t w, size_t h,
+                                  const void *pc, size_t pcs);
+```
+
+Each helper is a no-op / failure-return when Vulkan isn't running,
+so the calling module never needs an `if(dt_vulkan_running())`
+guard. The type is also stubbed in the `HAVE_VULKAN=0` block as an
+empty struct, so modules can keep a `dt_vk_module_kernel_t vk;` field
+without #ifdef walls in their global-data struct.
+
+A typical ported module is now:
+
+```c
+typedef struct dt_iop_X_global_data_t {
+  int kernel_X;
+  dt_vk_module_kernel_t vk;
+} dt_iop_X_global_data_t;
+
+#ifdef HAVE_VULKAN
+int process_vk(…) {
+  struct { int w, h; …scalars… } pc = { … };
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  pc.w, pc.h, &pc, sizeof(pc));
+}
+#endif
+
+void init_global(dt_iop_module_so_t *self) {
+  …allocate gd; OpenCL kernel registration if HAVE_OPENCL…
+  dt_vulkan_module_kernel_load(&gd->vk, "X", "X", 2, sizeof(pc_X_t),
+                               16, 16, 1);
+}
+
+void cleanup_global(dt_iop_module_so_t *self) {
+  …OpenCL frees if HAVE_OPENCL…
+  dt_vulkan_module_kernel_unload(&gd->vk);
+  free(self->data);
+}
+```
+
+The Vulkan-specific footprint per module is ~10 lines (one struct
+field, ~6-line `process_vk` body, one line each in `init_global` and
+`cleanup_global`). Modules that have two kernel variants
+(channelmixerrgb's adaptation modes, temperature's 4f-only path,
+invert's 4f vs 1f) keep one `dt_vk_module_kernel_t vk_<variant>;`
+field per kernel slot.
+
+This refactor cut ~300 lines of duplication from the first batch of
+ports without changing behaviour; it's the pattern every subsequent
+module port should follow.
+
+### 5.7 Kernel-side helpers (`dt_vulkan_common.h`)
+
+`data/kernels/vulkan/dt_vulkan_common.h` carries the small set of
+helpers that recur across kernels: `clipf` (matches the OpenCL helper
+in `data/kernels/common.h`), `idx2d`, `clampf`, `clampf4`,
+`read_clamped`, and `matmul3` / `matmul3_padded`. Including it from
+every `*.cl` keeps the per-kernel boilerplate consistent and makes
+behaviour drift between the kernels visible at one address.
 
 ## 6. Per-OS picture
 
@@ -523,11 +622,14 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    on `dt_dev_pixelpipe_iop_t`, dispatch hook in
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
-4. ✅ **Twelve module ports** (landed, with scope caveats noted in §4.2):
+4. ✅ **Thirteen module ports** (landed, with scope caveats noted in §4.2):
    exposure, velvia, invert, vibrance, colorcorrection,
-   colorcontrast, colorize, flip, negadoctor, primaries (all bit-
-   equal); channelmixerrgb (linear-Bradford only); diffuse (single-
-   pass approximation).
+   colorcontrast, colorize, flip, negadoctor, primaries, temperature
+   (all bit-equal for their supported paths); channelmixerrgb
+   (linear-Bradford only); diffuse (single-pass approximation).
+4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
+    Cuts the per-module wiring boilerplate by ~30 LOC each and gives
+    a uniform shape for every future port.
 5. **Image2D + sampler support.** Port `dt_opencl_alloc_device()` and
    `dt_opencl_write_image_*` to Vulkan storage / sampled images.
    Choose image format mapping table (the OpenCL `cl_image_format`
