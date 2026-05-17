@@ -24,6 +24,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -101,6 +102,7 @@ typedef struct dt_iop_levels_data_t
 typedef struct dt_iop_levels_global_data_t
 {
   int kernel_levels;
+  dt_vk_module_kernel_t vk;
 } dt_iop_levels_global_data_t;
 
 
@@ -465,6 +467,34 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_levels_data_t *d = piece->data;
+  dt_iop_levels_global_data_t *gd = self->global_data;
+
+  if(d->mode == LEVELS_MODE_AUTOMATIC)
+    commit_params_late(self, piece);
+
+  const size_t lut_bytes = sizeof(float) * 256 * 256;
+  dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(0, lut_bytes);
+  if(!dev_lut) return -1;
+  int rc = -1;
+  if(dt_vulkan_write_to_device(0, dev_lut, d->lut, lut_bytes) == 0)
+  {
+    struct { int w, h; float in_low, in_high, in_inv_gamma; } pc
+      = { roi_out->width, roi_out->height,
+          d->levels[0], d->levels[2], d->in_inv_gamma };
+    rc = dt_vulkan_dispatch_inout_lut(&gd->vk, dev_in, dev_out, dev_lut,
+                                      pc.w, pc.h, &pc, sizeof(pc));
+  }
+  dt_vulkan_free_buffer(0, dev_lut);
+  return rc;
+}
+#endif
+
 // void init_presets (dt_iop_module_so_t *self)
 //{
 //  dt_iop_levels_params_t p;
@@ -593,16 +623,24 @@ void init(dt_iop_module_t *self)
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 2; // basic.cl, from programs.conf
   dt_iop_levels_global_data_t *gd = malloc(sizeof(dt_iop_levels_global_data_t));
   self->data = gd;
-  gd->kernel_levels = dt_opencl_create_kernel(program, "levels");
+#ifdef HAVE_OPENCL
+  gd->kernel_levels = dt_opencl_create_kernel(/*basic.cl*/ 2, "levels");
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "levels", "levels",
+                               /*buffers*/ 3,
+                               /*pushsize*/ 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_levels_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_levels);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
