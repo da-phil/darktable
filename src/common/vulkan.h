@@ -203,6 +203,17 @@ int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
                                  const void *push_constants,
                                  size_t push_constant_size);
 
+/** General N-binding dispatch — buffers[0..count-1] become storage-
+ *  buffer descriptors 0..count-1. Used by modules that need more
+ *  than the convenience 2/3-binding shapes. */
+int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
+                         dt_vk_mem_t *const *buffers,
+                         size_t buffer_count,
+                         size_t global_w,
+                         size_t global_h,
+                         const void *push_constants,
+                         size_t push_constant_size);
+
 /** Create a kernel handle. The Vulkan model needs the binding shape up
  *  front (descriptor set layout); pass it here. Returns kernel index
  *  ≥0, or -1 on failure. */
@@ -276,6 +287,11 @@ static inline int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
                                                size_t w, size_t h,
                                                const void *pc, size_t pcs)
 { (void)k; (void)i; (void)o; (void)l; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
+static inline int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
+                                       dt_vk_mem_t *const *b, size_t bc,
+                                       size_t w, size_t h,
+                                       const void *pc, size_t pcs)
+{ (void)k; (void)b; (void)bc; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
 
 static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
 static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }

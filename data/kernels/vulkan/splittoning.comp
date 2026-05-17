@@ -1,0 +1,81 @@
+// GLSL fallback for splittoning.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float compress;
+    float balance;
+    float shadow_hue;
+    float shadow_saturation;
+    float highlight_hue;
+    float highlight_saturation;
+} pc;
+
+// Match the OpenCL RGB_2_HSL/HSL_2_RGB in colorspace.h byte-for-byte.
+
+vec4 RGB_to_HSL(vec4 RGB) {
+    float H = 0.0, S = 0.0;
+    float R = RGB.x, G = RGB.y, B = RGB.z;
+    float var_Min = min(R, min(G, B));
+    float var_Max = max(R, max(G, B));
+    float del_Max = var_Max - var_Min;
+    float L = (var_Max + var_Min) * 0.5;
+
+    if (abs(var_Max) > 1e-6 && abs(del_Max) > 1e-6) {
+        S = (L < 0.5) ? del_Max / (var_Max + var_Min)
+                      : del_Max / (2.0 - var_Max - var_Min);
+        float del_R = (((var_Max - R) / 6.0) + (del_Max / 2.0)) / del_Max;
+        float del_G = (((var_Max - G) / 6.0) + (del_Max / 2.0)) / del_Max;
+        float del_B = (((var_Max - B) / 6.0) + (del_Max / 2.0)) / del_Max;
+        if      (R == var_Max) H = del_B - del_G;
+        else if (G == var_Max) H = (1.0/3.0) + del_R - del_B;
+        else if (B == var_Max) H = (2.0/3.0) + del_G - del_R;
+        if (H < 0.0) H += 1.0;
+        if (H > 1.0) H -= 1.0;
+    }
+    return vec4(H, S, L, RGB.w);
+}
+
+float hue_to_rgb(float v1, float v2, float vH) {
+    if (vH < 0.0) vH += 1.0;
+    if (vH > 1.0) vH -= 1.0;
+    if (6.0 * vH < 1.0) return v1 + (v2 - v1) * 6.0 * vH;
+    if (2.0 * vH < 1.0) return v2;
+    if (3.0 * vH < 2.0) return v1 + (v2 - v1) * ((2.0/3.0) - vH) * 6.0;
+    return v1;
+}
+
+vec4 HSL_to_RGB(vec4 HSL) {
+    float H = HSL.x, S = HSL.y, L = HSL.z;
+    if (S < 1e-6) return vec4(L, L, L, HSL.w);
+    float var_2 = (L < 0.5) ? L * (1.0 + S) : (L + S) - (S * L);
+    float var_1 = 2.0 * L - var_2;
+    return vec4(hue_to_rgb(var_1, var_2, H + 1.0/3.0),
+                hue_to_rgb(var_1, var_2, H),
+                hue_to_rgb(var_1, var_2, H - 1.0/3.0),
+                HSL.w);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 pixel = in_buf.data[idx];
+    vec4 hsl = RGB_to_HSL(pixel);
+
+    if (hsl.z < pc.balance - pc.compress || hsl.z > pc.balance + pc.compress) {
+        hsl.x = (hsl.z < pc.balance) ? pc.shadow_hue        : pc.highlight_hue;
+        hsl.y = (hsl.z < pc.balance) ? pc.shadow_saturation : pc.highlight_saturation;
+        float ra = (hsl.z < pc.balance)
+                     ? clamp(2.0 * abs(-pc.balance + pc.compress + hsl.z), 0.0, 1.0)
+                     : clamp(2.0 * abs(-pc.balance - pc.compress + hsl.z), 0.0, 1.0);
+        vec4 mixrgb = HSL_to_RGB(hsl);
+        pixel.xyz = clamp(pixel * (1.0 - ra) + mixrgb * ra, vec4(0.0), vec4(1.0)).xyz;
+    }
+    out_buf.data[idx] = pixel;
+}

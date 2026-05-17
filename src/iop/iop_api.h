@@ -32,9 +32,14 @@
 #include <CL/cl.h>
 #endif
 
-// dt_vk_mem_t comes from common/vulkan.h, which must be included by
-// the file that pulls in iop_api.h (the same pattern as <CL/cl.h>
-// above). See src/develop/imageop.h for the canonical include order.
+#ifdef HAVE_VULKAN
+// Forward-declared typedef so the process_vk signature below resolves
+// even when iop_api.h is force-included from the command line (the
+// introspection build, see src/iop/CMakeLists.txt) before any caller
+// has included common/vulkan.h. The full definition in vulkan.h is a
+// compatible typedef redeclaration.
+typedef struct dt_vk_mem_t dt_vk_mem_t;
+#endif
 
 #if defined(__cplusplus) && !defined(INCLUDE_API_FROM_MODULE_H)
 extern "C" {

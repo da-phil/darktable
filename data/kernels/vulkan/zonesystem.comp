@@ -1,0 +1,30 @@
+// GLSL fallback for zonesystem.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In       { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out      { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer ZmOff    { float data[]; } zmo_buf;
+layout(std430, binding = 3) readonly buffer ZmScl    { float data[]; } zms_buf;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int size;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 pixel = in_buf.data[idx];
+
+    float rzscale = float(pc.size - 1) / 100.0;
+    int rz = clamp(int(pixel.x * rzscale), 0, pc.size - 2);
+    float zs = ((rz > 0) ? (zmo_buf.data[rz] / pixel.x) : 0.0)
+             + zms_buf.data[rz];
+
+    pixel.xyz *= zs;
+    out_buf.data[idx] = pixel;
+}

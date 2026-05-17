@@ -37,7 +37,11 @@ set(VK_KERNELS
     flip:flip
     negadoctor:negadoctor
     primaries:primaries
-    temperature:whitebalance_4f)
+    temperature:whitebalance_4f
+    profile_gamma_log:profilegamma_log
+    profile_gamma:profilegamma
+    splittoning:splittoning
+    zonesystem:zonesystem)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

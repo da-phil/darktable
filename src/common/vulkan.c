@@ -610,6 +610,25 @@ void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k)
   k->kernel  = -1;
 }
 
+int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
+                         dt_vk_mem_t *const *buffers,
+                         size_t buffer_count,
+                         size_t global_w,
+                         size_t global_h,
+                         const void *push_constants,
+                         size_t push_constant_size)
+{
+  if(!k || k->kernel < 0) return -1;
+  return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
+                                     buffers, buffer_count,
+                                     push_constants, push_constant_size);
+}
+
+// The 2- and 3-buffer flavours are thin wrappers over dispatch_n. We
+// keep them as named helpers because the common case reads better in
+// module code (`dispatch_inout(k, in, out, ...)` vs an explicit
+// 2-element array). Callers that need 4+ bindings use dispatch_n.
+
 int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
                              dt_vk_mem_t *dev_in,
                              dt_vk_mem_t *dev_out,
@@ -618,10 +637,9 @@ int dt_vulkan_dispatch_inout(const dt_vk_module_kernel_t *k,
                              const void *push_constants,
                              size_t push_constant_size)
 {
-  if(!k || k->kernel < 0) return -1;
   dt_vk_mem_t *bufs[2] = { dev_in, dev_out };
-  return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
-                                     bufs, 2, push_constants, push_constant_size);
+  return dt_vulkan_dispatch_n(k, bufs, 2, global_w, global_h,
+                              push_constants, push_constant_size);
 }
 
 int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
@@ -633,10 +651,9 @@ int dt_vulkan_dispatch_inout_lut(const dt_vk_module_kernel_t *k,
                                  const void *push_constants,
                                  size_t push_constant_size)
 {
-  if(!k || k->kernel < 0) return -1;
   dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_lut };
-  return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
-                                     bufs, 3, push_constants, push_constant_size);
+  return dt_vulkan_dispatch_n(k, bufs, 3, global_w, global_h,
+                              push_constants, push_constant_size);
 }
 
 int dt_vulkan_enqueue_kernel_2d(int devid, int kernel,
