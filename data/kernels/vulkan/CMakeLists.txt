@@ -21,9 +21,14 @@ if(NOT CLSPV_BIN AND NOT GLSLANG_BIN)
 endif()
 
 # Each entry is "kernel_filename:entry_point". For most kernels the
-# .cl filename matches the kernel function name; flip and a few
-# others diverge if they had multiple kernels per file (none currently
-# do).
+# .cl filename matches the kernel function name and the .spv has a
+# single entry point. A few .cl sources have multiple `kernel void`
+# entries (currently: channelmixerrgb's 5 adaptation kernels); clspv
+# emits all entry points into one .spv automatically, while the
+# glslang fallback can only expose the single entry named in the
+# spec. Host code probes each entry by name and falls back when it
+# isn't present — modules that need extra entry points just won't
+# have them available in glslang-only builds.
 set(VK_KERNELS
     exposure:exposure
     channelmixerrgb:channelmixerrgb_bradford_linear
