@@ -41,7 +41,8 @@ set(VK_KERNELS
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
     splittoning:splittoning
-    zonesystem:zonesystem)
+    zonesystem:zonesystem
+    levels:levels)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

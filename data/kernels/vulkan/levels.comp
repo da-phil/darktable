@@ -1,0 +1,46 @@
+// GLSL fallback for levels.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Lut { float data[]; } lut_buf;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    float in_low;
+    float in_high;
+    float in_inv_gamma;
+} pc;
+
+const int VK_LUT_SIZE = 0x10000;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+    vec4 pixel = in_buf.data[idx];
+    float L = pixel.x;
+    float L_in = pixel.x / 100.0;
+
+    if (L_in <= pc.in_low) {
+        pixel.x = 0.0;
+    } else if (L_in >= pc.in_high) {
+        pixel.x = 100.0 * pow((L_in - pc.in_low) / (pc.in_high - pc.in_low), pc.in_inv_gamma);
+    } else {
+        float t = (L_in - pc.in_low) / (pc.in_high - pc.in_low);
+        int xi = clamp(int(t * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+        pixel.x = lut_buf.data[xi];
+    }
+
+    if (L_in > 0.01) {
+        pixel.y *= pixel.x / L;
+        pixel.z *= pixel.x / L;
+    } else {
+        pixel.y *= pixel.x;
+        pixel.z *= pixel.x;
+    }
+    out_buf.data[idx] = pixel;
+}

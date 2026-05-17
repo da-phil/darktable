@@ -102,6 +102,16 @@ static inline float4 matmul3_padded(const float4 v, constant const float *m)
 
 #define VK_LUT_SIZE 0x10000  // 65536 entries; matches the OpenCL 256x256 layout
 
+// Plain LUT lookup, no extrapolation. The OpenCL counterpart
+// (data/kernels/color_conversion.h::lookup) clamps x*65536 to the
+// LUT index range and reads back; we do the same against a flat
+// float buffer.
+static inline float vk_lookup(global const float *lut, const float x)
+{
+  const int xi = clamp((int)(x * VK_LUT_SIZE), 0, VK_LUT_SIZE - 1);
+  return lut[xi];
+}
+
 // Three scalars rather than `constant const float *coeffs` because
 // clspv won't accept a private-pointer arg as `constant` and we want
 // to pass these coefficients via push constants without going via a
