@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -71,6 +72,7 @@ typedef struct dt_iop_splittoning_data_t
 typedef struct dt_iop_splittoning_global_data_t
 {
   int kernel_splittoning;
+  dt_vk_module_kernel_t vk;
 } dt_iop_splittoning_global_data_t;
 
 const char *name()
@@ -232,20 +234,45 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
  }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_splittoning_data_t *d = piece->data;
+  dt_iop_splittoning_global_data_t *gd = self->global_data;
+  struct { int w, h;
+           float compress, balance,
+                 sh_hue, sh_sat,
+                 hi_hue, hi_sat; } pc
+    = { roi_out->width, roi_out->height,
+        (d->compress / 110.0f) / 2.0f, d->balance,
+        d->shadow_hue, d->shadow_saturation,
+        d->highlight_hue, d->highlight_saturation };
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  pc.w, pc.h, &pc, sizeof(pc));
+}
+#endif
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 8; // extended.cl from programs.conf
   dt_iop_splittoning_global_data_t *gd = malloc(sizeof(dt_iop_splittoning_global_data_t));
   self->data = gd;
-  gd->kernel_splittoning = dt_opencl_create_kernel(program, "splittoning");
+#ifdef HAVE_OPENCL
+  gd->kernel_splittoning = dt_opencl_create_kernel(/*extended.cl*/ 8, "splittoning");
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "splittoning", "splittoning",
+                               2, 2 * sizeof(int) + 6 * sizeof(float),
+                               16, 16, 1);
 }
-
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_splittoning_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_splittoning);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }

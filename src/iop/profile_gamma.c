@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop_math.h"
@@ -85,6 +86,12 @@ typedef struct dt_iop_profilegamma_global_data_t
 {
   int kernel_profilegamma;
   int kernel_profilegamma_log;
+  // The two modes have separate Vulkan kernels: LOG is pure scalars
+  // (dispatch_inout), GAMMA needs the 65536-entry LUT bound at
+  // binding 2 (dispatch_inout_lut). Either may be -1 if its .spv
+  // didn't load.
+  dt_vk_module_kernel_t vk_log;
+  dt_vk_module_kernel_t vk_gamma;
 } dt_iop_profilegamma_global_data_t;
 
 
@@ -247,6 +254,47 @@ error:
   dt_opencl_release_mem_object(dev_table);
   dt_opencl_release_mem_object(dev_coeffs);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_profilegamma_data_t *d = piece->data;
+  dt_iop_profilegamma_global_data_t *gd = self->global_data;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  if(d->mode == PROFILEGAMMA_LOG)
+  {
+    struct { int w, h; float dynamic_range, shadows_range, grey; } pc
+      = { width, height, d->dynamic_range, d->shadows_range, d->grey_point / 100.0f };
+    return dt_vulkan_dispatch_inout(&gd->vk_log, dev_in, dev_out,
+                                    width, height, &pc, sizeof(pc));
+  }
+  if(d->mode == PROFILEGAMMA_GAMMA)
+  {
+    // Upload the 65536-entry LUT (d->table is laid out exactly like
+    // the 256x256 image the OpenCL kernel reads).
+    const size_t lut_bytes = sizeof(float) * 256 * 256;
+    dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(0, lut_bytes);
+    if(!dev_lut) return -1;
+    if(dt_vulkan_write_to_device(0, dev_lut, d->table, lut_bytes) != 0)
+    {
+      dt_vulkan_free_buffer(0, dev_lut);
+      return -1;
+    }
+    struct { int w, h; float ta0, ta1, ta2; } pc
+      = { width, height,
+          d->unbounded_coeffs[0], d->unbounded_coeffs[1], d->unbounded_coeffs[2] };
+    const int rc = dt_vulkan_dispatch_inout_lut(&gd->vk_gamma, dev_in, dev_out, dev_lut,
+                                                width, height, &pc, sizeof(pc));
+    dt_vulkan_free_buffer(0, dev_lut);
+    return rc;
+  }
+  return -1;
 }
 #endif
 
@@ -569,19 +617,31 @@ void gui_update(dt_iop_module_t *self)
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 2; // basic.cl, from programs.conf
   dt_iop_profilegamma_global_data_t *gd = malloc(sizeof(dt_iop_profilegamma_global_data_t));
-
   self->data = gd;
+#ifdef HAVE_OPENCL
+  const int program = 2; // basic.cl, from programs.conf
   gd->kernel_profilegamma = dt_opencl_create_kernel(program, "profilegamma");
   gd->kernel_profilegamma_log = dt_opencl_create_kernel(program, "profilegamma_log");
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk_log, "profile_gamma_log", "profilegamma_log",
+                               2, 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_gamma, "profile_gamma", "profilegamma",
+                               /*buffers*/ 3,  // in, out, lut
+                               /*pushsize*/ 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_profilegamma_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_profilegamma);
   dt_opencl_free_kernel(gd->kernel_profilegamma_log);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk_log);
+  dt_vulkan_module_kernel_unload(&gd->vk_gamma);
   free(self->data);
   self->data = NULL;
 }

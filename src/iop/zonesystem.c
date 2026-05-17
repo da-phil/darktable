@@ -23,6 +23,7 @@
 #include "common/gaussian.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -64,6 +65,7 @@ typedef struct dt_iop_zonesystem_data_t
 typedef struct dt_iop_zonesystem_global_data_t
 {
   int kernel_zonesystem;
+  dt_vk_module_kernel_t vk;
 } dt_iop_zonesystem_global_data_t;
 
 
@@ -321,20 +323,69 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_zonesystem_data_t *data = piece->data;
+  dt_iop_zonesystem_global_data_t *gd = self->global_data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int size = data->params.size;
+
+  // Vulkan storage buffers don't need the cl_mem constant-buffer
+  // 16-byte alignment that the OpenCL path uses; size to the
+  // maximum we'd ever read (size-1 entries) plus the 1-slot guard
+  // the kernel relies on.
+  float zonemap[MAX_ZONE_SYSTEM_SIZE]        = { -1 };
+  float zonemap_offset[MAX_ZONE_SYSTEM_SIZE] = { -1 };
+  float zonemap_scale [MAX_ZONE_SYSTEM_SIZE] = { -1 };
+  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap);
+  for(int k = 0; k < size - 1; k++) zonemap_scale[k]  = (zonemap[k + 1] - zonemap[k]) * (size - 1);
+  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = 100.0f * ((k + 1) * zonemap[k] - k * zonemap[k + 1]);
+
+  const size_t map_bytes = sizeof(zonemap_offset);  // same size for both
+  dt_vk_mem_t *dev_zmo = dt_vulkan_alloc_buffer(0, map_bytes);
+  dt_vk_mem_t *dev_zms = dt_vulkan_alloc_buffer(0, map_bytes);
+  int rc = -1;
+  if(dev_zmo && dev_zms
+     && dt_vulkan_write_to_device(0, dev_zmo, zonemap_offset, map_bytes) == 0
+     && dt_vulkan_write_to_device(0, dev_zms, zonemap_scale,  map_bytes) == 0)
+  {
+    struct { int w, h, sz; } pc = { width, height, size };
+    dt_vk_mem_t *bufs[4] = { dev_in, dev_out, dev_zmo, dev_zms };
+    rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 4, width, height, &pc, sizeof(pc));
+  }
+  dt_vulkan_free_buffer(0, dev_zmo);
+  dt_vulkan_free_buffer(0, dev_zms);
+  return rc;
+}
+#endif
+
 
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 2; // basic.cl, from programs.conf
   dt_iop_zonesystem_global_data_t *gd = malloc(sizeof(dt_iop_zonesystem_global_data_t));
   self->data = gd;
-  gd->kernel_zonesystem = dt_opencl_create_kernel(program, "zonesystem");
+#ifdef HAVE_OPENCL
+  gd->kernel_zonesystem = dt_opencl_create_kernel(/*basic.cl*/ 2, "zonesystem");
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "zonesystem", "zonesystem",
+                               /*buffers*/ 4,
+                               /*pushsize*/ 3 * sizeof(int),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_zonesystem_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_zonesystem);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
