@@ -19,6 +19,7 @@
 #include "common/debug.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -295,6 +296,12 @@ int legacy_params(dt_iop_module_t *self,
 typedef struct dt_iop_borders_global_data_t
 {
   int kernel_borders_fill;
+  // Vulkan: the two kernels share borders.spv (clspv path) or sit in
+  // two independent .spv files (glslang fallback exposes only the fill
+  // entry; modules that need the copy fall back to OpenCL/CPU).
+  int vk_program;
+  dt_vk_module_kernel_t vk_fill;
+  dt_vk_module_kernel_t vk_copy;
 } dt_iop_borders_global_data_t;
 
 
@@ -650,6 +657,123 @@ error:
 #endif
 
 
+#ifdef HAVE_VULKAN
+// Push-constant layouts. The fill kernel needs the output buffer
+// dimensions, the destination rectangle, and the fill color
+// (6 ints + 4 floats = 40 bytes). The copy kernel needs the input
+// width, output width, destination offset and copy region size
+// (6 ints = 24 bytes).
+typedef struct
+{
+  int   out_width;
+  int   out_height;
+  int   dst_x;
+  int   dst_y;
+  int   region_w;
+  int   region_h;
+  float color_r;
+  float color_g;
+  float color_b;
+  float color_a;
+} vk_borders_fill_pc_t;
+
+typedef struct
+{
+  int in_width;
+  int out_width;
+  int dst_x;
+  int dst_y;
+  int region_w;
+  int region_h;
+} vk_borders_copy_pc_t;
+
+static int _vk_borders_fill_rect(const dt_iop_borders_global_data_t *gd,
+                                 dt_vk_mem_t *dev_out,
+                                 const int out_w, const int out_h,
+                                 const int dst_x, const int dst_y,
+                                 const int region_w, const int region_h,
+                                 const float color[4])
+{
+  if(region_w <= 0 || region_h <= 0) return 0;
+  const vk_borders_fill_pc_t pc = {
+    .out_width  = out_w,
+    .out_height = out_h,
+    .dst_x      = dst_x,
+    .dst_y      = dst_y,
+    .region_w   = region_w,
+    .region_h   = region_h,
+    .color_r    = color[0],
+    .color_g    = color[1],
+    .color_b    = color[2],
+    .color_a    = color[3],
+  };
+  dt_vk_mem_t *buffers[] = { dev_out };
+  return dt_vulkan_dispatch_n(&gd->vk_fill, buffers, 1,
+                              region_w, region_h, &pc, sizeof(pc));
+}
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_borders_data_t *d = piece->data;
+  const dt_iop_borders_global_data_t *gd = self->global_data;
+
+  dt_iop_border_positions_t binfo;
+  dt_iop_setup_binfo(piece, roi_in, roi_out, d->pos_v, d->pos_h,
+                     d->color, d->frame_color, d->frame_size, d->frame_offset, &binfo);
+
+  const int out_w = roi_out->width;
+  const int out_h = roi_out->height;
+
+  // 1. Fill whole canvas with border color.
+  const float col[4] = { d->color[0], d->color[1], d->color[2], 1.0f };
+  int rc = _vk_borders_fill_rect(gd, dev_out, out_w, out_h, 0, 0, out_w, out_h, col);
+  if(rc != 0) return rc;
+
+  // 2. Optional decorative frame (two concentric fills).
+  if(binfo.frame_size != 0)
+  {
+    const float col_frame[4] = { d->frame_color[0], d->frame_color[1], d->frame_color[2], 1.0f };
+    const int outer_w = binfo.frame_br_out_x - binfo.frame_tl_out_x;
+    const int outer_h = binfo.frame_br_out_y - binfo.frame_tl_out_y;
+    rc = _vk_borders_fill_rect(gd, dev_out, out_w, out_h,
+                               binfo.frame_tl_out_x, binfo.frame_tl_out_y,
+                               outer_w, outer_h, col_frame);
+    if(rc != 0) return rc;
+
+    const int inner_w = binfo.frame_br_in_x - binfo.frame_tl_in_x;
+    const int inner_h = binfo.frame_br_in_y - binfo.frame_tl_in_y;
+    rc = _vk_borders_fill_rect(gd, dev_out, out_w, out_h,
+                               binfo.frame_tl_in_x, binfo.frame_tl_in_y,
+                               inner_w, inner_h, col);
+    if(rc != 0) return rc;
+  }
+
+  // 3. Copy the input image into the framed canvas. The copy kernel
+  // is only present on the clspv path (glslang fallback ships fill
+  // only); modules built against glslang-only fall back to OpenCL/CPU
+  // here.
+  if(gd->vk_copy.kernel < 0) return -1;
+
+  const vk_borders_copy_pc_t cpc = {
+    .in_width  = roi_in->width,
+    .out_width = out_w,
+    .dst_x     = binfo.border_in_x,
+    .dst_y     = binfo.border_in_y,
+    .region_w  = roi_in->width,
+    .region_h  = roi_in->height,
+  };
+  return dt_vulkan_dispatch_inout(&gd->vk_copy, dev_in, dev_out,
+                                  roi_in->width, roi_in->height,
+                                  &cpc, sizeof(cpc));
+}
+#endif
+
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 2; // basic.cl from programs.conf
@@ -657,6 +781,26 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_borders_global_data_t *gd = malloc(sizeof(dt_iop_borders_global_data_t));
   self->data = gd;
   gd->kernel_borders_fill = dt_opencl_create_kernel(program, "borders_fill");
+
+  // 6 ints + 4 floats = 40 bytes; matches vk_borders_fill_pc_t and
+  // borders.cl / borders.comp push constants.
+  const uint32_t fill_pcs = 6 * sizeof(int) + 4 * sizeof(float);
+  const uint32_t copy_pcs = 6 * sizeof(int);
+  gd->vk_program = -1;
+  gd->vk_fill = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
+  gd->vk_copy = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
+  if(dt_vulkan_running())
+  {
+    gd->vk_program = dt_vulkan_load_program_by_name("borders");
+    if(gd->vk_program >= 0)
+    {
+      // 1 binding (out only) for fill; 2 bindings (in + out) for copy.
+      dt_vulkan_module_kernel_create_from(&gd->vk_fill, gd->vk_program,
+                                          "borders_fill", 1, fill_pcs, 16, 16, 1);
+      dt_vulkan_module_kernel_create_from(&gd->vk_copy, gd->vk_program,
+                                          "borders_copy", 2, copy_pcs, 16, 16, 1);
+    }
+  }
 }
 
 
@@ -664,6 +808,8 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_borders_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_borders_fill);
+  dt_vulkan_module_kernel_unload(&gd->vk_fill);
+  dt_vulkan_module_kernel_unload(&gd->vk_copy);
   free(self->data);
   self->data = NULL;
 }
