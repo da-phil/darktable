@@ -251,6 +251,13 @@ void dt_vulkan_cleanup(dt_vulkan_t *vk)
     {
       if(d->programs[p].used) free(d->programs[p].spirv);
     }
+    if(d->staging)
+    {
+      if(d->staging->buffer) vkDestroyBuffer(d->device, d->staging->buffer, NULL);
+      if(d->staging->memory) vkFreeMemory(d->device, d->staging->memory, NULL);
+      free(d->staging);
+      d->staging = NULL;
+    }
     if(d->dset_pool) vkDestroyDescriptorPool(d->device, d->dset_pool, NULL);
     if(d->cmd_pool)  vkDestroyCommandPool(d->device, d->cmd_pool, NULL);
     if(d->device)    vkDestroyDevice(d->device, NULL);
@@ -548,6 +555,27 @@ static int _record_copy(VkCommandBuffer cmd, void *u)
   return 0;
 }
 
+// Return d->staging sized at least `size`. Reallocates if the
+// cached buffer is smaller. Always host-visible + both transfer
+// directions so the same buffer serves uploads and downloads.
+// Callers must hold the global VK lock (g_vk_lock).
+static dt_vk_mem_t *_ensure_staging(dt_vk_device_t *d, size_t size)
+{
+  if(d->staging && d->staging->size >= (VkDeviceSize)size)
+    return d->staging;
+  if(d->staging)
+  {
+    if(d->staging->buffer) vkDestroyBuffer(d->device, d->staging->buffer, NULL);
+    if(d->staging->memory) vkFreeMemory(d->device, d->staging->memory, NULL);
+    free(d->staging);
+    d->staging = NULL;
+  }
+  d->staging = _alloc(d, (VkDeviceSize)size,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  return d->staging;
+}
+
 int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
                               const void *host, size_t size)
 {
@@ -555,23 +583,17 @@ int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
   (void)devid;
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
 
-  dt_vk_mem_t *staging = _alloc(d, (VkDeviceSize)size,
-                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+  dt_vk_mem_t *staging = _ensure_staging(d, size);
   if(!staging) return -1;
 
   void *p = NULL;
   if(vkMapMemory(d->device, staging->memory, 0, size, 0, &p) != VK_SUCCESS)
-  {
-    dt_vulkan_free_buffer(devid, staging);
     return -1;
-  }
   memcpy(p, host, size);
   vkUnmapMemory(d->device, staging->memory);
 
   _copy_args_t a = { staging->buffer, dst->buffer, (VkDeviceSize)size };
-  int rc = _submit_one_shot(d, _record_copy, &a);
-  dt_vulkan_free_buffer(devid, staging);
-  return rc;
+  return _submit_one_shot(d, _record_copy, &a);
 }
 
 int dt_vulkan_read_from_device(int devid, void *host,
@@ -581,24 +603,18 @@ int dt_vulkan_read_from_device(int devid, void *host,
   (void)devid;
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
 
-  dt_vk_mem_t *staging = _alloc(d, (VkDeviceSize)size,
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+  dt_vk_mem_t *staging = _ensure_staging(d, size);
   if(!staging) return -1;
 
   _copy_args_t a = { src->buffer, staging->buffer, (VkDeviceSize)size };
   int rc = _submit_one_shot(d, _record_copy, &a);
-  if(rc != 0) { dt_vulkan_free_buffer(devid, staging); return rc; }
+  if(rc != 0) return rc;
 
   void *p = NULL;
   if(vkMapMemory(d->device, staging->memory, 0, size, 0, &p) != VK_SUCCESS)
-  {
-    dt_vulkan_free_buffer(devid, staging);
     return -1;
-  }
   memcpy(host, p, size);
   vkUnmapMemory(d->device, staging->memory);
-
-  dt_vulkan_free_buffer(devid, staging);
   return 0;
 }
 
