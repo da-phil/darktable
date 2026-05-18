@@ -59,6 +59,53 @@ static const char *_vkerr(VkResult r)
     }                                                            \
   } while(0)
 
+// Compare a SPIR-V literal-string operand against a C string.
+// SPIR-V strings are null-terminated bytes packed 4-per-word.
+// max_words bounds the read so we never run off the end of the
+// module if a string is malformed.
+static gboolean _spirv_string_match(const uint32_t *words, size_t max_words, const char *needle)
+{
+  const char *bytes = (const char *)words;
+  const size_t max_bytes = max_words * 4;
+  for(size_t k = 0; k < max_bytes; k++)
+  {
+    const char c = bytes[k];
+    if(c == 0)
+      return needle[k] == 0;
+    if(c != needle[k])
+      return FALSE;
+  }
+  return FALSE;
+}
+
+// Scan a SPIR-V module for OpEntryPoint (opcode 15) and return TRUE
+// iff one of them names `entry_name`. Used by dt_vulkan_create_kernel
+// to refuse pipeline creation when the requested entry isn't in the
+// module — Mesa RADV segfaults inside vkCreateComputePipelines in
+// that case (observed on multi-entry modules built with glslang,
+// which only emits one entry per .spv).
+static gboolean _spirv_has_entry(const uint32_t *spirv, size_t words, const char *entry_name)
+{
+  if(!spirv || words < 5) return FALSE;
+  size_t i = 5;  // SPIR-V module header is 5 words
+  while(i < words)
+  {
+    const uint32_t inst = spirv[i];
+    const uint16_t opcode = (uint16_t)(inst & 0xffff);
+    const uint16_t wc     = (uint16_t)(inst >> 16);
+    if(wc == 0 || i + wc > words) return FALSE;  // malformed
+    if(opcode == 15 /* OpEntryPoint */ && wc >= 4)
+    {
+      // Layout: word i+0 = inst, i+1 = ExecutionModel, i+2 = entry-point %id,
+      // i+3.. = LiteralString name (null-terminated), then Interface IDs.
+      if(_spirv_string_match(&spirv[i + 3], wc - 3, entry_name))
+        return TRUE;
+    }
+    i += wc;
+  }
+  return FALSE;
+}
+
 static uint32_t _find_memtype(const dt_vk_device_t *d,
                               uint32_t type_filter,
                               VkMemoryPropertyFlags props)
@@ -307,6 +354,19 @@ int dt_vulkan_create_kernel(int program,
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
   if(program < 0 || program >= DT_VULKAN_MAX_PROGRAMS || !d->programs[program].used)
     return -1;
+
+  // Multi-entry modules (channelmixerrgb, borders) load several entry
+  // names from the same program. clspv emits all of them; glslang's
+  // -e flag emits only one. Mesa RADV crashes inside
+  // vkCreateComputePipelines if asked for a missing entry, so scan
+  // the SPIR-V header here and bail cleanly before touching Vulkan.
+  if(!_spirv_has_entry(d->programs[program].spirv,
+                       d->programs[program].spirv_words, entry))
+  {
+    dt_print(DT_DEBUG_OPENCL,
+             "[vulkan] entry point '%s' not present in SPIR-V program %d", entry, program);
+    return -1;
+  }
 
   int slot = -1;
   for(int i = 0; i < DT_VULKAN_MAX_KERNELS; ++i)
