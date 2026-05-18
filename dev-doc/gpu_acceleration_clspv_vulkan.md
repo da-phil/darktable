@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 24 modules currently expose `process_vk`,
+**Per-module ports**: 25 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -211,6 +211,7 @@ in three categories.
 | `src/iop/mask_manager.c` | Pass-through dummy IOP; uses `dt_vulkan_copy_device_to_device` rather than a kernel. |
 | `src/iop/borders.c` | Multi-fill canvas + sub-region image copy. Uses `dt_vulkan_dispatch_n` (1 binding for fill, 2 for copy) and the two-entry-point multi-kernel pattern. |
 | `src/iop/colisa.c` | First LUT-on-storage-buffer port — uploads two 65536-entry tables freshly per dispatch and binds them at descriptors 2/3 alongside the in/out buffers. Pattern blueprint for `tonecurve`, `rgbcurve`, `rgblevels`, `basecurve`, … |
+| `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. The host-side colour-space transform that fills `tmp` is still CPU-side pending a Vulkan port of `dt_ioppr_transform_image_colorspace_rgb`. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -248,18 +249,18 @@ runs against a real RAW are deferred to CI.
   `tonecurve`, `rgbcurve`, `rgblevels`, `lowlight`. Each lifts off
   the existing colisa port template (~30 LOC module + ~50 LOC
   kernel). `monochrome` needs the bilateral filter VK port first
-  (multi-input dependency); `overexposed` needs the ICC profile
-  storage-buffer plumbing (work_profile luminance branch).
-  `rawoverexposed` is RAW-only and likely stays on OpenCL.
-  Done in earlier passes: `colisa`, `levels`, `profile_gamma`,
-  `zonesystem`, `splittoning` (added RGB↔HSL helpers to
-  `dt_vulkan_common.h`).
+  (multi-input dependency). `rawoverexposed` is RAW-only and likely
+  stays on OpenCL. Done in earlier passes: `colisa`, `levels`,
+  `profile_gamma`, `zonesystem`, `splittoning` (added RGB↔HSL
+  helpers to `dt_vulkan_common.h`), `overexposed` (first consumer
+  of ICC profile plumbing §5.11).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
   variants, push-constant-only), `colorbalancergb`, `colorout` (3
-  LUTs), `censorize`, `filmic` (1 LUT + scalars). Each is ~50 LOC
-  module + ~80 LOC kernel.
+  LUTs), `censorize`, `filmic` (1 LUT + scalars). `basicadj`,
+  `rgblevels`, `rgbcurve` use the §5.11 ICC profile plumbing.
+  Each is ~50 LOC module + ~80 LOC kernel.
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`, `shadhi`. The
@@ -603,6 +604,71 @@ the return value and fall through to `dt_gaussian_blur_cl` /
 CPU/OpenCL fallback pattern in the lowpass / shadhi / retouch
 modules.
 
+### 5.11 ICC profile info storage-buffer plumbing
+
+A large family of modules (`basicadj`, `basecurve`, `colorbalance`,
+`filmic`, `rgbcurve`, `rgblevels`, `overexposed`, ...) reads the
+work / histogram / output profile via
+`dt_colorspaces_iccprofile_info_cl_t` + a 2-D image2d_t tone-curve
+LUT. clspv doesn't surface samplers under our buffer-only kernel
+convention, so the Vulkan path replaces both with storage buffers:
+
+* `vk_dt_colorspaces_iccprofile_info_t` — declared in
+  `dt_vulkan_common.h`; byte-for-byte equivalent to the existing
+  `dt_colorspaces_iccprofile_info_cl_t` (156 bytes). `spirv-dis`
+  confirms the std430 offsets land at 0 / 36 / 72 / 76 / 112 / 148 /
+  152 — exactly what the C struct produces.
+* Tone-curve LUT — a flat float buffer of `6·lutsize` entries with
+  channels laid out as `[in_R, in_G, in_B, out_R, out_G, out_B]`,
+  each `lutsize` floats long. The OpenCL build uses the same flat
+  array internally; it only reshapes into a 256×(256·6) image2d_t
+  because of OpenCL sampler limits.
+* Kernel-side helpers in `dt_vulkan_common.h` mirror the OpenCL
+  helpers in `data/kernels/color_conversion.h` and `rgb_norms.h`
+  function-for-function: `vk_lerp_lookup_unbounded`,
+  `vk_apply_trc_in` / `vk_apply_trc_out`, `vk_get_rgb_matrix_luminance`,
+  `vk_dt_camera_rgb_luminance`, `vk_dt_rgb_norm`. All take the
+  profile struct + LUT as `global const` pointers, matching the
+  binding shape established by `dt_vulkan_dispatch_n`.
+
+Host-side mirrors the OpenCL surface in `iop_profile.h`:
+
+```c
+dt_colorspaces_iccprofile_info_vk_t *info = NULL;
+float *lut = NULL;
+dt_vk_mem_t *dev_info = NULL;
+dt_vk_mem_t *dev_lut  = NULL;
+if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid,
+                                       &info, &lut, &dev_info, &dev_lut) != 0)
+  goto cleanup;
+/* ... bind dev_info, dev_lut, dispatch_n ... */
+dt_ioppr_free_iccprofile_params_vk(&info, &lut, &dev_info, &dev_lut, devid);
+```
+
+`build_iccprofile_params_vk` copies the matrix / coeffs / lutsize /
+nonlinearlut / grey into the host struct, flattens the
+`lut_in[3]` / `lut_out[3]` arrays into the device-side 6·lutsize
+buffer, and uploads both. When `profile_info` is `NULL` (no profile)
+a 6-float placeholder is allocated so the binding stays valid; the
+kernel guards against actually reading it via `use_work_profile`.
+
+The first consumer (`overexposed`) is wired up: it uses
+`vk_get_rgb_matrix_luminance` for the GAMUT / LUMINANCE / SATURATION
+clipping previews and a 5-binding dispatch (in, out, tmp,
+profile_info, profile_lut). The host-side colorspace transform that
+populates `tmp` is currently still done CPU-side via
+`dt_ioppr_transform_image_colorspace_rgb` — porting that helper to
+Vulkan is the next step here. Once it's in, the round-trip through
+host memory in `overexposed::process_vk` goes away.
+
+Caveat shared with §5.8: the profile struct contains a `float[3][3]`
+in C, which std430 lays out identically to `float[9]` (alignment 4,
+no padding). The GLSL fallback in `overexposed.comp` declares the
+member as `float unbounded_coeffs_in[9]` and accesses
+`[channel*3 + coeff]`; the clspv-built kernel keeps the 2-D
+declaration. `spirv-dis` is the trustworthy oracle here; cross-check
+new modules against the offsets above on first compile.
+
 ## 6. Per-OS picture
 
 ### Linux
@@ -822,15 +888,16 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   24 modules now expose `process_vk`, covering the simple per-pixel
+   25 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
    whitebalance_1f / 1f_xtrans, channelmixerrgb ×5, graduatednd,
    vignette, relight), the first sub-region + multi-fill module
    (borders), the first pass-through HAL-only module (mask_manager),
-   and the first LUT-on-storage-buffer port (colisa). All are
-   bit-equal to their OpenCL counterparts for the supported paths.
+   the first LUT-on-storage-buffer port (colisa), and the first
+   ICC-profile-aware port (overexposed). All are bit-equal to their
+   OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
@@ -853,13 +920,15 @@ a `USE_*` option; see the inline `case` in `build.sh`).
     3D-grid splat / blur / slice pipeline (`src/common/bilateralcl.c`,
     several hundred lines); the Vulkan port mirrors the Gaussian
     helper's shape but with a multi-pass kernel chain.
-4f. ⏳ **ICC profile info storage-buffer plumbing** — pending.
-    `dt_colorspaces_iccprofile_info_cl_t` (156-byte struct + tone-
-    curve LUT) currently passed as `constant` + image2d_t in OpenCL.
-    Vulkan equivalent: one storage buffer for the struct + one for
-    the LUT, with a `vk_get_rgb_matrix_luminance` helper added to
-    `dt_vulkan_common.h`. Unblocks `basicadj`, `overexposed`, and
-    the work-profile branches of several colour modules.
+4f. ✅ **ICC profile info storage-buffer plumbing** (landed; see
+    §5.11). `vk_dt_colorspaces_iccprofile_info_t` storage buffer +
+    flat 6·lutsize tone-curve LUT, with `vk_lerp_lookup_unbounded` /
+    `vk_apply_trc_in` / `vk_get_rgb_matrix_luminance` / `vk_dt_rgb_norm`
+    helpers in `dt_vulkan_common.h` and `dt_ioppr_build_iccprofile_params_vk`
+    / `dt_ioppr_free_iccprofile_params_vk` host-side. First consumer
+    is `overexposed`; unblocks `basicadj`, `basecurve`, `rgbcurve`,
+    `rgblevels`, and the work-profile branches of several colour
+    modules.
 4g. ⏳ **diffuse multi-scale wavelet pipeline** (§8.9 below) —
     pending. The OpenCL kernel chain (6 kernels × up to 10 scales ×
     N iterations) needs (a) the 6 kernel translations, (b) a

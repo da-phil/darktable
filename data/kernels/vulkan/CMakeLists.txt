@@ -54,7 +54,8 @@ set(VK_KERNELS
     zonesystem:zonesystem
     levels:levels
     whitebalance_1f:whitebalance_1f
-    whitebalance_1f_xtrans:whitebalance_1f_xtrans)
+    whitebalance_1f_xtrans:whitebalance_1f_xtrans
+    overexposed:overexposed)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

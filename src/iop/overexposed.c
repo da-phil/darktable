@@ -22,6 +22,7 @@
 #include "common/opencl.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -56,6 +57,7 @@ static const float DT_ALIGNED_ARRAY dt_iop_overexposed_colors[][2][4]
 typedef struct dt_iop_overexposed_global_data_t
 {
   int kernel_overexposed;
+  dt_vk_module_kernel_t vk;
 } dt_iop_overexposed_global_data_t;
 
 typedef struct dt_iop_overexposed_t
@@ -369,6 +371,118 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Push-constant layout matches overexposed.cl / overexposed.comp
+// byte-for-byte (4 ints + 10 floats = 56 bytes, all scalar — no
+// vec4 to dodge the std430 16-byte-alignment trap).
+typedef struct
+{
+  int   width;
+  int   height;
+  int   mode;
+  int   use_work_profile;
+  float lower;
+  float upper;
+  float lower_r, lower_g, lower_b, lower_w;
+  float upper_r, upper_g, upper_b, upper_w;
+} vk_overexposed_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_develop_t *dev = self->dev;
+  dt_iop_overexposed_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const size_t pixels = (size_t)width * height;
+
+  dt_vk_mem_t *dev_tmp = NULL;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL;
+  dt_vk_mem_t *dev_profile_lut = NULL;
+  int rc = -1;
+
+  const dt_iop_order_iccprofile_info_t *const current_profile =
+    dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_histogram_profile_info(dev);
+
+  if(!(current_profile && work_profile))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[overexposed process_vk] can't create transform profile");
+    goto cleanup;
+  }
+
+  // We don't yet have a Vulkan implementation of the colorspace
+  // transform; round-trip via the host. roi_out->{width,height} are
+  // the bounds. The price is acceptable here because overexposed is
+  // a preview-only mode and the working buffer is small.
+  float *host_in  = dt_alloc_align_float(pixels * 4);
+  float *host_tmp = dt_alloc_align_float(pixels * 4);
+  if(!host_in || !host_tmp)
+  {
+    dt_free_align(host_in);
+    dt_free_align(host_tmp);
+    goto cleanup;
+  }
+  if(dt_vulkan_read_from_device(devid, host_in, dev_in,
+                                sizeof(float) * 4 * pixels) != 0)
+  {
+    dt_free_align(host_in);
+    dt_free_align(host_tmp);
+    goto cleanup;
+  }
+  dt_ioppr_transform_image_colorspace_rgb(host_in, host_tmp, width, height,
+                                          current_profile, work_profile, self->op);
+  dev_tmp = dt_vulkan_alloc_buffer(devid, sizeof(float) * 4 * pixels);
+  if(!dev_tmp
+     || dt_vulkan_write_to_device(devid, dev_tmp, host_tmp,
+                                  sizeof(float) * 4 * pixels) != 0)
+  {
+    dt_free_align(host_in);
+    dt_free_align(host_tmp);
+    goto cleanup;
+  }
+  dt_free_align(host_in);
+  dt_free_align(host_tmp);
+
+  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
+                                         &profile_lut_vk, &dev_profile_info,
+                                         &dev_profile_lut) != 0)
+    goto cleanup;
+
+  const int colorscheme = dev->overexposed.colorscheme;
+  const float *upper_color = dt_iop_overexposed_colors[colorscheme][0];
+  const float *lower_color = dt_iop_overexposed_colors[colorscheme][1];
+
+  const vk_overexposed_pc_t pc = {
+    .width            = width,
+    .height           = height,
+    .mode             = dev->overexposed.mode,
+    .use_work_profile = (work_profile == NULL) ? 0 : 1,
+    .lower            = exp2f(fminf(dev->overexposed.lower, -4.f)),
+    .upper            = dev->overexposed.upper / 100.0f,
+    .lower_r = lower_color[0], .lower_g = lower_color[1],
+    .lower_b = lower_color[2], .lower_w = lower_color[3],
+    .upper_r = upper_color[0], .upper_g = upper_color[1],
+    .upper_b = upper_color[2], .upper_w = upper_color[3],
+  };
+
+  dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_tmp,
+                              dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 5, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  dt_vulkan_free_buffer(devid, dev_tmp);
+  return rc;
+}
+#endif
+
 void tiling_callback(dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
                      dt_develop_tiling_t *tiling)
@@ -389,6 +503,12 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_overexposed_global_data_t *gd = malloc(sizeof(dt_iop_overexposed_global_data_t));
   self->data = gd;
   gd->kernel_overexposed = dt_opencl_create_kernel(program, "overexposed");
+  // 4 ints + 10 floats = 56 bytes; matches vk_overexposed_pc_t and
+  // the push-constant block in overexposed.cl / overexposed.comp.
+  // 5 bindings: in, out, tmp, profile_info, profile_lut.
+  const uint32_t pcsize = 4 * sizeof(int) + 10 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "overexposed", "overexposed",
+                               5, pcsize, 16, 16, 1);
 }
 
 
@@ -396,6 +516,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_overexposed_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_overexposed);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
