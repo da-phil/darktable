@@ -30,6 +30,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "develop/imageop_gui.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
@@ -75,6 +76,7 @@ typedef struct dt_iop_relight_data_t
 typedef struct dt_iop_relight_global_data_t
 {
   int kernel_relight;
+  dt_vk_module_kernel_t vk;
 } dt_iop_relight_global_data_t;
 
 
@@ -167,18 +169,52 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Push-constant layout matches relight.cl / relight.comp byte-for-byte
+// (2 ints + 3 floats = 20 bytes).
+typedef struct
+{
+  int   width;
+  int   height;
+  float center;
+  float wings;
+  float ev;
+} vk_relight_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_relight_data_t *data = piece->data;
+  const dt_iop_relight_global_data_t *gd = self->global_data;
+  const vk_relight_pc_t pc = {
+    .width  = roi_in->width,
+    .height = roi_in->height,
+    .center = data->center,
+    .wings  = data->width,
+    .ev     = data->ev,
+  };
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  roi_in->width, roi_in->height, &pc, sizeof(pc));
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 8; // extended.cl, from programs.conf
   dt_iop_relight_global_data_t *gd = malloc(sizeof(dt_iop_relight_global_data_t));
   self->data = gd;
   gd->kernel_relight = dt_opencl_create_kernel(program, "relight");
+  const uint32_t pcsize = 2 * sizeof(int) + 3 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "relight", "relight",
+                               2, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_relight_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_relight);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
