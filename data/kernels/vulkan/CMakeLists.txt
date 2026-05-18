@@ -55,7 +55,8 @@ set(VK_KERNELS
     levels:levels
     whitebalance_1f:whitebalance_1f
     whitebalance_1f_xtrans:whitebalance_1f_xtrans
-    overexposed:overexposed)
+    overexposed:overexposed
+    basicadj:basicadj)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
