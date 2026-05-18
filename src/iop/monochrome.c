@@ -19,6 +19,8 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
+#include "common/vulkan.h"
 #include "common/colorspaces.h"
 #include "common/math.h"
 #include "common/opencl.h"
@@ -67,6 +69,8 @@ typedef struct dt_iop_monochrome_gui_data_t
 typedef struct dt_iop_monochrome_global_data_t
 {
   int kernel_monochrome_filter, kernel_monochrome;
+  dt_vk_module_kernel_t vk_filter;
+  dt_vk_module_kernel_t vk_blend;
 } dt_iop_monochrome_global_data_t;
 
 
@@ -290,6 +294,93 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layouts match the .cl/.comp twins byte-for-byte.
+typedef struct
+{
+  int   width;
+  int   height;
+  float a;
+  float b;
+  float size;
+} vk_mono_filter_pc_t;
+
+typedef struct
+{
+  int   width;
+  int   height;
+  float a;
+  float b;
+  float size;
+  float highlights;
+} vk_mono_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_monochrome_data_t *d = piece->data;
+  const dt_iop_monochrome_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const float sigma2  = (d->size * 128.0f) * (d->size * 128.0f);
+  const float scale   = piece->iscale / roi_in->scale;
+  const float sigma_r = 250.0f;
+  const float sigma_s = 20.0f / scale;
+  const float detail  = -1.0f; // bilateral base layer
+
+  dt_vk_mem_t *dev_tmp = NULL;
+  dt_bilateral_vk_t *b = NULL;
+  int rc = -1;
+
+  // Step 1: monochrome_filter — write the chroma-distance weight
+  // into dev_out (overwriting in-place isn't an issue here; the
+  // splat below reads from dev_out, not dev_in).
+  {
+    const vk_mono_filter_pc_t pc = {
+      .width = width, .height = height,
+      .a = d->a, .b = d->b, .size = sigma2,
+    };
+    if(dt_vulkan_dispatch_inout(&gd->vk_filter, dev_in, dev_out,
+                                width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 2: bilateral splat → blur → slice on the dev_out weights;
+  // smoothed result goes into dev_tmp.
+  dev_tmp = dt_vulkan_alloc_buffer(devid, (size_t)width * height * 4 * sizeof(float));
+  if(!dev_tmp) goto cleanup;
+  b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+  if(!b) goto cleanup;
+  if(dt_bilateral_splat_vk(b, dev_out) != 0) goto cleanup;
+  if(dt_bilateral_blur_vk(b)            != 0) goto cleanup;
+  if(dt_bilateral_slice_vk(b, dev_out, dev_tmp, detail) != 0) goto cleanup;
+
+  // Step 3: monochrome blend — combine original input with the
+  // bilateral-filtered mask; write to dev_out (overwrites the
+  // intermediate filter result we used above).
+  {
+    const vk_mono_pc_t pc = {
+      .width = width, .height = height,
+      .a = d->a, .b = d->b, .size = sigma2,
+      .highlights = d->highlights,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_blend, bufs, 3, width, height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(b)       dt_bilateral_free_vk(b);
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  return rc;
+}
+#endif
+
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
                      dt_develop_tiling_t *tiling)
@@ -339,6 +430,16 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_monochrome_filter = dt_opencl_create_kernel(program, "monochrome_filter");
   gd->kernel_monochrome = dt_opencl_create_kernel(program, "monochrome");
+
+  // VK kernel slots. monochrome_filter: 2 ints + 3 floats = 20 B,
+  // 2 bindings. monochrome: 2 ints + 4 floats = 24 B, 3 bindings.
+  dt_vulkan_module_kernel_load(&gd->vk_filter, "monochrome_filter",
+                               "monochrome_filter",
+                               2, 2 * sizeof(int) + 3 * sizeof(float),
+                               16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_blend, "monochrome", "monochrome",
+                               3, 2 * sizeof(int) + 4 * sizeof(float),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -346,6 +447,8 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_iop_monochrome_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_monochrome_filter);
   dt_opencl_free_kernel(gd->kernel_monochrome);
+  dt_vulkan_module_kernel_unload(&gd->vk_filter);
+  dt_vulkan_module_kernel_unload(&gd->vk_blend);
   free(self->data);
   self->data = NULL;
 }
