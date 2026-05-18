@@ -30,6 +30,10 @@
 #include <CL/cl.h>           // for cl_mem
 #endif
 
+#ifdef HAVE_VULKAN
+#include "common/vulkan.h"
+#endif
+
 struct dt_iop_module_t;
 struct dt_develop_t;
 struct dt_dev_pixelpipe_t;
@@ -245,6 +249,42 @@ gboolean dt_ioppr_transform_image_colorspace_rgb_cl
    const dt_iop_order_iccprofile_info_t *const profile_info_from,
    const dt_iop_order_iccprofile_info_t *const profile_info_to,
    const char *message);
+#endif
+
+#ifdef HAVE_VULKAN
+// Byte-for-byte equivalent to dt_colorspaces_iccprofile_info_cl_t /
+// vk_dt_colorspaces_iccprofile_info_t in data/kernels/vulkan/
+// dt_vulkan_common.h (156 bytes). Carried in plain float/int so the
+// Vulkan path doesn't require <CL/cl.h>.
+typedef struct dt_colorspaces_iccprofile_info_vk_t
+{
+  float matrix_in[9];
+  float matrix_out[9];
+  int   lutsize;
+  float unbounded_coeffs_in[3][3];
+  float unbounded_coeffs_out[3][3];
+  int   nonlinearlut;
+  float grey;
+} dt_colorspaces_iccprofile_info_vk_t;
+
+/** Mirror of dt_ioppr_build_iccprofile_params_cl for the Vulkan
+ *  backend. Allocates a host-side struct (caller frees) and two
+ *  device buffers — one for the profile struct, one for the
+ *  6·lutsize tone-curve LUT. Returns 0 on success. */
+int dt_ioppr_build_iccprofile_params_vk
+  (const dt_iop_order_iccprofile_info_t *const profile_info,
+   const int devid,
+   dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+   float **_profile_lut_vk,
+   dt_vk_mem_t **_dev_profile_info,
+   dt_vk_mem_t **_dev_profile_lut);
+
+void dt_ioppr_free_iccprofile_params_vk
+  (dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+   float **_profile_lut_vk,
+   dt_vk_mem_t **_dev_profile_info,
+   dt_vk_mem_t **_dev_profile_lut,
+   const int devid);
 #endif
 
 /** the following must have the matrix_in and matrix_out generated */

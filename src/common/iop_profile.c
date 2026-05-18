@@ -1801,6 +1801,132 @@ cleanup:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+static void _ioppr_get_profile_info_vk(const dt_iop_order_iccprofile_info_t *const profile_info,
+                                       dt_colorspaces_iccprofile_info_vk_t *profile_info_vk)
+{
+  for(int i = 0; i < 9; i++)
+  {
+    profile_info_vk->matrix_in[i]  = profile_info->matrix_in[i/3][i%3];
+    profile_info_vk->matrix_out[i] = profile_info->matrix_out[i/3][i%3];
+  }
+  profile_info_vk->lutsize = profile_info->lutsize;
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+    {
+      profile_info_vk->unbounded_coeffs_in[i][j]  = profile_info->unbounded_coeffs_in[i][j];
+      profile_info_vk->unbounded_coeffs_out[i][j] = profile_info->unbounded_coeffs_out[i][j];
+    }
+  profile_info_vk->nonlinearlut = profile_info->nonlinearlut;
+  profile_info_vk->grey         = profile_info->grey;
+}
+
+// Same layout as _ioppr_get_trc_cl above: 6·lutsize floats, channels
+// in [in_R, in_G, in_B, out_R, out_G, out_B] order. The kernel-side
+// helper vk_lerp_lookup_unbounded reads via lut[n_lut * lutsize + t].
+static float *_ioppr_get_trc_vk(const dt_iop_order_iccprofile_info_t *const profile_info)
+{
+  float *trc = malloc(sizeof(float) * 6 * profile_info->lutsize);
+  if(trc)
+  {
+    int x = 0;
+    for(int c = 0; c < 3; c++)
+      for(int y = 0; y < profile_info->lutsize; y++, x++)
+        trc[x] = profile_info->lut_in[c][y];
+    for(int c = 0; c < 3; c++)
+      for(int y = 0; y < profile_info->lutsize; y++, x++)
+        trc[x] = profile_info->lut_out[c][y];
+  }
+  return trc;
+}
+
+int dt_ioppr_build_iccprofile_params_vk(const dt_iop_order_iccprofile_info_t *const profile_info,
+                                        const int devid,
+                                        dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+                                        float **_profile_lut_vk,
+                                        dt_vk_mem_t **_dev_profile_info,
+                                        dt_vk_mem_t **_dev_profile_lut)
+{
+  int err = 0;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk =
+    calloc(1, sizeof(dt_colorspaces_iccprofile_info_vk_t));
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL;
+  dt_vk_mem_t *dev_profile_lut  = NULL;
+
+  if(profile_info)
+  {
+    _ioppr_get_profile_info_vk(profile_info, profile_info_vk);
+    profile_lut_vk = _ioppr_get_trc_vk(profile_info);
+
+    dev_profile_info = dt_vulkan_alloc_buffer(devid, sizeof(*profile_info_vk));
+    if(!dev_profile_info
+       || dt_vulkan_write_to_device(devid, dev_profile_info, profile_info_vk,
+                                    sizeof(*profile_info_vk)) != 0)
+    {
+      err = -1;
+      goto cleanup;
+    }
+
+    const size_t lut_bytes = sizeof(float) * 6 * profile_info->lutsize;
+    dev_profile_lut = dt_vulkan_alloc_buffer(devid, lut_bytes);
+    if(!dev_profile_lut
+       || (profile_lut_vk
+           && dt_vulkan_write_to_device(devid, dev_profile_lut, profile_lut_vk, lut_bytes) != 0))
+    {
+      err = -1;
+    }
+  }
+  else
+  {
+    // Placeholder for the no-profile branch — the kernel won't read
+    // the LUT in that case, but we still need a valid binding object.
+    profile_lut_vk = calloc(1, sizeof(float) * 6);
+    if(profile_lut_vk)
+    {
+      dev_profile_lut = dt_vulkan_alloc_buffer(devid, sizeof(float) * 6);
+      if(!dev_profile_lut
+         || dt_vulkan_write_to_device(devid, dev_profile_lut, profile_lut_vk,
+                                      sizeof(float) * 6) != 0)
+      {
+        err = -1;
+      }
+    }
+    else
+    {
+      err = -1;
+    }
+  }
+
+cleanup:
+  if(err)
+    dt_print(DT_DEBUG_PIPE,
+             "[dt_ioppr_build_iccprofile_params_vk] failed to allocate / upload profile buffers");
+  *_profile_info_vk  = profile_info_vk;
+  *_profile_lut_vk   = profile_lut_vk;
+  *_dev_profile_info = dev_profile_info;
+  *_dev_profile_lut  = dev_profile_lut;
+  return err;
+}
+
+void dt_ioppr_free_iccprofile_params_vk(dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+                                        float **_profile_lut_vk,
+                                        dt_vk_mem_t **_dev_profile_info,
+                                        dt_vk_mem_t **_dev_profile_lut,
+                                        const int devid)
+{
+  if(*_profile_info_vk)  free(*_profile_info_vk);
+  if(*_dev_profile_info) dt_vulkan_free_buffer(devid, *_dev_profile_info);
+  if(*_dev_profile_lut)  dt_vulkan_free_buffer(devid, *_dev_profile_lut);
+  if(*_profile_lut_vk)   free(*_profile_lut_vk);
+
+  *_profile_info_vk  = NULL;
+  *_profile_lut_vk   = NULL;
+  *_dev_profile_info = NULL;
+  *_dev_profile_lut  = NULL;
+}
+#endif
+
 #undef DT_IOP_ORDER_PROFILE
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
