@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 25 modules currently expose `process_vk`,
+**Per-module ports**: 26 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -212,6 +212,7 @@ in three categories.
 | `src/iop/borders.c` | Multi-fill canvas + sub-region image copy. Uses `dt_vulkan_dispatch_n` (1 binding for fill, 2 for copy) and the two-entry-point multi-kernel pattern. |
 | `src/iop/colisa.c` | First LUT-on-storage-buffer port — uploads two 65536-entry tables freshly per dispatch and binds them at descriptors 2/3 alongside the in/out buffers. Pattern blueprint for `tonecurve`, `rgbcurve`, `rgblevels`, `basecurve`, … |
 | `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. The host-side colour-space transform that fills `tmp` is still CPU-side pending a Vulkan port of `dt_ioppr_transform_image_colorspace_rgb`. |
+| `src/iop/basicadj.c` | Exercises both arms of the §5.11 plumbing: `vk_get_rgb_matrix_luminance` for the highlight-compression branch + `vk_dt_rgb_norm` for the preserve-colors branch. 6-binding dispatch (in, out, gamma LUT, contrast LUT, profile_info, profile_lut); 8 ints + 10 floats of push constants drive the six independent sub-features (exposure, hlcompr, gamma, plain contrast, preserve-colors contrast, saturation+vibrance). Auto-exposure metering still runs CPU-side as in `process_cl` — the kernel only handles the static-parameter dispatch. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -258,9 +259,11 @@ runs against a real RAW are deferred to CI.
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
   variants, push-constant-only), `colorbalancergb`, `colorout` (3
-  LUTs), `censorize`, `filmic` (1 LUT + scalars). `basicadj`,
-  `rgblevels`, `rgbcurve` use the §5.11 ICC profile plumbing.
-  Each is ~50 LOC module + ~80 LOC kernel.
+  LUTs), `censorize`, `filmic` (1 LUT + scalars). `rgblevels`,
+  `rgbcurve` use the §5.11 ICC profile plumbing. Each is ~50 LOC
+  module + ~80 LOC kernel. Done in earlier passes: `basicadj`
+  (second consumer of the §5.11 plumbing; full 6-feature ICC-aware
+  kernel).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`, `shadhi`. The
@@ -888,7 +891,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   25 modules now expose `process_vk`, covering the simple per-pixel
+   26 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -896,8 +899,8 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    vignette, relight), the first sub-region + multi-fill module
    (borders), the first pass-through HAL-only module (mask_manager),
    the first LUT-on-storage-buffer port (colisa), and the first
-   ICC-profile-aware port (overexposed). All are bit-equal to their
-   OpenCL counterparts for the supported paths.
+   two ICC-profile-aware ports (overexposed, basicadj). All are
+   bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
