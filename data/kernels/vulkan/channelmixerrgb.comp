@@ -15,19 +15,31 @@ layout(std430, binding = 0) readonly buffer In  { vec4 data[];  } in_buf;
 layout(std430, binding = 1)          buffer Out { vec4 data[];  } out_buf;
 layout(std430, binding = 2) readonly buffer Mat { float data[]; } mat_buf;
 
+// Scalar layout (no vec4 padding) so this matches the C-side
+// vk_chmix_pc_t byte-for-byte: 5 ints + 2 floats + 4 float[4] arrays =
+// 92 bytes. Using vec4 here forces std430 16-byte alignment and
+// silently shifts illuminant from offset 28 to offset 32, corrupting
+// every read from this PC block under the glslang fallback path.
 layout(push_constant) uniform PC {
-    int width;
-    int height;
-    int version;
-    int clip;
-    int apply_grey;
+    int   width;
+    int   height;
+    int   version;
+    int   clip;
+    int   apply_grey;
     float p;
     float gamut;
-    vec4 illuminant;
-    vec4 saturation;
-    vec4 lightness;
-    vec4 grey;
+    float illuminant[4];
+    float saturation[4];
+    float lightness[4];
+    float grey[4];
 } pc;
+
+// Helpers to read the float[4] arrays back as vec4s — keeps the rest
+// of the kernel body unchanged.
+vec4 pc_illuminant(void) { return vec4(pc.illuminant[0], pc.illuminant[1], pc.illuminant[2], pc.illuminant[3]); }
+vec4 pc_saturation(void) { return vec4(pc.saturation[0], pc.saturation[1], pc.saturation[2], pc.saturation[3]); }
+vec4 pc_lightness(void)  { return vec4(pc.lightness[0],  pc.lightness[1],  pc.lightness[2],  pc.lightness[3]); }
+vec4 pc_grey(void)       { return vec4(pc.grey[0],       pc.grey[1],       pc.grey[2],       pc.grey[3]); }
 
 const float NORM_MIN       = 1.52587890625e-05;
 const float INVERSE_SQRT_3 = 0.5773502691896258;
@@ -149,18 +161,18 @@ void main() {
     RGB.w = 0.0;
     if (pc.clip != 0) RGB = max(RGB, vec4(0.0));
 
-    vec4 XYZ = chroma_adapt_bradford(RGB, pc.illuminant, pc.p, false);
+    vec4 XYZ = chroma_adapt_bradford(RGB, pc_illuminant(), pc.p, false);
     if (pc.clip != 0) XYZ = max(XYZ, vec4(0.0));
     XYZ = gamut_mapping(XYZ, pc.gamut, pc.clip != 0);
 
     vec4 LMS = XYZ_to_bradford_LMS(XYZ);
     if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
-    LMS = luma_chroma(LMS, pc.saturation, pc.lightness, pc.version);
+    LMS = luma_chroma(LMS, pc_saturation(), pc_lightness(), pc.version);
     if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
 
     vec4 RGB_out;
     if (pc.apply_grey != 0) {
-        float grey_mix = max(dot(LMS, pc.grey), 0.0);
+        float grey_mix = max(dot(LMS, pc_grey()), 0.0);
         RGB_out = vec4(grey_mix, grey_mix, grey_mix, pix_in.w);
     } else {
         XYZ = bradford_LMS_to_XYZ(LMS);
