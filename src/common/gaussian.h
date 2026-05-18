@@ -135,6 +135,50 @@ static inline int dt_gaussian_mean_blur_cl(const int devid,
 }
 #endif
 
+// Vulkan recursive Gaussian. Mirrors the OpenCL surface above but
+// operates on flat float4 storage buffers and runs row-then-column
+// instead of column+transpose (the transpose would need workgroup-
+// local memory plumbing we don't have yet, and the IIR cost
+// dominates the per-pixel walk regardless of dispatch shape).
+//
+// Only the 4-channel path is wired up for now — the modules that
+// need 1- or 2-channel Gaussian blur (a small minority) stay on
+// OpenCL/CPU until the kernel set grows.
+#include "common/vulkan.h"
+
+typedef struct dt_gaussian_vk_t
+{
+  int width, height;
+  float sigma;
+  int order;
+  float max[4], min[4];
+  dt_vk_mem_t *dev_temp1;
+  dt_vk_mem_t *dev_temp2;
+} dt_gaussian_vk_t;
+
+#ifdef HAVE_VULKAN
+dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height,
+                                      const float *max, const float *min,
+                                      float sigma, int order);
+
+/** Blur dev_in (binding 0, float4-per-pixel, sized width*height) into
+ *  dev_out using the two internal scratch buffers. dev_in and dev_out
+ *  may alias. Returns 0 on success or -1 if Vulkan isn't running /
+ *  the kernels aren't loaded / dispatch failed. */
+int dt_gaussian_blur_vk(dt_gaussian_vk_t *g,
+                        dt_vk_mem_t *dev_in,
+                        dt_vk_mem_t *dev_out);
+
+void dt_gaussian_free_vk(dt_gaussian_vk_t *g);
+#else
+static inline dt_gaussian_vk_t *dt_gaussian_init_vk(int w, int h, const float *mx,
+                                                    const float *mn, float s, int o)
+{ (void)w; (void)h; (void)mx; (void)mn; (void)s; (void)o; return NULL; }
+static inline int dt_gaussian_blur_vk(dt_gaussian_vk_t *g, dt_vk_mem_t *i, dt_vk_mem_t *o)
+{ (void)g; (void)i; (void)o; return -1; }
+static inline void dt_gaussian_free_vk(dt_gaussian_vk_t *g) { (void)g; }
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
