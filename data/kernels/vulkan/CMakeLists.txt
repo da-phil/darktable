@@ -44,6 +44,7 @@ set(VK_KERNELS
     temperature:whitebalance_4f
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
+    borders:borders_fill
     graduatednd:graduatednd
     relight:relight
     vignette:vignette

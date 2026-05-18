@@ -1,0 +1,35 @@
+// GLSL fallback for borders.cl. glslang exports one kernel per .spv,
+// so we ship borders_fill here (the dominant cost) — borders_copy
+// runs only once per dispatch and can fall back to OpenCL/CPU under
+// glslang-only builds without losing the framing effect (the inner
+// image is just absent).
+//
+// Push-constant layout matches the clspv path byte-for-byte at
+// 40 bytes (6 ints + 4 floats, no vec4 padding holes).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   out_width;
+    int   out_height;
+    int   dst_x;
+    int   dst_y;
+    int   region_w;
+    int   region_h;
+    float color_r;
+    float color_g;
+    float color_b;
+    float color_a;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.region_w || y >= pc.region_h) return;
+    int ox = pc.dst_x + x;
+    int oy = pc.dst_y + y;
+    if (ox >= pc.out_width || oy >= pc.out_height) return;
+    out_buf.data[oy * pc.out_width + ox] = vec4(pc.color_r, pc.color_g, pc.color_b, pc.color_a);
+}
