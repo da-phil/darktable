@@ -45,6 +45,7 @@ set(VK_KERNELS
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
     borders:borders_fill
+    colisa:colisa
     graduatednd:graduatednd
     relight:relight
     vignette:vignette
