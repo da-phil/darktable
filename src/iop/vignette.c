@@ -24,6 +24,7 @@
 #include "common/math.h"
 #include "common/opencl.h"
 #include "common/tea.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
@@ -103,6 +104,7 @@ typedef struct dt_iop_vignette_data_t
 typedef struct dt_iop_vignette_global_data_t
 {
   int kernel_vignette;
+  dt_vk_module_kernel_t vk;
 } dt_iop_vignette_global_data_t;
 
 
@@ -947,12 +949,119 @@ int process_cl(dt_iop_module_t *self,
 #endif
 
 
+#ifdef HAVE_VULKAN
+// Push-constant layout matches vignette.cl / vignette.comp byte-for-byte
+// (3 ints + 11 floats = 56 bytes, well inside the 128-byte push-constant
+// budget).
+typedef struct
+{
+  int   width;
+  int   height;
+  float scale_x;
+  float scale_y;
+  float roi_center_x;
+  float roi_center_y;
+  float expt_x;
+  float expt_y;
+  float dscale;
+  float fscale;
+  float brightness;
+  float saturation;
+  float dither;
+  int   unbound;
+} vk_vign_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_vignette_data_t *data = piece->data;
+  const dt_iop_vignette_global_data_t *gd = self->global_data;
+  const dt_iop_roi_t *buf_in = &piece->buf_in;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const dt_iop_vector_2d_t buf_center = { buf_in->width * .5f, buf_in->height * .5f };
+  const dt_iop_vector_2d_t vignette_center =
+    { buf_center.x + data->center.x * buf_in->width / 2.0,
+      buf_center.y + data->center.y * buf_in->height / 2.0 };
+  const dt_iop_vector_2d_t roi_center =
+    { vignette_center.x * roi_in->scale - roi_in->x,
+      vignette_center.y * roi_in->scale - roi_in->y };
+
+  float xscale, yscale;
+  if(data->autoratio)
+  {
+    xscale = 2.0 / (buf_in->width * roi_out->scale);
+    yscale = 2.0 / (buf_in->height * roi_out->scale);
+  }
+  else
+  {
+    const float basis = 2.0 / (MAX(buf_in->height, buf_in->width) * roi_out->scale);
+    if(data->whratio <= 1.0)
+    {
+      yscale = basis;
+      xscale = yscale / data->whratio;
+    }
+    else
+    {
+      xscale = basis;
+      yscale = xscale / (2.0 - data->whratio);
+    }
+  }
+  const float dscale = data->scale / 100.0;
+  const float min_falloff = 100.0 / MIN(buf_in->width, buf_in->height);
+  const float fscale = MAX(data->falloff_scale, min_falloff) / 100.0;
+  const float shape = MAX(data->shape, 0.001);
+  const float exp1 = 2.0 / shape;
+  const float exp2 = shape / 2.0;
+
+  float dither = 0.0f;
+  switch(data->dithering)
+  {
+    case DITHER_8BIT:  dither = 1.0f / 256;    break;
+    case DITHER_16BIT: dither = 1.0f / 65536;  break;
+    case DITHER_OFF:
+    default:           dither = 0.0f;
+  }
+
+  const vk_vign_pc_t pc = {
+    .width        = width,
+    .height       = height,
+    .scale_x      = xscale,
+    .scale_y      = yscale,
+    .roi_center_x = roi_center.x * xscale,
+    .roi_center_y = roi_center.y * yscale,
+    .expt_x       = exp1,
+    .expt_y       = exp2,
+    .dscale       = dscale,
+    .fscale       = fscale,
+    .brightness   = data->brightness,
+    .saturation   = data->saturation,
+    .dither       = dither,
+    .unbound      = data->unbound,
+  };
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  width, height, &pc, sizeof(pc));
+}
+#endif
+
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 8; // extended.cl from programs.conf
   dt_iop_vignette_global_data_t *gd = malloc(sizeof(dt_iop_vignette_global_data_t));
   self->data = gd;
   gd->kernel_vignette = dt_opencl_create_kernel(program, "vignette");
+  // 3 ints + 11 floats = 56 bytes; matches vk_vign_pc_t and the push
+  // constant block in vignette.cl / vignette.comp.
+  const uint32_t pcsize = 3 * sizeof(int) + 11 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "vignette", "vignette",
+                               2, pcsize, 16, 16, 1);
 }
 
 
@@ -960,6 +1069,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_vignette_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_vignette);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }

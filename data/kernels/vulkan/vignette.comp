@@ -1,0 +1,97 @@
+// GLSL fallback for vignette.cl. Mirrors the OpenCL kernel
+// byte-for-byte including the inlined TEA cipher / TPDF dither
+// generator.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+// Push-constant scalars in source order (no vec4 alignment padding).
+// 2 ints + 12 floats = 56 bytes — matches the C-side vk_vign_pc_t.
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float scale_x;
+    float scale_y;
+    float roi_center_x;
+    float roi_center_y;
+    float expt_x;
+    float expt_y;
+    float dscale;
+    float fscale;
+    float brightness;
+    float saturation;
+    float dither;
+    int   unbound;
+} pc;
+
+const float M_PI_F = 3.14159265358979323846;
+
+void encrypt_tea(inout uint v0, inout uint v1) {
+    const uint key0 = 0xa341316cu;
+    const uint key1 = 0xc8013ea4u;
+    const uint key2 = 0xad90777du;
+    const uint key3 = 0x7e95761eu;
+    const uint delta = 0x9e3779b9u;
+    uint sum = 0u;
+    for (int i = 0; i < 8; i++) {
+        sum += delta;
+        v0 += ((v1 << 4) + key0) ^ (v1 + sum) ^ ((v1 >> 5) + key1);
+        v1 += ((v0 << 4) + key2) ^ (v0 + sum) ^ ((v0 >> 5) + key3);
+    }
+}
+
+float tpdf(uint urandom) {
+    float frandom = float(urandom) / float(0xFFFFFFFFu);
+    return (frandom < 0.5)
+        ? (sqrt(2.0 * frandom) - 1.0)
+        : (1.0 - sqrt(2.0 * (1.0 - frandom)));
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int i = y * pc.width + x;
+
+    uint t0 = uint(y * pc.width + x);
+    uint t1 = 0u;
+    encrypt_tea(t0, t1);
+
+    float pvx = abs(float(x) * pc.scale_x - pc.roi_center_x);
+    float pvy = abs(float(y) * pc.scale_y - pc.roi_center_y);
+    float cplen = pow(pow(pvx, pc.expt_x) + pow(pvy, pc.expt_x), pc.expt_y);
+
+    float weight = 0.0;
+    float dith = 0.0;
+    if (cplen >= pc.dscale) {
+        weight = (cplen - pc.dscale) / pc.fscale;
+        dith = (weight <= 1.0 && weight >= 0.0) ? pc.dither * tpdf(t0) : 0.0;
+        weight = (weight >= 1.0) ? 1.0
+               : ((weight <= 0.0) ? 0.0
+                                  : 0.5 - cos(M_PI_F * weight) / 2.0);
+    }
+
+    vec4 pixel = in_buf.data[i];
+    if (weight > 0.0) {
+        float falloff = (pc.brightness < 0.0)
+                          ? 1.0 + (weight * pc.brightness)
+                          : weight * pc.brightness;
+        if (pc.brightness < 0.0) {
+            pixel.xyz = pixel.xyz * falloff + vec3(dith);
+        } else {
+            pixel.xyz = pixel.xyz + vec3(falloff + dith);
+        }
+        if (pc.unbound == 0) {
+            pixel.xyz = clamp(pixel.xyz, vec3(0.0), vec3(1.0));
+        }
+        float mv = (pixel.x + pixel.y + pixel.z) / 3.0;
+        float wss = weight * pc.saturation;
+        pixel.xyz = pixel.xyz - (vec3(mv) - pixel.xyz) * wss;
+        if (pc.unbound == 0) {
+            pixel.xyz = clamp(pixel.xyz, vec3(0.0), vec3(1.0));
+        }
+    }
+    out_buf.data[i] = pixel;
+}

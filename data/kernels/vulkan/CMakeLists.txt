@@ -45,6 +45,7 @@ set(VK_KERNELS
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
     graduatednd:graduatednd
+    vignette:vignette
     splittoning:splittoning
     zonesystem:zonesystem
     levels:levels
