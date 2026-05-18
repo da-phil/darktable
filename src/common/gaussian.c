@@ -1125,6 +1125,114 @@ void dt_gaussian_free_cl_global(dt_gaussian_cl_global_t *g)
 }
 
 #endif
+
+// ---- Vulkan recursive Gaussian -----------------------------------
+//
+// The two kernels share a 72-byte push-constant block laid out as
+// vk_gauss_pc_t below. Both axes use the same Deriche coefficients
+// computed via _compute_gauss_params. The row pass writes into a
+// scratch buffer; the column pass reads it and writes to dev_out.
+//
+// Kernel handles are loaded lazily on first init_vk call and cached
+// in two module-level static slots — the Gaussian helper is invoked
+// from multiple IOPs, so amortising the program load across all of
+// them avoids repeated SPV reads.
+
+#ifdef HAVE_VULKAN
+typedef struct vk_gauss_pc_t
+{
+  int   width;
+  int   height;
+  float a0, a1, a2, a3;
+  float b1, b2;
+  float coefp, coefn;
+  float Labmax[4];
+  float Labmin[4];
+} vk_gauss_pc_t;
+
+static dt_vk_module_kernel_t _vk_gauss_row_4c = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gauss_col_4c = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_gauss_loaded = FALSE;
+
+static void _vk_gauss_ensure_kernels(void)
+{
+  if(_vk_gauss_loaded) return;
+  if(!dt_vulkan_running()) return;
+  const int prog = dt_vulkan_load_program_by_name("gaussian");
+  if(prog < 0) return;
+  const uint32_t pcs = sizeof(vk_gauss_pc_t);
+  dt_vulkan_module_kernel_create_from(&_vk_gauss_row_4c, prog,
+                                      "gaussian_row_4c", 2, pcs, 64, 1, 1);
+  dt_vulkan_module_kernel_create_from(&_vk_gauss_col_4c, prog,
+                                      "gaussian_column_4c", 2, pcs, 64, 1, 1);
+  _vk_gauss_loaded = TRUE;
+}
+
+dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height,
+                                      const float *max, const float *min,
+                                      float sigma, int order)
+{
+  if(!dt_vulkan_running()) return NULL;
+  _vk_gauss_ensure_kernels();
+
+  dt_gaussian_vk_t *g = calloc(1, sizeof(*g));
+  if(!g) return NULL;
+  g->width  = width;
+  g->height = height;
+  g->sigma  = sigma;
+  g->order  = order;
+  for(int k = 0; k < 4; k++) { g->max[k] = max[k]; g->min[k] = min[k]; }
+
+  const size_t bytes = (size_t)width * height * 4 * sizeof(float);
+  g->dev_temp1 = dt_vulkan_alloc_buffer(0, bytes);
+  g->dev_temp2 = dt_vulkan_alloc_buffer(0, bytes);
+  if(!g->dev_temp1 || !g->dev_temp2)
+  {
+    dt_gaussian_free_vk(g);
+    return NULL;
+  }
+  return g;
+}
+
+int dt_gaussian_blur_vk(dt_gaussian_vk_t *g,
+                        dt_vk_mem_t *dev_in,
+                        dt_vk_mem_t *dev_out)
+{
+  if(!g || !dev_in || !dev_out) return -1;
+  if(_vk_gauss_row_4c.kernel < 0 || _vk_gauss_col_4c.kernel < 0)
+    return -1;
+
+  float a0, a1, a2, a3, b1, b2, coefp, coefn;
+  _compute_gauss_params(g->sigma, g->order, &a0, &a1, &a2, &a3, &b1, &b2,
+                        &coefp, &coefn);
+
+  vk_gauss_pc_t pc = {
+    .width  = g->width,
+    .height = g->height,
+    .a0 = a0, .a1 = a1, .a2 = a2, .a3 = a3,
+    .b1 = b1, .b2 = b2,
+    .coefp = coefp, .coefn = coefn,
+  };
+  for(int k = 0; k < 4; k++) { pc.Labmax[k] = g->max[k]; pc.Labmin[k] = g->min[k]; }
+
+  // row pass: dev_in -> dev_temp1, dispatched 1D over `height`.
+  int rc = dt_vulkan_dispatch_inout(&_vk_gauss_row_4c, dev_in, g->dev_temp1,
+                                    g->height, 1, &pc, sizeof(pc));
+  if(rc != 0) return rc;
+
+  // column pass: dev_temp1 -> dev_out, dispatched 1D over `width`.
+  return dt_vulkan_dispatch_inout(&_vk_gauss_col_4c, g->dev_temp1, dev_out,
+                                  g->width, 1, &pc, sizeof(pc));
+}
+
+void dt_gaussian_free_vk(dt_gaussian_vk_t *g)
+{
+  if(!g) return;
+  dt_vulkan_free_buffer(0, g->dev_temp1);
+  dt_vulkan_free_buffer(0, g->dev_temp2);
+  free(g);
+}
+#endif
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
