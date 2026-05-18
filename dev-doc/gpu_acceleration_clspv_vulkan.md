@@ -250,13 +250,13 @@ runs against a real RAW are deferred to CI.
   storage-buffer LUT or two (covered by the LUT pattern §5.8):
   `tonecurve`, `rgbcurve`, `rgblevels`. Each lifts off the
   existing colisa port template (~30 LOC module + ~50 LOC kernel).
-  `monochrome` needs the bilateral filter VK port first (multi-
-  input dependency). `rawoverexposed` is RAW-only and likely stays
-  on OpenCL. Done in earlier passes: `colisa`, `levels`,
-  `profile_gamma`, `zonesystem`, `splittoning` (added RGB↔HSL
-  helpers to `dt_vulkan_common.h`), `overexposed` (first consumer
-  of ICC profile plumbing §5.11), `lowlight` (template for the
-  next LUT consumers).
+  `monochrome` can now port via the bilateral helper (§5.13).
+  `rawoverexposed` is RAW-only and likely stays on OpenCL. Done in
+  earlier passes: `colisa`, `levels`, `profile_gamma`,
+  `zonesystem`, `splittoning` (added RGB↔HSL helpers to
+  `dt_vulkan_common.h`), `overexposed` (first consumer of ICC
+  profile plumbing §5.11), `lowlight` (template for the next LUT
+  consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
@@ -274,12 +274,12 @@ runs against a real RAW are deferred to CI.
   plumbing for the cache-friendly kernels. Done in earlier passes:
   `graduatednd`, `vignette`, `relight`, `borders` (multi-fill +
   sub-region copy, §5.9).
-- **HARD** — atrous, bilat, bloom, denoiseprofile, filmicrgb,
+- **HARD** — atrous, bloom, denoiseprofile, filmicrgb,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
   basecurve (full variants), colorreconstruction (atomics). Multi-
-  kernel pipelines or per-warp reductions. Most also need the
-  bilateral-filter VK helper before the host orchestration can be
-  ported.
+  kernel pipelines or per-warp reductions. `lowpass`, `censorize`,
+  `shadhi`, `retouch`, `monochrome`, `globaltonemap` can now build
+  on the bilateral helper (§5.13) for their grid-based passes.
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
   clipping, crop), liquify, overlay, rasterfile, colorin. These
   need the sampled-image + sampler bindings (§5.2 milestone 5) and
@@ -718,6 +718,78 @@ have not been ported yet — they're additional entry points in the
 same `.spv` module that we'd wire up the same way when a consumer
 needs them.
 
+### 5.13 Bilateral filter helper (`dt_bilateral_*_vk`)
+
+`src/common/bilateralvk.{c,h}` ship a Vulkan equivalent of the
+existing `dt_bilateral_*_cl` surface used by `lowpass`,
+`censorize`, `shadhi`, `retouch`, `monochrome`, `globaltonemap` and
+several other modules: 3-D-grid bilateral filtering of the L
+channel of a Lab buffer.
+
+```c
+dt_bilateral_vk_t *b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+dt_bilateral_splat_vk(b, dev_in);
+dt_bilateral_blur_vk(b);
+dt_bilateral_slice_vk(b, dev_in, dev_out, detail);
+dt_bilateral_free_vk(b);
+```
+
+The kernels live as six separate `.cl` / `.comp` pairs under
+`data/kernels/vulkan/`:
+
+| Entry                          | Bindings | PC bytes |
+|--------------------------------|---------:|---------:|
+| `bilateral_zero`               |        1 |        8 |
+| `bilateral_splat`              |        2 |       28 |
+| `bilateral_blur_line`          |        2 |       24 |
+| `bilateral_blur_line_z`        |        2 |       24 |
+| `bilateral_slice`              |        3 |       32 |
+| `bilateral_slice_to_output`    |        4 |       32 |
+
+Splitting each entry into its own `.spv` (rather than the multi-
+entry-in-one-module pattern used by channelmixerrgb) is deliberate:
+the glslang fallback path can only emit one entry per build, so
+modules that consume the whole bilateral pipeline need all six
+kernels available on glslang-only systems. The clspv path still
+compiles each `.cl` separately too — the storage cost is six tiny
+`.spv` files (~5 KB each) instead of one ~25 KB blob.
+
+The host helper sizes the grid via `dt_bilateral_grid_size` from
+`src/common/bilateral.c` — same `L_range = 100` convention and
+clamps as the CL backend, so VK and CL produce bit-equal grids for
+matching sigma inputs. Two device-local buffers are allocated up
+front (`dev_grid` and `dev_grid_tmp`) so the three blur passes can
+ping-pong without per-pass reallocations. The zero kernel runs
+once at init via a 2-D dispatch over `(size_x, size_y * size_z)`.
+
+**Splat correctness vs splat performance** — the OpenCL splat
+kernel uses workgroup-local memory to reduce atomic contention
+before the global `atomic_add_f`. The Vulkan port currently does
+direct `vk_atomic_add_f` per work-item × 8 grid cells (no local-
+memory reduction). This is correct but slower under heavy
+contention — adjacent pixels that map to the same grid cell pay
+CAS-loop retries. Local-memory reduction is a planned follow-up;
+the current form is the "correctness scaffold before optimisation"
+shape.
+
+**`vk_atomic_add_f`** — added to `dt_vulkan_common.h`. CAS loop on
+the `uint` reinterpretation of the float (same shape as
+`data/kernels/common.h::atomic_add_f` minus the NVIDIA-PTX fast
+path). The GLSL fallback inlines the equivalent loop with
+`atomicCompSwap` on a `uint`-aliased grid buffer (the splat `.comp`
+file).
+
+No darktable-global state — the six kernel slots live in static
+`dt_vk_module_kernel_t` slots in `bilateralvk.c`, loaded lazily on
+first `dt_bilateral_init_vk` call, same pattern as
+`dt_gaussian_*_vk` (§5.10) and the colorspaces helper (§5.12).
+
+`dt_bilateral_*_vk` returns -1 on any failure (Vulkan not running,
+kernel load failed, dispatch error). Callers should always check
+return values and fall through to `dt_bilateral_*_cl` /
+`dt_bilateral_*` (CPU) on -1, in the same shape as the existing
+CPU/OpenCL fallback pattern in `lowpass` / `shadhi` / `retouch`.
+
 ## 6. Per-OS picture
 
 ### Linux
@@ -964,12 +1036,14 @@ a `USE_*` option; see the inline `case` in `build.sh`).
     Worked example in `src/iop/colisa.c`; template for the remaining
     curve-based colour modules (`tonecurve`, `rgbcurve`, `rgblevels`,
     `basecurve`, `lowlight`, …).
-4e. ⏳ **Bilateral filter helper** — pending. Required for the
-    bilateral branch of lowpass / censorize / shadhi / retouch and
-    for monochrome's bilat-based base layer. The OpenCL build uses a
-    3D-grid splat / blur / slice pipeline (`src/common/bilateralcl.c`,
-    several hundred lines); the Vulkan port mirrors the Gaussian
-    helper's shape but with a multi-pass kernel chain.
+4e. ✅ **Bilateral filter helper** (landed; see §5.13).
+    `dt_bilateral_*_vk` 3-D splat / blur / slice pipeline as 6
+    separate `.spv` modules + `vk_atomic_add_f` CAS-loop helper.
+    Substrate for porting `lowpass`, `censorize`, `shadhi`,
+    `retouch`, `monochrome`, `globaltonemap` (each also needs at
+    least one of: LUT plumbing, work-profile struct plumbing). The
+    splat kernel ships the simple direct-atomic form first; local-
+    memory reduction is a planned perf follow-up.
 4f. ✅ **ICC profile info storage-buffer plumbing** (landed; see
     §5.11). `vk_dt_colorspaces_iccprofile_info_t` storage buffer +
     flat 6·lutsize tone-curve LUT, with `vk_lerp_lookup_unbounded` /

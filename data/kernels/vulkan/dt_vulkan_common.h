@@ -408,6 +408,34 @@ static inline float vk_dt_rgb_norm(const float4 in, const int norm, const int wo
   return (in.x + in.y + in.z) / 3.0f;
 }
 
+// ---- atomic float add (CAS-loop flavour) ----------------------------
+//
+// Vulkan / SPIR-V 1.3 doesn't guarantee a native atomicAdd(float, float)
+// on storage buffers; VK_EXT_shader_atomic_float lifts that but we
+// can't rely on the extension on every target driver. The CAS loop
+// on the uint reinterpretation of the float is the portable form
+// (same pattern as data/kernels/common.h::atomic_add_f minus the
+// NVIDIA-PTX fast path), and is what the bilateral splat kernel
+// needs to accumulate contributions from many work-items into the
+// same 3-D grid cell.
+//
+// `val` must point at storage-buffer (global) memory.
+
+static inline void vk_atomic_add_f(global float *val, const float delta)
+{
+  global volatile uint *ival = (global volatile uint *)val;
+  uint old_i = *ival;
+  union { float f; uint i; } u;
+  while(1)
+  {
+    u.i = old_i;
+    u.f += delta;
+    const uint witness = atomic_cmpxchg(ival, old_i, u.i);
+    if(witness == old_i) break;
+    old_i = witness;
+  }
+}
+
 // RGB <-> HSL — needed by splittoning et al. Matches the OpenCL
 // implementations in data/kernels/colorspace.h byte-for-byte.
 

@@ -58,7 +58,13 @@ set(VK_KERNELS
     overexposed:overexposed
     basicadj:basicadj
     colorspaces:colorspaces_transform_rgb_matrix_to_rgb
-    lowlight:lowlight)
+    lowlight:lowlight
+    bilateral_zero:bilateral_zero
+    bilateral_splat:bilateral_splat
+    bilateral_blur_line:bilateral_blur_line
+    bilateral_blur_line_z:bilateral_blur_line_z
+    bilateral_slice:bilateral_slice
+    bilateral_slice_to_output:bilateral_slice_to_output)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
