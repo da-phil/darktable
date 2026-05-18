@@ -1,0 +1,66 @@
+// GLSL fallback for bilateral_splat.cl. See the .cl header for
+// design notes. Uses atomicCompSwap on a uint-aliased grid buffer
+// to implement atomic add on float (the bitwise-equivalent of the
+// vk_atomic_add_f helper in dt_vulkan_common.h).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Grid { uint data[]; } grid_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   size_x;
+    int   size_y;
+    int   size_z;
+    float sigma_s;
+    float sigma_r;
+} pc;
+
+void atomic_add_f(int idx, float delta) {
+    uint old_i = grid_buf.data[idx];
+    while(true) {
+        float f = uintBitsToFloat(old_i);
+        uint new_i = floatBitsToUint(f + delta);
+        uint witness = atomicCompSwap(grid_buf.data[idx], old_i, new_i);
+        if(witness == old_i) break;
+        old_i = witness;
+    }
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+
+    vec4 pixel = in_buf.data[y * pc.width + x];
+    float L = pixel.x;
+
+    float gx = clamp(float(x) / pc.sigma_s, 0.0, float(pc.size_x - 1));
+    float gy = clamp(float(y) / pc.sigma_s, 0.0, float(pc.size_y - 1));
+    float gz = clamp(L         / pc.sigma_r, 0.0, float(pc.size_z - 1));
+
+    int xi = min(pc.size_x - 2, int(gx));
+    int yi = min(pc.size_y - 2, int(gy));
+    int zi = min(pc.size_z - 2, int(gz));
+    float fx = gx - float(xi);
+    float fy = gy - float(yi);
+    float fz = gz - float(zi);
+
+    int ox = 1;
+    int oy = pc.size_x;
+    int oz = pc.size_y * pc.size_x;
+    int gi0 = xi + oy * yi + oz * zi;
+
+    float contrib = 100.0 / (pc.sigma_s * pc.sigma_s);
+    atomic_add_f(gi0,                 contrib * (1.0 - fx) * (1.0 - fy) * (1.0 - fz));
+    atomic_add_f(gi0 + ox,            contrib * (      fx) * (1.0 - fy) * (1.0 - fz));
+    atomic_add_f(gi0 + oy,            contrib * (1.0 - fx) * (      fy) * (1.0 - fz));
+    atomic_add_f(gi0 + oy + ox,       contrib * (      fx) * (      fy) * (1.0 - fz));
+    atomic_add_f(gi0 + oz,            contrib * (1.0 - fx) * (1.0 - fy) * (      fz));
+    atomic_add_f(gi0 + oz + ox,       contrib * (      fx) * (1.0 - fy) * (      fz));
+    atomic_add_f(gi0 + oz + oy,       contrib * (1.0 - fx) * (      fy) * (      fz));
+    atomic_add_f(gi0 + oz + oy + ox,  contrib * (      fx) * (      fy) * (      fz));
+}
