@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: this PR ships `process_vk` for **13 modules**,
+**Per-module ports**: 24 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -201,6 +201,16 @@ in three categories.
 | `src/iop/negadoctor.c` | Analogue-film inversion + gamma in a single pass. |
 | `src/iop/primaries.c` | 3×4 ICC matrix transform applied per pixel. |
 | `src/iop/temperature.c` | All 3 paths ported: 4f (post-demosaic), 1f Bayer, 1f X-Trans. RAW pre-demosaic is single-channel; we dispatch a `float`-buffer kernel for those and a `float4`-buffer kernel for the 4f variant. |
+| `src/iop/splittoning.c` | RGB↔HSL split-shadow / highlight tinting. |
+| `src/iop/zonesystem.c` | Lab L*-zone clamping. |
+| `src/iop/levels.c` | Single-curve histogram remap. |
+| `src/iop/profile_gamma.c` | LOG and GAMMA modes. |
+| `src/iop/graduatednd.c` | Both density signs (positive divide, negative multiply) folded into one entry point with a uniform-branch on the sign of `density`. |
+| `src/iop/vignette.c` | Radial darkening/brightening with inlined TEA-cipher dither and TPDF noise (helpers private to this kernel). |
+| `src/iop/relight.c` | Gaussian-windowed Lab fill-light / shadow on L. |
+| `src/iop/mask_manager.c` | Pass-through dummy IOP; uses `dt_vulkan_copy_device_to_device` rather than a kernel. |
+| `src/iop/borders.c` | Multi-fill canvas + sub-region image copy. Uses `dt_vulkan_dispatch_n` (1 binding for fill, 2 for copy) and the two-entry-point multi-kernel pattern. |
+| `src/iop/colisa.c` | First LUT-on-storage-buffer port — uploads two 65536-entry tables freshly per dispatch and binds them at descriptors 2/3 alongside the in/out buffers. Pattern blueprint for `tonecurve`, `rgbcurve`, `rgblevels`, `basecurve`, … |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -234,14 +244,16 @@ runs against a real RAW are deferred to CI.
 **What's left** (from the 70 surveyed `process_cl` modules):
 
 - **TRIVIAL bucket** still to port. Examples that need only a
-  storage-buffer LUT (3rd binding, covered by
-  `dt_vulkan_dispatch_inout_lut`): `tonecurve`, `rgbcurve`,
-  `rgblevels`, `levels`, `profile_gamma`, `colisa`, `lowlight`,
-  `monochrome` (multi-input — needs separate work),
-  `zonesystem`, `splittoning` (needs RGB↔HSL helpers added to
-  `dt_vulkan_common.h`), `overexposed` (needs ICC profile lookups —
-  storage buffer plus the multi-mode kernel selection),
-  `rawoverexposed` (RAW-only — likely stays on OpenCL).
+  storage-buffer LUT or two (covered by the LUT pattern §5.8):
+  `tonecurve`, `rgbcurve`, `rgblevels`, `lowlight`. Each lifts off
+  the existing colisa port template (~30 LOC module + ~50 LOC
+  kernel). `monochrome` needs the bilateral filter VK port first
+  (multi-input dependency); `overexposed` needs the ICC profile
+  storage-buffer plumbing (work_profile luminance branch).
+  `rawoverexposed` is RAW-only and likely stays on OpenCL.
+  Done in earlier passes: `colisa`, `levels`, `profile_gamma`,
+  `zonesystem`, `splittoning` (added RGB↔HSL helpers to
+  `dt_vulkan_common.h`).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
@@ -249,20 +261,27 @@ runs against a real RAW are deferred to CI.
   LUTs), `censorize`, `filmic` (1 LUT + scalars). Each is ~50 LOC
   module + ~80 LOC kernel.
 - **MODERATE** — multi-pass with intermediate buffers or
-  local-memory barriers: `blurs`, `borders`, `colorchecker`,
-  `colorzones`, `graduatednd`, `sharpen`, `soften`, `vignette`,
-  `highpass`, `highlights`, `shadhi`, `relight`. The HAL needs
-  `dt_vulkan_alloc_image` (storage images) and a multi-dispatch
-  wrapper before these can land — that's milestone §8.5.
+  local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
+  `sharpen`, `soften`, `highpass`, `highlights`, `shadhi`. The
+  Gaussian VK helper (§5.10) handles the separable-blur half;
+  `sharpen` and the larger blurs still want workgroup-local-memory
+  plumbing for the cache-friendly kernels. Done in earlier passes:
+  `graduatednd`, `vignette`, `relight`, `borders` (multi-fill +
+  sub-region copy, §5.9).
 - **HARD** — atrous, bilat, bloom, denoiseprofile, filmicrgb,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
   basecurve (full variants), colorreconstruction (atomics). Multi-
-  kernel pipelines or per-warp reductions.
+  kernel pipelines or per-warp reductions. Most also need the
+  bilateral-filter VK helper before the host orchestration can be
+  ported.
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
-  clipping, crop, borders), liquify, mask_manager, overlay,
-  rasterfile, colorin. These need the sampled-image + sampler
-  bindings (§5.2 milestone 5) and in some cases full distort
-  pipelines.
+  clipping, crop), liquify, overlay, rasterfile, colorin. These
+  need the sampled-image + sampler bindings (§5.2 milestone 5) and
+  in some cases full distort pipelines. Done in earlier passes:
+  `borders` (without sampled images — used a sub-region copy
+  kernel instead), `mask_manager` (used the new
+  `dt_vulkan_copy_device_to_device` HAL primitive instead of a
+  kernel).
 
 See §8 for the staged milestone plan that gets us through these
 buckets without breaking the OpenCL coexistence.
@@ -451,6 +470,139 @@ in `data/kernels/common.h`), `idx2d`, `clampf`, `clampf4`,
 every `*.cl` keeps the per-kernel boilerplate consistent and makes
 behaviour drift between the kernels visible at one address.
 
+It also carries `vk_lookup` and `vk_lookup_unbounded` — the
+storage-buffer equivalents of the OpenCL `image2d_t`-backed
+`lookup` / `lookup_unbounded` in `color_conversion.h`. These take a
+flat 65536-entry float buffer (matching the OpenCL 256×256 layout)
+plus the linear-extrapolation coefficients as three scalars rather
+than a `constant float *` (clspv can't accept a private-pointer arg
+as `constant`, and push constants are the natural carrier).
+
+The RGB↔HSL helpers (`vk_RGB_to_HSL`, `vk_HSL_to_RGB`,
+`vk_hue_to_rgb`) and the Lab/XYZ/sRGB/ProPhoto matrices are also
+here. Keep additions to colour-space code byte-for-byte equivalent
+to the matching helpers in `data/kernels/colorspace.h`; the two
+files are an intentional duplicate that has to stay in sync.
+
+### 5.8 The LUT-on-storage-buffer pattern
+
+Curve-based colour modules (`tonecurve`, `rgbcurve`, `rgblevels`,
+`basecurve`, `colisa`, …) carry one or two 65536-entry per-channel
+look-up tables. In the OpenCL build these are 256×256 `image2d_t`
+LUTs sampled with `lookup_unbounded`; in the Vulkan port they're
+flat `global const float *` storage buffers bound at descriptors
+2..N alongside the standard in/out at 0..1.
+
+The canonical wiring (see `src/iop/colisa.c` for the worked
+example) is:
+
+```c
+// host side:
+dt_vk_mem_t *dev_ctable = dt_vulkan_alloc_buffer(0, sizeof(float) * 0x10000);
+dt_vulkan_write_to_device(0, dev_ctable, d->ctable, sizeof(float) * 0x10000);
+// … same for dev_ltable …
+dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_ctable, dev_ltable };
+int rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 4,
+                              width, height, &pc, sizeof(pc));
+dt_vulkan_free_buffer(0, dev_ctable);
+dt_vulkan_free_buffer(0, dev_ltable);
+```
+
+```c
+// kernel side (excerpt):
+kernel void X(global const float4 *in, global float4 *out,
+              global const float *ctable, global const float *ltable,
+              const int width, const int height,
+              const float ca0, const float ca1, const float ca2, …)
+{
+  // …
+  o.x = vk_lookup_unbounded(ctable, p.x / 100.0f, ca0, ca1, ca2);
+}
+```
+
+The three linear-extrapolation coefficients ride in push constants
+rather than a third storage buffer — they're scalars and a per-
+dispatch buffer allocation for 12 bytes isn't worth it.
+
+Today's implementation re-uploads the LUT on every dispatch.
+Curve params change at commit_params time, not per frame, so a
+piece-cached scratch buffer would let consecutive dispatches reuse
+the same upload — that's a future optimisation; the current
+fresh-upload-per-dispatch matches the OpenCL build's behaviour
+(see e.g. `colisa.c::process_cl`).
+
+### 5.9 Sub-region copy and multi-fill
+
+Modules that operate on a fraction of the output canvas (the framing
+module, mask compositors, history-anchor IOPs) need two primitives
+the simple `dispatch_inout` path doesn't cover: filling an
+arbitrary destination rectangle with a constant colour, and copying
+a source rectangle into an offset region of a larger destination
+buffer.
+
+Two complementary mechanisms exist:
+
+1. **Device-to-device buffer copy** (`dt_vulkan_copy_device_to_device`)
+   — a thin wrapper around `vkCmdCopyBuffer` for full-buffer
+   `dt_vk_mem_t* → dt_vk_mem_t*` transfers, no kernel needed. Used
+   by `mask_manager` (the entire OpenCL path was a single
+   `enqueue_copy_image`; the Vulkan equivalent is one
+   `vkCmdCopyBuffer` of the float4 pipe buffer).
+
+2. **Sub-region copy / fill kernels** (`borders.cl::borders_copy`,
+   `borders.cl::borders_fill`) — when the source or destination is
+   a strict subrectangle of a larger buffer, kernel-based copies and
+   fills are clearer than chains of `vkCmdCopyBuffer`s with per-row
+   `VkBufferCopy` regions. The OpenCL build dispatches the fill
+   kernel over the entire canvas and returns early outside the
+   target rectangle; the Vulkan port instead dispatches the kernel
+   exactly over the target rectangle (since buffer storage doesn't
+   get "early return outside region" for free — wasted work-items
+   are real cost). The kernel translates `(lid_x, lid_y)` into a
+   write at `(dst_x + lid_x, dst_y + lid_y)`.
+
+These two are deliberately separate APIs. `dt_vulkan_copy_device_to_device`
+is cheap (no SPIR-V to load, just a transfer command), and modules
+that just need a full-buffer pass-through copy shouldn't have to
+register a kernel program.
+
+### 5.10 Recursive Gaussian helper (`dt_gaussian_*_vk`)
+
+`src/common/gaussian.{c,h}` ship a Vulkan equivalent of the
+existing `dt_gaussian_*_cl` surface used by `lowpass`, `censorize`,
+`shadhi`, `retouch`, and several other modules: Deriche recursive
+IIR blur for arbitrary sigma. Shape:
+
+```c
+dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, max, min,
+                                          sigma, order);
+int rc = dt_gaussian_blur_vk(g, dev_in, dev_out);
+dt_gaussian_free_vk(g);
+```
+
+The OpenCL build runs column-blur + transpose + column-blur +
+transpose with a workgroup-local-memory transpose. The Vulkan port
+drops the transpose entirely and runs row-then-column blur with one
+work-item per row / column — the IIR recurrence is serial along its
+sweep axis anyway, so the natural parallelism granularity is one
+work-item per row/column, not per pixel. The local-memory transpose
+would be a meaningful speedup at large image sizes but needs
+clspv/glslang local-memory plumbing the HAL doesn't expose yet.
+
+The two kernels (`gaussian_row_4c`, `gaussian_column_4c`) live in
+one shared `.spv`. The host loads the program once and caches the
+kernel slots in module-level statics so every IOP that uses the
+helper amortises the SPV read across the process lifetime. Only the
+4-channel path is wired up so far; the OpenCL 1c/2c variants serve a
+small minority of modules and can be added on demand.
+
+`dt_gaussian_blur_vk` returns -1 on any failure (Vulkan not running,
+program load failed, dispatch error). Callers should always check
+the return value and fall through to `dt_gaussian_blur_cl` /
+`dt_gaussian_blur` (CPU) on -1, in the same shape as the existing
+CPU/OpenCL fallback pattern in the lowpass / shadhi / retouch
+modules.
+
 ## 6. Per-OS picture
 
 ### Linux
@@ -587,6 +739,53 @@ treated as success (the build-clean signal is still the main thing
 we care about at this stage). Non-zero, non-77 exit codes fail the
 matrix entry.
 
+### Testing a Vulkan kernel port
+
+The verification layers we exercise per port, smallest to largest:
+
+1. **SPIR-V validation at build time.** `data/kernels/vulkan/CMakeLists.txt`
+   pipes every produced `.spv` through `spirv-val` (when
+   `SPIRV_VAL_BIN` was found at configure time). Catches malformed
+   SPIR-V — typically caused by GLSL syntax errors or unsupported
+   intrinsics.
+
+2. **Push-constant layout cross-check.** After build, run
+   `spirv-dis <kernel>.spv | grep OpMemberDecorate` and confirm the
+   reported offsets match the C-side `vk_<module>_pc_t` struct
+   byte-for-byte. A mismatch silently corrupts kernel reads of push
+   constants — the build doesn't catch this, but a single
+   `spirv-dis` check does.
+
+3. **Library link check.** `cmake --build build --target <module>`
+   reproduces the per-module compile + link cycle (the same one the
+   pipelines load at runtime). Confirms the C-side `process_vk`
+   compiles, `dt_vk_module_kernel_t` field types are right, and
+   `dt_vulkan_*` calls resolve under both `HAVE_VULKAN={ON,OFF}`.
+
+4. **End-to-end dispatch on lavapipe.** Mesa ships a software Vulkan
+   ICD (`llvmpipe`) that works without any GPU. `vulkaninfo --summary`
+   shows it as `deviceType = PHYSICAL_DEVICE_TYPE_CPU`. The
+   `tools/vulkan_compute_poc/build/dt_vk_compute_poc` binary is the
+   reference dispatch harness — it loads a SPIR-V module, allocates
+   buffers, dispatches, and compares the result against a CPU
+   reference. The same harness can be pointed at any kernel module
+   under `data/kernels/vulkan/` with `--spv <path>.spv` and a
+   compatible push-constant struct; the existing build target uses
+   `basicadj_min.spv`.
+
+5. **Integration tests.** `src/tests/integration/` runs the full
+   darktable pipeline against reference RAW inputs and compares the
+   output via delta-E. Costlier (needs `darktable-cli` plus the
+   test image set) but is the only way to verify a port composes
+   correctly with the rest of the pipeline. Run with
+   `--disable-opencl` to force the CPU/Vulkan path; once
+   pixel-equality CI is in place this becomes the canonical
+   regression gate.
+
+The first three layers all run today in seconds and should be done
+on every change; the fourth is one extra command; the fifth is the
+gold standard but takes minutes.
+
 ### Developer convenience
 
 `build.sh` exposes the new options through the standard `--enable-X`
@@ -622,18 +821,46 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    on `dt_dev_pixelpipe_iop_t`, dispatch hook in
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
-4. ✅ **Module ports** (landed; see the §4.2 tables for which paths
-   each module covers): exposure, velvia, invert, vibrance,
-   colorcorrection, colorcontrast, colorize, flip, negadoctor,
-   primaries, temperature (4f + 1f Bayer + 1f X-Trans),
-   profile_gamma (LOG + GAMMA), splittoning, zonesystem, levels,
-   whitebalance_1f / 1f_xtrans, channelmixerrgb (all 5 adaptation
-   modes under clspv). All ports are bit-equal to their OpenCL
-   counterparts for the supported paths.
+4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
+   24 modules now expose `process_vk`, covering the simple per-pixel
+   bucket (exposure, velvia, invert, vibrance, colorcorrection,
+   colorcontrast, colorize, flip, negadoctor, primaries, temperature
+   ×3, profile_gamma ×2, splittoning, zonesystem, levels,
+   whitebalance_1f / 1f_xtrans, channelmixerrgb ×5, graduatednd,
+   vignette, relight), the first sub-region + multi-fill module
+   (borders), the first pass-through HAL-only module (mask_manager),
+   and the first LUT-on-storage-buffer port (colisa). All are
+   bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
-4b. ⏳ **diffuse multi-scale wavelet pipeline** (§8.9 below) —
+4b. ✅ **HAL-level device-to-device copy** (landed; see §5.9).
+    `dt_vulkan_copy_device_to_device` exposes the internal
+    `vkCmdCopyBuffer` machinery to pass-through modules — no SPIR-V
+    needed.
+4c. ✅ **Recursive Gaussian helper** (landed; see §5.10).
+    `dt_gaussian_*_vk` row-then-column IIR blur. Substrate for
+    porting lowpass, censorize, shadhi, retouch (each also needs at
+    least one of: LUT plumbing, work-profile struct plumbing,
+    bilateral helper).
+4d. ✅ **LUT-on-storage-buffer pattern** (landed; see §5.8).
+    Worked example in `src/iop/colisa.c`; template for the remaining
+    curve-based colour modules (`tonecurve`, `rgbcurve`, `rgblevels`,
+    `basecurve`, `lowlight`, …).
+4e. ⏳ **Bilateral filter helper** — pending. Required for the
+    bilateral branch of lowpass / censorize / shadhi / retouch and
+    for monochrome's bilat-based base layer. The OpenCL build uses a
+    3D-grid splat / blur / slice pipeline (`src/common/bilateralcl.c`,
+    several hundred lines); the Vulkan port mirrors the Gaussian
+    helper's shape but with a multi-pass kernel chain.
+4f. ⏳ **ICC profile info storage-buffer plumbing** — pending.
+    `dt_colorspaces_iccprofile_info_cl_t` (156-byte struct + tone-
+    curve LUT) currently passed as `constant` + image2d_t in OpenCL.
+    Vulkan equivalent: one storage buffer for the struct + one for
+    the LUT, with a `vk_get_rgb_matrix_luminance` helper added to
+    `dt_vulkan_common.h`. Unblocks `basicadj`, `overexposed`, and
+    the work-profile branches of several colour modules.
+4g. ⏳ **diffuse multi-scale wavelet pipeline** (§8.9 below) —
     pending. The OpenCL kernel chain (6 kernels × up to 10 scales ×
     N iterations) needs (a) the 6 kernel translations, (b) a
     multi-dispatch orchestration in process_vk, and (c) a batched-
