@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 27 modules currently expose `process_vk`,
+**Per-module ports**: 28 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -214,6 +214,7 @@ in three categories.
 | `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. Uses `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12) to do the current → histogram profile transform entirely on the GPU; only falls back to CPU when both profiles are non-matrix (lcms2-only). |
 | `src/iop/basicadj.c` | Exercises both arms of the §5.11 plumbing: `vk_get_rgb_matrix_luminance` for the highlight-compression branch + `vk_dt_rgb_norm` for the preserve-colors branch. 6-binding dispatch (in, out, gamma LUT, contrast LUT, profile_info, profile_lut); 8 ints + 10 floats of push constants drive the six independent sub-features (exposure, hlcompr, gamma, plain contrast, preserve-colors contrast, saturation+vibrance). Auto-exposure metering still runs CPU-side as in `process_cl` — the kernel only handles the static-parameter dispatch. |
 | `src/iop/lowlight.c` | Scotopic-luminance blend in Lab → XYZ → Lab; one user-driven 65536-entry blend curve + a 4-float scotopic white-point passed via push constants. 3-binding dispatch (in, out, lut); the Lab↔XYZ helpers come from `dt_vulkan_common.h`. Cheapest possible LUT-pattern port at ~70 LOC kernel + ~40 LOC module — useful as a template for the next batch of simple LUT consumers. |
+| `src/iop/monochrome.c` | First consumer of the bilateral helper (§5.13). Three-stage `process_vk`: `monochrome_filter` writes the chroma-distance weight into the output buffer; the bilateral helper (splat → blur → slice) smooths the weight into a scratch buffer; `monochrome` blends the original input with the smoothed weight and clears the chroma channels. Demonstrates the multi-kernel orchestration pattern that `lowpass` / `censorize` / `shadhi` / `retouch` / `globaltonemap` will follow. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -250,7 +251,8 @@ runs against a real RAW are deferred to CI.
   storage-buffer LUT or two (covered by the LUT pattern §5.8):
   `tonecurve`, `rgbcurve`, `rgblevels`. Each lifts off the
   existing colisa port template (~30 LOC module + ~50 LOC kernel).
-  `monochrome` can now port via the bilateral helper (§5.13).
+  `monochrome` is already ported as the first bilateral consumer
+  (§5.13).
   `rawoverexposed` is RAW-only and likely stays on OpenCL. Done in
   earlier passes: `colisa`, `levels`, `profile_gamma`,
   `zonesystem`, `splittoning` (added RGB↔HSL helpers to
@@ -1009,7 +1011,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   27 modules now expose `process_vk`, covering the simple per-pixel
+   28 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1017,9 +1019,9 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    vignette, relight, lowlight), the first sub-region + multi-fill
    module (borders), the first pass-through HAL-only module
    (mask_manager), the first LUT-on-storage-buffer port (colisa),
-   and the first two ICC-profile-aware ports (overexposed,
-   basicadj). All are bit-equal to their OpenCL counterparts for
-   the supported paths.
+   the first two ICC-profile-aware ports (overexposed, basicadj),
+   and the first bilateral-helper consumer (monochrome). All are
+   bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
