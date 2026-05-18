@@ -47,6 +47,7 @@ set(VK_KERNELS
     graduatednd:graduatednd
     relight:relight
     vignette:vignette
+    gaussian:gaussian_column_4c
     splittoning:splittoning
     zonesystem:zonesystem
     levels:levels
