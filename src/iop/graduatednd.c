@@ -25,6 +25,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -54,6 +55,7 @@ typedef struct dt_iop_graduatednd_global_data_t
 {
   int kernel_graduatedndp;
   int kernel_graduatedndm;
+  dt_vk_module_kernel_t vk;
 } dt_iop_graduatednd_global_data_t;
 
 
@@ -943,6 +945,73 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Push-constant layout matches graduatednd.comp / graduatednd.cl
+// byte-for-byte (2 ints + 8 floats = 40 bytes, no padding).
+typedef struct
+{
+  int   width;
+  int   height;
+  float density;
+  float length_base;
+  float length_inc_x;
+  float length_inc_y;
+  float color_r;
+  float color_g;
+  float color_b;
+  float color_a;
+} vk_grnd_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_graduatednd_data_t *data = piece->data;
+  const dt_iop_graduatednd_global_data_t *gd = self->global_data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int ix = roi_in->x;
+  const int iy = roi_in->y;
+  const float iw = piece->buf_in.width * roi_out->scale;
+  const float ih = piece->buf_in.height * roi_out->scale;
+  const float hw = iw / 2.0f;
+  const float hh = ih / 2.0f;
+  const float hw_inv = 1.0f / hw;
+  const float hh_inv = 1.0f / hh;
+  const float v = deg2radf(-data->rotation);
+  const float sinv = sinf(v);
+  const float cosv = cosf(v);
+  const float filter_radie = hypotf(hh, hw) / hh;
+  const float offset = data->offset / 100.0f * 2.0f;
+  const float density = data->density;
+  const float filter_hardness = (1.0f / filter_radie)
+                                / (1.0f - (0.5f + (data->hardness / 100.0f) * 0.9f / 2.0f)) * 0.5f;
+  const float length_base = (sinv * (-1.0f + ix * hw_inv) - cosv * (-1.0f + iy * hh_inv) - 1.0f + offset)
+                            * filter_hardness;
+  const float length_inc_y = -cosv * hh_inv * filter_hardness;
+  const float length_inc_x = sinv * hw_inv * filter_hardness;
+
+  const vk_grnd_pc_t pc = {
+    .width        = width,
+    .height       = height,
+    .density      = density,
+    .length_base  = length_base,
+    .length_inc_x = length_inc_x,
+    .length_inc_y = length_inc_y,
+    .color_r      = data->color[0],
+    .color_g      = data->color[1],
+    .color_b      = data->color[2],
+    .color_a      = data->color[3],
+  };
+  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                  width, height, &pc, sizeof(pc));
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 8; // extended.cl, from programs.conf
@@ -950,13 +1019,19 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_graduatedndp = dt_opencl_create_kernel(program, "graduatedndp");
   gd->kernel_graduatedndm = dt_opencl_create_kernel(program, "graduatedndm");
+  // 2 ints + 8 floats = 40 bytes; matches vk_grnd_pc_t and the push
+  // constant block in graduatednd.cl / graduatednd.comp.
+  const uint32_t pcsize = 2 * sizeof(int) + 8 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "graduatednd", "graduatednd",
+                               2, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_graduatednd_global_data_t *gd = self->data;
+  dt_iop_graduatednd_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_graduatedndp);
   dt_opencl_free_kernel(gd->kernel_graduatedndm);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
