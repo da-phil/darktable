@@ -1925,6 +1925,102 @@ void dt_ioppr_free_iccprofile_params_vk(dt_colorspaces_iccprofile_info_vk_t **_p
   *_dev_profile_info = NULL;
   *_dev_profile_lut  = NULL;
 }
+
+// Cached kernel slot for the colorspaces.spv RGB→RGB transform.
+// Loaded lazily on first call, same shape as dt_gaussian_*_vk in
+// src/common/gaussian.c. No darktable-global plumbing needed.
+typedef struct
+{
+  int   width;
+  int   height;
+  float m[9];
+} vk_colorspace_rgb_pc_t;
+
+static dt_vk_module_kernel_t _vk_colorspaces_rgb2rgb = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_colorspaces_loaded  = FALSE;
+
+static void _vk_colorspaces_ensure_kernels(void)
+{
+  if(_vk_colorspaces_loaded) return;
+  if(!dt_vulkan_running()) return;
+  const int prog = dt_vulkan_load_program_by_name("colorspaces");
+  if(prog < 0) return;
+  dt_vulkan_module_kernel_create_from(&_vk_colorspaces_rgb2rgb, prog,
+                                      "colorspaces_transform_rgb_matrix_to_rgb",
+                                      6, sizeof(vk_colorspace_rgb_pc_t), 16, 16, 1);
+  _vk_colorspaces_loaded = TRUE;
+}
+
+gboolean dt_ioppr_transform_image_colorspace_rgb_vk(const int devid,
+                                                    dt_vk_mem_t *dev_img_in,
+                                                    dt_vk_mem_t *dev_img_out,
+                                                    const int width,
+                                                    const int height,
+                                                    const dt_iop_order_iccprofile_info_t *const profile_info_from,
+                                                    const dt_iop_order_iccprofile_info_t *const profile_info_to,
+                                                    const char *message)
+{
+  if(!profile_info_from || !profile_info_to) return FALSE;
+  if(profile_info_from->type == DT_COLORSPACE_NONE
+     || profile_info_to->type == DT_COLORSPACE_NONE) return FALSE;
+
+  // Same-profile shortcut — just copy.
+  if(profile_info_from->type == profile_info_to->type
+     && strcmp(profile_info_from->filename, profile_info_to->filename) == 0)
+  {
+    if(dev_img_in != dev_img_out)
+    {
+      return dt_vulkan_copy_device_to_device(devid, dev_img_out, dev_img_in,
+                                              sizeof(float) * 4 * (size_t)width * height) == 0;
+    }
+    return TRUE;
+  }
+
+  // Only the matrix path is supported here; the lcms2 fallback is
+  // CPU-only and we leave that to the caller's err-path round-trip.
+  if(!dt_is_valid_colormatrix(profile_info_from->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info_from->matrix_out[0][0])
+     || !dt_is_valid_colormatrix(profile_info_to->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info_to->matrix_out[0][0]))
+    return FALSE;
+
+  _vk_colorspaces_ensure_kernels();
+  if(_vk_colorspaces_rgb2rgb.kernel < 0) return FALSE;
+
+  dt_colorspaces_iccprofile_info_vk_t *info_from = NULL, *info_to = NULL;
+  float *lut_from = NULL, *lut_to = NULL;
+  dt_vk_mem_t *dev_info_from = NULL, *dev_lut_from = NULL;
+  dt_vk_mem_t *dev_info_to   = NULL, *dev_lut_to   = NULL;
+  gboolean ok = FALSE;
+
+  if(dt_ioppr_build_iccprofile_params_vk(profile_info_from, devid, &info_from, &lut_from,
+                                         &dev_info_from, &dev_lut_from) != 0) goto cleanup;
+  if(dt_ioppr_build_iccprofile_params_vk(profile_info_to, devid, &info_to, &lut_to,
+                                         &dev_info_to, &dev_lut_to) != 0) goto cleanup;
+
+  dt_colormatrix_t matrix;
+  dt_colormatrix_mul(matrix, profile_info_to->matrix_out, profile_info_from->matrix_in);
+
+  vk_colorspace_rgb_pc_t pc = { .width = width, .height = height };
+  pack_3xSSE_to_3x3(matrix, pc.m);
+
+  dt_vk_mem_t *buffers[] = { dev_img_in, dev_img_out,
+                              dev_info_from, dev_lut_from,
+                              dev_info_to,   dev_lut_to };
+  ok = (dt_vulkan_dispatch_n(&_vk_colorspaces_rgb2rgb, buffers, 6,
+                              width, height, &pc, sizeof(pc)) == 0);
+
+  if(ok)
+    dt_print(DT_DEBUG_PIPE, "dt_ioppr_transform_image_colorspace_rgb_VK `%s' -> `%s' [%s]",
+             dt_colorspaces_get_name(profile_info_from->type, profile_info_from->filename),
+             dt_colorspaces_get_name(profile_info_to->type, profile_info_to->filename),
+             message ? message : "");
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&info_from, &lut_from, &dev_info_from, &dev_lut_from, devid);
+  dt_ioppr_free_iccprofile_params_vk(&info_to,   &lut_to,   &dev_info_to,   &dev_lut_to,   devid);
+  return ok;
+}
 #endif
 
 #undef DT_IOP_ORDER_PROFILE

@@ -416,38 +416,42 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     goto cleanup;
   }
 
-  // We don't yet have a Vulkan implementation of the colorspace
-  // transform; round-trip via the host. roi_out->{width,height} are
-  // the bounds. The price is acceptable here because overexposed is
-  // a preview-only mode and the working buffer is small.
-  float *host_in  = dt_alloc_align_float(pixels * 4);
-  float *host_tmp = dt_alloc_align_float(pixels * 4);
-  if(!host_in || !host_tmp)
-  {
-    dt_free_align(host_in);
-    dt_free_align(host_tmp);
-    goto cleanup;
-  }
-  if(dt_vulkan_read_from_device(devid, host_in, dev_in,
-                                sizeof(float) * 4 * pixels) != 0)
-  {
-    dt_free_align(host_in);
-    dt_free_align(host_tmp);
-    goto cleanup;
-  }
-  dt_ioppr_transform_image_colorspace_rgb(host_in, host_tmp, width, height,
-                                          current_profile, work_profile, self->op);
+  // GPU-side current_profile → work_profile (histogram) transform via
+  // dt_ioppr_transform_image_colorspace_rgb_vk. Falls back to a host
+  // round-trip if the helper rejects the input (no matrix profile).
   dev_tmp = dt_vulkan_alloc_buffer(devid, sizeof(float) * 4 * pixels);
-  if(!dev_tmp
-     || dt_vulkan_write_to_device(devid, dev_tmp, host_tmp,
-                                  sizeof(float) * 4 * pixels) != 0)
+  if(!dev_tmp) goto cleanup;
+  if(!dt_ioppr_transform_image_colorspace_rgb_vk(devid, dev_in, dev_tmp, width, height,
+                                                 current_profile, work_profile, self->op))
   {
+    // CPU fallback for the (rare) non-matrix-profile case.
+    float *host_in  = dt_alloc_align_float(pixels * 4);
+    float *host_tmp = dt_alloc_align_float(pixels * 4);
+    if(!host_in || !host_tmp)
+    {
+      dt_free_align(host_in);
+      dt_free_align(host_tmp);
+      goto cleanup;
+    }
+    if(dt_vulkan_read_from_device(devid, host_in, dev_in,
+                                  sizeof(float) * 4 * pixels) != 0)
+    {
+      dt_free_align(host_in);
+      dt_free_align(host_tmp);
+      goto cleanup;
+    }
+    dt_ioppr_transform_image_colorspace_rgb(host_in, host_tmp, width, height,
+                                            current_profile, work_profile, self->op);
+    if(dt_vulkan_write_to_device(devid, dev_tmp, host_tmp,
+                                 sizeof(float) * 4 * pixels) != 0)
+    {
+      dt_free_align(host_in);
+      dt_free_align(host_tmp);
+      goto cleanup;
+    }
     dt_free_align(host_in);
     dt_free_align(host_tmp);
-    goto cleanup;
   }
-  dt_free_align(host_in);
-  dt_free_align(host_tmp);
 
   if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
                                          &profile_lut_vk, &dev_profile_info,

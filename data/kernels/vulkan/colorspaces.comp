@@ -1,0 +1,123 @@
+// GLSL fallback for colorspaces.cl :: colorspaces_transform_rgb_matrix_to_rgb.
+// See the .cl header for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+layout(std430, binding = 2) readonly buffer ProfFrom {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info_from;
+
+layout(std430, binding = 3) readonly buffer LutFrom { float data[]; } lut_from;
+
+layout(std430, binding = 4) readonly buffer ProfTo {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info_to;
+
+layout(std430, binding = 5) readonly buffer LutTo { float data[]; } lut_to;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float m0; float m1; float m2;
+    float m3; float m4; float m5;
+    float m6; float m7; float m8;
+} pc;
+
+float lerp_lookup_from(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info_from.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return lut_from.data[base + t] * (1.0 - f) + lut_from.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+float lerp_lookup_to(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info_to.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return lut_to.data[base + t] * (1.0 - f) + lut_to.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in_from(vec4 rgb) {
+    float R = lerp_lookup_from(rgb.x,
+        profile_info_from.unbounded_coeffs_in[0],
+        profile_info_from.unbounded_coeffs_in[1],
+        profile_info_from.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_from(rgb.y,
+        profile_info_from.unbounded_coeffs_in[3],
+        profile_info_from.unbounded_coeffs_in[4],
+        profile_info_from.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_from(rgb.z,
+        profile_info_from.unbounded_coeffs_in[6],
+        profile_info_from.unbounded_coeffs_in[7],
+        profile_info_from.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb.w);
+}
+
+vec4 apply_trc_out_to(vec4 rgb) {
+    float R = lerp_lookup_to(rgb.x,
+        profile_info_to.unbounded_coeffs_out[0],
+        profile_info_to.unbounded_coeffs_out[1],
+        profile_info_to.unbounded_coeffs_out[2], 3);
+    float G = lerp_lookup_to(rgb.y,
+        profile_info_to.unbounded_coeffs_out[3],
+        profile_info_to.unbounded_coeffs_out[4],
+        profile_info_to.unbounded_coeffs_out[5], 4);
+    float B = lerp_lookup_to(rgb.z,
+        profile_info_to.unbounded_coeffs_out[6],
+        profile_info_to.unbounded_coeffs_out[7],
+        profile_info_to.unbounded_coeffs_out[8], 5);
+    return vec4(R, G, B, rgb.w);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    if(profile_info_from.nonlinearlut != 0)
+        pixel = apply_trc_in_from(pixel);
+
+    vec4 r = vec4(pc.m0 * pixel.x + pc.m1 * pixel.y + pc.m2 * pixel.z,
+                  pc.m3 * pixel.x + pc.m4 * pixel.y + pc.m5 * pixel.z,
+                  pc.m6 * pixel.x + pc.m7 * pixel.y + pc.m8 * pixel.z,
+                  pixel.w);
+
+    out_buf.data[idx] = (profile_info_to.nonlinearlut != 0)
+                          ? apply_trc_out_to(r) : r;
+}
