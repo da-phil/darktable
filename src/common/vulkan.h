@@ -259,6 +259,15 @@ int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
 int dt_vulkan_read_from_device(int devid, void *host,
                                const dt_vk_mem_t *src, size_t size);
 
+/** Device-to-device buffer copy (size bytes from src@0 to dst@0).
+ *  Used by pass-through modules and the "stage in / stage out" path
+ *  in the pixelpipe when a Vulkan-resident buffer needs to feed an
+ *  OpenCL/CPU module further down the chain. Blocking. */
+int dt_vulkan_copy_device_to_device(int devid,
+                                    dt_vk_mem_t *dst,
+                                    const dt_vk_mem_t *src,
+                                    size_t size);
+
 // ---- dispatch --------------------------------------------------------
 
 /** Bind storage buffers (count must match the kernel's registered
@@ -313,6 +322,10 @@ static inline int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
                                        size_t w, size_t h,
                                        const void *pc, size_t pcs)
 { (void)k; (void)b; (void)bc; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
+
+static inline int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *d,
+                                                  const dt_vk_mem_t *s, size_t sz)
+{ (void)devid; (void)d; (void)s; (void)sz; return -1; }
 
 static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
 static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }
