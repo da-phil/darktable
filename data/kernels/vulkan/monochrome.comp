@@ -1,0 +1,45 @@
+// GLSL fallback for monochrome.cl.
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer Base { vec4 data[]; } base_buf;
+layout(std430, binding = 2)          buffer Out  { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float a;
+    float b;
+    float size;
+    float highlights;
+} pc;
+
+float envelope(float L) {
+    float x = clamp(L / 100.0, 0.0, 1.0);
+    float beta = 0.6;
+    if(x < beta) {
+        float tmp = abs(x / beta - 1.0);
+        return 1.0 - tmp * tmp;
+    }
+    float tmp1 = (1.0 - x) / (1.0 - beta);
+    float tmp2 = tmp1 * tmp1;
+    float tmp3 = tmp2 * tmp1;
+    return 3.0 * tmp2 - 2.0 * tmp3;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    vec4 basep = base_buf.data[idx];
+    float tt = envelope(pixel.x);
+    float t  = tt + (1.0 - tt) * (1.0 - pc.highlights);
+    pixel.x = mix(pixel.x, pixel.x * basep.x / 100.0, t);
+    pixel.y = 0.0;
+    pixel.z = 0.0;
+    out_buf.data[idx] = pixel;
+}
