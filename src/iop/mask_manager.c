@@ -26,6 +26,7 @@
  */
 
 #include "common/imagebuf.h"
+#include "common/vulkan.h"
 #include "develop/develop.h"
 
 DT_MODULE_INTROSPECTION(2, dt_iop_mask_manager_params_t)
@@ -102,6 +103,20 @@ int process_cl(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_m
 
   const size_t region[2] = { width, height };
   return dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, CLIMG_ORIGIN, CLIMG_ORIGIN, region);
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  // mask_manager is a pass-through dummy used to anchor history
+  // entries — copy the input buffer straight over to the output.
+  // Both buffers are float4-per-pixel and sized identically by the
+  // pipeline for no-op modules.
+  const size_t size = (size_t)roi_in->width * roi_in->height * 4 * sizeof(float);
+  return dt_vulkan_copy_device_to_device(piece->pipe->devid, dev_out, dev_in, size);
 }
 #endif
 

@@ -542,6 +542,16 @@ int dt_vulkan_read_from_device(int devid, void *host,
   return 0;
 }
 
+int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *dst,
+                                    const dt_vk_mem_t *src, size_t size)
+{
+  if(!dt_vulkan_running() || !dst || !src) return -1;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  _copy_args_t a = { src->buffer, dst->buffer, (VkDeviceSize)size };
+  return _submit_one_shot(d, _record_copy, &a);
+}
+
 // ---- dispatch --------------------------------------------------------
 
 typedef struct
