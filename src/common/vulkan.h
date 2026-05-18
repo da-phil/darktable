@@ -104,6 +104,15 @@ typedef struct dt_vk_device_t
 
   dt_vk_program_t  programs[DT_VULKAN_MAX_PROGRAMS];
   dt_vk_kernel_t   kernels [DT_VULKAN_MAX_KERNELS];
+
+  // Persistent host-visible staging buffer reused across every
+  // dt_vulkan_write_to_device / dt_vulkan_read_from_device call.
+  // Grows monotonically (never shrinks) — large export pipelines
+  // can reach ~1 GB here on a 60 MPx canvas. Allocating a 1 GB
+  // VkDeviceMemory per dispatch was the dominant cost in early
+  // pixelpipe-VK timings; the cache cuts the steady-state
+  // overhead per module to a single vkCmdCopyBuffer.
+  struct dt_vk_mem_t *staging;
 } dt_vk_device_t;
 
 typedef struct dt_vulkan_t
