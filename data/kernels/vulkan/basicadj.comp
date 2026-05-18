@@ -1,0 +1,196 @@
+// GLSL fallback for basicadj.cl. Mirrors the clspv kernel byte-for-byte.
+// See basicadj.cl for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In        { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out       { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer LutGamma  { float data[]; } lut_gamma;
+layout(std430, binding = 3) readonly buffer LutCntr   { float data[]; } lut_contrast;
+layout(std430, binding = 4) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+layout(std430, binding = 5) readonly buffer ProfLut   { float data[]; } profile_lut;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   process_gamma;
+    int   plain_contrast;
+    int   process_saturation_vibrance;
+    int   process_hlcompr;
+    int   preserve_colors;
+    int   use_work_profile;
+    float black_point;
+    float scale;
+    float gamma;
+    float contrast;
+    float saturation;
+    float vibrance;
+    float hlcomp;
+    float hlrange;
+    float middle_grey;
+    float inv_middle_grey;
+} pc;
+
+#define VK_LUT_SIZE 0x10000
+#define VK_RGB_NORM_NONE      0
+#define VK_RGB_NORM_LUMINANCE 1
+#define VK_RGB_NORM_MAX       2
+#define VK_RGB_NORM_AVERAGE   3
+#define VK_RGB_NORM_SUM       4
+#define VK_RGB_NORM_NORM      5
+#define VK_RGB_NORM_POWER     6
+
+float vk_lookup(float x, int which)  // which: 0=gamma, 1=contrast
+{
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return (which == 0) ? lut_gamma.data[xi] : lut_contrast.data[xi];
+}
+
+float lerp_lookup_unbounded(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            float ft = clamp(x * float(profile_info.lutsize - 1),
+                             0.0, float(profile_info.lutsize - 1));
+            int   t  = (ft < float(profile_info.lutsize - 2))
+                         ? int(ft) : profile_info.lutsize - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * profile_info.lutsize;
+            float l1 = profile_lut.data[base + t];
+            float l2 = profile_lut.data[base + t + 1];
+            return l1 * (1.0 - f) + l2 * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in(vec4 rgb_in) {
+    float R = lerp_lookup_unbounded(rgb_in.x,
+        profile_info.unbounded_coeffs_in[0],
+        profile_info.unbounded_coeffs_in[1],
+        profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_unbounded(rgb_in.y,
+        profile_info.unbounded_coeffs_in[3],
+        profile_info.unbounded_coeffs_in[4],
+        profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_unbounded(rgb_in.z,
+        profile_info.unbounded_coeffs_in[6],
+        profile_info.unbounded_coeffs_in[7],
+        profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb_in.w);
+}
+
+float get_rgb_matrix_luminance(vec4 rgb) {
+    if(profile_info.nonlinearlut != 0) {
+        vec4 linear_rgb = apply_trc_in(rgb);
+        return profile_info.matrix_in[3] * linear_rgb.x
+             + profile_info.matrix_in[4] * linear_rgb.y
+             + profile_info.matrix_in[5] * linear_rgb.z;
+    }
+    return profile_info.matrix_in[3] * rgb.x
+         + profile_info.matrix_in[4] * rgb.y
+         + profile_info.matrix_in[5] * rgb.z;
+}
+
+float dt_camera_rgb_luminance(vec4 rgb) {
+    return 0.2225045 * rgb.x + 0.7168786 * rgb.y + 0.0606169 * rgb.z;
+}
+
+float dt_rgb_norm(vec4 rgb, int norm, int work_profile)
+{
+    if(norm == VK_RGB_NORM_LUMINANCE)
+        return (work_profile == 0) ? dt_camera_rgb_luminance(rgb)
+                                   : get_rgb_matrix_luminance(rgb);
+    if(norm == VK_RGB_NORM_MAX)     return max(rgb.x, max(rgb.y, rgb.z));
+    if(norm == VK_RGB_NORM_AVERAGE) return (rgb.x + rgb.y + rgb.z) / 3.0;
+    if(norm == VK_RGB_NORM_SUM)     return rgb.x + rgb.y + rgb.z;
+    if(norm == VK_RGB_NORM_NORM)    return pow(rgb.x*rgb.x + rgb.y*rgb.y + rgb.z*rgb.z, 0.5);
+    if(norm == VK_RGB_NORM_POWER) {
+        float R = rgb.x * rgb.x;
+        float G = rgb.y * rgb.y;
+        float B = rgb.z * rgb.z;
+        return (rgb.x * R + rgb.y * G + rgb.z * B) / (R + G + B);
+    }
+    return (rgb.x + rgb.y + rgb.z) / 3.0;
+}
+
+float hlcurve(float level, float hlcomp, float hlrange) {
+    if(hlcomp > 0.0) {
+        float val = level + (hlrange - 1.0);
+        if(val == 0.0) val = 0.000001;
+        float Y = val / hlrange;
+        Y *= hlcomp;
+        if(Y <= -1.0) Y = -0.999999;
+        float R = hlrange / (val * hlcomp);
+        return log(1.0 + Y) * R;
+    }
+    return 1.0;
+}
+
+float lut_g(float x, float gamma) {
+    return (x > 1.0) ? pow(x, gamma) : vk_lookup(x, 0);
+}
+
+float lut_c(float x, float contrast, float mg, float img) {
+    return (x > 1.0) ? pow(x * img, contrast) * mg : vk_lookup(x, 1);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    float w = pixel.w;
+
+    pixel = (pixel - vec4(pc.black_point)) * vec4(pc.scale);
+
+    if(pc.process_hlcompr != 0) {
+        float lum = (pc.use_work_profile == 0)
+                     ? dt_camera_rgb_luminance(pixel)
+                     : get_rgb_matrix_luminance(pixel);
+        if(lum > 0.0) {
+            float ratio = hlcurve(lum, pc.hlcomp, pc.hlrange);
+            pixel *= vec4(ratio);
+        }
+    }
+    if(pc.process_gamma != 0) {
+        if(pixel.x > 0.0) pixel.x = lut_g(pixel.x, pc.gamma);
+        if(pixel.y > 0.0) pixel.y = lut_g(pixel.y, pc.gamma);
+        if(pixel.z > 0.0) pixel.z = lut_g(pixel.z, pc.gamma);
+    }
+    if(pc.plain_contrast != 0) {
+        if(pixel.x > 0.0) pixel.x = lut_c(pixel.x, pc.contrast, pc.middle_grey, pc.inv_middle_grey);
+        if(pixel.y > 0.0) pixel.y = lut_c(pixel.y, pc.contrast, pc.middle_grey, pc.inv_middle_grey);
+        if(pixel.z > 0.0) pixel.z = lut_c(pixel.z, pc.contrast, pc.middle_grey, pc.inv_middle_grey);
+    }
+    if(pc.preserve_colors != VK_RGB_NORM_NONE) {
+        float ratio = 1.0;
+        float lum = dt_rgb_norm(pixel, pc.preserve_colors, pc.use_work_profile);
+        if(lum > 0.0) {
+            float contrast_lum = pow(lum / pc.middle_grey, pc.contrast) * pc.middle_grey;
+            ratio = contrast_lum / lum;
+        }
+        pixel *= vec4(ratio);
+    }
+    if(pc.process_saturation_vibrance != 0) {
+        float average = (pixel.x + pixel.y + pixel.z) / 3.0;
+        vec4 delta = pixel - vec4(average);
+        float dlen = sqrt(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
+        float P = pc.vibrance * (1.0 - pow(dlen, abs(pc.vibrance)));
+        pixel = vec4(average) + (vec4(pc.saturation) + vec4(P)) * delta;
+    }
+    pixel.w = w;
+    out_buf.data[idx] = pixel;
+}

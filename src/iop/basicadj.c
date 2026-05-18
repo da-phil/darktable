@@ -22,8 +22,10 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces_inline_conversions.h"
+#include "common/iop_profile.h"
 #include "common/math.h"
 #include "common/rgb_norms.h"
+#include "common/vulkan.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "gui/accelerators.h"
@@ -87,6 +89,7 @@ typedef struct dt_iop_basicadj_data_t
 typedef struct dt_iop_basicadj_global_data_t
 {
   int kernel_basicadj;
+  dt_vk_module_kernel_t vk;
 } dt_iop_basicadj_global_data_t;
 
 int legacy_params(dt_iop_module_t *self,
@@ -469,12 +472,20 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
 
   gd->kernel_basicadj = dt_opencl_create_kernel(program, "basicadj");
+  // 8 ints + 10 floats = 72 bytes; matches vk_basicadj_pc_t and
+  // the push-constant block in basicadj.cl / basicadj.comp. 6
+  // storage-buffer bindings: in, out, lut_gamma, lut_contrast,
+  // profile_info, profile_lut.
+  const uint32_t pcsize = 8 * sizeof(int) + 10 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "basicadj", "basicadj",
+                               6, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_basicadj_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_basicadj);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
@@ -1398,6 +1409,119 @@ cleanup:
 
   dt_free_align(src_buffer);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// Push-constant layout matches basicadj.cl / basicadj.comp byte-for-byte
+// (8 ints + 10 floats = 72 bytes; scalars only to dodge the std430
+// 16-byte-alignment trap).
+typedef struct
+{
+  int   width;
+  int   height;
+  int   process_gamma;
+  int   plain_contrast;
+  int   process_saturation_vibrance;
+  int   process_hlcompr;
+  int   preserve_colors;
+  int   use_work_profile;
+  float black_point;
+  float scale;
+  float gamma;
+  float contrast;
+  float saturation;
+  float vibrance;
+  float hlcomp;
+  float hlrange;
+  float middle_grey;
+  float inv_middle_grey;
+} vk_basicadj_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_iop_work_profile_info(self, self->dev->iop);
+
+  const dt_iop_basicadj_data_t *d = piece->data;
+  const dt_iop_basicadj_params_t *p = &d->params;
+  const dt_iop_basicadj_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  dt_vk_mem_t *dev_gamma = NULL;
+  dt_vk_mem_t *dev_contrast = NULL;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL;
+  dt_vk_mem_t *dev_profile_lut = NULL;
+  int rc = -1;
+
+  dev_gamma = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_contrast = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_gamma || !dev_contrast) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_gamma, d->lut_gamma, lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_contrast, d->lut_contrast, lut_bytes) != 0) goto cleanup;
+
+  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
+                                         &profile_lut_vk, &dev_profile_info,
+                                         &dev_profile_lut) != 0)
+    goto cleanup;
+
+  const int use_work_profile  = (work_profile == NULL) ? 0 : 1;
+  const int plain_contrast    = (!p->preserve_colors && p->contrast != 0.f);
+  const int preserve_colors   = (p->contrast != 0.f) ? p->preserve_colors : 0;
+  const int process_gamma     = (p->brightness != 0.f);
+  const int process_sat_vibr  = (p->saturation != 0.f) || (p->vibrance != 0.f);
+  const int process_hlcompr   = (p->hlcompr > 0.f);
+
+  const float saturation = p->saturation + 1.0f;
+  const float vibrance   = p->vibrance / 1.4f;
+  const float contrast   = p->contrast + 1.0f;
+  const float white      = exposure2white(p->exposure);
+  const float scale      = 1.0f / (white - p->black_point);
+  const float middle_grey = (p->middle_grey > 0.f) ? (p->middle_grey / 100.f) : 0.1842f;
+  const float inv_middle_grey = 1.f / middle_grey;
+  const float brightness = p->brightness * 2.f;
+  const float gamma = (brightness >= 0.0f) ? 1.0f / (1.0f + brightness) : (1.0f - brightness);
+  const float hlcomp     = p->hlcompr / 100.0f;
+  const float shoulder   = ((p->hlcomprthresh / 100.f) / 8.0f) + 0.1f;
+  const float hlrange    = 1.0f - shoulder;
+
+  const vk_basicadj_pc_t pc = {
+    .width = width, .height = height,
+    .process_gamma = process_gamma,
+    .plain_contrast = plain_contrast,
+    .process_saturation_vibrance = process_sat_vibr,
+    .process_hlcompr = process_hlcompr,
+    .preserve_colors = preserve_colors,
+    .use_work_profile = use_work_profile,
+    .black_point = p->black_point,
+    .scale = scale,
+    .gamma = gamma,
+    .contrast = contrast,
+    .saturation = saturation,
+    .vibrance = vibrance,
+    .hlcomp = hlcomp,
+    .hlrange = hlrange,
+    .middle_grey = middle_grey,
+    .inv_middle_grey = inv_middle_grey,
+  };
+
+  dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_gamma, dev_contrast,
+                              dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 6, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  dt_vulkan_free_buffer(devid, dev_gamma);
+  dt_vulkan_free_buffer(devid, dev_contrast);
+  return rc;
 }
 #endif
 
