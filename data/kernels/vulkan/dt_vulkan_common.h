@@ -247,6 +247,167 @@ static inline float4 vk_Lab_to_prophotorgb(float4 lab)
   return vk_XYZ_to_prophotorgb(vk_Lab_to_XYZ(lab));
 }
 
+// ---- ICC profile info (storage-buffer flavour) ----------------------
+//
+// OpenCL passes profile info as a constant buffer + a 256×(256·6)
+// image2d_t LUT and reads the LUT through image samplers. clspv
+// doesn't surface samplers under our buffer-only kernel convention,
+// so we pass the profile info as a flat storage buffer (struct below)
+// and the LUT as a 1-D float buffer of 6·lutsize entries laid out as:
+//
+//   lut[0·lutsize .. 1·lutsize-1]  ->  in_R
+//   lut[1·lutsize .. 2·lutsize-1]  ->  in_G
+//   lut[2·lutsize .. 3·lutsize-1]  ->  in_B
+//   lut[3·lutsize .. 4·lutsize-1]  ->  out_R
+//   lut[4·lutsize .. 5·lutsize-1]  ->  out_G
+//   lut[5·lutsize .. 6·lutsize-1]  ->  out_B
+//
+// This struct is byte-for-byte equivalent to
+// dt_colorspaces_iccprofile_info_cl_t (156 bytes). The host-side
+// helper dt_ioppr_build_iccprofile_params_vk fills both buffers and
+// dt_ioppr_free_iccprofile_params_vk frees them.
+
+typedef struct vk_dt_colorspaces_iccprofile_info_t
+{
+  float matrix_in[9];
+  float matrix_out[9];
+  int   lutsize;
+  float unbounded_coeffs_in[3][3];
+  float unbounded_coeffs_out[3][3];
+  int   nonlinearlut;
+  float grey;
+} vk_dt_colorspaces_iccprofile_info_t;
+
+// 1-D linear-interp lookup into the flat 6·lutsize LUT. Mirrors
+// data/kernels/color_conversion.h::lerp_lookup_unbounded but reads
+// from the flat buffer above instead of a 2-D image (the OpenCL
+// helper splits a 65536-entry curve into 256×256 tiles to fit
+// image2d_t limits; we don't have that constraint here).
+static inline float vk_lerp_lookup_unbounded(global const float *lut,
+                                             const float x,
+                                             const float c0, const float c1, const float c2,
+                                             const int n_lut, const int lutsize)
+{
+  if(c0 >= 0.0f)
+  {
+    if(x < 1.0f)
+    {
+      const float ft = clamp(x * (float)(lutsize - 1), 0.0f, (float)(lutsize - 1));
+      const int   t  = (int)((ft < (float)(lutsize - 2)) ? ft : (float)(lutsize - 2));
+      const float f  = ft - (float)t;
+      const int   base = n_lut * lutsize;
+      const float l1 = lut[base + t];
+      const float l2 = lut[base + t + 1];
+      return l1 * (1.0f - f) + l2 * f;
+    }
+    return c1 * pow(x * c0, c2);
+  }
+  return x;
+}
+
+static inline float4 vk_apply_trc_in(const float4 rgb_in,
+                                     global const vk_dt_colorspaces_iccprofile_info_t *profile_info,
+                                     global const float *lut)
+{
+  const float R = vk_lerp_lookup_unbounded(lut, rgb_in.x,
+                                            profile_info->unbounded_coeffs_in[0][0],
+                                            profile_info->unbounded_coeffs_in[0][1],
+                                            profile_info->unbounded_coeffs_in[0][2],
+                                            0, profile_info->lutsize);
+  const float G = vk_lerp_lookup_unbounded(lut, rgb_in.y,
+                                            profile_info->unbounded_coeffs_in[1][0],
+                                            profile_info->unbounded_coeffs_in[1][1],
+                                            profile_info->unbounded_coeffs_in[1][2],
+                                            1, profile_info->lutsize);
+  const float B = vk_lerp_lookup_unbounded(lut, rgb_in.z,
+                                            profile_info->unbounded_coeffs_in[2][0],
+                                            profile_info->unbounded_coeffs_in[2][1],
+                                            profile_info->unbounded_coeffs_in[2][2],
+                                            2, profile_info->lutsize);
+  return (float4)(R, G, B, rgb_in.w);
+}
+
+static inline float4 vk_apply_trc_out(const float4 rgb_in,
+                                      global const vk_dt_colorspaces_iccprofile_info_t *profile_info,
+                                      global const float *lut)
+{
+  const float R = vk_lerp_lookup_unbounded(lut, rgb_in.x,
+                                            profile_info->unbounded_coeffs_out[0][0],
+                                            profile_info->unbounded_coeffs_out[0][1],
+                                            profile_info->unbounded_coeffs_out[0][2],
+                                            3, profile_info->lutsize);
+  const float G = vk_lerp_lookup_unbounded(lut, rgb_in.y,
+                                            profile_info->unbounded_coeffs_out[1][0],
+                                            profile_info->unbounded_coeffs_out[1][1],
+                                            profile_info->unbounded_coeffs_out[1][2],
+                                            4, profile_info->lutsize);
+  const float B = vk_lerp_lookup_unbounded(lut, rgb_in.z,
+                                            profile_info->unbounded_coeffs_out[2][0],
+                                            profile_info->unbounded_coeffs_out[2][1],
+                                            profile_info->unbounded_coeffs_out[2][2],
+                                            5, profile_info->lutsize);
+  return (float4)(R, G, B, rgb_in.w);
+}
+
+static inline float vk_get_rgb_matrix_luminance(const float4 rgb,
+                                                global const vk_dt_colorspaces_iccprofile_info_t *profile_info,
+                                                global const float *lut)
+{
+  // matrix is row-major 3x3 in 9 floats. Y-row is matrix[3..5].
+  float luminance;
+  if(profile_info->nonlinearlut)
+  {
+    const float4 linear_rgb = vk_apply_trc_in(rgb, profile_info, lut);
+    luminance = profile_info->matrix_in[3] * linear_rgb.x
+              + profile_info->matrix_in[4] * linear_rgb.y
+              + profile_info->matrix_in[5] * linear_rgb.z;
+  }
+  else
+  {
+    luminance = profile_info->matrix_in[3] * rgb.x
+              + profile_info->matrix_in[4] * rgb.y
+              + profile_info->matrix_in[5] * rgb.z;
+  }
+  return luminance;
+}
+
+static inline float vk_dt_camera_rgb_luminance(const float4 rgb)
+{
+  // sRGB Y row, used as fallback when no work profile is available.
+  const float4 coeffs = (float4)(0.2225045f, 0.7168786f, 0.0606169f, 0.0f);
+  return dot(rgb, coeffs);
+}
+
+// dt_iop_rgb_norms_t mirror. Keep in sync with rgb_norms.h.
+#define VK_RGB_NORM_NONE      0
+#define VK_RGB_NORM_LUMINANCE 1
+#define VK_RGB_NORM_MAX       2
+#define VK_RGB_NORM_AVERAGE   3
+#define VK_RGB_NORM_SUM       4
+#define VK_RGB_NORM_NORM      5
+#define VK_RGB_NORM_POWER     6
+
+static inline float vk_dt_rgb_norm(const float4 in, const int norm, const int work_profile,
+                                   global const vk_dt_colorspaces_iccprofile_info_t *profile_info,
+                                   global const float *lut)
+{
+  if(norm == VK_RGB_NORM_LUMINANCE)
+    return (work_profile == 0) ? vk_dt_camera_rgb_luminance(in)
+                               : vk_get_rgb_matrix_luminance(in, profile_info, lut);
+  if(norm == VK_RGB_NORM_MAX)     return fmax(in.x, fmax(in.y, in.z));
+  if(norm == VK_RGB_NORM_AVERAGE) return (in.x + in.y + in.z) / 3.0f;
+  if(norm == VK_RGB_NORM_SUM)     return in.x + in.y + in.z;
+  if(norm == VK_RGB_NORM_NORM)    return pow(in.x * in.x + in.y * in.y + in.z * in.z, 0.5f);
+  if(norm == VK_RGB_NORM_POWER)
+  {
+    const float R = in.x * in.x;
+    const float G = in.y * in.y;
+    const float B = in.z * in.z;
+    return (in.x * R + in.y * G + in.z * B) / (R + G + B);
+  }
+  return (in.x + in.y + in.z) / 3.0f;
+}
+
 // RGB <-> HSL — needed by splittoning et al. Matches the OpenCL
 // implementations in data/kernels/colorspace.h byte-for-byte.
 

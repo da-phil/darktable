@@ -1,0 +1,145 @@
+// GLSL fallback for overexposed.cl. Mirrors the clspv kernel
+// byte-for-byte: 5 storage-buffer bindings, push-constant block
+// matches vk_overexposed_pc_t (4 ints + 10 floats = 56 bytes).
+//
+// See overexposed.cl for design notes. The ICC profile struct is
+// declared inline here because GLSL has no #include.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly  buffer Tmp  { vec4  data[]; } tmp_buf;
+layout(std430, binding = 3) readonly  buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];   // [3][3] flattened — std430 layout
+    float unbounded_coeffs_out[9];  // matches C struct byte-for-byte
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+layout(std430, binding = 4) readonly  buffer Lut  { float data[]; } lut_buf;
+
+// Scalar push-constant block. All members 4-byte aligned (no vec4).
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   mode;
+    int   use_work_profile;
+    float lower;
+    float upper;
+    float lower_r;  float lower_g;  float lower_b;  float lower_w;
+    float upper_r;  float upper_g;  float upper_b;  float upper_w;
+} pc;
+
+#define DT_CLIPPING_PREVIEW_GAMUT      0
+#define DT_CLIPPING_PREVIEW_ANYRGB     1
+#define DT_CLIPPING_PREVIEW_LUMINANCE  2
+#define DT_CLIPPING_PREVIEW_SATURATION 3
+
+float lerp_lookup_unbounded(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            float ft = clamp(x * float(profile_info.lutsize - 1),
+                             0.0, float(profile_info.lutsize - 1));
+            int   t  = (ft < float(profile_info.lutsize - 2))
+                         ? int(ft) : profile_info.lutsize - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * profile_info.lutsize;
+            float l1 = lut_buf.data[base + t];
+            float l2 = lut_buf.data[base + t + 1];
+            return l1 * (1.0 - f) + l2 * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in(vec4 rgb_in) {
+    float R = lerp_lookup_unbounded(rgb_in.x,
+        profile_info.unbounded_coeffs_in[0],
+        profile_info.unbounded_coeffs_in[1],
+        profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_unbounded(rgb_in.y,
+        profile_info.unbounded_coeffs_in[3],
+        profile_info.unbounded_coeffs_in[4],
+        profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_unbounded(rgb_in.z,
+        profile_info.unbounded_coeffs_in[6],
+        profile_info.unbounded_coeffs_in[7],
+        profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb_in.w);
+}
+
+float get_rgb_matrix_luminance(vec4 rgb) {
+    if(profile_info.nonlinearlut != 0) {
+        vec4 linear_rgb = apply_trc_in(rgb);
+        return profile_info.matrix_in[3] * linear_rgb.x
+             + profile_info.matrix_in[4] * linear_rgb.y
+             + profile_info.matrix_in[5] * linear_rgb.z;
+    }
+    return profile_info.matrix_in[3] * rgb.x
+         + profile_info.matrix_in[4] * rgb.y
+         + profile_info.matrix_in[5] * rgb.z;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    vec4 ptmp  = tmp_buf.data[idx];
+    vec4 lo    = vec4(pc.lower_r, pc.lower_g, pc.lower_b, pc.lower_w);
+    vec4 hi    = vec4(pc.upper_r, pc.upper_g, pc.upper_b, pc.upper_w);
+    float lower = pc.lower;
+    float upper = pc.upper;
+
+    if(pc.mode == DT_CLIPPING_PREVIEW_ANYRGB) {
+        if(ptmp.x >= upper || ptmp.y >= upper || ptmp.z >= upper)
+            pixel = vec4(hi.x, hi.y, hi.z, pixel.w);
+        else if(ptmp.x <= lower && ptmp.y <= lower && ptmp.z <= lower)
+            pixel = vec4(lo.x, lo.y, lo.z, pixel.w);
+    }
+    else if(pc.mode == DT_CLIPPING_PREVIEW_GAMUT && pc.use_work_profile != 0) {
+        float luminance = get_rgb_matrix_luminance(pixel);
+        if(luminance >= upper)
+            pixel = vec4(hi.x, hi.y, hi.z, pixel.w);
+        else if(luminance <= lower)
+            pixel = vec4(lo.x, lo.y, lo.z, pixel.w);
+        else {
+            vec4 sat = ptmp - vec4(luminance);
+            sat = sqrt(sat * sat / (vec4(luminance * luminance) + ptmp * ptmp));
+            if(sat.x > upper || sat.y > upper || sat.z > upper
+               || ptmp.x >= upper || ptmp.y >= upper || ptmp.z >= upper)
+                pixel = vec4(hi.x, hi.y, hi.z, pixel.w);
+            else if(ptmp.x <= lower && ptmp.y <= lower && ptmp.z <= lower)
+                pixel = vec4(lo.x, lo.y, lo.z, pixel.w);
+        }
+    }
+    else if(pc.mode == DT_CLIPPING_PREVIEW_LUMINANCE && pc.use_work_profile != 0) {
+        float luminance = get_rgb_matrix_luminance(pixel);
+        if(luminance >= upper)
+            pixel = vec4(hi.x, hi.y, hi.z, pixel.w);
+        else if(luminance <= lower)
+            pixel = vec4(lo.x, lo.y, lo.z, pixel.w);
+    }
+    else if(pc.mode == DT_CLIPPING_PREVIEW_SATURATION && pc.use_work_profile != 0) {
+        float luminance = get_rgb_matrix_luminance(pixel);
+        if(luminance < upper && luminance > lower) {
+            vec4 sat = ptmp - vec4(luminance);
+            sat = sqrt(sat * sat / (vec4(luminance * luminance) + ptmp * ptmp));
+            if(sat.x > upper || sat.y > upper || sat.z > upper
+               || ptmp.x >= upper || ptmp.y >= upper || ptmp.z >= upper)
+                pixel = vec4(hi.x, hi.y, hi.z, pixel.w);
+            else if(ptmp.x <= lower && ptmp.y <= lower && ptmp.z <= lower)
+                pixel = vec4(lo.x, lo.y, lo.z, pixel.w);
+        }
+    }
+
+    out_buf.data[idx] = pixel;
+}
