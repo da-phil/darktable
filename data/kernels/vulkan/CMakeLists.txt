@@ -57,7 +57,8 @@ set(VK_KERNELS
     whitebalance_1f_xtrans:whitebalance_1f_xtrans
     overexposed:overexposed
     basicadj:basicadj
-    colorspaces:colorspaces_transform_rgb_matrix_to_rgb)
+    colorspaces:colorspaces_transform_rgb_matrix_to_rgb
+    lowlight:lowlight)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

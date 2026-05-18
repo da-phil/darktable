@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 26 modules currently expose `process_vk`,
+**Per-module ports**: 27 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -213,6 +213,7 @@ in three categories.
 | `src/iop/colisa.c` | First LUT-on-storage-buffer port — uploads two 65536-entry tables freshly per dispatch and binds them at descriptors 2/3 alongside the in/out buffers. Pattern blueprint for `tonecurve`, `rgbcurve`, `rgblevels`, `basecurve`, … |
 | `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. Uses `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12) to do the current → histogram profile transform entirely on the GPU; only falls back to CPU when both profiles are non-matrix (lcms2-only). |
 | `src/iop/basicadj.c` | Exercises both arms of the §5.11 plumbing: `vk_get_rgb_matrix_luminance` for the highlight-compression branch + `vk_dt_rgb_norm` for the preserve-colors branch. 6-binding dispatch (in, out, gamma LUT, contrast LUT, profile_info, profile_lut); 8 ints + 10 floats of push constants drive the six independent sub-features (exposure, hlcompr, gamma, plain contrast, preserve-colors contrast, saturation+vibrance). Auto-exposure metering still runs CPU-side as in `process_cl` — the kernel only handles the static-parameter dispatch. |
+| `src/iop/lowlight.c` | Scotopic-luminance blend in Lab → XYZ → Lab; one user-driven 65536-entry blend curve + a 4-float scotopic white-point passed via push constants. 3-binding dispatch (in, out, lut); the Lab↔XYZ helpers come from `dt_vulkan_common.h`. Cheapest possible LUT-pattern port at ~70 LOC kernel + ~40 LOC module — useful as a template for the next batch of simple LUT consumers. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -247,14 +248,15 @@ runs against a real RAW are deferred to CI.
 
 - **TRIVIAL bucket** still to port. Examples that need only a
   storage-buffer LUT or two (covered by the LUT pattern §5.8):
-  `tonecurve`, `rgbcurve`, `rgblevels`, `lowlight`. Each lifts off
-  the existing colisa port template (~30 LOC module + ~50 LOC
-  kernel). `monochrome` needs the bilateral filter VK port first
-  (multi-input dependency). `rawoverexposed` is RAW-only and likely
-  stays on OpenCL. Done in earlier passes: `colisa`, `levels`,
+  `tonecurve`, `rgbcurve`, `rgblevels`. Each lifts off the
+  existing colisa port template (~30 LOC module + ~50 LOC kernel).
+  `monochrome` needs the bilateral filter VK port first (multi-
+  input dependency). `rawoverexposed` is RAW-only and likely stays
+  on OpenCL. Done in earlier passes: `colisa`, `levels`,
   `profile_gamma`, `zonesystem`, `splittoning` (added RGB↔HSL
   helpers to `dt_vulkan_common.h`), `overexposed` (first consumer
-  of ICC profile plumbing §5.11).
+  of ICC profile plumbing §5.11), `lowlight` (template for the
+  next LUT consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
@@ -935,16 +937,17 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   26 modules now expose `process_vk`, covering the simple per-pixel
+   27 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
    whitebalance_1f / 1f_xtrans, channelmixerrgb ×5, graduatednd,
-   vignette, relight), the first sub-region + multi-fill module
-   (borders), the first pass-through HAL-only module (mask_manager),
-   the first LUT-on-storage-buffer port (colisa), and the first
-   two ICC-profile-aware ports (overexposed, basicadj). All are
-   bit-equal to their OpenCL counterparts for the supported paths.
+   vignette, relight, lowlight), the first sub-region + multi-fill
+   module (borders), the first pass-through HAL-only module
+   (mask_manager), the first LUT-on-storage-buffer port (colisa),
+   and the first two ICC-profile-aware ports (overexposed,
+   basicadj). All are bit-equal to their OpenCL counterparts for
+   the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
@@ -1074,6 +1077,48 @@ unmaintained Apple OpenCL stack gives on Apple Silicon.
 For workloads where MoltenVK overhead matters (sub-millisecond
 dispatches with tiny buffers), we already batch on the host. Image
 modules are millisecond-scale or longer; the overhead is irrelevant.
+
+### 10.1 Current observed numbers (Vulkan-OpenCL hybrid pipeline)
+
+The pixelpipe integration in §4.2 currently routes one module at a
+time through Vulkan with host-staging at each boundary. This is
+**slower per module** than the equivalent OpenCL dispatch — the
+extra cost is real and measurable, and the §8.6 milestone (skip
+host-staging when both ends are VK) is the path to closing it.
+
+A real-world export on AMD Radeon RX 9060 XT (RADV) with both
+backends enabled and the default `prefer-vulkan` routing reported:
+
+| Module      | Pipeline | Canvas    | Time   | ms/MPx |
+|-------------|----------|-----------|-------:|-------:|
+| temperature | [export] | 9568×6376 | 1.37 s |     22 |
+| exposure    | [export] | 9568×6374 | 7.30 s |    120 |
+| temperature | [preview]| 2587×1723 | 0.11 s |     25 |
+| exposure    | [preview]| 2587×1723 | 0.43 s |     96 |
+
+The 4–5× asymmetry between temperature and exposure on the same
+canvas isn't kernel cost (both kernels are trivial per-pixel
+arithmetic) — it's allocator pressure. Each
+`dt_vulkan_write_to_device` / `read_from_device` call was doing a
+fresh ~1 GB `vkAllocateMemory` for the staging buffer; the first
+VK module (temperature) warms the driver's host-visible memory
+pool, the second (exposure) lands in a fragmented pool after the
+first one freed 4 GB of buffers.
+
+**Mitigation already in tree** — `dt_vk_device_t.staging` (added
+this iteration) keeps one host-visible staging buffer per device
+that grows monotonically and is reused across every host transfer.
+Drops the steady-state per-dispatch HAL overhead to one
+`vkCmdCopyBuffer` + one `vkMapMemory`, with the
+`vkAllocateMemory` happening once per high-water-mark instead of
+per call. Expected to close most of the temperature/exposure gap
+on the next export.
+
+**Still outstanding** — the per-dispatch device-local `vin` /
+`vout` allocations in `src/develop/pixelpipe_hb.c` still happen
+fresh per module, and we still pay one full host round-trip per VK
+module. The §8.6 milestone (track VK-resident buffers across
+consecutive process_vk modules) is the bigger structural fix.
 
 ## 11. Optional intermediate: clvk
 
