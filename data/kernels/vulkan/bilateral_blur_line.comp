@@ -1,0 +1,50 @@
+// GLSL fallback for bilateral_blur_line.cl. See the .cl header
+// for the kernel design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { float data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int offset1; int offset2; int offset3;
+    int size1;   int size2;   int size3;
+} pc;
+
+void main() {
+    int k = int(gl_GlobalInvocationID.x);
+    int j = int(gl_GlobalInvocationID.y);
+    if(k >= pc.size1 || j >= pc.size2) return;
+
+    float w0 = 6.0 / 16.0;
+    float w1 = 4.0 / 16.0;
+    float w2 = 1.0 / 16.0;
+    int index = k * pc.offset1 + j * pc.offset2;
+
+    float tmp1 = in_buf.data[index];
+    out_buf.data[index] = in_buf.data[index] * w0
+                        + w1 * in_buf.data[index + pc.offset3]
+                        + w2 * in_buf.data[index + 2 * pc.offset3];
+    index += pc.offset3;
+    float tmp2 = in_buf.data[index];
+    out_buf.data[index] = in_buf.data[index] * w0
+                        + w1 * (in_buf.data[index + pc.offset3] + tmp1)
+                        + w2 * in_buf.data[index + 2 * pc.offset3];
+    index += pc.offset3;
+    for(int i = 2; i < pc.size3 - 2; i++) {
+        float tmp3 = in_buf.data[index];
+        out_buf.data[index] = in_buf.data[index] * w0
+                            + w1 * (in_buf.data[index + pc.offset3]     + tmp2)
+                            + w2 * (in_buf.data[index + 2 * pc.offset3] + tmp1);
+        index += pc.offset3;
+        tmp1 = tmp2;
+        tmp2 = tmp3;
+    }
+    float tmp3 = in_buf.data[index];
+    out_buf.data[index] = in_buf.data[index] * w0
+                        + w1 * (in_buf.data[index + pc.offset3] + tmp2)
+                        + w2 * tmp1;
+    index += pc.offset3;
+    out_buf.data[index] = in_buf.data[index] * w0 + w1 * tmp3 + w2 * tmp2;
+}

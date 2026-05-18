@@ -1,0 +1,62 @@
+// GLSL fallback for bilateral_slice_to_output.cl. See the .cl
+// header for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In     { vec4  data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer Target { vec4  data[]; } target_buf;
+layout(std430, binding = 2)          buffer Out    { vec4  data[]; } out_buf;
+layout(std430, binding = 3) readonly buffer Grid   { float data[]; } grid_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   size_x;
+    int   size_y;
+    int   size_z;
+    float sigma_s;
+    float sigma_r;
+    float detail;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    float norm = -pc.detail * pc.sigma_r * 0.04;
+    int ox = 1;
+    int oy = pc.size_x;
+    int oz = pc.size_y * pc.size_x;
+
+    vec4 pixel  = in_buf.data[idx];
+    vec4 tpixel = target_buf.data[idx];
+    float L = pixel.x;
+
+    float gx = clamp(float(x) / pc.sigma_s, 0.0, float(pc.size_x - 1));
+    float gy = clamp(float(y) / pc.sigma_s, 0.0, float(pc.size_y - 1));
+    float gz = clamp(L         / pc.sigma_r, 0.0, float(pc.size_z - 1));
+
+    int xi = min(pc.size_x - 2, int(gx));
+    int yi = min(pc.size_y - 2, int(gy));
+    int zi = min(pc.size_z - 2, int(gz));
+    float fx = gx - float(xi);
+    float fy = gy - float(yi);
+    float fz = gz - float(zi);
+    int gi = xi + oy * yi + oz * zi;
+
+    float Ldiff =
+        grid_buf.data[gi]                * (1.0 - fx) * (1.0 - fy) * (1.0 - fz)
+      + grid_buf.data[gi + ox]           * (      fx) * (1.0 - fy) * (1.0 - fz)
+      + grid_buf.data[gi + oy]           * (1.0 - fx) * (      fy) * (1.0 - fz)
+      + grid_buf.data[gi + ox + oy]      * (      fx) * (      fy) * (1.0 - fz)
+      + grid_buf.data[gi + oz]           * (1.0 - fx) * (1.0 - fy) * (      fz)
+      + grid_buf.data[gi + ox + oz]      * (      fx) * (1.0 - fy) * (      fz)
+      + grid_buf.data[gi + oy + oz]      * (1.0 - fx) * (      fy) * (      fz)
+      + grid_buf.data[gi + ox + oy + oz] * (      fx) * (      fy) * (      fz);
+
+    tpixel.x = max(0.0, tpixel.x + norm * Ldiff);
+    out_buf.data[idx] = tpixel;
+}
