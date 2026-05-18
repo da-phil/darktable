@@ -285,6 +285,21 @@ void dt_ioppr_free_iccprofile_params_vk
    dt_vk_mem_t **_dev_profile_info,
    dt_vk_mem_t **_dev_profile_lut,
    const int devid);
+
+/** Vulkan equivalent of dt_ioppr_transform_image_colorspace_rgb_cl.
+ *  Both buffers carry float4 pixels. Returns TRUE on success, FALSE
+ *  if the transform couldn't be set up (e.g. no matrix on either
+ *  profile). Falls back to a CPU round-trip in the latter case so
+ *  the caller still gets a correct output. */
+gboolean dt_ioppr_transform_image_colorspace_rgb_vk
+  (const int devid,
+   dt_vk_mem_t *dev_img_in,
+   dt_vk_mem_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_order_iccprofile_info_t *const profile_info_from,
+   const dt_iop_order_iccprofile_info_t *const profile_info_to,
+   const char *message);
 #endif
 
 /** the following must have the matrix_in and matrix_out generated */
