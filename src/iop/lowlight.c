@@ -20,6 +20,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -75,6 +76,7 @@ typedef struct dt_iop_lowlight_data_t
 typedef struct dt_iop_lowlight_global_data_t
 {
   int kernel_lowlight;
+  dt_vk_module_kernel_t vk;
 } dt_iop_lowlight_global_data_t;
 
 
@@ -215,6 +217,54 @@ finish:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Push-constant layout matches lowlight.cl / lowlight.comp byte-for-byte
+// (2 ints + 4 floats = 24 bytes; XYZ_sw passed as 4 scalars to keep
+// the std430 packing flat — same convention as the rest of the ports).
+typedef struct
+{
+  int   width;
+  int   height;
+  float XYZ_sw_x, XYZ_sw_y, XYZ_sw_z, XYZ_sw_w;
+} vk_lowlight_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lowlight_data_t *d = piece->data;
+  const dt_iop_lowlight_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+
+  dt_aligned_pixel_t Lab_sw = { 100.0f, 0.0f, -d->blueness };
+  dt_aligned_pixel_t XYZ_sw;
+  dt_Lab_to_XYZ(Lab_sw, XYZ_sw);
+
+  const size_t lut_bytes = sizeof(float) * DT_IOP_LOWLIGHT_LUT_RES;
+  dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_lut) return -1;
+  if(dt_vulkan_write_to_device(devid, dev_lut, d->lut, lut_bytes) != 0)
+  {
+    dt_vulkan_free_buffer(devid, dev_lut);
+    return -1;
+  }
+
+  const vk_lowlight_pc_t pc = {
+    .width = width, .height = height,
+    .XYZ_sw_x = XYZ_sw[0], .XYZ_sw_y = XYZ_sw[1],
+    .XYZ_sw_z = XYZ_sw[2], .XYZ_sw_w = 0.0f,
+  };
+
+  dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_lut };
+  const int rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 3, width, height, &pc, sizeof(pc));
+
+  dt_vulkan_free_buffer(devid, dev_lut);
+  return rc;
+}
+#endif
+
 
 void init_global(dt_iop_module_so_t *self)
 {
@@ -222,6 +272,12 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_lowlight_global_data_t *gd = malloc(sizeof(dt_iop_lowlight_global_data_t));
   self->data = gd;
   gd->kernel_lowlight = dt_opencl_create_kernel(program, "lowlight");
+  // 2 ints + 4 floats = 24 bytes; matches vk_lowlight_pc_t and
+  // the push-constant block in lowlight.cl / lowlight.comp. 3
+  // storage-buffer bindings: in, out, lut.
+  const uint32_t pcsize = 2 * sizeof(int) + 4 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "lowlight", "lowlight",
+                               3, pcsize, 16, 16, 1);
 }
 
 
@@ -229,6 +285,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_lowlight_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_lowlight);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
