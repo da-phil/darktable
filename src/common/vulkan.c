@@ -370,8 +370,14 @@ int dt_vulkan_create_kernel(int program,
   if(!_spirv_has_entry(d->programs[program].spirv,
                        d->programs[program].spirv_words, entry))
   {
+    // Expected on glslang-fallback builds — the multi-entry modules
+    // (channelmixerrgb, borders) probe each entry; the ones absent
+    // here just stay on OpenCL. Logged once per probe so a developer
+    // chasing real failures has a breadcrumb, but the wording is
+    // intentionally informational rather than alarmist.
     dt_print(DT_DEBUG_OPENCL,
-             "[vulkan] entry point '%s' not present in SPIR-V program %d", entry, program);
+             "[vulkan] entry '%s' not in program %d (likely glslang fallback build; "
+             "module will use OpenCL for this entry)", entry, program);
     return -1;
   }
 
@@ -696,14 +702,12 @@ void dt_vulkan_module_kernel_create_from(dt_vk_module_kernel_t *out,
   out->program = program;
   out->kernel  = -1;
   if(!dt_vulkan_running() || program < 0) return;
+  // dt_vulkan_create_kernel already logs the missing-entry case
+  // with full context; don't duplicate it here.
   out->kernel = dt_vulkan_create_kernel(program, entry,
                                         num_storage_buffers,
                                         push_constant_size,
                                         local_x, local_y, local_z);
-  if(out->kernel < 0)
-    dt_print(DT_DEBUG_OPENCL,
-             "[vulkan] kernel '%s' failed to create (entry point likely absent in .spv)",
-             entry);
 }
 
 void dt_vulkan_module_kernel_unload(dt_vk_module_kernel_t *k)
