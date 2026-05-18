@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/debug.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -68,6 +69,7 @@ typedef struct dt_iop_colisa_data_t
 typedef struct dt_iop_colisa_global_data_t
 {
   int kernel_colisa;
+  dt_vk_module_kernel_t vk;
 } dt_iop_colisa_global_data_t;
 
 
@@ -147,6 +149,67 @@ error:
   dt_opencl_release_mem_object(dev_ccoeffs);
   dt_opencl_release_mem_object(dev_cm);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// Push-constant layout matches colisa.cl / colisa.comp byte-for-byte
+// (2 ints + 7 floats = 36 bytes).
+typedef struct
+{
+  int   width;
+  int   height;
+  float saturation;
+  float ca0;
+  float ca1;
+  float ca2;
+  float la0;
+  float la1;
+  float la2;
+} vk_colisa_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colisa_data_t *d = piece->data;
+  const dt_iop_colisa_global_data_t *gd = self->global_data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;  // 65536 entries per LUT
+
+  // Upload the two unbounded curves freshly each dispatch — the
+  // tables change with user params at commit time, and we don't
+  // currently have a cached per-piece scratch buffer story.
+  dt_vk_mem_t *dev_ctable = dt_vulkan_alloc_buffer(0, lut_bytes);
+  dt_vk_mem_t *dev_ltable = dt_vulkan_alloc_buffer(0, lut_bytes);
+  if(!dev_ctable || !dev_ltable) goto error;
+  if(dt_vulkan_write_to_device(0, dev_ctable, d->ctable, lut_bytes) != 0) goto error;
+  if(dt_vulkan_write_to_device(0, dev_ltable, d->ltable, lut_bytes) != 0) goto error;
+
+  const vk_colisa_pc_t pc = {
+    .width      = width,
+    .height     = height,
+    .saturation = d->saturation,
+    .ca0 = d->cunbounded_coeffs[0],
+    .ca1 = d->cunbounded_coeffs[1],
+    .ca2 = d->cunbounded_coeffs[2],
+    .la0 = d->lunbounded_coeffs[0],
+    .la1 = d->lunbounded_coeffs[1],
+    .la2 = d->lunbounded_coeffs[2],
+  };
+  dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_ctable, dev_ltable };
+  int rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 4, width, height, &pc, sizeof(pc));
+
+  dt_vulkan_free_buffer(0, dev_ctable);
+  dt_vulkan_free_buffer(0, dev_ltable);
+  return rc;
+
+error:
+  dt_vulkan_free_buffer(0, dev_ctable);
+  dt_vulkan_free_buffer(0, dev_ltable);
+  return -1;
 }
 #endif
 
@@ -253,6 +316,12 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_colisa_global_data_t *gd = malloc(sizeof(dt_iop_colisa_global_data_t));
   self->data = gd;
   gd->kernel_colisa = dt_opencl_create_kernel(program, "colisa");
+  // 2 ints + 7 floats = 36 bytes; matches vk_colisa_pc_t and the
+  // push constant block in colisa.cl / colisa.comp. 4 storage-buffer
+  // bindings: in, out, ctable, ltable.
+  const uint32_t pcsize = 2 * sizeof(int) + 7 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "colisa", "colisa",
+                               4, pcsize, 16, 16, 1);
 }
 
 
@@ -260,6 +329,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_colisa_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colisa);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
