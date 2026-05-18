@@ -1,0 +1,39 @@
+// GLSL fallback for relight.cl. Scalar push-constant layout matches
+// the clspv path byte-for-byte at 20 bytes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float center;
+    float wings;
+    float ev;
+} pc;
+
+float gauss(float center, float wings, float x) {
+    float b = -1.0 + center * 2.0;
+    float c = (wings / 10.0) / 2.0;
+    return exp(-(x - b) * (x - b) / (c * c));
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int i = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[i];
+    float lightness = pixel.x / 100.0;
+    float value = -1.0 + (lightness * 2.0);
+    float g = gauss(pc.center, pc.wings, value);
+    if (isnan(g) || isinf(g)) g = 0.0;
+
+    float r = 1.0 / exp2(-pc.ev * clamp(g, 0.0, 1.0));
+    if (isnan(r) || isinf(r)) r = 1.0;
+
+    pixel.x = 100.0 * clamp(lightness * r, 0.0, 1.0);
+    out_buf.data[i] = pixel;
+}
