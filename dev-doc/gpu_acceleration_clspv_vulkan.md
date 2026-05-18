@@ -211,7 +211,7 @@ in three categories.
 | `src/iop/mask_manager.c` | Pass-through dummy IOP; uses `dt_vulkan_copy_device_to_device` rather than a kernel. |
 | `src/iop/borders.c` | Multi-fill canvas + sub-region image copy. Uses `dt_vulkan_dispatch_n` (1 binding for fill, 2 for copy) and the two-entry-point multi-kernel pattern. |
 | `src/iop/colisa.c` | First LUT-on-storage-buffer port — uploads two 65536-entry tables freshly per dispatch and binds them at descriptors 2/3 alongside the in/out buffers. Pattern blueprint for `tonecurve`, `rgbcurve`, `rgblevels`, `basecurve`, … |
-| `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. The host-side colour-space transform that fills `tmp` is still CPU-side pending a Vulkan port of `dt_ioppr_transform_image_colorspace_rgb`. |
+| `src/iop/overexposed.c` | First consumer of the ICC profile storage-buffer plumbing (§5.11). 5-binding dispatch (in, out, histogram-profile tmp, profile_info, profile_lut) covering all four clipping-preview modes. Uses `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12) to do the current → histogram profile transform entirely on the GPU; only falls back to CPU when both profiles are non-matrix (lcms2-only). |
 | `src/iop/basicadj.c` | Exercises both arms of the §5.11 plumbing: `vk_get_rgb_matrix_luminance` for the highlight-compression branch + `vk_dt_rgb_norm` for the preserve-colors branch. 6-binding dispatch (in, out, gamma LUT, contrast LUT, profile_info, profile_lut); 8 ints + 10 floats of push constants drive the six independent sub-features (exposure, hlcompr, gamma, plain contrast, preserve-colors contrast, saturation+vibrance). Auto-exposure metering still runs CPU-side as in `process_cl` — the kernel only handles the static-parameter dispatch. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
@@ -671,6 +671,50 @@ member as `float unbounded_coeffs_in[9]` and accesses
 `[channel*3 + coeff]`; the clspv-built kernel keeps the 2-D
 declaration. `spirv-dis` is the trustworthy oracle here; cross-check
 new modules against the offsets above on first compile.
+
+### 5.12 Cross-profile RGB→RGB transform on the GPU
+
+Several modules need a working-space → output-space (or histogram-
+space) RGB transform mid-pipeline: optional input TRC LUT, 3×3
+matrix product, optional output TRC LUT. The OpenCL build does
+this via `dt_ioppr_transform_image_colorspace_rgb_cl` calling the
+`colorspaces_transform_rgb_matrix_to_rgb` kernel.
+
+Vulkan mirror in `src/common/iop_profile.{c,h}`:
+
+```c
+if(!dt_ioppr_transform_image_colorspace_rgb_vk(devid, dev_in, dev_out,
+                                               width, height,
+                                               profile_from, profile_to,
+                                               self->op)) {
+    /* fall back to CPU round-trip for lcms2-only profiles */
+}
+```
+
+* Kernel: `data/kernels/vulkan/colorspaces.cl` (+ `.comp` fallback);
+  6 storage-buffer bindings (in, out, from-profile_info, from-LUT,
+  to-profile_info, to-LUT) and a 44-byte push constant block
+  (`vk_colorspace_rgb_pc_t`: 2 ints + 9 floats = `pack_3xSSE_to_3x3`
+  output of `matrix_to->matrix_out · matrix_from->matrix_in`).
+* The host helper pre-combines the two 3×3 matrices into a single
+  product so the kernel only does one matmul per pixel — same shape
+  as the OpenCL code path.
+* Same-profile shortcut: when `from->type == to->type` and
+  filenames match, the helper does a `vkCmdCopyBuffer` (via
+  `dt_vulkan_copy_device_to_device`) instead of dispatching.
+* Non-matrix profile fallback: when either profile lacks a usable
+  matrix (lcms2-only), the helper returns `FALSE` so the caller can
+  round-trip through host memory. `overexposed::process_vk` is the
+  first consumer; the fallback path runs only when the histogram /
+  current profile is a CMS-only entry.
+
+Kernel slot caching mirrors `dt_gaussian_*_vk` (§5.10): a static
+`_vk_colorspaces_rgb2rgb` slot in `iop_profile.c` loaded lazily on
+first call, no `dt_vulkan_t` plumbing needed. The two other
+colorspaces.cl kernels (`lab_to_rgb_matrix`, `rgb_matrix_to_lab`)
+have not been ported yet — they're additional entry points in the
+same `.spv` module that we'd wire up the same way when a consumer
+needs them.
 
 ## 6. Per-OS picture
 
