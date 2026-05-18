@@ -64,7 +64,9 @@ set(VK_KERNELS
     bilateral_blur_line:bilateral_blur_line
     bilateral_blur_line_z:bilateral_blur_line_z
     bilateral_slice:bilateral_slice
-    bilateral_slice_to_output:bilateral_slice_to_output)
+    bilateral_slice_to_output:bilateral_slice_to_output
+    monochrome_filter:monochrome_filter
+    monochrome:monochrome)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
