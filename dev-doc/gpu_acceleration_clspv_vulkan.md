@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 28 modules currently expose `process_vk`,
+**Per-module ports**: 31 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -215,6 +215,9 @@ in three categories.
 | `src/iop/basicadj.c` | Exercises both arms of the §5.11 plumbing: `vk_get_rgb_matrix_luminance` for the highlight-compression branch + `vk_dt_rgb_norm` for the preserve-colors branch. 6-binding dispatch (in, out, gamma LUT, contrast LUT, profile_info, profile_lut); 8 ints + 10 floats of push constants drive the six independent sub-features (exposure, hlcompr, gamma, plain contrast, preserve-colors contrast, saturation+vibrance). Auto-exposure metering still runs CPU-side as in `process_cl` — the kernel only handles the static-parameter dispatch. |
 | `src/iop/lowlight.c` | Scotopic-luminance blend in Lab → XYZ → Lab; one user-driven 65536-entry blend curve + a 4-float scotopic white-point passed via push constants. 3-binding dispatch (in, out, lut); the Lab↔XYZ helpers come from `dt_vulkan_common.h`. Cheapest possible LUT-pattern port at ~70 LOC kernel + ~40 LOC module — useful as a template for the next batch of simple LUT consumers. |
 | `src/iop/monochrome.c` | First consumer of the bilateral helper (§5.13). Three-stage `process_vk`: `monochrome_filter` writes the chroma-distance weight into the output buffer; the bilateral helper (splat → blur → slice) smooths the weight into a scratch buffer; `monochrome` blends the original input with the smoothed weight and clears the chroma channels. Demonstrates the multi-kernel orchestration pattern that `lowpass` / `censorize` / `shadhi` / `retouch` / `globaltonemap` will follow. |
+| `src/iop/rgbcurve.c` | Per-channel RGB curve via three 65536-entry LUTs with linear-extrapolation tails (the `vk_lookup_unbounded` pattern). The norm-preserving "automatic" mode goes through `vk_dt_rgb_norm` to compute luminance via the §5.11 ICC profile plumbing. 7-binding dispatch (in, out, table_{r,g,b}, profile_info, profile_lut), 56 B push constants (5 ints + 9 floats — three 3-coeff unbounded tails). |
+| `src/iop/rgblevels.c` | Per-channel levels remap (low / middle / high triplet + inv-gamma) via three 65536-entry LUTs for the interior range + gamma-power extrapolation for x ≥ high. Same 7-binding shape as rgbcurve; 68 B push constants (5 ints + 12 floats — 3 levels × 3 channels + 3 inv_gamma). Norm-preserving mode goes through `vk_dt_rgb_norm` like rgbcurve. |
+| `src/iop/tonecurve.c` | Lab-space tone curve with four chroma-handling modes (`autoscale_ab`): independent a/b curves with optional two-sided unbounded extrapolation, automatic L/old-L chroma scaling, automatic in XYZ (curve applied to all three XYZ channels), and automatic in ProPhoto RGB (optionally norm-preserving). Largest curve-pattern PC at 84 B (5 ints + 16 floats — L coeffs + 6-float two-sided coeffs per a, b channel). Uses Lab↔XYZ + Lab↔ProPhoto helpers from `dt_vulkan_common.h`. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -247,12 +250,12 @@ runs against a real RAW are deferred to CI.
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
-- **TRIVIAL bucket** still to port. Examples that need only a
-  storage-buffer LUT or two (covered by the LUT pattern §5.8):
-  `tonecurve`, `rgbcurve`, `rgblevels`. Each lifts off the
-  existing colisa port template (~30 LOC module + ~50 LOC kernel).
-  `monochrome` is already ported as the first bilateral consumer
-  (§5.13).
+- **TRIVIAL bucket** still to port. The Lab/RGB-curve cohort
+  (`tonecurve`, `rgbcurve`, `rgblevels`) is now landed — they
+  lifted off the colisa template (§5.8) + the §5.11 ICC profile
+  plumbing for their norm-preserving modes. `monochrome` is
+  already ported as the first bilateral consumer (§5.13).
+  `rawoverexposed` is RAW-only and likely stays on OpenCL.
   `rawoverexposed` is RAW-only and likely stays on OpenCL. Done in
   earlier passes: `colisa`, `levels`, `profile_gamma`,
   `zonesystem`, `splittoning` (added RGB↔HSL helpers to
@@ -263,11 +266,11 @@ runs against a real RAW are deferred to CI.
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalance` (3
   variants, push-constant-only), `colorbalancergb`, `colorout` (3
-  LUTs), `censorize`, `filmic` (1 LUT + scalars). `rgblevels`,
-  `rgbcurve` use the §5.11 ICC profile plumbing. Each is ~50 LOC
+  LUTs), `censorize`, `filmic` (1 LUT + scalars). Each is ~50 LOC
   module + ~80 LOC kernel. Done in earlier passes: `basicadj`
   (second consumer of the §5.11 plumbing; full 6-feature ICC-aware
-  kernel).
+  kernel), `rgbcurve` / `rgblevels` / `tonecurve` (the Lab/RGB
+  curve cohort, all sharing the 7-binding §5.11 + §5.8 pattern).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`, `shadhi`. The
@@ -1011,7 +1014,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   28 modules now expose `process_vk`, covering the simple per-pixel
+   31 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1020,7 +1023,8 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    module (borders), the first pass-through HAL-only module
    (mask_manager), the first LUT-on-storage-buffer port (colisa),
    the first two ICC-profile-aware ports (overexposed, basicadj),
-   and the first bilateral-helper consumer (monochrome). All are
+   the first bilateral-helper consumer (monochrome), and the
+   Lab/RGB-curve cohort (rgbcurve, rgblevels, tonecurve). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
