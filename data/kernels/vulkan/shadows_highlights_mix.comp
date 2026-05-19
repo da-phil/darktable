@@ -1,0 +1,105 @@
+// GLSL fallback for shadows_highlights_mix.cl. See the .cl header
+// for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer Mask { vec4 data[]; } mask_buf;
+layout(std430, binding = 2)          buffer Out  { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   flags;
+    int   unbound_mask;
+    float shadows;
+    float highlights;
+    float compress;
+    float shadows_ccorrect;
+    float highlights_ccorrect;
+    float low_approximation;
+    float whitepoint;
+} pc;
+
+#define VK_SHADHI_UNBOUND_L              1
+#define VK_SHADHI_UNBOUND_A              2
+#define VK_SHADHI_UNBOUND_B              4
+#define VK_SHADHI_UNBOUND_HIGHLIGHTS_L   (VK_SHADHI_UNBOUND_L << 3)
+#define VK_SHADHI_UNBOUND_HIGHLIGHTS_A   (VK_SHADHI_UNBOUND_A << 3)
+#define VK_SHADHI_UNBOUND_HIGHLIGHTS_B   (VK_SHADHI_UNBOUND_B << 3)
+
+vec4 vk_overlay(vec4 in_a, vec4 in_b, float opacity, float transform, float ccorrect,
+                int ub_x, int ub_y, int ub_z, int ub_w, float low_approximation) {
+    vec4 scale = vec4(100.0, 128.0, 128.0, 1.0);
+    float lmin = 0.0;
+    float lmax = 1.0;
+    float halfmax = 0.5;
+    float doublemax = 2.0;
+    vec4 a = in_a / scale;
+    vec4 b = in_b / scale;
+    float opacity2 = opacity * opacity;
+
+    while(opacity2 > 0.0) {
+        float la = (ub_x != 0) ? a.x : clamp(a.x, lmin, lmax);
+        float lb = (b.x - halfmax) * sign(opacity) * sign(lmax - la) + halfmax;
+        lb = (ub_w != 0) ? lb : clamp(lb, lmin, lmax);
+        float lref = (abs(la) > low_approximation
+                        ? 1.0 / abs(la) : 1.0 / low_approximation) * sign(la);
+        float href = (abs(1.0 - la) > low_approximation
+                        ? 1.0 / abs(1.0 - la) : 1.0 / low_approximation) * sign(1.0 - la);
+
+        float chunk   = opacity2 > 1.0 ? 1.0 : opacity2;
+        float optrans = chunk * transform;
+        opacity2 -= 1.0;
+
+        a.x = la * (1.0 - optrans)
+            + ((la > halfmax)
+                  ? lmax - (lmax - doublemax * (la - halfmax)) * (lmax - lb)
+                  : doublemax * la * lb) * optrans;
+        a.x = (ub_x != 0) ? a.x : clamp(a.x, lmin, lmax);
+
+        float blend = a.x * lref * ccorrect + (1.0 - a.x) * href * (1.0 - ccorrect);
+        a.y = a.y * (1.0 - optrans) + (a.y + b.y) * blend * optrans;
+        a.y = (ub_y != 0) ? a.y : clamp(a.y, -1.0, 1.0);
+        a.z = a.z * (1.0 - optrans) + (a.z + b.z) * blend * optrans;
+        a.z = (ub_z != 0) ? a.z : clamp(a.z, -1.0, 1.0);
+    }
+    return a * scale;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 io = in_buf.data[idx];
+    float w = io.w;
+    vec4 m  = vec4(0.0);
+    m.x = 100.0 - mask_buf.data[idx].x;
+
+    io.x = io.x > 0.0 ? io.x / pc.whitepoint : io.x;
+    m.x  = m.x  > 0.0 ? m.x  / pc.whitepoint : m.x;
+
+    {
+        float xform = clamp(1.0 - 0.01 * m.x / (1.0 - pc.compress), 0.0, 1.0);
+        io = vk_overlay(io, m, -pc.highlights, xform, 1.0 - pc.highlights_ccorrect,
+                        pc.flags & VK_SHADHI_UNBOUND_HIGHLIGHTS_L,
+                        pc.flags & VK_SHADHI_UNBOUND_HIGHLIGHTS_A,
+                        pc.flags & VK_SHADHI_UNBOUND_HIGHLIGHTS_B,
+                        pc.unbound_mask, pc.low_approximation);
+    }
+    {
+        float xform = clamp(0.01 * m.x / (1.0 - pc.compress)
+                            - pc.compress / (1.0 - pc.compress), 0.0, 1.0);
+        io = vk_overlay(io, m, pc.shadows, xform, pc.shadows_ccorrect,
+                        pc.flags & VK_SHADHI_UNBOUND_L,
+                        pc.flags & VK_SHADHI_UNBOUND_A,
+                        pc.flags & VK_SHADHI_UNBOUND_B,
+                        pc.unbound_mask, pc.low_approximation);
+    }
+
+    io.w = w;
+    out_buf.data[idx] = io;
+}

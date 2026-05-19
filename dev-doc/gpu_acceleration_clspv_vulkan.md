@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 32 modules currently expose `process_vk`,
+**Per-module ports**: 33 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -219,6 +219,7 @@ in three categories.
 | `src/iop/rgblevels.c` | Per-channel levels remap (low / middle / high triplet + inv-gamma) via three 65536-entry LUTs for the interior range + gamma-power extrapolation for x ≥ high. Same 7-binding shape as rgbcurve; 68 B push constants (5 ints + 12 floats — 3 levels × 3 channels + 3 inv_gamma). Norm-preserving mode goes through `vk_dt_rgb_norm` like rgbcurve. |
 | `src/iop/tonecurve.c` | Lab-space tone curve with four chroma-handling modes (`autoscale_ab`): independent a/b curves with optional two-sided unbounded extrapolation, automatic L/old-L chroma scaling, automatic in XYZ (curve applied to all three XYZ channels), and automatic in ProPhoto RGB (optionally norm-preserving). Largest curve-pattern PC at 84 B (5 ints + 16 floats — L coeffs + 6-float two-sided coeffs per a, b channel). Uses Lab↔XYZ + Lab↔ProPhoto helpers from `dt_vulkan_common.h`. |
 | `src/iop/lowpass.c` | First combined-helper consumer: chains `dt_gaussian_*_vk` (§5.10) **or** `dt_bilateral_*_vk` (§5.13) for the low-pass step, then snapshots dev_out into a scratch buffer via `dt_vulkan_copy_device_to_device`, then runs the new `lowpass_mix` kernel (4 bindings, 40 B PC) to apply contrast + lightness curves on L and scale a/b chroma by saturation. Same algorithmic shape as `process_cl` 1:1, exercising the multi-helper orchestration pattern that censorize / shadhi / retouch can copy. |
+| `src/iop/shadhi.c` | Shadows / highlights recovery. Same Gaussian-or-bilateral choice as lowpass, then snapshot, then a new `shadows_highlights_mix` kernel (3 bindings, 44 B PC) that runs two soft-light overlays — one for highlights (negative opacity), one for shadows (positive opacity). The overlay helper handles per-channel unbound flags via the `flags` bitmask, mirroring the OpenCL kernel byte-for-byte. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -274,13 +275,15 @@ runs against a real RAW are deferred to CI.
   curve cohort, all sharing the 7-binding §5.11 + §5.8 pattern).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
-  `sharpen`, `soften`, `highpass`, `highlights`, `shadhi`. The
-  Gaussian VK helper (§5.10) handles the separable-blur half;
-  `sharpen` and the larger blurs still want workgroup-local-memory
-  plumbing for the cache-friendly kernels. Done in earlier passes:
+  `sharpen`, `soften`, `highpass`, `highlights`. The Gaussian VK
+  helper (§5.10) handles the separable-blur half; `sharpen` and
+  the larger blurs still want workgroup-local-memory plumbing for
+  the cache-friendly kernels. Done in earlier passes:
   `graduatednd`, `vignette`, `relight`, `borders` (multi-fill +
-  sub-region copy, §5.9), `lowpass` (first combined-helper consumer
-  — chains §5.10 or §5.13 followed by a curve-mix kernel).
+  sub-region copy, §5.9), `lowpass` (first combined-helper
+  consumer — chains §5.10 or §5.13 followed by a curve-mix
+  kernel), `shadhi` (second combined-helper consumer — same shape
+  + soft-light overlays).
 - **HARD** — atrous, bloom, denoiseprofile, filmicrgb,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
   basecurve (full variants), colorreconstruction (atomics). Multi-
@@ -1056,7 +1059,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   32 modules now expose `process_vk`, covering the simple per-pixel
+   33 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1067,9 +1070,9 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    the first two ICC-profile-aware ports (overexposed, basicadj),
    the first bilateral-helper consumer (monochrome), the
    Lab/RGB-curve cohort (rgbcurve, rgblevels, tonecurve), and the
-   first combined-helper consumer (lowpass — chains §5.10 / §5.13
-   with a curve-mix kernel). All are bit-equal to their OpenCL
-   counterparts for the supported paths.
+   two combined-helper consumers (lowpass, shadhi — each chains
+   §5.10 / §5.13 with a mix kernel). All are bit-equal to their
+   OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.
