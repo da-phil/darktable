@@ -18,9 +18,11 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/debug.h"
 #include "common/gaussian.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -109,6 +111,7 @@ typedef struct dt_iop_shadhi_data_t
 typedef struct dt_iop_shadhi_global_data_t
 {
   int kernel_shadows_highlights_mix;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_shadhi_global_data_t;
 
 
@@ -582,6 +585,114 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layout matches shadows_highlights_mix.cl / .comp byte-for-byte:
+// 4 ints + 7 floats = 44 bytes.
+typedef struct
+{
+  int   width;
+  int   height;
+  int   flags;
+  int   unbound_mask;
+  float shadows;
+  float highlights;
+  float compress;
+  float shadows_ccorrect;
+  float highlights_ccorrect;
+  float low_approximation;
+  float whitepoint;
+} vk_shadhi_mix_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_shadhi_data_t *d = piece->data;
+  const dt_iop_shadhi_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const int order = d->order;
+  const float radius = fmaxf(0.1f, d->radius);
+  const float sigma  = radius * roi_in->scale / piece->iscale;
+  const float shadows = 2.0f * fmin(fmax(-1.0f, (d->shadows / 100.0f)), 1.0f);
+  const float highlights = 2.0f * fmin(fmax(-1.0f, (d->highlights / 100.0f)), 1.0f);
+  const float whitepoint = fmax(1.0f - d->whitepoint / 100.0f, 0.01f);
+  const float compress = fmin(fmax(0.0f, (d->compress / 100.0f)), 0.99f);
+  const float shadows_ccorrect =
+      (fmin(fmax(0.0f, (d->shadows_ccorrect / 100.0f)), 1.0f) - 0.5f) * sign(shadows) + 0.5f;
+  const float highlights_ccorrect =
+      (fmin(fmax(0.0f, (d->highlights_ccorrect / 100.0f)), 1.0f) - 0.5f) * sign(-highlights) + 0.5f;
+  const float low_approximation = d->low_approximation;
+  const unsigned int flags = d->flags;
+  const int unbound_mask = ((d->shadhi_algo == SHADHI_ALGO_BILATERAL) && (flags & UNBOUND_BILATERAL))
+                          || ((d->shadhi_algo == SHADHI_ALGO_GAUSSIAN) && (flags & UNBOUND_GAUSSIAN));
+
+  dt_gaussian_vk_t  *g = NULL;
+  dt_bilateral_vk_t *b = NULL;
+  dt_vk_mem_t *dev_tmp = NULL;
+  int rc = -1;
+
+  // Step 1: low-pass mask into dev_out (Gaussian or bilateral).
+  if(d->shadhi_algo == SHADHI_ALGO_GAUSSIAN)
+  {
+    dt_aligned_pixel_t Labmax = { 100.0f, 128.0f, 128.0f, 1.0f };
+    dt_aligned_pixel_t Labmin = {   0.0f, -128.0f, -128.0f, 0.0f };
+    if(unbound_mask)
+    {
+      for(int k = 0; k < 4; k++) Labmax[k] = FLT_MAX;
+      for(int k = 0; k < 4; k++) Labmin[k] = -FLT_MAX;
+    }
+    g = dt_gaussian_init_vk(width, height, Labmax, Labmin, sigma, order);
+    if(!g) goto cleanup;
+    if(dt_gaussian_blur_vk(g, dev_in, dev_out) != 0) goto cleanup;
+    dt_gaussian_free_vk(g);
+    g = NULL;
+  }
+  else
+  {
+    const float sigma_r = 100.0f;
+    const float sigma_s = sigma;
+    const float detail  = -1.0f;
+    b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+    if(!b) goto cleanup;
+    if(dt_bilateral_splat_vk(b, dev_in) != 0) goto cleanup;
+    if(dt_bilateral_blur_vk(b)          != 0) goto cleanup;
+    if(dt_bilateral_slice_vk(b, dev_in, dev_out, detail) != 0) goto cleanup;
+    dt_bilateral_free_vk(b);
+    b = NULL;
+  }
+
+  // Step 2: snapshot mask so the mix kernel reads from a stable
+  // source while writing the final blend back to dev_out.
+  dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  if(!dev_tmp) goto cleanup;
+  if(dt_vulkan_copy_device_to_device(devid, dev_tmp, dev_out, img_bytes) != 0)
+    goto cleanup;
+
+  const vk_shadhi_mix_pc_t pc = {
+    .width = width, .height = height,
+    .flags = (int)flags,
+    .unbound_mask = unbound_mask,
+    .shadows = shadows, .highlights = highlights, .compress = compress,
+    .shadows_ccorrect = shadows_ccorrect,
+    .highlights_ccorrect = highlights_ccorrect,
+    .low_approximation = low_approximation,
+    .whitepoint = whitepoint,
+  };
+  dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out };
+  rc = dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 3, width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(g) dt_gaussian_free_vk(g);
+  if(b) dt_bilateral_free_vk(b);
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  return rc;
+}
+#endif
+
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
                      dt_develop_tiling_t *tiling)
@@ -662,12 +773,19 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_shadhi_global_data_t *gd = malloc(sizeof(dt_iop_shadhi_global_data_t));
   self->data = gd;
   gd->kernel_shadows_highlights_mix = dt_opencl_create_kernel(program, "shadows_highlights_mix");
+  // 4 ints + 7 floats = 44 bytes; matches vk_shadhi_mix_pc_t. 3
+  // storage bindings: in, mask, out.
+  const uint32_t pcsize = 4 * sizeof(int) + 7 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "shadows_highlights_mix",
+                               "shadows_highlights_mix",
+                               3, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_shadhi_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_shadows_highlights_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }

@@ -70,7 +70,8 @@ set(VK_KERNELS
     rgbcurve:rgbcurve
     rgblevels:rgblevels
     tonecurve:tonecurve
-    lowpass_mix:lowpass_mix)
+    lowpass_mix:lowpass_mix
+    shadows_highlights_mix:shadows_highlights_mix)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
