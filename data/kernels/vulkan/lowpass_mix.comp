@@ -1,0 +1,55 @@
+// GLSL fallback for lowpass_mix.cl. See the .cl header for design.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Ctab { float data[]; } ctable;
+layout(std430, binding = 3) readonly buffer Ltab { float data[]; } ltable;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   unbound;
+    float saturation;
+    float ca0; float ca1; float ca2;
+    float la0; float la1; float la2;
+} pc;
+
+#define VK_LUT_SIZE 0x10000
+
+float lookup_c(float x) { return ctable.data[clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1)]; }
+float lookup_l(float x) { return ltable.data[clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1)]; }
+
+float lookup_unbounded_c(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return lookup_c(x);
+    return c1 * pow(x * c0, c2);
+}
+float lookup_unbounded_l(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return lookup_l(x);
+    return c1 * pow(x * c0, c2);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+    vec4 o;
+    o.x = lookup_unbounded_c(i.x / 100.0, pc.ca0, pc.ca1, pc.ca2);
+    o.x = lookup_unbounded_l(o.x / 100.0, pc.la0, pc.la1, pc.la2);
+    if(pc.unbound != 0) {
+        o.y = i.y * pc.saturation;
+        o.z = i.z * pc.saturation;
+    } else {
+        o.y = clamp(i.y * pc.saturation, -128.0, 128.0);
+        o.z = clamp(i.z * pc.saturation, -128.0, 128.0);
+    }
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}

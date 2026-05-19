@@ -19,9 +19,11 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/debug.h"
 #include "common/gaussian.h"
 #include "common/imagebuf.h"
+#include "common/vulkan.h"
 #include "common/math.h"
 #include "common/opencl.h"
 #include "control/control.h"
@@ -89,6 +91,7 @@ typedef struct dt_iop_lowpass_data_t
 typedef struct dt_iop_lowpass_global_data_t
 {
   int kernel_lowpass_mix;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_lowpass_global_data_t;
 
 
@@ -325,6 +328,112 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layout matches lowpass_mix.cl / lowpass_mix.comp byte-for-byte:
+// 3 ints + 7 floats = 40 bytes.
+typedef struct
+{
+  int   width;
+  int   height;
+  int   unbound;
+  float saturation;
+  float ca0, ca1, ca2;
+  float la0, la1, la2;
+} vk_lowpass_mix_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lowpass_data_t *d = piece->data;
+  const dt_iop_lowpass_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const float radius = fmax(0.1f, d->radius);
+  const float sigma  = radius * roi_in->scale / piece->iscale;
+  const int   order  = d->order;
+  const int   unbound = d->unbound;
+
+  float Labmax[] = { 100.0f, 128.0f, 128.0f, 1.0f };
+  float Labmin[] = {   0.0f, -128.0f, -128.0f, 0.0f };
+  if(unbound)
+  {
+    for(int k = 0; k < 4; k++) Labmax[k] = FLT_MAX;
+    for(int k = 0; k < 4; k++) Labmin[k] = -FLT_MAX;
+  }
+
+  dt_gaussian_vk_t  *g = NULL;
+  dt_bilateral_vk_t *b = NULL;
+  dt_vk_mem_t *dev_tmp = NULL;
+  dt_vk_mem_t *dev_cm  = NULL;
+  dt_vk_mem_t *dev_lm  = NULL;
+  int rc = -1;
+
+  // Step 1: low-pass filter (Gaussian or bilateral), dev_in → dev_out
+  if(d->lowpass_algo == LOWPASS_ALGO_GAUSSIAN)
+  {
+    g = dt_gaussian_init_vk(width, height, Labmax, Labmin, sigma, order);
+    if(!g) goto cleanup;
+    if(dt_gaussian_blur_vk(g, dev_in, dev_out) != 0) goto cleanup;
+    dt_gaussian_free_vk(g);
+    g = NULL;
+  }
+  else
+  {
+    const float sigma_r = 100.0f;
+    const float sigma_s = sigma;
+    const float detail  = -1.0f; // bilateral base layer
+    b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+    if(!b) goto cleanup;
+    if(dt_bilateral_splat_vk(b, dev_in) != 0) goto cleanup;
+    if(dt_bilateral_blur_vk(b)          != 0) goto cleanup;
+    if(dt_bilateral_slice_vk(b, dev_in, dev_out, detail) != 0) goto cleanup;
+    dt_bilateral_free_vk(b);
+    b = NULL;
+  }
+
+  // Step 2: snapshot the low-pass output so the mix kernel reads
+  // from a stable source while writing the final blend to dev_out.
+  dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  if(!dev_tmp) goto cleanup;
+  if(dt_vulkan_copy_device_to_device(devid, dev_tmp, dev_out, img_bytes) != 0)
+    goto cleanup;
+
+  // Step 3: upload the two curve LUTs and dispatch lowpass_mix.
+  dev_cm = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_lm = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_cm || !dev_lm) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_cm, d->ctable, lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_lm, d->ltable, lut_bytes) != 0) goto cleanup;
+
+  const vk_lowpass_mix_pc_t pc = {
+    .width = width, .height = height,
+    .unbound = unbound,
+    .saturation = d->saturation,
+    .ca0 = d->cunbounded_coeffs[0],
+    .ca1 = d->cunbounded_coeffs[1],
+    .ca2 = d->cunbounded_coeffs[2],
+    .la0 = d->lunbounded_coeffs[0],
+    .la1 = d->lunbounded_coeffs[1],
+    .la2 = d->lunbounded_coeffs[2],
+  };
+  dt_vk_mem_t *bufs[] = { dev_tmp, dev_out, dev_cm, dev_lm };
+  rc = dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 4, width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(g) dt_gaussian_free_vk(g);
+  if(b) dt_bilateral_free_vk(b);
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_cm)  dt_vulkan_free_buffer(devid, dev_cm);
+  if(dev_lm)  dt_vulkan_free_buffer(devid, dev_lm);
+  return rc;
+}
+#endif
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -544,6 +653,11 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_lowpass_global_data_t *gd = malloc(sizeof(dt_iop_lowpass_global_data_t));
   self->data = gd;
   gd->kernel_lowpass_mix = dt_opencl_create_kernel(program, "lowpass_mix");
+  // 3 ints + 7 floats = 40 bytes; matches vk_lowpass_mix_pc_t.
+  // 4 storage bindings: in, out, ctable, ltable.
+  const uint32_t pcsize = 3 * sizeof(int) + 7 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "lowpass_mix", "lowpass_mix",
+                               4, pcsize, 16, 16, 1);
 }
 
 void init_presets(dt_iop_module_so_t *self)
@@ -561,6 +675,7 @@ void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_lowpass_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_lowpass_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }
