@@ -74,7 +74,8 @@ set(VK_KERNELS
     shadows_highlights_mix:shadows_highlights_mix
     colorbalance:colorbalance
     colorbalance_lgg:colorbalance_lgg
-    colorbalance_cdl:colorbalance_cdl)
+    colorbalance_cdl:colorbalance_cdl
+    colorout:colorout)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

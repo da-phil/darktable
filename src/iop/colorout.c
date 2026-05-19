@@ -24,6 +24,7 @@
 #include "common/iop_profile.h"
 #include "common/opencl.h"
 #include "common/utility.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -59,7 +60,26 @@ typedef struct dt_iop_colorout_data_t
 typedef struct dt_iop_colorout_global_data_t
 {
   int kernel_colorout;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk;
+#endif
 } dt_iop_colorout_global_data_t;
+
+#ifdef HAVE_VULKAN
+// Push-constant layout shared between init_global (sizeof) and
+// process_vk (assignment); declared up here so init_global can refer
+// to it.
+typedef struct
+{
+  int   width, height;
+  float m00, m01, m02;
+  float m10, m11, m12;
+  float m20, m21, m22;
+  float ar0, ar1, ar2;
+  float ag0, ag1, ag2;
+  float ab0, ab1, ab2;
+} vk_colorout_pc_t;
+#endif
 
 typedef struct dt_iop_colorout_params_t
 {
@@ -232,12 +252,22 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_colorout_global_data_t *gd = malloc(sizeof(dt_iop_colorout_global_data_t));
   self->data = gd;
   gd->kernel_colorout = dt_opencl_create_kernel(program, "colorout");
+#ifdef HAVE_VULKAN
+  // 5 storage buffers (in, out, lut_r/g/b); push constants are
+  // 2 ints + 18 floats = 80 B.
+  dt_vulkan_module_kernel_load(&gd->vk, "colorout", "colorout",
+                               5, sizeof(vk_colorout_pc_t),
+                               16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_colorout_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colorout);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk);
+#endif
   free(self->data);
   self->data = NULL;
 }
@@ -354,6 +384,61 @@ error:
   dt_opencl_release_mem_object(dev_b);
   dt_opencl_release_mem_object(dev_coeffs);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorout_data_t *const d = piece->data;
+  const dt_iop_colorout_global_data_t *const gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const size_t image_bytes =
+    (size_t)roi_in->width * roi_in->height * 4 * sizeof(float);
+
+  // Lab pass-through: matches the OpenCL `enqueue_copy_image` fast path.
+  if(d->type == DT_COLORSPACE_LAB)
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, image_bytes);
+
+  // No valid matrix means we can't take the GPU shaper-LUT path; fall
+  // through to the CPU lcms2 transform (same decision as process_cl).
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0])) return -1;
+
+  const size_t lut_bytes = sizeof(float) * LUT_SAMPLES;
+  dt_vk_mem_t *dev_r = NULL, *dev_g = NULL, *dev_b = NULL;
+  int rc = -1;
+
+  dev_r = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_g = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_r || !dev_g || !dev_b) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_r, d->lut[0], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_g, d->lut[1], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_b, d->lut[2], lut_bytes) != 0) goto cleanup;
+
+  float m[9];
+  pack_3xSSE_to_3x3(d->cmatrix, m);
+  const vk_colorout_pc_t pc = {
+    .width = roi_in->width, .height = roi_in->height,
+    .m00 = m[0], .m01 = m[1], .m02 = m[2],
+    .m10 = m[3], .m11 = m[4], .m12 = m[5],
+    .m20 = m[6], .m21 = m[7], .m22 = m[8],
+    .ar0 = d->unbounded_coeffs[0][0], .ar1 = d->unbounded_coeffs[0][1], .ar2 = d->unbounded_coeffs[0][2],
+    .ag0 = d->unbounded_coeffs[1][0], .ag1 = d->unbounded_coeffs[1][1], .ag2 = d->unbounded_coeffs[1][2],
+    .ab0 = d->unbounded_coeffs[2][0], .ab1 = d->unbounded_coeffs[2][1], .ab2 = d->unbounded_coeffs[2][2],
+  };
+
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_r, dev_g, dev_b };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 5,
+                            roi_in->width, roi_in->height, &pc, sizeof(pc));
+
+cleanup:
+  if(dev_r) dt_vulkan_free_buffer(devid, dev_r);
+  if(dev_g) dt_vulkan_free_buffer(devid, dev_g);
+  if(dev_b) dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
 }
 #endif
 
