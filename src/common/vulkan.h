@@ -113,7 +113,29 @@ typedef struct dt_vk_device_t
   // pixelpipe-VK timings; the cache cuts the steady-state
   // overhead per module to a single vkCmdCopyBuffer.
   struct dt_vk_mem_t *staging;
+
+  // Device-buffer pool. dt_vulkan_alloc_buffer / dt_vulkan_free_buffer
+  // route through a small free-list of recently freed device-local
+  // buffers; alloc returns the smallest-fit buffer ≥ requested size,
+  // free pushes back to the list (up to DT_VULKAN_BUF_POOL_CAP). This
+  // cuts the per-dispatch `vkAllocateMemory` / `vkCreateBuffer` churn
+  // that dominates the steady-state HAL cost (§10.1 follow-up).
+  // Lifetime is bound to the device — buffers are released at
+  // dt_vulkan_cleanup. Access serialised by g_vk_lock together with
+  // the rest of the dispatch path.
+  struct dt_vk_mem_t *buf_pool[64];
+  int                 buf_pool_count;
+
+  // Reusable one-shot submission resources. _submit_one_shot used to
+  // allocate a fresh VkCommandBuffer and VkFence per call (4-5 per
+  // module dispatch — upload, kernel, readback). Reusing them via
+  // vkResetCommandBuffer + vkResetFences saves the create/destroy
+  // pair on every submission.
+  VkCommandBuffer     oneshot_cmd;
+  VkFence             oneshot_fence;
 } dt_vk_device_t;
+
+#define DT_VULKAN_BUF_POOL_CAP 64
 
 typedef struct dt_vulkan_t
 {
