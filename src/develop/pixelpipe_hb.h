@@ -21,6 +21,7 @@
 #include "common/atomic.h"
 #include "common/image.h"
 #include "common/iop_order.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -287,6 +288,16 @@ typedef struct dt_dev_pixelpipe_t
   // sum of all per-piece detail/raster mask caches currently allocated in this pipe
   size_t mask_cache_size;
   gint64 started_time; // monotonic timestamp (in microseconds) when the pipe started
+
+  // VK→VK chain hand-off cache (§8.6 / §5.14 in
+  // gpu_acceleration_clspv_vulkan.md). After a process_vk module
+  // finishes we keep its device-local output buffer alive so the
+  // next module can reuse it as input without a host round-trip.
+  // The buffer is freed when the next non-VK module runs, when
+  // the next VK module has a mismatched input size, or at
+  // pipeline teardown.
+  dt_vk_mem_t *vk_handoff_buf;
+  size_t       vk_handoff_size;
 } dt_dev_pixelpipe_t;
 
 struct dt_develop_t;
