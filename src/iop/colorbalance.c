@@ -25,6 +25,7 @@ http://www.youtube.com/watch?v=JVoUgR6bhBc
 #include "common/colorspaces_inline_conversions.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -141,6 +142,9 @@ typedef struct dt_iop_colorbalance_global_data_t
   int kernel_colorbalance;
   int kernel_colorbalance_cdl;
   int kernel_colorbalance_lgg;
+  dt_vk_module_kernel_t vk_legacy;
+  dt_vk_module_kernel_t vk_lgg;
+  dt_vk_module_kernel_t vk_cdl;
 } dt_iop_colorbalance_global_data_t;
 
 
@@ -866,6 +870,130 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layouts byte-for-byte matching the .cl/.comp twins. LEGACY
+// has 15 floats (no saturation_out); LGG/CDL share a 16-float
+// layout with saturation_out as the trailing slot.
+typedef struct
+{
+  int   width;
+  int   height;
+  float lift_r,  lift_g,  lift_b,  lift_w;
+  float gain_r,  gain_g,  gain_b,  gain_w;
+  float gam_r,   gam_g,   gam_b,   gam_w;
+  float saturation;
+  float contrast;
+  float grey;
+} vk_cb_legacy_pc_t;
+
+typedef struct
+{
+  int   width;
+  int   height;
+  float lift_r,  lift_g,  lift_b,  lift_w;
+  float gain_r,  gain_g,  gain_b,  gain_w;
+  float gam_r,   gam_g,   gam_b,   gam_w;
+  float saturation;
+  float contrast;
+  float grey;
+  float saturation_out;
+} vk_cb_lgg_cdl_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorbalance_data_t *d = piece->data;
+  const dt_iop_colorbalance_global_data_t *gd = self->global_data;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  switch(d->mode)
+  {
+    case LEGACY:
+    {
+      const vk_cb_legacy_pc_t pc = {
+        .width = width, .height = height,
+        .lift_r = 2.0f - (d->lift[CHANNEL_RED]   * d->lift[CHANNEL_FACTOR]),
+        .lift_g = 2.0f - (d->lift[CHANNEL_GREEN] * d->lift[CHANNEL_FACTOR]),
+        .lift_b = 2.0f - (d->lift[CHANNEL_BLUE]  * d->lift[CHANNEL_FACTOR]),
+        .lift_w = 0.0f,
+        .gain_r = d->gain[CHANNEL_RED]   * d->gain[CHANNEL_FACTOR],
+        .gain_g = d->gain[CHANNEL_GREEN] * d->gain[CHANNEL_FACTOR],
+        .gain_b = d->gain[CHANNEL_BLUE]  * d->gain[CHANNEL_FACTOR],
+        .gain_w = 0.0f,
+        .gam_r = (d->gamma[CHANNEL_RED]   * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_RED]   * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_g = (d->gamma[CHANNEL_GREEN] * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_GREEN] * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_b = (d->gamma[CHANNEL_BLUE]  * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_BLUE]  * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_w = 0.0f,
+        .saturation = d->saturation,
+        .contrast = (d->contrast != 0.0f) ? 1.0f / d->contrast : 1000000.0f,
+        .grey = d->grey / 100.0f,
+      };
+      return dt_vulkan_dispatch_inout(&gd->vk_legacy, dev_in, dev_out,
+                                       width, height, &pc, sizeof(pc));
+    }
+    case LIFT_GAMMA_GAIN:
+    {
+      const vk_cb_lgg_cdl_pc_t pc = {
+        .width = width, .height = height,
+        .lift_r = 2.0f - (d->lift[CHANNEL_RED]   * d->lift[CHANNEL_FACTOR]),
+        .lift_g = 2.0f - (d->lift[CHANNEL_GREEN] * d->lift[CHANNEL_FACTOR]),
+        .lift_b = 2.0f - (d->lift[CHANNEL_BLUE]  * d->lift[CHANNEL_FACTOR]),
+        .lift_w = 0.0f,
+        .gain_r = d->gain[CHANNEL_RED]   * d->gain[CHANNEL_FACTOR],
+        .gain_g = d->gain[CHANNEL_GREEN] * d->gain[CHANNEL_FACTOR],
+        .gain_b = d->gain[CHANNEL_BLUE]  * d->gain[CHANNEL_FACTOR],
+        .gain_w = 0.0f,
+        .gam_r = (d->gamma[CHANNEL_RED]   * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_RED]   * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_g = (d->gamma[CHANNEL_GREEN] * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_GREEN] * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_b = (d->gamma[CHANNEL_BLUE]  * d->gamma[CHANNEL_FACTOR] != 0.0f)
+                  ? 1.0f / (d->gamma[CHANNEL_BLUE]  * d->gamma[CHANNEL_FACTOR]) : 1000000.0f,
+        .gam_w = 0.0f,
+        .saturation = d->saturation,
+        .contrast = (d->contrast != 0.0f) ? 1.0f / d->contrast : 1000000.0f,
+        .grey = d->grey / 100.0f,
+        .saturation_out = d->saturation_out,
+      };
+      return dt_vulkan_dispatch_inout(&gd->vk_lgg, dev_in, dev_out,
+                                       width, height, &pc, sizeof(pc));
+    }
+    case SLOPE_OFFSET_POWER:
+    {
+      // CDL uses gamma (not gamma_inv) directly as the power
+      // exponent. lift is additive, not multiplicative.
+      const vk_cb_lgg_cdl_pc_t pc = {
+        .width = width, .height = height,
+        .lift_r = d->lift[CHANNEL_RED]   + d->lift[CHANNEL_FACTOR] - 2.0f,
+        .lift_g = d->lift[CHANNEL_GREEN] + d->lift[CHANNEL_FACTOR] - 2.0f,
+        .lift_b = d->lift[CHANNEL_BLUE]  + d->lift[CHANNEL_FACTOR] - 2.0f,
+        .lift_w = 0.0f,
+        .gain_r = d->gain[CHANNEL_RED]   * d->gain[CHANNEL_FACTOR],
+        .gain_g = d->gain[CHANNEL_GREEN] * d->gain[CHANNEL_FACTOR],
+        .gain_b = d->gain[CHANNEL_BLUE]  * d->gain[CHANNEL_FACTOR],
+        .gain_w = 0.0f,
+        .gam_r = (2.0f - d->gamma[CHANNEL_RED])   * (2.0f - d->gamma[CHANNEL_FACTOR]),
+        .gam_g = (2.0f - d->gamma[CHANNEL_GREEN]) * (2.0f - d->gamma[CHANNEL_FACTOR]),
+        .gam_b = (2.0f - d->gamma[CHANNEL_BLUE])  * (2.0f - d->gamma[CHANNEL_FACTOR]),
+        .gam_w = 0.0f,
+        .saturation = d->saturation,
+        .contrast = (d->contrast != 0.0f) ? 1.0f / d->contrast : 1000000.0f,
+        .grey = d->grey / 100.0f,
+        .saturation_out = d->saturation_out,
+      };
+      return dt_vulkan_dispatch_inout(&gd->vk_cdl, dev_in, dev_out,
+                                       width, height, &pc, sizeof(pc));
+    }
+  }
+  return -1;
+}
+#endif
+
 static inline void update_saturation_slider_color(GtkWidget *slider, float hue)
 {
   dt_aligned_pixel_t rgb;
@@ -1383,6 +1511,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_colorbalance = dt_opencl_create_kernel(program, "colorbalance");
   gd->kernel_colorbalance_lgg = dt_opencl_create_kernel(program, "colorbalance_lgg");
   gd->kernel_colorbalance_cdl = dt_opencl_create_kernel(program, "colorbalance_cdl");
+
+  // LEGACY:    2 ints + 15 floats = 68 bytes
+  // LGG, CDL:  2 ints + 16 floats = 72 bytes
+  // 2 storage bindings (in, out) — push-constant-only kernels.
+  const uint32_t pc_legacy = 2 * sizeof(int) + 15 * sizeof(float);
+  const uint32_t pc_lgg_cdl = 2 * sizeof(int) + 16 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_legacy, "colorbalance", "colorbalance",
+                               2, pc_legacy, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_lgg, "colorbalance_lgg", "colorbalance_lgg",
+                               2, pc_lgg_cdl, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_cdl, "colorbalance_cdl", "colorbalance_cdl",
+                               2, pc_lgg_cdl, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -1391,6 +1531,9 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_colorbalance);
   dt_opencl_free_kernel(gd->kernel_colorbalance_lgg);
   dt_opencl_free_kernel(gd->kernel_colorbalance_cdl);
+  dt_vulkan_module_kernel_unload(&gd->vk_legacy);
+  dt_vulkan_module_kernel_unload(&gd->vk_lgg);
+  dt_vulkan_module_kernel_unload(&gd->vk_cdl);
   free(self->data);
   self->data = NULL;
 }
