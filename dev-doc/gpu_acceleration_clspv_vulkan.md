@@ -1255,10 +1255,30 @@ the device-local input allocation and the host upload entirely
 boundary host traffic for VK chains. Visible in the trace as a
 `[vk handoff]` annotation on the `process_vk` log line.
 
-**Still outstanding** — the per-dispatch device-local `vout`
-allocation still happens fresh per module. A device-buffer pool
-(complementing the staging-buffer cache) would close the
-remaining alloc/free cost for repeat sizes.
+**Follow-up landed** — `dt_vk_device_t.buf_pool` is a small (64-slot)
+free-list of recently released device-local buffers.
+`dt_vulkan_alloc_buffer` does a best-fit scan against the pool
+before falling back to `_alloc`; `dt_vulkan_free_buffer` pushes
+back to the pool (evicting the smallest pooled buffer when full,
+so the most-expensive-to-recreate allocations stay cached). For
+typical pixelpipe workloads the steady-state per-module cost
+collapses to two pool hits — no `vkAllocateMemory` /
+`vkCreateBuffer` calls inside the per-dispatch critical section.
+
+**Follow-up landed** — `_submit_one_shot` now reuses a persistent
+`VkCommandBuffer` + `VkFence` per device via
+`vkResetCommandBuffer` + `vkResetFences`. The previous create-
+destroy pair per submission cost ~5-50 µs of driver overhead;
+with three submissions per module (upload, kernel, readback) and
+hundreds of submissions per export pipeline, the savings show up
+in the trace as smaller "wall-time minus useful-work" gaps.
+
+**Still outstanding** — the global `g_vk_lock` still serialises
+all dispatches across concurrent pipelines (thumbnail / preview /
+full / export). Splitting the lock so buffer alloc/free, host
+memcpys, and the staging-buffer access can overlap across
+pipelines would unblock the multi-pipeline thumbnailer case
+visible in §10.1's traces.
 
 ## 11. Optional intermediate: clvk
 

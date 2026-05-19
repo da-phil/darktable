@@ -258,6 +258,17 @@ void dt_vulkan_cleanup(dt_vulkan_t *vk)
       free(d->staging);
       d->staging = NULL;
     }
+    for(int b = 0; b < d->buf_pool_count; b++)
+    {
+      dt_vk_mem_t *m = d->buf_pool[b];
+      if(m->buffer) vkDestroyBuffer(d->device, m->buffer, NULL);
+      if(m->memory) vkFreeMemory(d->device, m->memory, NULL);
+      free(m);
+    }
+    d->buf_pool_count = 0;
+    if(d->oneshot_fence) vkDestroyFence(d->device, d->oneshot_fence, NULL);
+    if(d->oneshot_cmd)
+      vkFreeCommandBuffers(d->device, d->cmd_pool, 1, &d->oneshot_cmd);
     if(d->dset_pool) vkDestroyDescriptorPool(d->device, d->dset_pool, NULL);
     if(d->cmd_pool)  vkDestroyCommandPool(d->device, d->cmd_pool, NULL);
     if(d->device)    vkDestroyDevice(d->device, NULL);
@@ -492,11 +503,69 @@ error:
   return NULL;
 }
 
+// Device-buffer pool. The HAL's `_alloc` path is dominated by
+// `vkAllocateMemory` (5-30 ms per large buffer on RADV / lavapipe).
+// Each VK module dispatch allocates two buffers (vin/vout); without
+// a pool that's 10-60 ms of pure driver overhead per module before
+// any work happens. The pool serves alloc requests from a free-list
+// of previously-released buffers; only when no buffer ≥ requested
+// size is available do we fall back to a fresh _alloc. Buffers
+// remain device-local + storage + transfer-src/dst, matching the
+// fresh-allocation flags, so any caller can use a pooled buffer
+// interchangeably.
+static dt_vk_mem_t *_pool_take(dt_vk_device_t *d, VkDeviceSize size)
+{
+  // Best fit: pick the smallest pooled buffer that still satisfies
+  // `size`. Avoids handing out a 1 GB staging-leftover for a 4 MB
+  // dispatch.
+  int best = -1;
+  VkDeviceSize best_size = (VkDeviceSize)-1;
+  for(int i = 0; i < d->buf_pool_count; i++)
+  {
+    const VkDeviceSize s = d->buf_pool[i]->size;
+    if(s >= size && s < best_size)
+    {
+      best = i;
+      best_size = s;
+    }
+  }
+  if(best < 0) return NULL;
+  dt_vk_mem_t *m = d->buf_pool[best];
+  // O(1) removal — order in the pool isn't meaningful.
+  d->buf_pool[best] = d->buf_pool[--d->buf_pool_count];
+  return m;
+}
+
+static gboolean _pool_put(dt_vk_device_t *d, dt_vk_mem_t *m)
+{
+  // Don't pool host-visible buffers — the staging buffer is the only
+  // host-visible allocation we make and it has its own caching path.
+  if(m->host_visible) return FALSE;
+  if(d->buf_pool_count >= DT_VULKAN_BUF_POOL_CAP)
+  {
+    // Pool full: evict the smallest buffer (most likely to be
+    // re-allocated cheaply if its size class comes up again) and
+    // make room for this one.
+    int victim = 0;
+    for(int i = 1; i < d->buf_pool_count; i++)
+      if(d->buf_pool[i]->size < d->buf_pool[victim]->size) victim = i;
+    dt_vk_mem_t *ev = d->buf_pool[victim];
+    if(ev->buffer) vkDestroyBuffer(d->device, ev->buffer, NULL);
+    if(ev->memory) vkFreeMemory(d->device, ev->memory, NULL);
+    free(ev);
+    d->buf_pool[victim] = d->buf_pool[--d->buf_pool_count];
+  }
+  d->buf_pool[d->buf_pool_count++] = m;
+  return TRUE;
+}
+
 dt_vk_mem_t *dt_vulkan_alloc_buffer(int devid, size_t size)
 {
   if(!dt_vulkan_running()) return NULL;
   (void)devid;
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  dt_vk_mem_t *pooled = _pool_take(d, (VkDeviceSize)size);
+  if(pooled) return pooled;
   return _alloc(d, (VkDeviceSize)size,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
@@ -509,26 +578,50 @@ void dt_vulkan_free_buffer(int devid, dt_vk_mem_t *mem)
   if(!mem || !dt_vulkan_running()) return;
   (void)devid;
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  if(_pool_put(d, mem)) return;
   if(mem->buffer) vkDestroyBuffer(d->device, mem->buffer, NULL);
   if(mem->memory) vkFreeMemory(d->device, mem->memory, NULL);
   free(mem);
 }
 
-// Generic one-shot command-buffer helper: alloc, begin, fill via cb,
-// end, submit, wait, free. Used by upload/download/dispatch.
+// Generic one-shot command-buffer helper: record fn into the
+// persistent command buffer, submit on the queue, wait on the
+// persistent fence, return. Reuses d->oneshot_cmd and
+// d->oneshot_fence rather than creating/destroying them per call —
+// each module dispatch invokes this 3+ times (upload, kernel,
+// readback) and the create/destroy pair was costing 5-20 µs per
+// call on RADV. Callers must hold g_vk_lock; the persistent
+// resources are device-wide.
 typedef int (*_record_cb)(VkCommandBuffer, void *);
 
 static int _submit_one_shot(dt_vk_device_t *d, _record_cb fn, void *user)
 {
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
-  VkFence fence = VK_NULL_HANDLE;
+  // Lazily create the persistent cmd-buffer + fence on first use.
+  // The command pool is created with RESET_COMMAND_BUFFER_BIT so
+  // vkResetCommandBuffer is legal.
+  if(d->oneshot_cmd == VK_NULL_HANDLE)
+  {
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                         .commandPool = d->cmd_pool,
+                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                         .commandBufferCount = 1 };
+    if(vkAllocateCommandBuffers(d->device, &cbai, &d->oneshot_cmd) != VK_SUCCESS)
+      return -1;
+  }
+  if(d->oneshot_fence == VK_NULL_HANDLE)
+  {
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if(vkCreateFence(d->device, &fci, NULL, &d->oneshot_fence) != VK_SUCCESS)
+      return -1;
+  }
+
+  VkCommandBuffer cmd = d->oneshot_cmd;
   int rc = -1;
 
-  VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                       .commandPool = d->cmd_pool,
-                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                       .commandBufferCount = 1 };
-  VKCHECK(vkAllocateCommandBuffers(d->device, &cbai, &cmd));
+  // Reset rather than recreate. The previous fence wait guarantees
+  // the GPU is no longer using the cmd buffer (this helper is
+  // called synchronously, lock-held).
+  VKCHECK(vkResetCommandBuffer(cmd, 0));
 
   VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -536,18 +629,14 @@ static int _submit_one_shot(dt_vk_device_t *d, _record_cb fn, void *user)
   if(fn(cmd, user) != 0) goto error;
   VKCHECK(vkEndCommandBuffer(cmd));
 
-  VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-  VKCHECK(vkCreateFence(d->device, &fci, NULL, &fence));
-
+  VKCHECK(vkResetFences(d->device, 1, &d->oneshot_fence));
   VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                       .commandBufferCount = 1, .pCommandBuffers = &cmd };
-  VKCHECK(vkQueueSubmit(d->queue, 1, &si, fence));
-  VKCHECK(vkWaitForFences(d->device, 1, &fence, VK_TRUE, UINT64_MAX));
+  VKCHECK(vkQueueSubmit(d->queue, 1, &si, d->oneshot_fence));
+  VKCHECK(vkWaitForFences(d->device, 1, &d->oneshot_fence, VK_TRUE, UINT64_MAX));
   rc = 0;
 
 error:
-  if(fence) vkDestroyFence(d->device, fence, NULL);
-  if(cmd)   vkFreeCommandBuffers(d->device, d->cmd_pool, 1, &cmd);
   return rc;
 }
 
