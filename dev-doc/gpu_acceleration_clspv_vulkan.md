@@ -1280,6 +1280,35 @@ memcpys, and the staging-buffer access can overlap across
 pipelines would unblock the multi-pipeline thumbnailer case
 visible in §10.1's traces.
 
+**Follow-up landed — chain-aware prefer-vulkan routing.** Earlier
+the `prefer-vulkan` decision in `pixelpipe_hb.c` routed every
+module with a `process_vk` callback through Vulkan whenever the
+user had VK enabled. For a 5208×3472 image on a discrete GPU
+each isolated VK module wedged between CL ones paid a
+CL→host→VK→host→CL transition (~1-2 s for 290 MB), while the
+kernel itself ran in microseconds — net 4-5 s of pure overhead
+on a typical export, with no upside.
+
+The routing now scrutinises four cases:
+- **Chain live** (`pipe->vk_handoff_buf != NULL`): continue VK,
+  the upload is free via §5.14.
+- **VK-only** (the module has no CL path): VK is the only GPU
+  option, route to VK regardless of cost.
+- **Chain-start**: look ahead one module — if the next enabled
+  piece has `process_vk_ready`, this is a chain of ≥2 and the
+  entry transition amortises. Route to VK.
+- **Singleton**: VK module surrounded by CL with no chain ahead.
+  Fall through to CL — its kernel is microsecond-scale and the
+  round-trip is the bottleneck. The VK kernel still gets exercised
+  on real chains (e.g. `exposure → exposure.2 → exposure.1`),
+  just not on isolated stops.
+
+Set `opencl_force_vulkan_routing=true` to override (forces VK
+for every module that offers it; needed when fuzzing the VK port
+for coverage). The `prefer-vulkan` log line carries a
+`[chain]`/`[chain-start]`/`[no-cl]`/`[forced]` tag so the routing
+decision is visible in `-d opencl` traces.
+
 ## 11. Optional intermediate: clvk
 
 A way to de-risk the host-side rewrite is to keep the OpenCL ICD
