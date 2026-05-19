@@ -312,6 +312,8 @@ gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   pipe->bcache_hash = DT_INVALID_HASH;
   memset(pipe->mask_distort_buf, 0, sizeof(pipe->mask_distort_buf));
   memset(pipe->mask_distort_buf_size, 0, sizeof(pipe->mask_distort_buf_size));
+  pipe->vk_handoff_buf  = NULL;
+  pipe->vk_handoff_size = 0;
   return dt_dev_pixelpipe_cache_init(pipe, entries, size, memlimit);
 }
 
@@ -396,6 +398,23 @@ void dt_dev_pixelpipe_cleanup(dt_dev_pixelpipe_t *pipe)
   dt_dev_pixelpipe_cache_cleanup(pipe);
   dt_free_align(pipe->bcache_data);
   _free_distort_bufs(pipe);
+
+#ifdef HAVE_VULKAN
+  // Drop any lingering VK hand-off buffer (§5.14). Normally
+  // released by the last module's invalidation hook, but a
+  // mid-pipeline abort can leave it dangling.
+  if(pipe->vk_handoff_buf)
+  {
+    const int devid = dt_vulkan_lock_device();
+    if(devid >= 0)
+    {
+      dt_vulkan_free_buffer(devid, pipe->vk_handoff_buf);
+      dt_vulkan_unlock_device(devid);
+    }
+    pipe->vk_handoff_buf  = NULL;
+    pipe->vk_handoff_size = 0;
+  }
+#endif
 
   pipe->icc_type = DT_COLORSPACE_NONE;
   g_free(pipe->icc_filename);
@@ -1524,10 +1543,35 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
         const int devid = dt_vulkan_lock_device();
         if(devid >= 0)
         {
-          dt_vk_mem_t *vin  = dt_vulkan_alloc_buffer(devid, in_size);
+          // §5.14: VK→VK chain skip. If the previous VK module
+          // left a live output buffer whose size matches this
+          // module's input, reuse it directly and skip the host
+          // upload. Buffer ownership transfers to `vin`.
+          dt_vk_mem_t *vin  = NULL;
+          gboolean vin_from_cache = FALSE;
+          if(pipe->vk_handoff_buf && pipe->vk_handoff_size == in_size)
+          {
+            vin = pipe->vk_handoff_buf;
+            pipe->vk_handoff_buf  = NULL;
+            pipe->vk_handoff_size = 0;
+            vin_from_cache = TRUE;
+          }
+          else
+          {
+            // Stale handoff buffer (size mismatch) — drop it now.
+            if(pipe->vk_handoff_buf)
+            {
+              dt_vulkan_free_buffer(devid, pipe->vk_handoff_buf);
+              pipe->vk_handoff_buf  = NULL;
+              pipe->vk_handoff_size = 0;
+            }
+            vin = dt_vulkan_alloc_buffer(devid, in_size);
+          }
           dt_vk_mem_t *vout = dt_vulkan_alloc_buffer(devid, out_size);
-          if(vin && vout
-             && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0
+          const gboolean upload_ok = vin_from_cache
+              ? TRUE
+              : (vin && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0);
+          if(vin && vout && upload_ok
              && module->process_vk(module, piece, vin, vout, roi_in, roi_out) == 0
              && dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
           {
@@ -1536,10 +1580,17 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
             dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
                           pipe, module, DT_DEVICE_VK, roi_in, roi_out,
-                          "%dx%d", roi_in->width, roi_in->height);
+                          "%dx%d%s", roi_in->width, roi_in->height,
+                          vin_from_cache ? " [vk handoff]" : "");
+            // Hand off vout to the next module instead of freeing
+            // it. If the next module is non-VK or has a mismatched
+            // size, it'll get dropped on that branch.
+            pipe->vk_handoff_buf  = vout;
+            pipe->vk_handoff_size = out_size;
+            vout = NULL;
           }
           dt_vulkan_free_buffer(devid, vin);
-          dt_vulkan_free_buffer(devid, vout);
+          if(vout) dt_vulkan_free_buffer(devid, vout);
           dt_vulkan_unlock_device(devid);
         }
         if(!processed)
@@ -1549,6 +1600,22 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
 #endif
       if(!processed)
       {
+#ifdef HAVE_VULKAN
+        // §5.14: any VK→VK hand-off is stale once a CPU module
+        // runs (output now lives in host memory, the cached VK
+        // buffer no longer matches).
+        if(pipe->vk_handoff_buf)
+        {
+          const int vdev = dt_vulkan_lock_device();
+          if(vdev >= 0)
+          {
+            dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
+            dt_vulkan_unlock_device(vdev);
+          }
+          pipe->vk_handoff_buf  = NULL;
+          pipe->vk_handoff_size = 0;
+        }
+#endif
         if(darktable.bench_module && _is_debug_pipe(pipe) && dt_str_commasubstring(darktable.bench_module, module->op))
           _cpu_benchmark(pipe, module, piece, input, *output, roi_out, roi_in);
 
@@ -2262,6 +2329,22 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
 
     if(possible_cl)
     {
+#ifdef HAVE_VULKAN
+      // §5.14: any prior VK→VK hand-off becomes stale once we
+      // switch to the OpenCL chain. Release it so the buffer
+      // memory comes back to the driver pool.
+      if(pipe->vk_handoff_buf)
+      {
+        const int vdev = dt_vulkan_lock_device();
+        if(vdev >= 0)
+        {
+          dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
+          dt_vulkan_unlock_device(vdev);
+        }
+        pipe->vk_handoff_buf  = NULL;
+        pipe->vk_handoff_size = 0;
+      }
+#endif
       const dt_iop_colorspace_type_t cst_from = input_cst_cl;
       const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
       const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
