@@ -69,7 +69,8 @@ set(VK_KERNELS
     monochrome:monochrome
     rgbcurve:rgbcurve
     rgblevels:rgblevels
-    tonecurve:tonecurve)
+    tonecurve:tonecurve
+    lowpass_mix:lowpass_mix)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
