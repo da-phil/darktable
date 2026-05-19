@@ -66,7 +66,10 @@ set(VK_KERNELS
     bilateral_slice:bilateral_slice
     bilateral_slice_to_output:bilateral_slice_to_output
     monochrome_filter:monochrome_filter
-    monochrome:monochrome)
+    monochrome:monochrome
+    rgbcurve:rgbcurve
+    rgblevels:rgblevels
+    tonecurve:tonecurve)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

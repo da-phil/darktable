@@ -1,0 +1,168 @@
+// GLSL fallback for rgbcurve.cl. See the .cl header for design.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer TR   { float data[]; } table_r;
+layout(std430, binding = 3) readonly buffer TG   { float data[]; } table_g;
+layout(std430, binding = 4) readonly buffer TB   { float data[]; } table_b;
+layout(std430, binding = 5) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+layout(std430, binding = 6) readonly buffer ProfLut { float data[]; } profile_lut;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   autoscale;
+    int   preserve_colors;
+    int   use_work_profile;
+    float cr0; float cr1; float cr2;
+    float cg0; float cg1; float cg2;
+    float cb0; float cb1; float cb2;
+} pc;
+
+#define VK_LUT_SIZE                       0x10000
+#define VK_RGBCURVE_AUTOSCALE_AUTOMATIC   0
+#define VK_RGBCURVE_AUTOSCALE_MANUAL      1
+#define VK_RGB_NORM_NONE                  0
+#define VK_RGB_NORM_LUMINANCE             1
+#define VK_RGB_NORM_MAX                   2
+#define VK_RGB_NORM_AVERAGE               3
+#define VK_RGB_NORM_SUM                   4
+#define VK_RGB_NORM_NORM                  5
+#define VK_RGB_NORM_POWER                 6
+
+float vk_lookup_r(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return table_r.data[xi];
+}
+float vk_lookup_g(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return table_g.data[xi];
+}
+float vk_lookup_b(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return table_b.data[xi];
+}
+
+float vk_unbounded_r(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return vk_lookup_r(x);
+    return c1 * pow(x * c0, c2);
+}
+float vk_unbounded_g(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return vk_lookup_g(x);
+    return c1 * pow(x * c0, c2);
+}
+float vk_unbounded_b(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return vk_lookup_b(x);
+    return c1 * pow(x * c0, c2);
+}
+
+float lerp_lookup_unbounded(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return profile_lut.data[base + t] * (1.0 - f)
+                 + profile_lut.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in(vec4 rgb_in) {
+    float R = lerp_lookup_unbounded(rgb_in.x,
+        profile_info.unbounded_coeffs_in[0],
+        profile_info.unbounded_coeffs_in[1],
+        profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_unbounded(rgb_in.y,
+        profile_info.unbounded_coeffs_in[3],
+        profile_info.unbounded_coeffs_in[4],
+        profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_unbounded(rgb_in.z,
+        profile_info.unbounded_coeffs_in[6],
+        profile_info.unbounded_coeffs_in[7],
+        profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb_in.w);
+}
+
+float get_rgb_matrix_luminance(vec4 rgb) {
+    if(profile_info.nonlinearlut != 0) {
+        vec4 linear_rgb = apply_trc_in(rgb);
+        return profile_info.matrix_in[3] * linear_rgb.x
+             + profile_info.matrix_in[4] * linear_rgb.y
+             + profile_info.matrix_in[5] * linear_rgb.z;
+    }
+    return profile_info.matrix_in[3] * rgb.x
+         + profile_info.matrix_in[4] * rgb.y
+         + profile_info.matrix_in[5] * rgb.z;
+}
+
+float dt_camera_rgb_luminance(vec4 rgb) {
+    return 0.2225045 * rgb.x + 0.7168786 * rgb.y + 0.0606169 * rgb.z;
+}
+
+float dt_rgb_norm(vec4 rgb, int norm, int work_profile) {
+    if(norm == VK_RGB_NORM_LUMINANCE)
+        return (work_profile == 0) ? dt_camera_rgb_luminance(rgb)
+                                   : get_rgb_matrix_luminance(rgb);
+    if(norm == VK_RGB_NORM_MAX)     return max(rgb.x, max(rgb.y, rgb.z));
+    if(norm == VK_RGB_NORM_AVERAGE) return (rgb.x + rgb.y + rgb.z) / 3.0;
+    if(norm == VK_RGB_NORM_SUM)     return rgb.x + rgb.y + rgb.z;
+    if(norm == VK_RGB_NORM_NORM)    return pow(rgb.x*rgb.x + rgb.y*rgb.y + rgb.z*rgb.z, 0.5);
+    if(norm == VK_RGB_NORM_POWER) {
+        float R = rgb.x*rgb.x; float G = rgb.y*rgb.y; float B = rgb.z*rgb.z;
+        return (rgb.x*R + rgb.y*G + rgb.z*B) / (R + G + B);
+    }
+    return (rgb.x + rgb.y + rgb.z) / 3.0;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+
+    if(pc.autoscale == VK_RGBCURVE_AUTOSCALE_MANUAL) {
+        pixel.x = vk_unbounded_r(pixel.x, pc.cr0, pc.cr1, pc.cr2);
+        pixel.y = vk_unbounded_g(pixel.y, pc.cg0, pc.cg1, pc.cg2);
+        pixel.z = vk_unbounded_b(pixel.z, pc.cb0, pc.cb1, pc.cb2);
+    } else {
+        if(pc.preserve_colors == VK_RGB_NORM_NONE) {
+            pixel.x = vk_unbounded_r(pixel.x, pc.cr0, pc.cr1, pc.cr2);
+            pixel.y = vk_unbounded_r(pixel.y, pc.cr0, pc.cr1, pc.cr2);
+            pixel.z = vk_unbounded_r(pixel.z, pc.cr0, pc.cr1, pc.cr2);
+        } else {
+            float ratio = 1.0;
+            float lum = dt_rgb_norm(pixel, pc.preserve_colors, pc.use_work_profile);
+            if(lum > 0.0) {
+                float curve_lum = vk_unbounded_r(lum, pc.cr0, pc.cr1, pc.cr2);
+                ratio = curve_lum / lum;
+            }
+            pixel.x *= ratio;
+            pixel.y *= ratio;
+            pixel.z *= ratio;
+        }
+    }
+
+    out_buf.data[idx] = pixel;
+}

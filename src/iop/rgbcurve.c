@@ -20,6 +20,7 @@
 #include "common/iop_profile.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/rgb_norms.h"
+#include "common/vulkan.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
@@ -111,6 +112,7 @@ typedef float (*_coeffs_table_ptr)[3];
 typedef struct dt_iop_rgbcurve_global_data_t
 {
   int kernel_rgbcurve;
+  dt_vk_module_kernel_t vk;
 } dt_iop_rgbcurve_global_data_t;
 
 const char *name()
@@ -1656,12 +1658,20 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
 
   gd->kernel_rgbcurve = dt_opencl_create_kernel(program, "rgbcurve");
+  // 5 ints + 9 floats = 56 bytes; matches vk_rgbcurve_pc_t and the
+  // push-constant block in rgbcurve.cl / rgbcurve.comp. 7
+  // storage-buffer bindings: in, out, table_{r,g,b},
+  // profile_info, profile_lut.
+  const uint32_t pcsize = 5 * sizeof(int) + 9 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "rgbcurve", "rgbcurve",
+                               7, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_rgbcurve_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_rgbcurve);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   dt_free_align(self->data);
   self->data = NULL;
 }
@@ -1861,6 +1871,80 @@ cleanup:
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl, &profile_lut_cl,
                                      &dev_profile_info, &dev_profile_lut);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// PC layout matches rgbcurve.cl / rgbcurve.comp byte-for-byte:
+// 5 ints + 9 floats = 56 bytes. coeffs[r/g/b] passed as scalars.
+typedef struct
+{
+  int   width;
+  int   height;
+  int   autoscale;
+  int   preserve_colors;
+  int   use_work_profile;
+  float cr0, cr1, cr2;
+  float cg0, cg1, cg2;
+  float cb0, cb1, cb2;
+} vk_rgbcurve_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_rgbcurve_data_t *d = piece->data;
+  const dt_iop_rgbcurve_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  _generate_curve_lut(piece->pipe, d);
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+
+  dt_vk_mem_t *dev_r = NULL, *dev_g = NULL, *dev_b = NULL;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL, *dev_profile_lut = NULL;
+  int rc = -1;
+
+  dev_r = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_g = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_r || !dev_g || !dev_b) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_r, d->table[DT_IOP_RGBCURVE_R], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_g, d->table[DT_IOP_RGBCURVE_G], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_b, d->table[DT_IOP_RGBCURVE_B], lut_bytes) != 0) goto cleanup;
+
+  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
+                                         &profile_lut_vk, &dev_profile_info,
+                                         &dev_profile_lut) != 0)
+    goto cleanup;
+
+  const vk_rgbcurve_pc_t pc = {
+    .width = width, .height = height,
+    .autoscale = d->params.curve_autoscale,
+    .preserve_colors = d->params.preserve_colors,
+    .use_work_profile = (work_profile == NULL) ? 0 : 1,
+    .cr0 = d->unbounded_coeffs[0][0], .cr1 = d->unbounded_coeffs[0][1], .cr2 = d->unbounded_coeffs[0][2],
+    .cg0 = d->unbounded_coeffs[1][0], .cg1 = d->unbounded_coeffs[1][1], .cg2 = d->unbounded_coeffs[1][2],
+    .cb0 = d->unbounded_coeffs[2][0], .cb1 = d->unbounded_coeffs[2][1], .cb2 = d->unbounded_coeffs[2][2],
+  };
+
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_r, dev_g, dev_b,
+                          dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  if(dev_r) dt_vulkan_free_buffer(devid, dev_r);
+  if(dev_g) dt_vulkan_free_buffer(devid, dev_g);
+  if(dev_b) dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
 }
 #endif
 
