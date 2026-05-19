@@ -2263,20 +2263,66 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
         && !(dt_pipe_is_preview(pipe) && (module->flags() & IOP_FLAGS_PREVIEW_NON_OPENCL));
 
 #ifdef HAVE_VULKAN
-    /* if the module has a Vulkan path and Vulkan is the active
-       preference, skip the OpenCL arm so the CPU-dispatch arm picks
-       up the module via process_vk (with host-staging at the
-       boundary). Without this, OpenCL would grab every module that
-       has process_cl, leaving the Vulkan code dead on systems where
-       both backends are available. */
-    if(possible_cl
-       && module->process_vk
+    /* When the module exposes both a Vulkan and an OpenCL path, the
+       choice between them is not just "VK is enabled" — it's about
+       whether a VK dispatch is *worth* the host-staging round-trip.
+       For a 5208x3472 image on a discrete GPU the CL→host→VK→host→CL
+       transition costs 1-2 s per module, far more than the ~ms an
+       isolated CL kernel takes. The cost amortises only if the next
+       enabled module(s) can keep their input on the VK side via the
+       §5.14 hand-off cache.
+
+       Routing rule:
+       - if a VK chain is live (pipe->vk_handoff_buf), continue VK to
+         skip this module's host upload;
+       - else if VK is the only GPU option (no CL path on this module),
+         use VK — there's no cheaper alternative;
+       - else look ahead: count consecutive upcoming enabled modules
+         with process_vk_ready. If ≥1 follows this one, the chain we
+         start here pays the entry CL→VK transition once but
+         amortises it over the rest of the chain. Single-module VK
+         islands (chain length 1) cost more than they save, so they
+         fall through to the CL arm.
+
+       Set opencl_force_vulkan_routing=true to override (for VK
+       coverage testing): VK then runs for every module that offers
+       it regardless of cost. */
+    if(module->process_vk
        && piece->process_vk_ready
        && dt_vulkan_running())
     {
-      dt_print_pipe(DT_DEBUG_OPENCL, "prefer-vulkan",
-                    pipe, module, DT_DEVICE_VK, &roi_in, roi_out, "");
-      possible_cl = FALSE;
+      static int force_vk = -1;
+      if(force_vk < 0)
+        force_vk = dt_conf_get_bool("opencl_force_vulkan_routing") ? 1 : 0;
+      const gboolean vk_chain_live  = (pipe->vk_handoff_buf != NULL);
+      const gboolean vk_is_only_gpu = !possible_cl;
+
+      gboolean vk_chain_ahead = FALSE;
+      if(!force_vk && !vk_chain_live && !vk_is_only_gpu)
+      {
+        // Walk forward through the pieces list looking for an
+        // enabled piece that also has a Vulkan path. Stop at the
+        // first enabled piece — if it's not VK-ready, the chain
+        // would break there and this module is a singleton.
+        for(GList *p = g_list_next(pieces); p; p = g_list_next(p))
+        {
+          const dt_dev_pixelpipe_iop_t *const next = p->data;
+          if(!next->enabled) continue;
+          if(next->process_vk_ready) vk_chain_ahead = TRUE;
+          break;
+        }
+      }
+
+      if(force_vk || vk_chain_live || vk_is_only_gpu || vk_chain_ahead)
+      {
+        dt_print_pipe(DT_DEBUG_OPENCL, "prefer-vulkan",
+                      pipe, module, DT_DEVICE_VK, &roi_in, roi_out, "%s",
+                      vk_chain_live   ? "[chain]"
+                      : vk_is_only_gpu? "[no-cl]"
+                      : vk_chain_ahead? "[chain-start]"
+                      :                 "[forced]");
+        possible_cl = FALSE;
+      }
     }
 #endif
 
