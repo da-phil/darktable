@@ -1,0 +1,256 @@
+// GLSL fallback for tonecurve.cl. See the .cl header for design.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer TL   { float data[]; } table_L;
+layout(std430, binding = 3) readonly buffer TA   { float data[]; } table_a;
+layout(std430, binding = 4) readonly buffer TB   { float data[]; } table_b;
+layout(std430, binding = 5) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+layout(std430, binding = 6) readonly buffer PLut { float data[]; } profile_lut;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   autoscale_ab;
+    int   unbound_ab;
+    int   preserve_colors;
+    float low_approximation;
+    float cL0; float cL1; float cL2;
+    float ca0; float ca1; float ca2;
+    float ca3; float ca4; float ca5;
+    float cb0; float cb1; float cb2;
+    float cb3; float cb4; float cb5;
+} pc;
+
+#define VK_LUT_SIZE      0x10000
+#define VK_RGB_NORM_NONE 0
+#define VK_RGB_NORM_LUMINANCE 1
+#define VK_RGB_NORM_MAX  2
+#define VK_RGB_NORM_AVERAGE 3
+#define VK_RGB_NORM_SUM  4
+#define VK_RGB_NORM_NORM 5
+#define VK_RGB_NORM_POWER 6
+
+float lookup_L(float x) { return table_L.data[clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1)]; }
+float lookup_a(float x) { return table_a.data[clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1)]; }
+float lookup_b(float x) { return table_b.data[clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1)]; }
+
+float lookup_unbounded_L(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return lookup_L(x);
+    return c1 * pow(x * c0, c2);
+}
+
+float lookup_twosided_a(float x,
+                        float a0, float a1, float a2,
+                        float a3, float a4, float a5) {
+    if(a0 < 0.0) return x;
+    float ar = 1.0 / a0;
+    float al = 1.0 - 1.0 / a3;
+    if(x < ar && x >= al) return lookup_a(x);
+    if(x >= ar) return a1 * pow(x * a0, a2);
+    return a4 * pow((1.0 - x) * a3, a5);
+}
+
+float lookup_twosided_b(float x,
+                        float a0, float a1, float a2,
+                        float a3, float a4, float a5) {
+    if(a0 < 0.0) return x;
+    float ar = 1.0 / a0;
+    float al = 1.0 - 1.0 / a3;
+    if(x < ar && x >= al) return lookup_b(x);
+    if(x >= ar) return a1 * pow(x * a0, a2);
+    return a4 * pow((1.0 - x) * a3, a5);
+}
+
+// Lab ↔ XYZ helpers (D50)
+vec4 lab_f(vec4 x) {
+    vec4 eps = vec4(216.0 / 24389.0);
+    vec4 k   = vec4(24389.0 / 27.0);
+    bvec4 m = greaterThan(x, eps);
+    vec4 a = vec4(pow(x.x, 1.0/3.0), pow(x.y, 1.0/3.0),
+                  pow(x.z, 1.0/3.0), pow(x.w, 1.0/3.0));
+    vec4 b = (k * x + vec4(16.0)) / vec4(116.0);
+    return mix(b, a, m);
+}
+vec4 lab_f_inv(vec4 x) {
+    vec4 eps = vec4(0.20689655172413796);
+    vec4 k   = vec4(24389.0 / 27.0);
+    bvec4 m = greaterThan(x, eps);
+    vec4 a = x * x * x;
+    vec4 b = (vec4(116.0) * x - vec4(16.0)) / k;
+    return mix(b, a, m);
+}
+vec4 Lab_to_XYZ(vec4 Lab) {
+    vec4 d50 = vec4(0.9642, 1.0, 0.8249, 0.0);
+    vec4 f;
+    f.y = (Lab.x + 16.0) / 116.0;
+    f.x = Lab.y / 500.0 + f.y;
+    f.z = f.y - Lab.z / 200.0;
+    f.w = 0.0;
+    vec4 xyz = d50 * lab_f_inv(f);
+    xyz.w = Lab.w;
+    return xyz;
+}
+vec4 XYZ_to_Lab(vec4 xyz) {
+    vec4 d50i = vec4(1.0/0.9642, 1.0, 1.0/0.8249, 1.0);
+    vec4 f = lab_f(xyz * d50i);
+    vec4 lab;
+    lab.x = 116.0 * f.y - 16.0;
+    lab.y = 500.0 * (f.x - f.y);
+    lab.z = 200.0 * (f.y - f.z);
+    lab.w = xyz.w;
+    return lab;
+}
+
+// ProPhoto RGB ↔ XYZ (D50)
+vec4 prophotorgb_to_XYZ(vec4 rgb) {
+    vec4 XYZ = vec4(0.0, 0.0, 0.0, rgb.w);
+    XYZ.x = 0.7976749 * rgb.x + 0.1351917 * rgb.y + 0.0313534 * rgb.z;
+    XYZ.y = 0.2880402 * rgb.x + 0.7118741 * rgb.y + 0.0000857 * rgb.z;
+    XYZ.z = 0.0000000 * rgb.x + 0.0000000 * rgb.y + 0.8252100 * rgb.z;
+    return XYZ;
+}
+vec4 XYZ_to_prophotorgb(vec4 XYZ) {
+    vec4 rgb = vec4(0.0, 0.0, 0.0, XYZ.w);
+    rgb.x =  1.3459433 * XYZ.x - 0.2556075 * XYZ.y - 0.0511118 * XYZ.z;
+    rgb.y = -0.5445989 * XYZ.x + 1.5081673 * XYZ.y + 0.0205351 * XYZ.z;
+    rgb.z =  0.0000000 * XYZ.x + 0.0000000 * XYZ.y + 1.2118128 * XYZ.z;
+    return rgb;
+}
+
+// ICC profile plumbing helpers (same shape as overexposed.comp /
+// basicadj.comp / rgbcurve.comp)
+float lerp_lookup_unbounded(float x, float c0, float c1, float c2, int n_lut) {
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return profile_lut.data[base + t] * (1.0 - f)
+                 + profile_lut.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in(vec4 rgb_in) {
+    float R = lerp_lookup_unbounded(rgb_in.x,
+        profile_info.unbounded_coeffs_in[0], profile_info.unbounded_coeffs_in[1],
+        profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_unbounded(rgb_in.y,
+        profile_info.unbounded_coeffs_in[3], profile_info.unbounded_coeffs_in[4],
+        profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_unbounded(rgb_in.z,
+        profile_info.unbounded_coeffs_in[6], profile_info.unbounded_coeffs_in[7],
+        profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb_in.w);
+}
+
+float get_rgb_matrix_luminance(vec4 rgb) {
+    if(profile_info.nonlinearlut != 0) {
+        vec4 linear_rgb = apply_trc_in(rgb);
+        return profile_info.matrix_in[3] * linear_rgb.x
+             + profile_info.matrix_in[4] * linear_rgb.y
+             + profile_info.matrix_in[5] * linear_rgb.z;
+    }
+    return profile_info.matrix_in[3] * rgb.x
+         + profile_info.matrix_in[4] * rgb.y
+         + profile_info.matrix_in[5] * rgb.z;
+}
+
+float dt_camera_rgb_luminance(vec4 rgb) {
+    return 0.2225045 * rgb.x + 0.7168786 * rgb.y + 0.0606169 * rgb.z;
+}
+
+float dt_rgb_norm(vec4 rgb, int norm, int work_profile) {
+    if(norm == VK_RGB_NORM_LUMINANCE)
+        return (work_profile == 0) ? dt_camera_rgb_luminance(rgb)
+                                   : get_rgb_matrix_luminance(rgb);
+    if(norm == VK_RGB_NORM_MAX)     return max(rgb.x, max(rgb.y, rgb.z));
+    if(norm == VK_RGB_NORM_AVERAGE) return (rgb.x + rgb.y + rgb.z) / 3.0;
+    if(norm == VK_RGB_NORM_SUM)     return rgb.x + rgb.y + rgb.z;
+    if(norm == VK_RGB_NORM_NORM)    return pow(rgb.x*rgb.x + rgb.y*rgb.y + rgb.z*rgb.z, 0.5);
+    if(norm == VK_RGB_NORM_POWER) {
+        float R = rgb.x*rgb.x; float G = rgb.y*rgb.y; float B = rgb.z*rgb.z;
+        return (rgb.x*R + rgb.y*G + rgb.z*B) / (R + G + B);
+    }
+    return (rgb.x + rgb.y + rgb.z) / 3.0;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    float L_in = pixel.x / 100.0;
+    float L    = lookup_unbounded_L(L_in, pc.cL0, pc.cL1, pc.cL2);
+
+    if(pc.autoscale_ab == 0) {
+        float a_in = (pixel.y + 128.0) / 256.0;
+        float b_in = (pixel.z + 128.0) / 256.0;
+        if(pc.unbound_ab == 0) {
+            pixel.y = lookup_a(a_in);
+            pixel.z = lookup_b(b_in);
+        } else {
+            pixel.y = lookup_twosided_a(a_in, pc.ca0, pc.ca1, pc.ca2, pc.ca3, pc.ca4, pc.ca5);
+            pixel.z = lookup_twosided_b(b_in, pc.cb0, pc.cb1, pc.cb2, pc.cb3, pc.cb4, pc.cb5);
+        }
+        pixel.x = L;
+    }
+    else if(pc.autoscale_ab == 1) {
+        if(L_in > 0.01) {
+            float scale = L / pixel.x;
+            pixel.y *= scale;
+            pixel.z *= scale;
+        } else {
+            pixel.y *= pc.low_approximation;
+            pixel.z *= pc.low_approximation;
+        }
+        pixel.x = L;
+    }
+    else if(pc.autoscale_ab == 2) {
+        vec4 xyz = Lab_to_XYZ(pixel);
+        xyz.x = lookup_unbounded_L(xyz.x, pc.cL0, pc.cL1, pc.cL2);
+        xyz.y = lookup_unbounded_L(xyz.y, pc.cL0, pc.cL1, pc.cL2);
+        xyz.z = lookup_unbounded_L(xyz.z, pc.cL0, pc.cL1, pc.cL2);
+        vec4 lab = XYZ_to_Lab(xyz);
+        pixel.x = lab.x; pixel.y = lab.y; pixel.z = lab.z;
+    }
+    else { // autoscale_ab == 3 — ProPhoto RGB path
+        vec4 rgb = XYZ_to_prophotorgb(Lab_to_XYZ(pixel));
+        if(pc.preserve_colors == VK_RGB_NORM_NONE) {
+            rgb.x = lookup_unbounded_L(rgb.x, pc.cL0, pc.cL1, pc.cL2);
+            rgb.y = lookup_unbounded_L(rgb.y, pc.cL0, pc.cL1, pc.cL2);
+            rgb.z = lookup_unbounded_L(rgb.z, pc.cL0, pc.cL1, pc.cL2);
+        } else {
+            float ratio = 1.0;
+            float lum = dt_rgb_norm(rgb, pc.preserve_colors, 1);
+            if(lum > 0.0) {
+                float curve_lum = lookup_unbounded_L(lum, pc.cL0, pc.cL1, pc.cL2);
+                ratio = curve_lum / lum;
+            }
+            rgb.x *= ratio; rgb.y *= ratio; rgb.z *= ratio;
+        }
+        vec4 lab = XYZ_to_Lab(prophotorgb_to_XYZ(rgb));
+        pixel.x = lab.x; pixel.y = lab.y; pixel.z = lab.z;
+    }
+
+    out_buf.data[idx] = pixel;
+}
