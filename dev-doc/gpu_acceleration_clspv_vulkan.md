@@ -797,6 +797,46 @@ return values and fall through to `dt_bilateral_*_cl` /
 `dt_bilateral_*` (CPU) on -1, in the same shape as the existing
 CPU/OpenCL fallback pattern in `lowpass` / `shadhi` / `retouch`.
 
+### 5.14 VK→VK chain hand-off cache
+
+The original pixelpipe-VK integration (§4.2) host-stages every
+module: download input → upload to VK → dispatch → download to
+host. For two consecutive `process_vk` modules that's two
+redundant transfers around the boundary — the previous output
+buffer is already on the GPU and the new module is about to
+upload exactly the same bytes back.
+
+The hand-off cache eliminates that redundancy. After a successful
+`process_vk` dispatch the pixelpipe keeps the output `dt_vk_mem_t*`
+alive on the pipe state (`dt_dev_pixelpipe_t::vk_handoff_buf` /
+`vk_handoff_size`). On the next module:
+
+* If it has `process_vk` and the cached buffer's size matches the
+  expected input size, reuse it directly as `vin` — skip both the
+  device-local input allocation and the host→device upload. The
+  log line gains a `[vk handoff]` suffix so it's easy to see in a
+  trace.
+* If it has `process_vk` but the size doesn't match (ROI changed
+  mid-pipeline, e.g. crop), drop the cached buffer and follow the
+  normal alloc-and-upload path.
+* If it's an OpenCL module or a CPU-only module, the cache is
+  invalidated immediately. Per-pipeline teardown also releases any
+  lingering buffer, covering mid-pipeline aborts.
+
+Buffer ownership transfers atomically — once a module reuses the
+cached buffer, the pipe state slot is cleared so a dispatch
+failure can't double-free it. The cache is per-pipeline rather
+than global, which matches the OpenCL `cl_mem` chain semantics
+and means parallel preview/full/export pipelines don't interfere.
+
+For VK→VK pairs this halves the per-boundary host traffic. The
+asymmetric temperature→exposure timing reported in §10.1 was
+*not* caused by VK→VK transitions (other OpenCL modules ran in
+between), so the user-visible improvement only shows up once
+enough modules in the default pipeline expose `process_vk` to
+form chains. The infrastructure is in place now; module coverage
+catches up incrementally as more modules port.
+
 ## 6. Per-OS picture
 
 ### Linux
@@ -1074,10 +1114,15 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    Choose image format mapping table (the OpenCL `cl_image_format`
    enum vs `VkFormat`). Today's integration uses storage buffers
    only; once images land we can drop the per-module host-staging.
-6. **Skip host-staging when both ends are Vulkan.** Track which
-   buffer type holds the live pipeline data; when consecutive
-   modules both have `process_vk`, pass the `dt_vk_mem_t*` directly
-   between them instead of round-tripping through host memory.
+6. ✅ **Skip host-staging when both ends are Vulkan** (landed; see
+   §5.14). `dt_dev_pixelpipe_t::vk_handoff_buf` keeps the previous
+   VK output buffer alive across module boundaries; the next
+   `process_vk` reuses it when the size matches, skipping the
+   redundant device-alloc + host upload. Per-pipeline state so
+   parallel preview/full/export pipelines stay independent.
+   Invalidated on switch to OpenCL/CPU or at pipeline teardown.
+   User-visible gain shows up once enough modules port to form
+   consecutive VK chains in the default pipeline.
 7. **Port the easy half.** Other modules that use only image2d +
    scalar args (filmic, basecurve, sigmoid, ~30 others). Verified
    pixel-equal against the OpenCL output.
@@ -1198,11 +1243,17 @@ Drops the steady-state per-dispatch HAL overhead to one
 per call. Expected to close most of the temperature/exposure gap
 on the next export.
 
-**Still outstanding** — the per-dispatch device-local `vin` /
-`vout` allocations in `src/develop/pixelpipe_hb.c` still happen
-fresh per module, and we still pay one full host round-trip per VK
-module. The §8.6 milestone (track VK-resident buffers across
-consecutive process_vk modules) is the bigger structural fix.
+**Follow-up landed** — §5.14 VK→VK chain hand-off cache. When two
+consecutive modules both have `process_vk`, the second one skips
+the device-local input allocation and the host upload entirely
+(reuses the previous module's output buffer). Halves the per-
+boundary host traffic for VK chains. Visible in the trace as a
+`[vk handoff]` annotation on the `process_vk` log line.
+
+**Still outstanding** — the per-dispatch device-local `vout`
+allocation still happens fresh per module. A device-buffer pool
+(complementing the staging-buffer cache) would close the
+remaining alloc/free cost for repeat sizes.
 
 ## 11. Optional intermediate: clvk
 
