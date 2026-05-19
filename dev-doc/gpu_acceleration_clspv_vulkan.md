@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 34 modules currently expose `process_vk`,
+**Per-module ports**: 35 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -221,6 +221,7 @@ in three categories.
 | `src/iop/lowpass.c` | First combined-helper consumer: chains `dt_gaussian_*_vk` (§5.10) **or** `dt_bilateral_*_vk` (§5.13) for the low-pass step, then snapshots dev_out into a scratch buffer via `dt_vulkan_copy_device_to_device`, then runs the new `lowpass_mix` kernel (4 bindings, 40 B PC) to apply contrast + lightness curves on L and scale a/b chroma by saturation. Same algorithmic shape as `process_cl` 1:1, exercising the multi-helper orchestration pattern that censorize / shadhi / retouch can copy. |
 | `src/iop/shadhi.c` | Shadows / highlights recovery. Same Gaussian-or-bilateral choice as lowpass, then snapshot, then a new `shadows_highlights_mix` kernel (3 bindings, 44 B PC) that runs two soft-light overlays — one for highlights (negative opacity), one for shadows (positive opacity). The overlay helper handles per-channel unbound flags via the `flags` bitmask, mirroring the OpenCL kernel byte-for-byte. |
 | `src/iop/colorbalance.c` | All three legacy modes (LEGACY sRGB-space, LIFT_GAMMA_GAIN ProPhoto, SLOPE_OFFSET_POWER aka CDL). Push-constant-only — no LUTs, no profile info — so the three kernels share the 2-binding shape but differ in body. LEGACY at 68 B PC (no saturation_out), LGG/CDL at 72 B. process_vk switches on `d->mode` and dispatches the matching `dt_vk_module_kernel_t` slot. |
+| `src/iop/colorout.c` | Output-side Lab → RGB via a 3×3 matrix + per-channel shaper LUT with linear-extrapolation tails (the matrix-fast-path from `process_cl`; the lcms2 slow path stays on CPU). 5-binding dispatch (in, out, lut_r/g/b), 80 B PC (2 ints + 9 matrix floats + 9 extrapolation-coeff floats). The `DT_COLORSPACE_LAB` pass-through case goes through `dt_vulkan_copy_device_to_device` rather than a kernel, mirroring the OpenCL `enqueue_copy_image` shortcut. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -243,13 +244,13 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 12 module files and the new
+**Verified in this container:** all 35 module files and the new
 backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
-combinations (syntax-only check via `gcc -fsyntax-only`). All 12
-GLSL twins build to valid SPIR-V via glslang + `spirv-val`. End-to-
-end darktable build requires upstream dependencies (intltool-merge
-etc.) that aren't installed in the remote execution environment, so
-runs against a real RAW are deferred to CI.
+combinations (the full darktable build target succeeds, including
+`libcolorout.so` and the other plugin shared libraries). All GLSL
+twins build to valid SPIR-V via glslang + `spirv-val`. End-to-end
+runs against a real RAW are exercised by the user out-of-container
+on AMD RX 9060 XT (RADV).
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
@@ -268,13 +269,15 @@ runs against a real RAW are deferred to CI.
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
   sampled image), `channelmixer` (legacy), `colorbalancergb`,
-  `colorout` (3 LUTs), `filmic` (1 LUT + scalars). Each is ~50 LOC
-  module + ~80 LOC kernel. Done in earlier passes: `basicadj`
-  (second consumer of the §5.11 plumbing; full 6-feature ICC-aware
-  kernel), `rgbcurve` / `rgblevels` / `tonecurve` (the Lab/RGB
-  curve cohort, all sharing the 7-binding §5.11 + §5.8 pattern),
-  `colorbalance` (3 variants, push-constant-only — switches on
-  `d->mode` to dispatch the matching `.spv`).
+  `filmic` (1 LUT + scalars). Each is ~50 LOC module + ~80 LOC
+  kernel. Done in earlier passes: `basicadj` (second consumer of
+  the §5.11 plumbing; full 6-feature ICC-aware kernel), `rgbcurve`
+  / `rgblevels` / `tonecurve` (the Lab/RGB curve cohort, all
+  sharing the 7-binding §5.11 + §5.8 pattern), `colorbalance` (3
+  variants, push-constant-only — switches on `d->mode` to dispatch
+  the matching `.spv`), `colorout` (Lab→RGB matrix + 3 shaper LUTs,
+  with the `DT_COLORSPACE_LAB` pass-through case routed through
+  `dt_vulkan_copy_device_to_device`).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`. The Gaussian VK
