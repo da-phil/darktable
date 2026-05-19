@@ -22,9 +22,11 @@
 #include <string.h>
 
 #include "bauhaus/bauhaus.h"
+#include "common/iop_profile.h"
 #include "common/opencl.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/rgb_norms.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -143,6 +145,7 @@ typedef struct dt_iop_tonecurve_data_t
 
 typedef struct dt_iop_tonecurve_global_data_t
 {
+  dt_vk_module_kernel_t vk;
   float picked_color[3];
   float picked_color_min[3];
   float picked_color_max[3];
@@ -367,6 +370,84 @@ error:
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl,
                                      &profile_lut_cl, &dev_profile_info, &dev_profile_lut);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// PC layout matches tonecurve.cl / tonecurve.comp byte-for-byte:
+// 5 ints + 16 floats = 84 bytes.
+typedef struct
+{
+  int   width;
+  int   height;
+  int   autoscale_ab;
+  int   unbound_ab;
+  int   preserve_colors;
+  float low_approximation;
+  float cL0, cL1, cL2;
+  float ca0, ca1, ca2, ca3, ca4, ca5;
+  float cb0, cb1, cb2, cb3, cb4, cb5;
+} vk_tonecurve_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_tonecurve_data_t *d = piece->data;
+  const dt_iop_tonecurve_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile
+    = dt_ioppr_add_profile_info_to_list(self->dev, DT_COLORSPACE_PROPHOTO_RGB, "",
+                                        INTENT_PERCEPTUAL);
+
+  dt_vk_mem_t *dev_L = NULL, *dev_a = NULL, *dev_b = NULL;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL, *dev_profile_lut = NULL;
+  int rc = -1;
+
+  dev_L = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_a = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_L || !dev_a || !dev_b) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_L, d->table[0], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_a, d->table[1], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_b, d->table[2], lut_bytes) != 0) goto cleanup;
+
+  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
+                                         &profile_lut_vk, &dev_profile_info,
+                                         &dev_profile_lut) != 0)
+    goto cleanup;
+
+  const float low_approximation = d->table[0][(int)(0.01f * 0x10000ul)];
+  const vk_tonecurve_pc_t pc = {
+    .width = width, .height = height,
+    .autoscale_ab = d->autoscale_ab,
+    .unbound_ab = d->unbound_ab,
+    .preserve_colors = d->preserve_colors,
+    .low_approximation = low_approximation,
+    .cL0 = d->unbounded_coeffs_L[0], .cL1 = d->unbounded_coeffs_L[1], .cL2 = d->unbounded_coeffs_L[2],
+    .ca0 = d->unbounded_coeffs_ab[0],  .ca1 = d->unbounded_coeffs_ab[1],  .ca2 = d->unbounded_coeffs_ab[2],
+    .ca3 = d->unbounded_coeffs_ab[3],  .ca4 = d->unbounded_coeffs_ab[4],  .ca5 = d->unbounded_coeffs_ab[5],
+    .cb0 = d->unbounded_coeffs_ab[6],  .cb1 = d->unbounded_coeffs_ab[7],  .cb2 = d->unbounded_coeffs_ab[8],
+    .cb3 = d->unbounded_coeffs_ab[9],  .cb4 = d->unbounded_coeffs_ab[10], .cb5 = d->unbounded_coeffs_ab[11],
+  };
+
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_L, dev_a, dev_b,
+                          dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  if(dev_L) dt_vulkan_free_buffer(devid, dev_L);
+  if(dev_a) dt_vulkan_free_buffer(devid, dev_a);
+  if(dev_b) dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
 }
 #endif
 /*
@@ -945,12 +1026,18 @@ void init_global(dt_iop_module_so_t *self)
     gd->picked_color_max[k] = .0f;
     gd->picked_output_color[k] = .0f;
   }
+  // 5 ints + 16 floats = 84 bytes; matches vk_tonecurve_pc_t.
+  // 7 storage bindings: in, out, table_{L,a,b}, profile_info, profile_lut.
+  const uint32_t pcsize = 5 * sizeof(int) + 16 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "tonecurve", "tonecurve",
+                               7, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_tonecurve_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_tonecurve);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }

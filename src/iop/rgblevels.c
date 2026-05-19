@@ -20,6 +20,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/rgb_norms.h"
+#include "common/vulkan.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "dtgtk/drawingarea.h"
@@ -91,6 +92,7 @@ typedef struct dt_iop_rgblevels_data_t
 typedef struct dt_iop_rgblevels_global_data_t
 {
   int kernel_levels;
+  dt_vk_module_kernel_t vk;
 } dt_iop_rgblevels_global_data_t;
 
 const char *name()
@@ -936,12 +938,18 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_rgblevels_global_data_t *gd = malloc(sizeof(dt_iop_rgblevels_global_data_t));
   self->data = gd;
   gd->kernel_levels = dt_opencl_create_kernel(program, "rgblevels");
+  // 5 ints + 12 floats = 68 bytes; matches vk_rgblevels_pc_t.
+  // 7 storage bindings: in, out, lut{r,g,b}, profile_info, profile_lut.
+  const uint32_t pcsize = 5 * sizeof(int) + 12 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "rgblevels", "rgblevels",
+                               7, pcsize, 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_rgblevels_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_levels);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
@@ -1530,6 +1538,82 @@ cleanup:
 
   dt_free_align(src_buffer);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// PC layout matches rgblevels.cl / rgblevels.comp byte-for-byte:
+// 5 ints + 12 floats = 68 bytes.
+typedef struct
+{
+  int   width;
+  int   height;
+  int   autoscale;
+  int   preserve_colors;
+  int   use_work_profile;
+  float r_lo, r_mid, r_hi;
+  float g_lo, g_mid, g_hi;
+  float b_lo, b_mid, b_hi;
+  float inv_gamma_r, inv_gamma_g, inv_gamma_b;
+} vk_rgblevels_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rgblevels_data_t *d = piece->data;
+  const dt_iop_rgblevels_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+
+  dt_vk_mem_t *dev_lutr = NULL, *dev_lutg = NULL, *dev_lutb = NULL;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL, *dev_profile_lut = NULL;
+  int rc = -1;
+
+  dev_lutr = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_lutg = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_lutb = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_lutr || !dev_lutg || !dev_lutb) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_lutr, d->lut[0], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_lutg, d->lut[1], lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_lutb, d->lut[2], lut_bytes) != 0) goto cleanup;
+
+  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
+                                         &profile_lut_vk, &dev_profile_info,
+                                         &dev_profile_lut) != 0)
+    goto cleanup;
+
+  const vk_rgblevels_pc_t pc = {
+    .width = width, .height = height,
+    .autoscale = d->params.autoscale,
+    .preserve_colors = d->params.preserve_colors,
+    .use_work_profile = (work_profile == NULL) ? 0 : 1,
+    .r_lo = d->params.levels[0][0], .r_mid = d->params.levels[0][1], .r_hi = d->params.levels[0][2],
+    .g_lo = d->params.levels[1][0], .g_mid = d->params.levels[1][1], .g_hi = d->params.levels[1][2],
+    .b_lo = d->params.levels[2][0], .b_mid = d->params.levels[2][1], .b_hi = d->params.levels[2][2],
+    .inv_gamma_r = d->inv_gamma[0],
+    .inv_gamma_g = d->inv_gamma[1],
+    .inv_gamma_b = d->inv_gamma[2],
+  };
+
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_lutr, dev_lutg, dev_lutb,
+                          dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  if(dev_lutr) dt_vulkan_free_buffer(devid, dev_lutr);
+  if(dev_lutg) dt_vulkan_free_buffer(devid, dev_lutg);
+  if(dev_lutb) dt_vulkan_free_buffer(devid, dev_lutb);
+  return rc;
 }
 #endif
 
