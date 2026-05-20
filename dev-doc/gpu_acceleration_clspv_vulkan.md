@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 35 modules currently expose `process_vk`,
+**Per-module ports**: 36 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -222,6 +222,7 @@ in three categories.
 | `src/iop/shadhi.c` | Shadows / highlights recovery. Same Gaussian-or-bilateral choice as lowpass, then snapshot, then a new `shadows_highlights_mix` kernel (3 bindings, 44 B PC) that runs two soft-light overlays — one for highlights (negative opacity), one for shadows (positive opacity). The overlay helper handles per-channel unbound flags via the `flags` bitmask, mirroring the OpenCL kernel byte-for-byte. |
 | `src/iop/colorbalance.c` | All three legacy modes (LEGACY sRGB-space, LIFT_GAMMA_GAIN ProPhoto, SLOPE_OFFSET_POWER aka CDL). Push-constant-only — no LUTs, no profile info — so the three kernels share the 2-binding shape but differ in body. LEGACY at 68 B PC (no saturation_out), LGG/CDL at 72 B. process_vk switches on `d->mode` and dispatches the matching `dt_vk_module_kernel_t` slot. |
 | `src/iop/colorout.c` | Output-side Lab → RGB via a 3×3 matrix + per-channel shaper LUT with linear-extrapolation tails (the matrix-fast-path from `process_cl`; the lcms2 slow path stays on CPU). 5-binding dispatch (in, out, lut_r/g/b), 80 B PC (2 ints + 9 matrix floats + 9 extrapolation-coeff floats). The `DT_COLORSPACE_LAB` pass-through case goes through `dt_vulkan_copy_device_to_device` rather than a kernel, mirroring the OpenCL `enqueue_copy_image` shortcut. |
+| `src/iop/filmic.c` | Legacy single-pass filmic (the predecessor to `filmicrgb`). Lab → XYZ → ProPhotoRGB → global saturation desat → log → 65536-entry S-curve LUT → derivative LUT for selective desat → power gamma → ProPhotoRGB → Lab. Both `preserve_color` modes (per-channel vs norm-preserving) folded into one entry point with a uniform branch on the flag. 4-binding dispatch (in, out, table, diff); 36 B PC (2 ints + 6 floats + 1 int). Wavelet-based `filmicrgb` is a separate port pending §8.5 (image2d + sampler bindings) for its reconstruction kernels. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -244,13 +245,13 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 35 module files and the new
+**Verified in this container:** all 36 module files and the new
 backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
 combinations (the full darktable build target succeeds, including
-`libcolorout.so` and the other plugin shared libraries). All GLSL
-twins build to valid SPIR-V via glslang + `spirv-val`. End-to-end
-runs against a real RAW are exercised by the user out-of-container
-on AMD RX 9060 XT (RADV).
+`libfilmic.so`, `libcolorout.so` and the other plugin shared
+libraries). All GLSL twins build to valid SPIR-V via glslang +
+`spirv-val`. End-to-end runs against a real RAW are exercised by
+the user out-of-container on AMD RX 9060 XT (RADV).
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
@@ -268,16 +269,18 @@ on AMD RX 9060 XT (RADV).
   consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
-  sampled image), `channelmixer` (legacy), `colorbalancergb`,
-  `filmic` (1 LUT + scalars). Each is ~50 LOC module + ~80 LOC
-  kernel. Done in earlier passes: `basicadj` (second consumer of
-  the §5.11 plumbing; full 6-feature ICC-aware kernel), `rgbcurve`
-  / `rgblevels` / `tonecurve` (the Lab/RGB curve cohort, all
-  sharing the 7-binding §5.11 + §5.8 pattern), `colorbalance` (3
-  variants, push-constant-only — switches on `d->mode` to dispatch
-  the matching `.spv`), `colorout` (Lab→RGB matrix + 3 shaper LUTs,
-  with the `DT_COLORSPACE_LAB` pass-through case routed through
-  `dt_vulkan_copy_device_to_device`).
+  sampled image), `channelmixer` (legacy), `colorbalancergb`. Each
+  is ~50 LOC module + ~80 LOC kernel. Done in earlier passes:
+  `basicadj` (second consumer of the §5.11 plumbing; full
+  6-feature ICC-aware kernel), `rgbcurve` / `rgblevels` /
+  `tonecurve` (the Lab/RGB curve cohort, all sharing the 7-binding
+  §5.11 + §5.8 pattern), `colorbalance` (3 variants, push-
+  constant-only — switches on `d->mode` to dispatch the matching
+  `.spv`), `colorout` (Lab→RGB matrix + 3 shaper LUTs, with the
+  `DT_COLORSPACE_LAB` pass-through case routed through
+  `dt_vulkan_copy_device_to_device`), `filmic` (legacy single-pass
+  variant; the newer `filmicrgb` is wavelet-based and pending
+  §8.5 image2d/sampler support).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`. The Gaussian VK
@@ -1311,6 +1314,141 @@ for every module that offers it; needed when fuzzing the VK port
 for coverage). The `prefer-vulkan` log line carries a
 `[chain]`/`[chain-start]`/`[no-cl]`/`[forced]` tag so the routing
 decision is visible in `-d opencl` traces.
+
+### 10.2 Performance roadmap — what's left and where the time goes
+
+After the buffer pool, persistent fence/cmd-buffer, chain-aware
+routing, and §5.14 hand-off cache have landed, a fresh trace from
+an RX 9060 XT (RADV) full export of a 5208×3472 image still
+takes ~15 s. The breakdown is sobering and clarifies which
+direction has the most leverage:
+
+| Bucket | Time | Cause | Fixable how |
+|---|---:|---|---|
+| CPU-only modules (`toneequal` ×2) | ~5.6 s | No `process_cl`, no `process_vk` — pure CPU work on 290 MB | Module port (large) |
+| CPU blending after VK | ~3-5 s | VK arm forces blending to CPU; CL arm runs blending on GPU via `blendop.cl` (15 kernels, ~1700 LOC) | Port `blendop.cl` to VK (large) |
+| CL ↔ VK boundary transitions | ~1-2 s | 290 MB `clEnqueueReadImage` + host→VK upload at each switch | VK-CL interop OR more VK ports to extend chains |
+| Per-VK-module overhead (alloc, fences) | <0.1 s | Buffer pool + persistent fence already cover this | Already done |
+| Lock contention across pipelines | ~1-2 s in multi-pipeline traces | `g_vk_lock` serialises all dispatches | Split lock (moderate) |
+| Misc dispatch + kernel work | <0.5 s | Actually GPU-bound | Already optimal |
+
+The first three rows account for almost the entire export
+runtime, and **none of them are addressed by HAL micro-opts**
+(buffer pool, fence reuse, lock-scope reduction). The buffer
+pool that landed in `b65132b` saves measurable driver overhead
+but doesn't move the needle on a discrete-GPU export with
+hundreds of MB of staging traffic — that test confirmed in the
+follow-up trace.
+
+#### Architectural paths forward, ranked by impact-to-effort
+
+**Path A — Port `blendop.cl` to Vulkan.** The single highest-
+impact item. Each VK module that wants masking/blending today
+forces a 290 MB device→host readback, ~3 GB/s of CPU blend work,
+then a host→device re-upload for the next module. Putting blend
+on the GPU side keeps the chain on-device. Impact: ~3-5 s saved
+on a typical export with default mask settings. Effort: large —
+15 compute kernels (Lab / RAW / RGB-jzczhz × {mask, mask-tone-curve,
+rgb-blend, …}) plus ~500 LOC of host plumbing in
+`src/develop/blend.c`. Tractable incrementally: start with the
+"normal mode + no blendif + no raster mask" path that covers
+80% of real-world use, then layer in the conditional modes.
+
+**Path B — Continue module ports to *extend* existing VK chains.**
+Each module ported brings two wins: (1) it removes its own host
+roundtrip when a chain reaches it, and (2) it expands chain
+boundaries so neighbour modules can stay on-device too. Highest-
+value targets in dependency order: `filmicrgb` (commonly used,
+single-pass), `colorbalancergb` (used in nearly every modern
+pipeline; ~500 LOC of LMS/Yrg/Ych/JzAzBz transforms),
+`colorequal` (uses guided filter — overlaps with Path D groundwork),
+`agx`, `lut3d` (needs §8.5 milestone: image2D + sampler). Effort:
+medium per module (~100-200 LOC kernel + ~100 LOC host). Impact:
+cumulative — each port shaves ~50-200 ms once VK chains form
+around it; the leverage compounds with Path A.
+
+**Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
+host roundtrip at CL↔VK boundaries with a shared physical
+allocation. `VK_KHR_external_memory_fd` + `cl_khr_external_memory`
+(or AMD's `cl_amd_copy_buffer_p2p` / NVIDIA's
+`cl_nv_external_memory`) let a buffer's `VkDeviceMemory` and
+`cl_mem` point to the same VRAM page; the pixel data never
+crosses PCIe at the transition. Impact: ~3-5 s saved per export
+on this hardware (eliminates entry + exit transitions on every
+VK chain). Effort: high (~500-1000 LOC) and platform-specific —
+extension support is solid on AMD/Intel Linux, present but
+fiddly on NVIDIA, and absent on most macOS configurations.
+Best deferred until a critical mass of modules is ported (Path B
+maturity) so the interop investment compounds.
+
+**Path D — Port CPU-only modules (`toneequal`, `cacorrect`,
+multi-pass diffuse pipeline).** `toneequal` alone is ~3 s of the
+export trace and has no `process_cl`. These ports are large
+individual investments (`toneequal` is 3445 LOC of host code
+using a guided filter we haven't ported yet) but the gain is
+direct: ~1 s saved per second of CPU work replaced by an ~10×
+faster GPU dispatch. Best tackled after the guided-filter
+helper exists (which Path B's `colorequal` port would
+naturally produce).
+
+**Path E — Split `g_vk_lock` into per-area mutexes.** Currently a
+single mutex serialises all VK work across all pipelines (full,
+preview, thumbnails). On multi-pipeline workloads (re-thumb a
+folder while editing) the lock multiplies dispatch wall time by
+the number of concurrent pipelines. Splitting into a
+descriptor-pool lock, command-pool lock, queue submit lock, and
+staging-buffer lock would let independent pipelines do alloc /
+upload / readback in parallel and serialise only on the queue.
+Impact: significant on multi-pipeline scenes (~30-50% wall-time
+reduction in those traces); zero impact on single-pipeline
+exports. Effort: moderate (~150 LOC, careful audit of
+ordering invariants).
+
+#### Recommended sequence
+
+1. **Path B continued** (this session and next) — every port
+   compounds with future Path A and Path C work. Low risk, high
+   reuse. The recent `colorout` and `filmic` landings are in
+   this lane; `colorbalancergb` and `lut3d` (after §8.5) are the
+   next logical picks.
+2. **Path A** (multi-session) — start with the common-case
+   blend ("normal mode, no blendif, no raster mask") which
+   covers the bulk of real pipelines, then incrementally add the
+   conditional / mask / colorspace variants. Each landed kernel
+   immediately benefits every VK module downstream of it.
+3. **Path E** when the multi-pipeline traces become the
+   bottleneck (i.e. once Path A makes the single-pipeline path
+   fast enough that lock contention dominates the remaining
+   slowness).
+4. **Path C** once enough modules are ported that VK chains
+   span most of the pipeline — at that point the CL boundary is
+   only at one or two points and interop pays for its complexity.
+5. **Path D** opportunistically as the helpers needed (guided
+   filter for `toneequal`, etc.) emerge as side-products of
+   Path B work.
+
+#### Things that *don't* help (and why)
+
+- **More aggressive deferred readback inside the VK arm.**
+  Investigated: keeping the device buffer "live" past the
+  module dispatch only helps when the *next* module both reads
+  from the device buffer (VK with handoff) *and* doesn't trigger
+  CPU blending/picker/color-space-transform that needs the host
+  buffer. The current export's chain (`exposure` →
+  `exposure.2[blend]` → `exposure.1[blend]`) has CPU blending on
+  every chain link except the first — every deferral would force
+  a sync at the next module's blending step anyway. Net savings
+  on this trace: zero. Worth implementing only after Path A
+  removes the blend-forced syncs.
+- **Async kernel dispatch / pipeline barriers within a single
+  command buffer.** Investigated: the fence-wait cost per
+  dispatch is already ~µs-scale on RADV. The bottleneck is
+  *data motion*, not kernel-launch latency.
+- **Resizable-BAR / direct host-visible-device-local staging.**
+  Investigated: would save the staging→device DMA hop (~10 ms
+  per 290 MB transfer), so ~80-160 ms over an export. Real but
+  marginal next to Path A / C scope. Worth doing once at HAL
+  level when we touch staging again, but not a project of its own.
 
 ## 11. Optional intermediate: clvk
 
