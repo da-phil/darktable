@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop_math.h"
@@ -151,7 +152,26 @@ typedef struct dt_iop_filmic_global_data_t
 {
   int kernel_filmic;
   int kernel_filmic_log;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk;
+#endif
 } dt_iop_filmic_global_data_t;
+
+#ifdef HAVE_VULKAN
+// Push-constant layout shared between init_global (sizeof) and
+// process_vk (assignment). 2 ints + 6 floats + 1 int = 36 bytes.
+typedef struct
+{
+  int   width, height;
+  float dynamic_range;
+  float shadows_range;
+  float grey;
+  float contrast;
+  float power;
+  float saturation;
+  int   preserve_color;
+} vk_filmic_pc_t;
+#endif
 
 
 const char *name()
@@ -587,6 +607,47 @@ error:
   dt_opencl_release_mem_object(dev_table);
   dt_opencl_release_mem_object(diff_table);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_filmic_data_t *const d = piece->data;
+  const dt_iop_filmic_global_data_t *const gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  dt_vk_mem_t *dev_table = NULL, *dev_diff = NULL;
+  int rc = -1;
+
+  dev_table = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_diff  = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_table || !dev_diff) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_table, d->table,  lut_bytes) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_diff,  d->grad_2, lut_bytes) != 0) goto cleanup;
+
+  const vk_filmic_pc_t pc = {
+    .width = roi_in->width, .height = roi_in->height,
+    .dynamic_range = d->dynamic_range,
+    .shadows_range = d->black_source,
+    .grey = d->grey_source,
+    .contrast = d->contrast,
+    .power = d->output_power,
+    .saturation = d->global_saturation / 100.0f,
+    .preserve_color = d->preserve_color ? 1 : 0,
+  };
+
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_table, dev_diff };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 4,
+                            roi_in->width, roi_in->height, &pc, sizeof(pc));
+
+cleanup:
+  if(dev_table) dt_vulkan_free_buffer(devid, dev_table);
+  if(dev_diff)  dt_vulkan_free_buffer(devid, dev_diff);
+  return rc;
 }
 #endif
 
@@ -1321,12 +1382,22 @@ void init_global(dt_iop_module_so_t *self)
 
   self->data = gd;
   gd->kernel_filmic = dt_opencl_create_kernel(program, "filmic");
+#ifdef HAVE_VULKAN
+  // 4 storage buffers (in, out, s-curve table, derivative table);
+  // 2 ints + 6 floats + 1 int = 36 B push constants.
+  dt_vulkan_module_kernel_load(&gd->vk, "filmic", "filmic",
+                               4, sizeof(vk_filmic_pc_t),
+                               16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_filmic_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_filmic);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk);
+#endif
   free(self->data);
   self->data = NULL;
 }
