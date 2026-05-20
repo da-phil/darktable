@@ -1,0 +1,165 @@
+// GLSL fallback for filmic.cl. See the .cl header for design.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In    { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out   { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Table { float data[]; } s_curve;
+layout(std430, binding = 3) readonly buffer Diff  { float data[]; } deriv;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float dynamic_range;
+    float shadows_range;
+    float grey;
+    float contrast;
+    float power;
+    float saturation;
+    int   preserve_color;
+} pc;
+
+#define VK_LUT_SIZE 0x10000
+
+// Lab -> XYZ (D50). Mirrors dt_vulkan_common.h.
+vec4 lab_f_inv(vec4 x) {
+    vec4 eps = vec4(0.20689655172413796);
+    vec4 k   = vec4(24389.0 / 27.0);
+    bvec4 m = greaterThan(x, eps);
+    vec4 a = x * x * x;
+    vec4 b = (vec4(116.0) * x - vec4(16.0)) / k;
+    return mix(b, a, m);
+}
+vec4 lab_f(vec4 x) {
+    vec4 eps = vec4(216.0 / 24389.0);
+    vec4 k   = vec4(24389.0 / 27.0);
+    bvec4 m = greaterThan(x, eps);
+    vec4 a = vec4(pow(x.x, 1.0/3.0), pow(x.y, 1.0/3.0),
+                  pow(x.z, 1.0/3.0), pow(x.w, 1.0/3.0));
+    vec4 b = (k * x + vec4(16.0)) / vec4(116.0);
+    return mix(b, a, m);
+}
+vec4 Lab_to_XYZ(vec4 Lab) {
+    vec4 d50 = vec4(0.9642, 1.0, 0.8249, 0.0);
+    vec4 f;
+    f.y = (Lab.x + 16.0) / 116.0;
+    f.x = Lab.y / 500.0 + f.y;
+    f.z = f.y - Lab.z / 200.0;
+    f.w = 0.0;
+    vec4 xyz = d50 * lab_f_inv(f);
+    xyz.w = Lab.w;
+    return xyz;
+}
+vec4 XYZ_to_Lab(vec4 xyz) {
+    vec4 d50i = vec4(1.0/0.9642, 1.0, 1.0/0.8249, 1.0);
+    vec4 f = lab_f(xyz * d50i);
+    vec4 lab;
+    lab.x = 116.0 * f.y - 16.0;
+    lab.y = 500.0 * (f.x - f.y);
+    lab.z = 200.0 * (f.y - f.z);
+    lab.w = xyz.w;
+    return lab;
+}
+vec4 XYZ_to_prophotorgb(vec4 XYZ) {
+    vec4 rgb = vec4(0.0, 0.0, 0.0, XYZ.w);
+    rgb.x =  1.3459433 * XYZ.x - 0.2556075 * XYZ.y - 0.0511118 * XYZ.z;
+    rgb.y = -0.5445989 * XYZ.x + 1.5081673 * XYZ.y + 0.0205351 * XYZ.z;
+    rgb.z =  0.0000000 * XYZ.x + 0.0000000 * XYZ.y + 1.2118128 * XYZ.z;
+    return rgb;
+}
+vec4 prophotorgb_to_XYZ(vec4 rgb) {
+    vec4 XYZ = vec4(0.0, 0.0, 0.0, rgb.w);
+    XYZ.x = 0.7976749 * rgb.x + 0.1351917 * rgb.y + 0.0313534 * rgb.z;
+    XYZ.y = 0.2880402 * rgb.x + 0.7118741 * rgb.y + 0.0000857 * rgb.z;
+    XYZ.z = 0.0000000 * rgb.x + 0.0000000 * rgb.y + 0.8252100 * rgb.z;
+    return XYZ;
+}
+vec4 prophotorgb_to_Lab(vec4 rgb) { return XYZ_to_Lab(prophotorgb_to_XYZ(rgb)); }
+
+float lookup_s(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return s_curve.data[xi];
+}
+float lookup_d(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return deriv.data[xi];
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+    vec4 xyz = Lab_to_XYZ(i);
+    vec4 o = XYZ_to_prophotorgb(xyz);
+
+    float noise = pow(2.0, -16.0);
+    float derivative, luma;
+
+    if(pc.saturation != 1.0) {
+        float lum = xyz.y;
+        o.x = lum + pc.saturation * (o.x - lum);
+        o.y = lum + pc.saturation * (o.y - lum);
+        o.z = lum + pc.saturation * (o.z - lum);
+    }
+
+    if(pc.preserve_color != 0) {
+        float maxRGB = max(o.x, max(o.y, o.z));
+        float inv_max = (maxRGB > 0.0) ? (1.0 / maxRGB) : 0.0;
+        float rr = o.x * inv_max;
+        float rg = o.y * inv_max;
+        float rb = o.z * inv_max;
+
+        maxRGB = maxRGB / pc.grey;
+        maxRGB = (maxRGB < noise) ? noise : maxRGB;
+        maxRGB = (log2(maxRGB) - pc.shadows_range) / pc.dynamic_range;
+        maxRGB = clamp(maxRGB, 0.0, 1.0);
+        float index = maxRGB;
+
+        maxRGB = lookup_s(maxRGB);
+
+        o.x = maxRGB * rr;
+        o.y = maxRGB * rg;
+        o.z = maxRGB * rb;
+
+        derivative = lookup_d(index);
+        luma = maxRGB;
+    }
+    else {
+        o.x = (o.x / pc.grey < noise) ? noise : (o.x / pc.grey);
+        o.y = (o.y / pc.grey < noise) ? noise : (o.y / pc.grey);
+        o.z = (o.z / pc.grey < noise) ? noise : (o.z / pc.grey);
+        o.x = clamp((log2(o.x) - pc.shadows_range) / pc.dynamic_range, 0.0, 1.0);
+        o.y = clamp((log2(o.y) - pc.shadows_range) / pc.dynamic_range, 0.0, 1.0);
+        o.z = clamp((log2(o.z) - pc.shadows_range) / pc.dynamic_range, 0.0, 1.0);
+
+        float index = prophotorgb_to_XYZ(o).y;
+
+        o.x = lookup_s(o.x);
+        o.y = lookup_s(o.y);
+        o.z = lookup_s(o.z);
+
+        derivative = lookup_d(index);
+        luma = prophotorgb_to_XYZ(o).y;
+    }
+
+    o.x = luma + derivative * (o.x - luma);
+    o.y = luma + derivative * (o.y - luma);
+    o.z = luma + derivative * (o.z - luma);
+    o.x = clamp(o.x, 0.0, 1.0);
+    o.y = clamp(o.y, 0.0, 1.0);
+    o.z = clamp(o.z, 0.0, 1.0);
+
+    o.x = pow(o.x, pc.power);
+    o.y = pow(o.y, pc.power);
+    o.z = pow(o.z, pc.power);
+
+    vec4 lab_out = prophotorgb_to_Lab(o);
+    i.x = lab_out.x;
+    i.y = lab_out.y;
+    i.z = lab_out.z;
+    out_buf.data[idx] = i;
+}
