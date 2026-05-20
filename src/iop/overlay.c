@@ -21,6 +21,7 @@
 #include "common/math.h"
 #include "common/overlay.h"
 #include "common/utility.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -137,7 +138,16 @@ typedef struct dt_iop_overlay_global_data_t
   dt_pthread_mutex_t overlay_threadsafe;
   int kernel_overlay_blend;        // float RGBA blend (HQ)
   int kernel_overlay_blend_legacy; // 8-bit Cairo ARGB blend (legacy)
+  dt_vk_module_kernel_t vk;
 } dt_iop_overlay_global_data_t;
+
+typedef struct vk_overlay_pc_t
+{
+  int   width;
+  int   height;
+  float opacity;
+  int   stride;
+} vk_overlay_pc_t;
 
 typedef struct dt_iop_overlay_gui_data_t
 {
@@ -1046,6 +1056,57 @@ cleanup:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_overlay_data_t *data = piece->data;
+  const dt_iop_overlay_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+
+  // Only the legacy 8-bit Cairo ARGB32 compositing path has a Vulkan
+  // kernel. The HQ float compositor has no VK twin yet, so refuse it
+  // here and let the pipeline fall back to OpenCL/CPU rather than
+  // silently blending it at legacy quality.
+  if(data->compositing != DT_OVERLAY_COMPOSITE_LEGACY) return -1;
+
+  int stride = 0;
+  guint8 *image = _get_overlay_argb(self, piece, roi_in, roi_out, &stride);
+
+  if(!image)
+  {
+    // No overlay: device-side passthrough.
+    const size_t bytes = (size_t)width * height * 4 * sizeof(float);
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, bytes);
+  }
+
+  int rc = -1;
+  const size_t overlay_size = (size_t)height * stride;
+  dt_vk_mem_t *dev_overlay = dt_vulkan_alloc_buffer(devid, overlay_size);
+  if(!dev_overlay) goto cleanup;
+
+  if(dt_vulkan_write_to_device(devid, dev_overlay, image, overlay_size) != 0)
+    goto cleanup;
+
+  const vk_overlay_pc_t pc = {
+    .width   = width,
+    .height  = height,
+    .opacity = data->opacity / 100.0f,
+    .stride  = stride,
+  };
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_overlay, dev_out };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 3, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_overlay);
+  g_free(image);
+  return rc;
+}
+#endif
+
 static gboolean _draw_thumb(GtkWidget *area,
                             cairo_t *crf,
                             const dt_iop_module_t *self)
@@ -1331,6 +1392,9 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_overlay_blend = -1;
   gd->kernel_overlay_blend_legacy = -1;
 #endif
+  dt_vulkan_module_kernel_load(&gd->vk, "overlay", "overlay_blend",
+                               3, sizeof(vk_overlay_pc_t),
+                               16, 16, 1);
 
   self->data = gd;
 }
@@ -1348,6 +1412,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_overlay_blend);
   dt_opencl_free_kernel(gd->kernel_overlay_blend_legacy);
 #endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
 
   free(gd);
   self->data = NULL;
