@@ -223,6 +223,7 @@ in three categories.
 | `src/iop/colorbalance.c` | All three legacy modes (LEGACY sRGB-space, LIFT_GAMMA_GAIN ProPhoto, SLOPE_OFFSET_POWER aka CDL). Push-constant-only — no LUTs, no profile info — so the three kernels share the 2-binding shape but differ in body. LEGACY at 68 B PC (no saturation_out), LGG/CDL at 72 B. process_vk switches on `d->mode` and dispatches the matching `dt_vk_module_kernel_t` slot. |
 | `src/iop/colorout.c` | Output-side Lab → RGB via a 3×3 matrix + per-channel shaper LUT with linear-extrapolation tails (the matrix-fast-path from `process_cl`; the lcms2 slow path stays on CPU). 5-binding dispatch (in, out, lut_r/g/b), 80 B PC (2 ints + 9 matrix floats + 9 extrapolation-coeff floats). The `DT_COLORSPACE_LAB` pass-through case goes through `dt_vulkan_copy_device_to_device` rather than a kernel, mirroring the OpenCL `enqueue_copy_image` shortcut. |
 | `src/iop/filmic.c` | Legacy single-pass filmic (the predecessor to `filmicrgb`). Lab → XYZ → ProPhotoRGB → global saturation desat → log → 65536-entry S-curve LUT → derivative LUT for selective desat → power gamma → ProPhotoRGB → Lab. Both `preserve_color` modes (per-channel vs norm-preserving) folded into one entry point with a uniform branch on the flag. 4-binding dispatch (in, out, table, diff); 36 B PC (2 ints + 6 floats + 1 int). Wavelet-based `filmicrgb` is a separate port pending §8.5 (image2d + sampler bindings) for its reconstruction kernels. |
+| `src/iop/overlay.c` | Composite (Cairo ARGB32 → RGBA float alpha-blend). The Cairo overlay buffer arrives as a packed 8-bit BGRA byte buffer; with Cairo's 4-byte stride alignment and `x*4` naturally word-aligned, each pixel is exactly one `uint` so the storage buffer is bound as `uint *` and the four bytes are extracted with shift+mask. 3-binding dispatch (in, argb, out); 16 B PC (2 ints + 1 float + 1 int). The "no overlay" branch routes through `dt_vulkan_copy_device_to_device` rather than a kernel, mirroring the OpenCL `enqueue_copy_image` shortcut. Cairo overlay rendering still runs CPU-side (`_get_overlay_argb`); the GPU only does the per-pixel alpha-blend over the full canvas. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -245,7 +246,7 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 36 module files and the new
+**Verified in this container:** all 37 module files and the new
 backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
 combinations (the full darktable build target succeeds, including
 `libfilmic.so`, `libcolorout.so` and the other plugin shared

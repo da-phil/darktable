@@ -76,7 +76,8 @@ set(VK_KERNELS
     colorbalance_lgg:colorbalance_lgg
     colorbalance_cdl:colorbalance_cdl
     colorout:colorout
-    filmic:filmic)
+    filmic:filmic
+    overlay:overlay_blend)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
