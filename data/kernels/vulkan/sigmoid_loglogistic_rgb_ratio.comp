@@ -1,0 +1,75 @@
+// GLSL fallback for sigmoid_loglogistic_rgb_ratio.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float white_target;
+    float black_target;
+    float paper_exp;
+    float film_fog;
+    float contrast_power;
+    float skew_power;
+} pc;
+
+vec4 desat_neg(vec4 i) {
+    float avg = max((i.x + i.y + i.z) / 3.0, 0.0);
+    float mn  = min(min(i.x, i.y), i.z);
+    float sf  = (mn < 0.0) ? -avg / (mn - avg) : 1.0;
+    return avg + sf * (i - avg);
+}
+
+float sigmoid_scalar(float v, float magnitude, float paper_exp, float film_fog,
+                     float film_power, float paper_power) {
+    float c = max(v, 0.0);
+    float film  = pow(film_fog + c, film_power);
+    float paper = magnitude * pow(film / (paper_exp + film), paper_power);
+    return isnan(paper) ? magnitude : paper;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+    float alpha = i.w;
+
+    i = desat_neg(i);
+
+    float luma = (i.x + i.y + i.z) / 3.0;
+    float mapped = sigmoid_scalar(luma, pc.white_target,
+                                  pc.paper_exp, pc.film_fog,
+                                  pc.contrast_power, pc.skew_power);
+
+    if(luma > 1e-9) {
+        float s = mapped / luma;
+        i = s * i;
+    } else {
+        i = vec4(mapped);
+    }
+
+    float pmin = min(min(i.x, i.y), i.z);
+    float pmax = max(max(i.x, i.y), i.z);
+
+    float eps = 1e-6;
+    float dw  = (pc.white_target - mapped) / (pmax - mapped + eps);
+    float db  = (pc.black_target - mapped) / (pmin - mapped - eps);
+    float d   = min(dw, db);
+    float c   = (mapped - pmin) / (mapped + eps);
+
+    float adj = 1.0 / (c * d + eps);
+    float hc  = 2.0 * c / (1.0 - c * c + eps) * adj;
+    float hz  = sqrt(hc * hc + 1.0);
+    float cf  = hc / (1.0 + hz) * d;
+
+    i = mapped + cf * (i - mapped);
+    i.w = alpha;
+    out_buf.data[idx] = i;
+}

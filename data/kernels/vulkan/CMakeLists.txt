@@ -77,7 +77,9 @@ set(VK_KERNELS
     colorbalance_cdl:colorbalance_cdl
     colorout:colorout
     filmic:filmic
-    overlay:overlay_blend)
+    overlay:overlay_blend
+    sigmoid_loglogistic_rgb_ratio:sigmoid_loglogistic_rgb_ratio
+    sigmoid_loglogistic_per_channel:sigmoid_loglogistic_per_channel)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
