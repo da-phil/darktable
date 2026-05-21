@@ -491,3 +491,58 @@ static inline float4 vk_HSL_to_RGB(const float4 HSL)
                   vk_hue_to_rgb(var_1, var_2, H - 1.0f / 3.0f),
                   HSL.w);
 }
+
+// RGB <-> HSV — mirrors RGB_2_HSV / HSV_2_RGB in colorspace.h. agx
+// uses these for the optional hue-restore step.
+static inline float4 vk_RGB_to_HSV(const float4 RGB)
+{
+  float4 HSV;
+  const float minv = fmin(RGB.x, fmin(RGB.y, RGB.z));
+  const float maxv = fmax(RGB.x, fmax(RGB.y, RGB.z));
+  const float delta = maxv - minv;
+
+  HSV.z = maxv;
+  HSV.w = RGB.w;
+
+  if(fabs(maxv) > 1e-6f && fabs(delta) > 1e-6f)
+  {
+    HSV.y = delta / maxv;
+  }
+  else
+  {
+    HSV.x = 0.0f;
+    HSV.y = 0.0f;
+    return HSV;
+  }
+
+  if(RGB.x == maxv)      HSV.x = (RGB.y - RGB.z) / delta;
+  else if(RGB.y == maxv) HSV.x = 2.0f + (RGB.z - RGB.x) / delta;
+  else                   HSV.x = 4.0f + (RGB.x - RGB.y) / delta;
+
+  HSV.x /= 6.0f;
+  HSV.x -= floor(HSV.x);
+  return HSV;
+}
+
+static inline float4 vk_HSV_to_RGB(const float4 HSV)
+{
+  if(fabs(HSV.y) < 1e-6f)
+    return (float4)(HSV.z, HSV.z, HSV.z, HSV.w);
+
+  const int   i = (int)floor(6.0f * HSV.x);
+  const float v = HSV.z;
+  const float w = HSV.w;
+  const float p = v * (1.0f - HSV.y);
+  const float q = v * (1.0f - HSV.y * (6.0f * HSV.x - (float)i));
+  const float t = v * (1.0f - HSV.y * (1.0f - (6.0f * HSV.x - (float)i)));
+
+  switch(i)
+  {
+    case 0:  return (float4)(v, t, p, w);
+    case 1:  return (float4)(q, v, p, w);
+    case 2:  return (float4)(p, v, t, w);
+    case 3:  return (float4)(p, q, v, w);
+    case 4:  return (float4)(t, p, v, w);
+    default: return (float4)(v, p, q, w);  // case 5 + wrap
+  }
+}

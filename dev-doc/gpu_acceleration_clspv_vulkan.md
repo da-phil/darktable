@@ -282,7 +282,10 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `DT_COLORSPACE_LAB` pass-through case routed through
   `dt_vulkan_copy_device_to_device`), `filmic` (legacy single-pass
   variant; the newer `filmicrgb` is wavelet-based and pending
-  §8.5 image2d/sampler support).
+  §8.5 image2d/sampler support), `sigmoid` (both color-processing
+  modes — `rgb_ratio` is push-constant-only, `per_channel` carries
+  3 matrices as storage-buffer bindings packed by
+  `pack_3xSSE_to_3x3`).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `blurs`, `colorchecker`, `colorzones`,
   `sharpen`, `soften`, `highpass`, `highlights`. The Gaussian VK
@@ -301,13 +304,19 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `shadhi`, `retouch`, `monochrome`, `globaltonemap` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
-  clipping, crop), liquify, overlay, rasterfile, colorin. These
+  clipping, crop), liquify, rasterfile, colorin. These
   need the sampled-image + sampler bindings (§5.2 milestone 5) and
   in some cases full distort pipelines. Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
   kernel instead), `mask_manager` (used the new
   `dt_vulkan_copy_device_to_device` HAL primitive instead of a
-  kernel).
+  kernel). `overlay` was originally in this bucket but turned out
+  to be tractable without sampler support — its image-bound CL
+  signature was rewritten to storage buffers (RGBA float in/out)
+  and the Cairo ARGB32 byte buffer is bound as a packed `uint`
+  storage buffer (Cairo's 4-byte stride alignment + naturally
+  word-aligned x*4 means each pixel is exactly one uint, no
+  cross-word shuffles needed).
 
 See §8 for the staged milestone plan that gets us through these
 buckets without breaking the OpenCL coexistence.
@@ -1364,10 +1373,21 @@ value targets in dependency order: `filmicrgb` (commonly used,
 single-pass), `colorbalancergb` (used in nearly every modern
 pipeline; ~500 LOC of LMS/Yrg/Ych/JzAzBz transforms),
 `colorequal` (uses guided filter — overlaps with Path D groundwork),
-`agx`, `lut3d` (needs §8.5 milestone: image2D + sampler). Effort:
-medium per module (~100-200 LOC kernel + ~100 LOC host). Impact:
-cumulative — each port shaves ~50-200 ms once VK chains form
-around it; the leverage compounds with Path A.
+`agx` (params struct exceeds the 128 B PC limit, so the kernel
+will need a uniform-buffer binding for the curve coefficients — a
+useful HAL stretch as well as a module port), `lut3d` (needs §8.5
+milestone: image2D + sampler). Effort: medium per module
+(~100-200 LOC kernel + ~100 LOC host). Impact: cumulative — each
+port shaves ~50-200 ms once VK chains form around it; the leverage
+compounds with Path A.
+
+Recent landings on this lane: `colorout`, `filmic` (legacy
+single-pass), `overlay` (image-bindings rewritten to storage
+buffers; demonstrates that some "VERY HARD" entries actually
+fit the buffer-only HAL once you replace `image2d_t in/out` with
+`global float4 *in/out`), `sigmoid` (both color-processing modes
+in one commit — `rgb_ratio` push-constant-only, `per_channel`
+with three 3×3 matrices in storage buffers).
 
 **Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
 host roundtrip at CL↔VK boundaries with a shared physical
@@ -1410,9 +1430,10 @@ ordering invariants).
 
 1. **Path B continued** (this session and next) — every port
    compounds with future Path A and Path C work. Low risk, high
-   reuse. The recent `colorout` and `filmic` landings are in
-   this lane; `colorbalancergb` and `lut3d` (after §8.5) are the
-   next logical picks.
+   reuse. The recent `colorout`, `filmic`, `overlay`, and
+   `sigmoid` landings are in this lane; `colorbalancergb`, `agx`
+   (after PC→UB migration for params), and `lut3d` (after §8.5)
+   are the next logical picks.
 2. **Path A** (multi-session) — start with the common-case
    blend ("normal mode, no blendif, no raster mask") which
    covers the bulk of real pipelines, then incrementally add the
