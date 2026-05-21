@@ -1,0 +1,148 @@
+// GLSL fallback for sigmoid_loglogistic_per_channel.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer MPB  { float data[]; } m_pb;
+layout(std430, binding = 3) readonly buffer MBR  { float data[]; } m_br;
+layout(std430, binding = 4) readonly buffer MRP  { float data[]; } m_rp;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float white_target;
+    float paper_exp;
+    float film_fog;
+    float contrast_power;
+    float skew_power;
+    float hue_preservation;
+} pc;
+
+vec4 mat3x3v(vec4 v, int slot) {
+    float R, G, B;
+    if(slot == 0) {
+        R = m_pb.data[0] * v.x + m_pb.data[1] * v.y + m_pb.data[2] * v.z;
+        G = m_pb.data[3] * v.x + m_pb.data[4] * v.y + m_pb.data[5] * v.z;
+        B = m_pb.data[6] * v.x + m_pb.data[7] * v.y + m_pb.data[8] * v.z;
+    } else if(slot == 1) {
+        R = m_br.data[0] * v.x + m_br.data[1] * v.y + m_br.data[2] * v.z;
+        G = m_br.data[3] * v.x + m_br.data[4] * v.y + m_br.data[5] * v.z;
+        B = m_br.data[6] * v.x + m_br.data[7] * v.y + m_br.data[8] * v.z;
+    } else {
+        R = m_rp.data[0] * v.x + m_rp.data[1] * v.y + m_rp.data[2] * v.z;
+        G = m_rp.data[3] * v.x + m_rp.data[4] * v.y + m_rp.data[5] * v.z;
+        B = m_rp.data[6] * v.x + m_rp.data[7] * v.y + m_rp.data[8] * v.z;
+    }
+    return vec4(R, G, B, v.w);
+}
+
+vec4 desat_neg(vec4 i) {
+    float avg = max((i.x + i.y + i.z) / 3.0, 0.0);
+    float mn  = min(min(i.x, i.y), i.z);
+    float sf  = (mn < 0.0) ? -avg / (mn - avg) : 1.0;
+    return avg + sf * (i - avg);
+}
+
+vec4 sigmoid_vec(vec4 i, float magnitude, float paper_exp, float film_fog,
+                 float film_power, float paper_power) {
+    i = max(i, vec4(0.0));
+    i = pow(film_fog + i, vec4(film_power));
+    i = magnitude * pow(i / (paper_exp + i), vec4(paper_power));
+    return any(isnan(i)) ? vec4(magnitude) : i;
+}
+
+ivec3 pixel_order(float r, float g, float b) {
+    if(r >= g) {
+        if(g > b)        return ivec3(0, 1, 2);
+        else if(b > r)   return ivec3(2, 0, 1);
+        else if(b > g)   return ivec3(0, 2, 1);
+        else             return ivec3(0, 1, 2);
+    } else {
+        if(r >= b)       return ivec3(1, 0, 2);
+        else if(b > g)   return ivec3(2, 1, 0);
+        else             return ivec3(1, 2, 0);
+    }
+}
+
+float idx3(float a, float b, float c, int i) {
+    return (i == 0) ? a : ((i == 1) ? b : c);
+}
+
+vec4 preserve_hue_and_energy(vec4 pix_in, vec4 per_channel,
+                             ivec3 order, float hue_preservation) {
+    int imax = order.x;
+    int imid = order.y;
+    int imin = order.z;
+
+    float pix_max = idx3(pix_in.x, pix_in.y, pix_in.z, imax);
+    float pix_mid = idx3(pix_in.x, pix_in.y, pix_in.z, imid);
+    float pix_min = idx3(pix_in.x, pix_in.y, pix_in.z, imin);
+    float pc_max  = idx3(per_channel.x, per_channel.y, per_channel.z, imax);
+    float pc_mid  = idx3(per_channel.x, per_channel.y, per_channel.z, imid);
+    float pc_min  = idx3(per_channel.x, per_channel.y, per_channel.z, imin);
+
+    float chroma   = pix_max - pix_min;
+    float midscale = (chroma != 0.0) ? (pix_mid - pix_min) / chroma : 0.0;
+    float full_hc  = pc_min + (pc_max - pc_min) * midscale;
+    float naive_mid = (1.0 - hue_preservation) * pc_mid + hue_preservation * full_hc;
+
+    float pc_energy    = per_channel.x + per_channel.y + per_channel.z;
+    float naive_energy = pc_min + naive_mid + pc_max;
+    float pix_minmid   = pix_min + pix_mid;
+    float blend = (pix_minmid != 0.0) ? (2.0 * pix_min / pix_minmid) : 0.0;
+    float energy_target = blend * pc_energy + (1.0 - blend) * naive_energy;
+
+    float new_max, new_mid, new_min;
+    if(naive_mid <= pc_mid) {
+        float corrected_mid =
+          ((1.0 - hue_preservation) * pc_mid + hue_preservation *
+           (midscale * pc_max + (1.0 - midscale) * (energy_target - pc_max))) /
+          (1.0 + hue_preservation * (1.0 - midscale));
+        new_min = energy_target - pc_max - corrected_mid;
+        new_mid = corrected_mid;
+        new_max = pc_max;
+    } else {
+        float corrected_mid =
+          ((1.0 - hue_preservation) * pc_mid + hue_preservation *
+           (pc_min * (1.0 - midscale) + midscale * (energy_target - pc_min))) /
+          (1.0 + hue_preservation * midscale);
+        new_min = pc_min;
+        new_mid = corrected_mid;
+        new_max = energy_target - pc_min - corrected_mid;
+    }
+
+    vec4 r = pix_in;
+    if(imin == 0) r.x = new_min; else if(imid == 0) r.x = new_mid; else r.x = new_max;
+    if(imin == 1) r.y = new_min; else if(imid == 1) r.y = new_mid; else r.y = new_max;
+    if(imin == 2) r.z = new_min; else if(imid == 2) r.z = new_mid; else r.z = new_max;
+    return r;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+    float alpha = i.w;
+
+    i = mat3x3v(i, 0);
+    i = desat_neg(i);
+    i = mat3x3v(i, 1);
+
+    vec4 pix_in_rendering = i;
+    vec4 per_channel = sigmoid_vec(i, pc.white_target, pc.paper_exp,
+                                   pc.film_fog, pc.contrast_power, pc.skew_power);
+
+    ivec3 order = pixel_order(pix_in_rendering.x, pix_in_rendering.y, pix_in_rendering.z);
+    vec4 mixed = preserve_hue_and_energy(pix_in_rendering, per_channel,
+                                         order, pc.hue_preservation);
+    mixed.w = alpha;
+
+    vec4 o = mat3x3v(mixed, 2);
+    o.w = alpha;
+    out_buf.data[idx] = o;
+}
