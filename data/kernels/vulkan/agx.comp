@@ -1,0 +1,284 @@
+// GLSL fallback for agx.cl. See the .cl header for design.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// std430 layout matches the C struct's flat 4-byte-aligned float/int
+// fields exactly. Order must match the C side
+// (tone_mapping_params_t in src/iop/agx.c) byte-for-byte.
+struct ToneMappingParams
+{
+    float min_ev;
+    float max_ev;
+    float range_in_ev;
+    float curve_gamma;
+    float pivot_x;
+    float pivot_y;
+    float target_black;
+    float toe_power;
+    float toe_transition_x;
+    float toe_transition_y;
+    float toe_scale;
+    int   need_convex_toe;
+    float toe_fallback_coefficient;
+    float toe_fallback_power;
+    float slope;
+    float intercept;
+    float target_white;
+    float shoulder_power;
+    float shoulder_transition_x;
+    float shoulder_transition_y;
+    float shoulder_scale;
+    int   need_concave_shoulder;
+    float shoulder_fallback_coefficient;
+    float shoulder_fallback_power;
+    float look_offset;
+    float look_slope;
+    float look_power;
+    float look_saturation;
+    float look_original_hue_mix_ratio;
+    int   look_tuned;
+    int   restore_hue;
+};
+
+layout(std430, binding = 0) readonly buffer In     { vec4  data[];        } in_buf;
+layout(std430, binding = 1)          buffer Out    { vec4  data[];        } out_buf;
+layout(std430, binding = 2) readonly buffer PBuf   { ToneMappingParams p; } params;
+layout(std430, binding = 3) readonly buffer MPB    { float data[];        } m_pb;
+layout(std430, binding = 4) readonly buffer MBR    { float data[];        } m_br;
+layout(std430, binding = 5) readonly buffer MRP    { float data[];        } m_rp;
+layout(std430, binding = 6) readonly buffer MRXYZ  { float data[];        } m_rxyz;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int base_working_same_profile;
+} pc;
+
+#define _AGX_EPS 1e-6
+
+vec4 mat3x3_apply(vec4 v, int slot) {
+    float R, G, B;
+    if(slot == 0) {
+        R = m_pb.data[0] * v.x + m_pb.data[1] * v.y + m_pb.data[2] * v.z;
+        G = m_pb.data[3] * v.x + m_pb.data[4] * v.y + m_pb.data[5] * v.z;
+        B = m_pb.data[6] * v.x + m_pb.data[7] * v.y + m_pb.data[8] * v.z;
+    } else if(slot == 1) {
+        R = m_br.data[0] * v.x + m_br.data[1] * v.y + m_br.data[2] * v.z;
+        G = m_br.data[3] * v.x + m_br.data[4] * v.y + m_br.data[5] * v.z;
+        B = m_br.data[6] * v.x + m_br.data[7] * v.y + m_br.data[8] * v.z;
+    } else if(slot == 2) {
+        R = m_rp.data[0] * v.x + m_rp.data[1] * v.y + m_rp.data[2] * v.z;
+        G = m_rp.data[3] * v.x + m_rp.data[4] * v.y + m_rp.data[5] * v.z;
+        B = m_rp.data[6] * v.x + m_rp.data[7] * v.y + m_rp.data[8] * v.z;
+    } else {
+        R = m_rxyz.data[0] * v.x + m_rxyz.data[1] * v.y + m_rxyz.data[2] * v.z;
+        G = m_rxyz.data[3] * v.x + m_rxyz.data[4] * v.y + m_rxyz.data[5] * v.z;
+        B = m_rxyz.data[6] * v.x + m_rxyz.data[7] * v.y + m_rxyz.data[8] * v.z;
+    }
+    return vec4(R, G, B, v.w);
+}
+
+vec4 rgb_to_hsv(vec4 RGB) {
+    vec4 HSV;
+    float minv = min(RGB.x, min(RGB.y, RGB.z));
+    float maxv = max(RGB.x, max(RGB.y, RGB.z));
+    float delta = maxv - minv;
+
+    HSV.z = maxv;
+    HSV.w = RGB.w;
+
+    if(abs(maxv) > 1e-6 && abs(delta) > 1e-6) {
+        HSV.y = delta / maxv;
+    } else {
+        HSV.x = 0.0;
+        HSV.y = 0.0;
+        return HSV;
+    }
+
+    if(RGB.x == maxv)      HSV.x = (RGB.y - RGB.z) / delta;
+    else if(RGB.y == maxv) HSV.x = 2.0 + (RGB.z - RGB.x) / delta;
+    else                   HSV.x = 4.0 + (RGB.x - RGB.y) / delta;
+
+    HSV.x /= 6.0;
+    HSV.x -= floor(HSV.x);
+    return HSV;
+}
+
+vec4 hsv_to_rgb(vec4 HSV) {
+    if(abs(HSV.y) < 1e-6)
+        return vec4(HSV.z, HSV.z, HSV.z, HSV.w);
+
+    int   i = int(floor(6.0 * HSV.x));
+    float v = HSV.z;
+    float w = HSV.w;
+    float p = v * (1.0 - HSV.y);
+    float q = v * (1.0 - HSV.y * (6.0 * HSV.x - float(i)));
+    float t = v * (1.0 - HSV.y * (1.0 - (6.0 * HSV.x - float(i))));
+
+    if(i == 0)      return vec4(v, t, p, w);
+    else if(i == 1) return vec4(q, v, p, w);
+    else if(i == 2) return vec4(p, v, t, w);
+    else if(i == 3) return vec4(p, q, v, w);
+    else if(i == 4) return vec4(t, p, v, w);
+    else            return vec4(v, p, q, w);
+}
+
+void compress_into_gamut(inout vec4 pixel) {
+    const vec3 lc = vec3(0.2658180370250449, 0.59846986045365, 0.1357121025213052);
+    float input_y = pixel.x * lc.x + pixel.y * lc.y + pixel.z * lc.z;
+    float max_rgb = max(pixel.x, max(pixel.y, pixel.z));
+
+    vec4 opp = vec4(max_rgb) - pixel;
+    float opp_y = opp.x * lc.x + opp.y * lc.y + opp.z * lc.z;
+    float max_opp = max(opp.x, max(opp.y, opp.z));
+    float y_compensate_negative = max_opp - opp_y + input_y;
+
+    float min_rgb = min(pixel.x, min(pixel.y, pixel.z));
+    float offset = max(-min_rgb, 0.0);
+    vec4 rgb_off = pixel + vec4(offset, offset, offset, 0.0);
+
+    float max_off = max(rgb_off.x, max(rgb_off.y, rgb_off.z));
+    vec4 opp_off = vec4(max_off) - rgb_off;
+
+    float max_inv = max(opp_off.x, max(opp_off.y, opp_off.z));
+    float y_inv = opp_off.x * lc.x + opp_off.y * lc.y + opp_off.z * lc.z;
+    float y_new = rgb_off.x * lc.x + rgb_off.y * lc.y + rgb_off.z * lc.z;
+    y_new = max_inv - y_inv + y_new;
+
+    float ratio = (y_new > y_compensate_negative && y_new > _AGX_EPS)
+                ? y_compensate_negative / y_new
+                : 1.0;
+    pixel = ratio * rgb_off;
+}
+
+float log_encode(float x, float range_in_ev, float min_ev) {
+    float xr = max(_AGX_EPS, x / 0.18);
+    float mapped = (log2(max(xr, 0.0)) - min_ev) / range_in_ev;
+    return clamp(mapped, 0.0, 1.0);
+}
+
+float sigmoid_one(float x, float power) {
+    return x / pow(1.0 + pow(x, power), 1.0 / power);
+}
+
+float scaled_sigmoid(float x, float scale, float slope, float power, float tx, float ty) {
+    return scale * sigmoid_one(slope * (x - tx) / scale, power) + ty;
+}
+
+float fallback_toe(float x) {
+    return (x < 0.0)
+        ? params.p.target_black
+        : params.p.target_black + max(0.0, params.p.toe_fallback_coefficient
+                                          * pow(x, params.p.toe_fallback_power));
+}
+
+float fallback_shoulder(float x) {
+    return (x >= 1.0)
+        ? params.p.target_white
+        : params.p.target_white - max(0.0, params.p.shoulder_fallback_coefficient
+                                            * pow(1.0 - x, params.p.shoulder_fallback_power));
+}
+
+float curve_apply(float x) {
+    float r;
+    if(x < params.p.toe_transition_x) {
+        r = (params.p.need_convex_toe != 0)
+          ? fallback_toe(x)
+          : scaled_sigmoid(x, params.p.toe_scale, params.p.slope, params.p.toe_power,
+                           params.p.toe_transition_x, params.p.toe_transition_y);
+    } else if(x <= params.p.shoulder_transition_x) {
+        r = params.p.slope * x + params.p.intercept;
+    } else {
+        r = (params.p.need_concave_shoulder != 0)
+          ? fallback_shoulder(x)
+          : scaled_sigmoid(x, params.p.shoulder_scale, params.p.slope,
+                           params.p.shoulder_power, params.p.shoulder_transition_x,
+                           params.p.shoulder_transition_y);
+    }
+    return clamp(r, params.p.target_black, params.p.target_white);
+}
+
+float slope_offset(float x, float slope, float offset) {
+    float m = slope / (1.0 + offset);
+    float b = offset * m;
+    return m * x + b;
+}
+
+void apply_look(inout vec4 pixel) {
+    float slope  = params.p.look_slope;
+    float offset = params.p.look_offset;
+    float power  = params.p.look_power;
+    float sat    = params.p.look_saturation;
+
+    vec4 t;
+    t.x = slope_offset(pixel.x, slope, offset);
+    t.y = slope_offset(pixel.y, slope, offset);
+    t.z = slope_offset(pixel.z, slope, offset);
+
+    pixel.x = (t.x > 0.0) ? pow(t.x, power) : t.x;
+    pixel.y = (t.y > 0.0) ? pow(t.y, power) : t.y;
+    pixel.z = (t.z > 0.0) ? pow(t.z, power) : t.z;
+
+    vec4 xyz = mat3x3_apply(pixel, 3);
+    float luma = xyz.y;
+    pixel.x = luma + sat * (pixel.x - luma);
+    pixel.y = luma + sat * (pixel.y - luma);
+    pixel.z = luma + sat * (pixel.z - luma);
+}
+
+float lerp_hue(float h0, float h1, float mix) {
+    float d = h1 - h0 - roundEven(h1 - h0);
+    float h = (1.0 - mix) * d + h0;
+    return h - floor(h);
+}
+
+void tone_mapping(inout vec4 rgb) {
+    vec4 hsv = vec4(0.0);
+    if(params.p.restore_hue != 0) hsv = rgb_to_hsv(rgb);
+    float h_before = hsv.x;
+
+    vec4 t;
+    t.x = curve_apply(log_encode(rgb.x, params.p.range_in_ev, params.p.min_ev));
+    t.y = curve_apply(log_encode(rgb.y, params.p.range_in_ev, params.p.min_ev));
+    t.z = curve_apply(log_encode(rgb.z, params.p.range_in_ev, params.p.min_ev));
+    t.w = rgb.w;
+
+    if(params.p.look_tuned != 0) apply_look(t);
+
+    t.x = pow(max(0.0, t.x), params.p.curve_gamma);
+    t.y = pow(max(0.0, t.y), params.p.curve_gamma);
+    t.z = pow(max(0.0, t.z), params.p.curve_gamma);
+
+    if(params.p.restore_hue != 0) {
+        hsv = rgb_to_hsv(t);
+        hsv.x = lerp_hue(h_before, hsv.x, params.p.look_original_hue_mix_ratio);
+        rgb = hsv_to_rgb(hsv);
+    } else {
+        rgb = t;
+    }
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+    // Sanitize input range and replace NaNs with 0.
+    i = mix(clamp(i, vec4(-1e6), vec4(1e6)), vec4(0.0), bvec4(isnan(i)));
+
+    vec4 base_rgb = (pc.base_working_same_profile != 0)
+                  ? i
+                  : mat3x3_apply(i, 0);
+
+    compress_into_gamut(base_rgb);
+
+    vec4 rendering = mat3x3_apply(base_rgb, 1);
+    tone_mapping(rendering);
+
+    vec4 o = mat3x3_apply(rendering, 2);
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}
