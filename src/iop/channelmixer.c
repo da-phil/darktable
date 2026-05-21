@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -115,7 +116,15 @@ typedef struct dt_iop_channelmixer_data_t
 typedef struct dt_iop_channelmixer_global_data_t
 {
   int kernel_channelmixer;
+  dt_vk_module_kernel_t vk;
 } dt_iop_channelmixer_global_data_t;
+
+typedef struct vk_channelmixer_pc_t
+{
+  int width;
+  int height;
+  int operation_mode;
+} vk_channelmixer_pc_t;
 
 
 const char *name()
@@ -419,19 +428,61 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_channelmixer_data_t *data = piece->data;
+  const dt_iop_channelmixer_global_data_t *gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_hsl = dt_vulkan_alloc_buffer(devid, sizeof(data->hsl_matrix));
+  dt_vk_mem_t *dev_rgb = dt_vulkan_alloc_buffer(devid, sizeof(data->rgb_matrix));
+  if(!dev_hsl || !dev_rgb) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_hsl, data->hsl_matrix, sizeof(data->hsl_matrix)) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_rgb, data->rgb_matrix, sizeof(data->rgb_matrix)) != 0) goto cleanup;
+
+  const vk_channelmixer_pc_t pc = {
+    .width          = width,
+    .height         = height,
+    .operation_mode = (int)data->operation_mode,
+  };
+  dt_vk_mem_t *bufs[4] = { dev_in, dev_out, dev_hsl, dev_rgb };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 4, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_hsl);
+  dt_vulkan_free_buffer(devid, dev_rgb);
+  return rc;
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 8; // extended.cl, from programs.conf
-
   dt_iop_channelmixer_global_data_t *gd = malloc(sizeof(dt_iop_channelmixer_global_data_t));
   self->data = gd;
+#ifdef HAVE_OPENCL
+  const int program = 8; // extended.cl, from programs.conf
   gd->kernel_channelmixer = dt_opencl_create_kernel(program, "channelmixer");
+#else
+  gd->kernel_channelmixer = -1;
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "channelmixer", "channelmixer",
+                               4, sizeof(vk_channelmixer_pc_t),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_channelmixer_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_channelmixer);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
