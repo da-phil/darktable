@@ -19,10 +19,12 @@
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/custom_primaries.h"
+#include "common/dttypes.h"
 #include "common/image.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
 #include "common/matrices.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -2716,19 +2718,32 @@ void gui_reset(dt_iop_module_t *self)
   dt_iop_color_picker_reset(self, TRUE);
 }
 
-#ifdef HAVE_OPENCL
-
 typedef struct dt_iop_agx_global_data_t
 {
   int kernel_agx;
+  dt_vk_module_kernel_t vk;
 } dt_iop_agx_global_data_t;
+
+typedef struct vk_agx_pc_t
+{
+  int width;
+  int height;
+  int base_working_same_profile;
+} vk_agx_pc_t;
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 39; // agx.cl, from programs.conf
   dt_iop_agx_global_data_t *gd = malloc(sizeof(dt_iop_agx_global_data_t));
   self->data = gd;
+#ifdef HAVE_OPENCL
+  const int program = 39; // agx.cl, from programs.conf
   gd->kernel_agx = dt_opencl_create_kernel(program, "kernel_agx");
+#else
+  gd->kernel_agx = -1;
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "agx", "kernel_agx",
+                               7, sizeof(vk_agx_pc_t),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -2736,12 +2751,16 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_iop_agx_global_data_t *gd = self->data;
   if(gd)
   {
+#ifdef HAVE_OPENCL
     dt_opencl_free_kernel(gd->kernel_agx);
+#endif
+    dt_vulkan_module_kernel_unload(&gd->vk);
     free(self->data);
     self->data = NULL;
   }
 }
 
+#ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
                cl_mem dev_in,
@@ -2835,6 +2854,75 @@ cleanup:
   return err;
 }
 #endif // HAVE_OPENCL
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_agx_global_data_t *gd = self->global_data;
+  const dt_iop_agx_data_t *d = piece->data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *const pipe_work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const base_profile =
+    _agx_get_base_profile(self->dev, pipe_work_profile, d->primaries_params.base_primaries);
+  if(!base_profile) return -1;
+
+  dt_colormatrix_t pipe_to_base, base_to_rendering, rendering_to_pipe, rendering_to_xyz;
+  dt_colormatrix_t pipe_to_base_t, base_to_rendering_t, rendering_to_pipe_t, rendering_to_xyz_t;
+  _create_matrices(&d->primaries_params, pipe_work_profile, base_profile,
+                   rendering_to_xyz_t, pipe_to_base_t, base_to_rendering_t,
+                   rendering_to_pipe_t);
+  dt_colormatrix_transpose(pipe_to_base,      pipe_to_base_t);
+  dt_colormatrix_transpose(base_to_rendering, base_to_rendering_t);
+  dt_colormatrix_transpose(rendering_to_pipe, rendering_to_pipe_t);
+  dt_colormatrix_transpose(rendering_to_xyz,  rendering_to_xyz_t);
+
+  float m_pb[9], m_br[9], m_rp[9], m_rxyz[9];
+  pack_3xSSE_to_3x3(pipe_to_base,      m_pb);
+  pack_3xSSE_to_3x3(base_to_rendering, m_br);
+  pack_3xSSE_to_3x3(rendering_to_pipe, m_rp);
+  pack_3xSSE_to_3x3(rendering_to_xyz,  m_rxyz);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_params = dt_vulkan_alloc_buffer(devid, sizeof(d->tone_mapping_params));
+  dt_vk_mem_t *dev_m_pb   = dt_vulkan_alloc_buffer(devid, sizeof(m_pb));
+  dt_vk_mem_t *dev_m_br   = dt_vulkan_alloc_buffer(devid, sizeof(m_br));
+  dt_vk_mem_t *dev_m_rp   = dt_vulkan_alloc_buffer(devid, sizeof(m_rp));
+  dt_vk_mem_t *dev_m_rxyz = dt_vulkan_alloc_buffer(devid, sizeof(m_rxyz));
+  if(!dev_params || !dev_m_pb || !dev_m_br || !dev_m_rp || !dev_m_rxyz) goto cleanup;
+
+  if(dt_vulkan_write_to_device(devid, dev_params, &d->tone_mapping_params,
+                               sizeof(d->tone_mapping_params)) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_pb,   m_pb,   sizeof(m_pb))   != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_br,   m_br,   sizeof(m_br))   != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_rp,   m_rp,   sizeof(m_rp))   != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_rxyz, m_rxyz, sizeof(m_rxyz)) != 0) goto cleanup;
+
+  const vk_agx_pc_t pc = {
+    .width  = width,
+    .height = height,
+    .base_working_same_profile = (pipe_work_profile == base_profile),
+  };
+  dt_vk_mem_t *bufs[7] = { dev_in, dev_out, dev_params, dev_m_pb, dev_m_br, dev_m_rp, dev_m_rxyz };
+  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_params);
+  dt_vulkan_free_buffer(devid, dev_m_pb);
+  dt_vulkan_free_buffer(devid, dev_m_br);
+  dt_vulkan_free_buffer(devid, dev_m_rp);
+  dt_vulkan_free_buffer(devid, dev_m_rxyz);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 
 // clang-format off

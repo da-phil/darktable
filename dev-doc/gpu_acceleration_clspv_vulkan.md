@@ -225,6 +225,7 @@ in three categories.
 | `src/iop/filmic.c` | Legacy single-pass filmic (the predecessor to `filmicrgb`). Lab → XYZ → ProPhotoRGB → global saturation desat → log → 65536-entry S-curve LUT → derivative LUT for selective desat → power gamma → ProPhotoRGB → Lab. Both `preserve_color` modes (per-channel vs norm-preserving) folded into one entry point with a uniform branch on the flag. 4-binding dispatch (in, out, table, diff); 36 B PC (2 ints + 6 floats + 1 int). Wavelet-based `filmicrgb` is a separate port pending §8.5 (image2d + sampler bindings) for its reconstruction kernels. |
 | `src/iop/overlay.c` | Composite (Cairo ARGB32 → RGBA float alpha-blend). The Cairo overlay buffer arrives as a packed 8-bit BGRA byte buffer; with Cairo's 4-byte stride alignment and `x*4` naturally word-aligned, each pixel is exactly one `uint` so the storage buffer is bound as `uint *` and the four bytes are extracted with shift+mask. 3-binding dispatch (in, argb, out); 16 B PC (2 ints + 1 float + 1 int). The "no overlay" branch routes through `dt_vulkan_copy_device_to_device` rather than a kernel, mirroring the OpenCL `enqueue_copy_image` shortcut. Cairo overlay rendering still runs CPU-side (`_get_overlay_argb`); the GPU only does the per-pixel alpha-blend over the full canvas. |
 | `src/iop/sigmoid.c` | Modern sigmoid tone mapper, both color processing modes. **`rgb_ratio`** (norm-preserving): 2-binding dispatch (in, out), 32 B PC (2 ints + 6 floats — `white_target`, `black_target`, paper-exp, film-fog, contrast/skew powers); applies a loglogistic curve to per-pixel luma, scales RGB uniformly, then hyperbolic chroma roll-off against display+mapping gamut. **`per_channel`** (hue-preserving): 5-binding dispatch (in, out, m_pb, m_br, m_rp — three 9-float 3×3 matrices via `pack_3xSSE_to_3x3`), 32 B PC (2 ints + 6 floats — adds `hue_preservation`). Transforms pipe→base, desaturates negatives, transforms base→rendering primaries, applies per-channel sigmoid, then a 7-case `pixel_order` + `preserve_hue_and_energy` block that linearly interpolates the middle channel back toward the hue-correct value while keeping channel-sum energy constant, finally back via rendering→pipe. Both kernels build to standalone `.spv`; the host picks one based on `d->color_processing`. |
+| `src/iop/agx.c` | AgX-inspired tone mapper. First port to migrate a kernel parameter struct out of push-constants: the OpenCL signature took `dt_iop_agx_tone_mapping_params_t` by value (124 B = 27 floats + 4 ints), which exceeded the 128 B PC budget once `width`/`height`/`base_working_same_profile` were added. The Vulkan kernel binds the struct as a storage buffer instead; std430 layout matches the C struct's flat 4-byte-aligned scalar fields byte-for-byte (verified against `OpMemberDecorate ... Offset` chain — 31 fields at consecutive 4-byte offsets, total 124 B). 7-binding dispatch (in, out, params, m_pb, m_br, m_rp, m_rxyz — four matrices as 9-float storage buffers packed via `pack_3xSSE_to_3x3`); 12 B PC (3 ints). Uses the `vk_RGB_to_HSV` / `vk_HSV_to_RGB` helpers landed in the prior commit for the optional hue-restore step. The toe / linear / shoulder curve with fallback branches and the gamut-compression preroll are mirrored byte-for-byte from the OpenCL kernel. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -247,7 +248,7 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 38 module files and the new
+**Verified in this container:** all 39 module files and the new
 backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
 combinations (the full darktable build target succeeds, including
 `libfilmic.so`, `libcolorout.so` and the other plugin shared
@@ -298,8 +299,12 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   kernel), `shadhi` (second combined-helper consumer — same shape
   + soft-light overlays).
 - **HARD** — atrous, bloom, denoiseprofile, filmicrgb,
-  globaltonemap, hazeremoval, nlmeans, retouch, colorequal, agx,
-  basecurve (full variants), colorreconstruction (atomics). Multi-
+  globaltonemap, hazeremoval, nlmeans, retouch, colorequal,
+  basecurve (full variants), colorreconstruction (atomics). Done
+  in earlier passes: `agx` (params struct migrated from PC into a
+  storage-buffer binding so the 124 B struct fits — the pattern is
+  now available for any future port whose param block exceeds the
+  128 B PC budget). Multi-
   kernel pipelines or per-warp reductions. `lowpass`, `censorize`,
   `shadhi`, `retouch`, `monochrome`, `globaltonemap` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
@@ -1373,13 +1378,11 @@ value targets in dependency order: `filmicrgb` (commonly used,
 single-pass), `colorbalancergb` (used in nearly every modern
 pipeline; ~500 LOC of LMS/Yrg/Ych/JzAzBz transforms),
 `colorequal` (uses guided filter — overlaps with Path D groundwork),
-`agx` (params struct exceeds the 128 B PC limit, so the kernel
-will need a uniform-buffer binding for the curve coefficients — a
-useful HAL stretch as well as a module port), `lut3d` (needs §8.5
-milestone: image2D + sampler). Effort: medium per module
-(~100-200 LOC kernel + ~100 LOC host). Impact: cumulative — each
-port shaves ~50-200 ms once VK chains form around it; the leverage
-compounds with Path A.
+`lut3d` (needs §8.5 milestone: image2D + sampler), `channelmixer`
+(legacy, ~750 LOC kernel split across several entry points).
+Effort: medium per module (~100-200 LOC kernel + ~100 LOC host).
+Impact: cumulative — each port shaves ~50-200 ms once VK chains
+form around it; the leverage compounds with Path A.
 
 Recent landings on this lane: `colorout`, `filmic` (legacy
 single-pass), `overlay` (image-bindings rewritten to storage
@@ -1387,7 +1390,10 @@ buffers; demonstrates that some "VERY HARD" entries actually
 fit the buffer-only HAL once you replace `image2d_t in/out` with
 `global float4 *in/out`), `sigmoid` (both color-processing modes
 in one commit — `rgb_ratio` push-constant-only, `per_channel`
-with three 3×3 matrices in storage buffers).
+with three 3×3 matrices in storage buffers), `agx` (first port
+to migrate a kernel param struct from PC into a storage-buffer
+binding so the 124 B struct fits — the pattern unlocks any
+future port whose param block exceeds the 128 B PC budget).
 
 **Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
 host roundtrip at CL↔VK boundaries with a shared physical
@@ -1430,10 +1436,10 @@ ordering invariants).
 
 1. **Path B continued** (this session and next) — every port
    compounds with future Path A and Path C work. Low risk, high
-   reuse. The recent `colorout`, `filmic`, `overlay`, and
-   `sigmoid` landings are in this lane; `colorbalancergb`, `agx`
-   (after PC→UB migration for params), and `lut3d` (after §8.5)
-   are the next logical picks.
+   reuse. The recent `colorout`, `filmic`, `overlay`, `sigmoid`,
+   and `agx` landings are in this lane; `colorbalancergb`,
+   `channelmixer` (legacy), and `lut3d` (after §8.5) are the next
+   logical picks.
 2. **Path A** (multi-session) — start with the common-case
    blend ("normal mode, no blendif, no raster mask") which
    covers the bulk of real pipelines, then incrementally add the
