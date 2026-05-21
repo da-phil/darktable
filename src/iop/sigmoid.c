@@ -21,6 +21,7 @@
 #include "common/math.h"
 #include "common/matrices.h"
 #include "common/dttypes.h"
+#include "common/vulkan.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "develop/openmp_maths.h"
@@ -184,7 +185,33 @@ typedef struct dt_iop_sigmoid_global_data_t
 {
   int kernel_sigmoid_loglogistic_per_channel;
   int kernel_sigmoid_loglogistic_rgb_ratio;
+  dt_vk_module_kernel_t vk_per_channel;
+  dt_vk_module_kernel_t vk_rgb_ratio;
 } dt_iop_sigmoid_global_data_t;
+
+typedef struct vk_sigmoid_pc_per_channel_t
+{
+  int   width;
+  int   height;
+  float white_target;
+  float paper_exp;
+  float film_fog;
+  float contrast_power;
+  float skew_power;
+  float hue_preservation;
+} vk_sigmoid_pc_per_channel_t;
+
+typedef struct vk_sigmoid_pc_rgb_ratio_t
+{
+  int   width;
+  int   height;
+  float white_target;
+  float black_target;
+  float paper_exp;
+  float film_fog;
+  float contrast_power;
+  float skew_power;
+} vk_sigmoid_pc_rgb_ratio_t;
 
 
 const char *name()
@@ -837,6 +864,83 @@ cleanup:
 }
 #endif // HAVE_OPENCL
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_sigmoid_data_t *const d = piece->data;
+  const dt_iop_sigmoid_global_data_t *const gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  if(d->color_processing == DT_SIGMOID_METHOD_RGB_RATIO)
+  {
+    const vk_sigmoid_pc_rgb_ratio_t pc = {
+      .width          = width,
+      .height         = height,
+      .white_target   = d->white_target,
+      .black_target   = d->black_target,
+      .paper_exp      = d->paper_exposure,
+      .film_fog       = d->film_fog,
+      .contrast_power = d->film_power,
+      .skew_power     = d->paper_power,
+    };
+    return dt_vulkan_dispatch_inout(&gd->vk_rgb_ratio, dev_in, dev_out,
+                                    width, height, &pc, sizeof(pc));
+  }
+
+  // DT_SIGMOID_METHOD_PER_CHANNEL: 3 matrices + scalars.
+  const dt_iop_order_iccprofile_info_t *pipe_work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *base_profile = _get_base_profile(self->dev, pipe_work_profile, d->base_primaries);
+  dt_colormatrix_t pipe_to_base_t, base_to_rendering_t, rendering_to_pipe_t,
+                   pipe_to_base, base_to_rendering, rendering_to_pipe;
+  _calculate_adjusted_primaries(d, pipe_work_profile, base_profile,
+                                pipe_to_base_t, base_to_rendering_t, rendering_to_pipe_t);
+  transpose_3xSSE(pipe_to_base_t, pipe_to_base);
+  transpose_3xSSE(base_to_rendering_t, base_to_rendering);
+  transpose_3xSSE(rendering_to_pipe_t, rendering_to_pipe);
+
+  float m_pb[9], m_br[9], m_rp[9];
+  pack_3xSSE_to_3x3(pipe_to_base,      m_pb);
+  pack_3xSSE_to_3x3(base_to_rendering, m_br);
+  pack_3xSSE_to_3x3(rendering_to_pipe, m_rp);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_m_pb = dt_vulkan_alloc_buffer(devid, sizeof(m_pb));
+  dt_vk_mem_t *dev_m_br = dt_vulkan_alloc_buffer(devid, sizeof(m_br));
+  dt_vk_mem_t *dev_m_rp = dt_vulkan_alloc_buffer(devid, sizeof(m_rp));
+  if(!dev_m_pb || !dev_m_br || !dev_m_rp) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_pb, m_pb, sizeof(m_pb)) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_br, m_br, sizeof(m_br)) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m_rp, m_rp, sizeof(m_rp)) != 0) goto cleanup;
+
+  const vk_sigmoid_pc_per_channel_t pc = {
+    .width            = width,
+    .height           = height,
+    .white_target     = d->white_target,
+    .paper_exp        = d->paper_exposure,
+    .film_fog         = d->film_fog,
+    .contrast_power   = d->film_power,
+    .skew_power       = d->paper_power,
+    .hue_preservation = d->hue_preservation,
+  };
+  dt_vk_mem_t *bufs[5] = { dev_in, dev_out, dev_m_pb, dev_m_br, dev_m_rp };
+  rc = dt_vulkan_dispatch_n(&gd->vk_per_channel, bufs, 5,
+                            width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_m_pb);
+  dt_vulkan_free_buffer(devid, dev_m_br);
+  dt_vulkan_free_buffer(devid, dev_m_rp);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 36; // sigmoid.cl, from programs.conf
@@ -845,13 +949,25 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_sigmoid_loglogistic_per_channel = dt_opencl_create_kernel(program, "sigmoid_loglogistic_per_channel");
   gd->kernel_sigmoid_loglogistic_rgb_ratio = dt_opencl_create_kernel(program, "sigmoid_loglogistic_rgb_ratio");
+  dt_vulkan_module_kernel_load(&gd->vk_per_channel,
+                               "sigmoid_loglogistic_per_channel",
+                               "sigmoid_loglogistic_per_channel",
+                               5, sizeof(vk_sigmoid_pc_per_channel_t),
+                               16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_rgb_ratio,
+                               "sigmoid_loglogistic_rgb_ratio",
+                               "sigmoid_loglogistic_rgb_ratio",
+                               2, sizeof(vk_sigmoid_pc_rgb_ratio_t),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_sigmoid_global_data_t *gd = self->data;
+  dt_iop_sigmoid_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_sigmoid_loglogistic_per_channel);
   dt_opencl_free_kernel(gd->kernel_sigmoid_loglogistic_rgb_ratio);
+  dt_vulkan_module_kernel_unload(&gd->vk_per_channel);
+  dt_vulkan_module_kernel_unload(&gd->vk_rgb_ratio);
   free(self->data);
   self->data = NULL;
 }
