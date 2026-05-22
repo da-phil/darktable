@@ -261,6 +261,33 @@ int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
                          const void *push_constants,
                          size_t push_constant_size);
 
+// One pre-dispatch upload: copy `size` bytes from `host` into device
+// buffer `dst` (at offset 0) before the kernel runs.
+typedef struct dt_vk_upload_t
+{
+  dt_vk_mem_t *dst;
+  const void  *host;
+  size_t       size;
+} dt_vk_upload_t;
+
+/** Bundled upload + dispatch in a single submit/wait. Equivalent to a
+ *  sequence of dt_vulkan_write_to_device(...) calls followed by
+ *  dt_vulkan_dispatch_n(...), but issued as one command buffer with
+ *  an internal pipeline barrier between the transfer phase and the
+ *  compute phase. Saves N submit/wait round-trips per module dispatch
+ *  (typically 30–150 ms when N small uploads — LUTs, matrices,
+ *  param structs — accompany each kernel call). The staging buffer
+ *  is partitioned by offset so all uploads share one DMA region. */
+int dt_vulkan_dispatch_n_batched(const dt_vk_module_kernel_t *k,
+                                 dt_vk_mem_t *const *buffers,
+                                 size_t buffer_count,
+                                 const dt_vk_upload_t *uploads,
+                                 size_t upload_count,
+                                 size_t global_w,
+                                 size_t global_h,
+                                 const void *push_constants,
+                                 size_t push_constant_size);
+
 /** Create a kernel handle. The Vulkan model needs the binding shape up
  *  front (descriptor set layout); pass it here. Returns kernel index
  *  ≥0, or -1 on failure. */
@@ -353,6 +380,14 @@ static inline int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
                                        size_t w, size_t h,
                                        const void *pc, size_t pcs)
 { (void)k; (void)b; (void)bc; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
+
+typedef struct dt_vk_upload_t { int _unused; } dt_vk_upload_t;
+static inline int dt_vulkan_dispatch_n_batched(const dt_vk_module_kernel_t *k,
+                                               dt_vk_mem_t *const *b, size_t bc,
+                                               const dt_vk_upload_t *u, size_t uc,
+                                               size_t w, size_t h,
+                                               const void *pc, size_t pcs)
+{ (void)k; (void)b; (void)bc; (void)u; (void)uc; (void)w; (void)h; (void)pc; (void)pcs; return -1; }
 
 static inline int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *d,
                                                   const dt_vk_mem_t *s, size_t sz)
