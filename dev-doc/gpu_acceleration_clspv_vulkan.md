@@ -552,6 +552,34 @@ dt_vulkan_free_buffer(0, dev_ctable);
 dt_vulkan_free_buffer(0, dev_ltable);
 ```
 
+For modules with multiple small uploads (matrices, LUTs, param
+structs), prefer the batched variant — it records all uploads,
+a single transfer→compute barrier, and the dispatch into one
+command buffer with a single `vkQueueSubmit` + `vkWaitForFences`:
+
+```c
+dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_ctable, dev_ltable };
+const dt_vk_upload_t uploads[] = {
+  { dev_ctable, d->ctable, sizeof(float) * 0x10000 },
+  { dev_ltable, d->ltable, sizeof(float) * 0x10000 },
+};
+int rc = dt_vulkan_dispatch_n_batched(&gd->vk, buffers, 4,
+                                      uploads, 2,
+                                      width, height, &pc, sizeof(pc));
+```
+
+The shared staging buffer is partitioned by 4-byte-aligned
+offsets (Vulkan's `vkCmdCopyBuffer` requirement), so all uploads
+share one DMA region without extra allocations. For a module
+with N small uploads, batching saves N submit/wait round-trips
+(~5-30 ms each on a discrete GPU). Modules currently on the
+batched path: `agx` (5 uploads — params + 4 matrices), `sigmoid`
+per_channel (3 matrices), `channelmixer` (2 matrices), `overlay`
+(1 Cairo ARGB buffer). For modules with zero uploads,
+`dt_vulkan_dispatch_n_batched` short-circuits to
+`dt_vulkan_dispatch_n` so there's no overhead from picking the
+batched variant.
+
 ```c
 // kernel side (excerpt):
 kernel void X(global const float4 *in, global float4 *out,
@@ -1468,6 +1496,35 @@ on VK at export resolution while the kernel itself ran in ~5 ms;
 the host-staging cost (CL→host→VK plus VK→host→CL across the
 chain) was the entire delta. Tightening the heuristic moves
 these singletons onto the CL fast path.
+
+#### Batched HAL dispatch landed (§5.6 update)
+
+Modules carrying small pre-dispatch uploads (LUTs, 3×3 matrices,
+param structs) used to call `dt_vulkan_write_to_device` once per
+upload, each issuing its own `vkQueueSubmit` +
+`vkWaitForFences(UINT64_MAX)`. On a discrete GPU each sync is
+5-30 ms, so an `agx` dispatch with 5 small uploads paid 25-150 ms
+in sync overhead alone before the compute kernel even ran.
+
+`dt_vulkan_dispatch_n_batched` now records all uploads + a single
+`TRANSFER_WRITE → SHADER_READ` pipeline barrier + the compute
+dispatch into one command buffer and submits it once. The shared
+staging buffer is partitioned by 4-byte-aligned offsets (Vulkan's
+`vkCmdCopyBuffer` requirement) so all uploads share one DMA
+region. For N small uploads, this collapses N+1 submit/wait
+round-trips to 1.
+
+Modules migrated to the batched path: `agx` (5 uploads — the
+params storage buffer plus four 3×3 matrices), `sigmoid`
+per_channel (3 matrices), `channelmixer` (2 matrices), `overlay`
+(1 Cairo ARGB buffer). Modules with zero uploads short-circuit
+back to `dt_vulkan_dispatch_n`, so swapping in the batched call
+is always safe and never slower.
+
+This compounds with the chain-ahead tightening: even when a VK
+chain is genuinely worth running, each module now pays less per
+dispatch. Expected ~25-150 ms saved per VK module that has
+matrix / LUT uploads, scaling with the upload count.
 
 #### Recommended sequence
 

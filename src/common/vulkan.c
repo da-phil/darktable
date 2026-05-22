@@ -749,6 +749,59 @@ static int _record_dispatch(VkCommandBuffer cmd, void *u)
   return 0;
 }
 
+// Batched: upload copies + memory barrier + compute dispatch, all
+// recorded into one command buffer. Each upload reads from a disjoint
+// region of the shared staging buffer (4-byte aligned offsets), so
+// no extra staging allocations are needed.
+typedef struct
+{
+  // dispatch fields (same as _dispatch_args_t)
+  dt_vk_kernel_t *k;
+  VkDescriptorSet dset;
+  uint32_t        gx, gy, gz;
+  const void     *push;
+  size_t          push_size;
+  // batched-upload fields
+  VkBuffer        staging;
+  size_t          upload_count;
+  const dt_vk_upload_t *uploads;
+  const VkDeviceSize   *offsets;  // staging offset per upload, 4-byte aligned
+} _batched_args_t;
+
+static int _record_batched(VkCommandBuffer cmd, void *u)
+{
+  const _batched_args_t *a = u;
+
+  for(size_t i = 0; i < a->upload_count; i++)
+  {
+    const VkBufferCopy r = { a->offsets[i], 0, (VkDeviceSize)a->uploads[i].size };
+    vkCmdCopyBuffer(cmd, a->staging, a->uploads[i].dst->buffer, 1, &r);
+  }
+
+  if(a->upload_count > 0)
+  {
+    // Make the staged writes visible to the compute shader.
+    const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                 .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+  }
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->k->pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          a->k->pipeline_layout, 0, 1, &a->dset, 0, NULL);
+  if(a->push_size && a->push)
+  {
+    vkCmdPushConstants(cmd, a->k->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, (uint32_t)a->push_size, a->push);
+  }
+  vkCmdDispatch(cmd, a->gx, a->gy, a->gz);
+  return 0;
+}
+
 // ---- module helpers --------------------------------------------------
 //
 // Reduce the per-module wiring boilerplate to ~3 lines. See the
@@ -823,6 +876,92 @@ int dt_vulkan_dispatch_n(const dt_vk_module_kernel_t *k,
   return dt_vulkan_enqueue_kernel_2d(0, k->kernel, global_w, global_h,
                                      buffers, buffer_count,
                                      push_constants, push_constant_size);
+}
+
+int dt_vulkan_dispatch_n_batched(const dt_vk_module_kernel_t *k,
+                                 dt_vk_mem_t *const *buffers,
+                                 size_t buffer_count,
+                                 const dt_vk_upload_t *uploads,
+                                 size_t upload_count,
+                                 size_t global_w,
+                                 size_t global_h,
+                                 const void *push_constants,
+                                 size_t push_constant_size)
+{
+  if(!dt_vulkan_running() || !k || k->kernel < 0) return -1;
+  if(!buffers || buffer_count > DT_VULKAN_MAX_BINDINGS) return -1;
+  if(upload_count > 0 && !uploads) return -1;
+  // No uploads? Fall back to the plain dispatch.
+  if(upload_count == 0)
+    return dt_vulkan_dispatch_n(k, buffers, buffer_count, global_w, global_h,
+                                push_constants, push_constant_size);
+
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  dt_vk_kernel_t *kk = &d->kernels[k->kernel];
+  if(!kk->used) return -1;
+  if(buffer_count != kk->num_storage_buffer_bindings) return -1;
+  if(push_constant_size != kk->push_constant_size)    return -1;
+
+  // Pack all uploads contiguously in the shared staging buffer. Each
+  // upload's staging offset is 4-byte aligned (Vulkan requires this
+  // for vkCmdCopyBuffer srcOffset on non-image buffers).
+  VkDeviceSize offsets[DT_VULKAN_MAX_BINDINGS];
+  VkDeviceSize total = 0;
+  for(size_t i = 0; i < upload_count; i++)
+  {
+    if(!uploads[i].dst || !uploads[i].host) return -1;
+    offsets[i] = total;
+    total += uploads[i].size;
+    total = (total + 3u) & ~(VkDeviceSize)3u;
+  }
+
+  dt_vk_mem_t *staging = _ensure_staging(d, (size_t)total);
+  if(!staging) return -1;
+
+  void *p = NULL;
+  if(vkMapMemory(d->device, staging->memory, 0, total, 0, &p) != VK_SUCCESS)
+    return -1;
+  for(size_t i = 0; i < upload_count; i++)
+    memcpy((char *)p + offsets[i], uploads[i].host, uploads[i].size);
+  vkUnmapMemory(d->device, staging->memory);
+
+  // Allocate + populate the descriptor set for the kernel.
+  VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                       .descriptorPool = d->dset_pool,
+                                       .descriptorSetCount = 1,
+                                       .pSetLayouts = &kk->dset_layout };
+  VkDescriptorSet dset = VK_NULL_HANDLE;
+  if(vkAllocateDescriptorSets(d->device, &dsai, &dset) != VK_SUCCESS) return -1;
+
+  VkDescriptorBufferInfo bi[DT_VULKAN_MAX_BINDINGS];
+  VkWriteDescriptorSet   ws[DT_VULKAN_MAX_BINDINGS];
+  for(size_t i = 0; i < buffer_count; i++)
+  {
+    bi[i] = (VkDescriptorBufferInfo){ .buffer = buffers[i]->buffer,
+                                      .offset = 0, .range = buffers[i]->size };
+    ws[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstSet = dset, .dstBinding = (uint32_t)i,
+                                    .descriptorCount = 1,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                    .pBufferInfo = &bi[i] };
+  }
+  vkUpdateDescriptorSets(d->device, (uint32_t)buffer_count, ws, 0, NULL);
+
+  _batched_args_t ba = {
+    .k = kk, .dset = dset,
+    .gx = (uint32_t)((global_w + kk->local_size_x - 1) / kk->local_size_x),
+    .gy = (uint32_t)((global_h + kk->local_size_y - 1) / kk->local_size_y),
+    .gz = 1,
+    .push = push_constants, .push_size = push_constant_size,
+    .staging = staging->buffer,
+    .upload_count = upload_count,
+    .uploads = uploads,
+    .offsets = offsets,
+  };
+  int rc = _submit_one_shot(d, _record_batched, &ba);
+
+  vkFreeDescriptorSets(d->device, d->dset_pool, 1, &dset);
+  return rc;
 }
 
 // The 2- and 3-buffer flavours are thin wrappers over dispatch_n. We
