@@ -757,9 +757,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dt_vk_mem_t *dev_overlay = dt_vulkan_alloc_buffer(devid, overlay_size);
   if(!dev_overlay) goto cleanup;
 
-  if(dt_vulkan_write_to_device(devid, dev_overlay, image, overlay_size) != 0)
-    goto cleanup;
-
   const vk_overlay_pc_t pc = {
     .width   = width,
     .height  = height,
@@ -767,7 +764,12 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     .stride  = stride,
   };
   dt_vk_mem_t *bufs[3] = { dev_in, dev_overlay, dev_out };
-  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 3, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_overlay, image, overlay_size },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 3,
+                                    uploads, 1,
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   dt_vulkan_free_buffer(devid, dev_overlay);
