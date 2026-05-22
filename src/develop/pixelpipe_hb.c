@@ -2300,16 +2300,26 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
       gboolean vk_chain_ahead = FALSE;
       if(!force_vk && !vk_chain_live && !vk_is_only_gpu)
       {
-        // Walk forward through the pieces list looking for an
-        // enabled piece that also has a Vulkan path. Stop at the
-        // first enabled piece — if it's not VK-ready, the chain
-        // would break there and this module is a singleton.
+        // Walk forward through the pieces list, looking for **two**
+        // consecutive enabled VK-ready modules ahead. A single
+        // VK-ready neighbour isn't enough: real-world profile/blend
+        // paths frequently make a "VK-ready" module fall back to CPU
+        // at runtime (Lab-profile colorout, CPU-blended blendop). If
+        // we chain-start on a singleton VK island we pay the CL→VK
+        // entry transition (~50-200 ms on a discrete GPU at export
+        // resolution) and the chain dies one module later anyway,
+        // costing more than it saves. Requiring chain length ≥3 (this
+        // module + 2 ahead) ensures the entry transition has a
+        // realistic chance of amortising. Stops at the first enabled
+        // piece that *isn't* VK-ready, since the chain would break
+        // there.
+        int run = 0;
         for(GList *p = g_list_next(pieces); p; p = g_list_next(p))
         {
           const dt_dev_pixelpipe_iop_t *const next = p->data;
           if(!next->enabled) continue;
-          if(next->process_vk_ready) vk_chain_ahead = TRUE;
-          break;
+          if(!next->process_vk_ready) break;
+          if(++run >= 2) { vk_chain_ahead = TRUE; break; }
         }
       }
 

@@ -1439,6 +1439,36 @@ reduction in those traces); zero impact on single-pipeline
 exports. Effort: moderate (~150 LOC, careful audit of
 ordering invariants).
 
+#### Routing heuristic tightened: chain-ahead requires length ≥ 3
+
+The `vk_chain_ahead` look-ahead used to trip on a single VK-ready
+neighbour. In practice that mis-fired routinely: a real-world
+`agx → colorout` pair would chain-start `agx` on VK because
+`colorout` was marked VK-ready, only for `colorout` to fall back
+to CPU at runtime on a non-matrix Lab profile. We paid the CL→VK
+entry transition (~50-200 ms on a discrete GPU at export
+resolution) and the chain died one module later anyway. Same
+shape for `exposure → exposure.1` when blendop forces a CPU blend.
+
+The chain-ahead heuristic now requires **two** consecutive
+enabled VK-ready modules ahead before chain-start fires (chain
+length ≥ 3 including the current module). Singleton VK islands
+fall through to OpenCL; genuine multi-module chains still trigger.
+`opencl_force_vulkan_routing=true` still overrides for coverage
+testing.
+
+The data motivating this lives in a user-supplied trace
+(8.14 s export on a 4632×2895 ORF / AMD RX 9060 XT / RADV):
+`agx` was 303 ms on VK in preview but 9 ms on CL in export
+because the export path's longer chain happened to evade the
+heuristic. The kernel itself was 5 ms in both cases — the
+remaining ~300 ms in the VK path was pure host-staging
+overhead. The same trace showed `exposure` taking 0.98 s wall
+on VK at export resolution while the kernel itself ran in ~5 ms;
+the host-staging cost (CL→host→VK plus VK→host→CL across the
+chain) was the entire delta. Tightening the heuristic moves
+these singletons onto the CL fast path.
+
 #### Recommended sequence
 
 1. **Path B continued** (this session and next) — every port
