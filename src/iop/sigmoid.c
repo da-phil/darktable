@@ -915,9 +915,6 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *dev_m_br = dt_vulkan_alloc_buffer(devid, sizeof(m_br));
   dt_vk_mem_t *dev_m_rp = dt_vulkan_alloc_buffer(devid, sizeof(m_rp));
   if(!dev_m_pb || !dev_m_br || !dev_m_rp) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_pb, m_pb, sizeof(m_pb)) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_br, m_br, sizeof(m_br)) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_rp, m_rp, sizeof(m_rp)) != 0) goto cleanup;
 
   const vk_sigmoid_pc_per_channel_t pc = {
     .width            = width,
@@ -930,8 +927,14 @@ int process_vk(dt_iop_module_t *self,
     .hue_preservation = d->hue_preservation,
   };
   dt_vk_mem_t *bufs[5] = { dev_in, dev_out, dev_m_pb, dev_m_br, dev_m_rp };
-  rc = dt_vulkan_dispatch_n(&gd->vk_per_channel, bufs, 5,
-                            width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_m_pb, m_pb, sizeof(m_pb) },
+    { dev_m_br, m_br, sizeof(m_br) },
+    { dev_m_rp, m_rp, sizeof(m_rp) },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk_per_channel, bufs, 5,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   dt_vulkan_free_buffer(devid, dev_m_pb);

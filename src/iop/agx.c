@@ -2899,20 +2899,22 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *dev_m_rxyz = dt_vulkan_alloc_buffer(devid, sizeof(m_rxyz));
   if(!dev_params || !dev_m_pb || !dev_m_br || !dev_m_rp || !dev_m_rxyz) goto cleanup;
 
-  if(dt_vulkan_write_to_device(devid, dev_params, &d->tone_mapping_params,
-                               sizeof(d->tone_mapping_params)) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_pb,   m_pb,   sizeof(m_pb))   != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_br,   m_br,   sizeof(m_br))   != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_rp,   m_rp,   sizeof(m_rp))   != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_m_rxyz, m_rxyz, sizeof(m_rxyz)) != 0) goto cleanup;
-
   const vk_agx_pc_t pc = {
     .width  = width,
     .height = height,
     .base_working_same_profile = (pipe_work_profile == base_profile),
   };
   dt_vk_mem_t *bufs[7] = { dev_in, dev_out, dev_params, dev_m_pb, dev_m_br, dev_m_rp, dev_m_rxyz };
-  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_params, &d->tone_mapping_params, sizeof(d->tone_mapping_params) },
+    { dev_m_pb,   m_pb,                    sizeof(m_pb)   },
+    { dev_m_br,   m_br,                    sizeof(m_br)   },
+    { dev_m_rp,   m_rp,                    sizeof(m_rp)   },
+    { dev_m_rxyz, m_rxyz,                  sizeof(m_rxyz) },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 7,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   dt_vulkan_free_buffer(devid, dev_params);
