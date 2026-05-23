@@ -1502,6 +1502,27 @@ the host-staging cost (CL→host→VK plus VK→host→CL across the
 chain) was the entire delta. Tightening the heuristic moves
 these singletons onto the CL fast path.
 
+#### Predictive `process_vk_ready` for runtime-conditional fallbacks
+
+The trace also showed `colorout` taking the `vulkan -> CPU fallback`
+path inside `process_vk` whenever the output profile required
+lcms2 (i.e. wasn't a matrix profile). The chain-ahead heuristic
+had already committed to VK at that point: the pixelpipe staged
+the input CL→VK, `process_vk` returned -1, and the runtime
+re-staged VK→CPU to run the lcms2 path — three transitions for a
+module that was always going to fall back.
+
+The matrix-vs-lcms2 decision is made at `commit_params` time
+(`dt_colorspaces_get_matrix_from_output_profile`). When that
+returns "no matrix" we now clear `piece->process_vk_ready` in
+the same place we already clear `piece->process_cl_ready`. The
+routing logic then never sees `colorout` as a VK candidate for
+that piece — neither for chain-ahead lookahead nor for chain
+continuation — and the surrounding modules pick the CL/CPU path
+without the wasted detour. Same pattern is available for any
+future module whose VK port is conditionally unavailable at
+commit time.
+
 #### Batched HAL dispatch landed (§5.6 update)
 
 Modules carrying small pre-dispatch uploads (LUTs, 3×3 matrices,
