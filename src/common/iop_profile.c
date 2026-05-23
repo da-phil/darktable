@@ -1909,6 +1909,76 @@ cleanup:
   return err;
 }
 
+// Deferred-upload sibling — same allocations and host-side payload
+// preparation as dt_ioppr_build_iccprofile_params_vk above, but the
+// uploads are appended to the caller's `uploads` array (to be issued
+// later via dt_vulkan_dispatch_n_batched) instead of submitted now.
+int dt_ioppr_build_iccprofile_params_vk_deferred(
+    const dt_iop_order_iccprofile_info_t *const profile_info,
+    const int devid,
+    dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+    float **_profile_lut_vk,
+    dt_vk_mem_t **_dev_profile_info,
+    dt_vk_mem_t **_dev_profile_lut,
+    dt_vk_upload_t *uploads,
+    size_t max_uploads,
+    size_t *upload_count)
+{
+  int err = 0;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk =
+    calloc(1, sizeof(dt_colorspaces_iccprofile_info_vk_t));
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL;
+  dt_vk_mem_t *dev_profile_lut  = NULL;
+  size_t idx = upload_count ? *upload_count : 0;
+
+  if(!profile_info_vk || !uploads || !upload_count) { err = -1; goto cleanup; }
+
+  if(profile_info)
+  {
+    _ioppr_get_profile_info_vk(profile_info, profile_info_vk);
+    profile_lut_vk = _ioppr_get_trc_vk(profile_info);
+
+    dev_profile_info = dt_vulkan_alloc_buffer(devid, sizeof(*profile_info_vk));
+    if(!dev_profile_info) { err = -1; goto cleanup; }
+    if(idx >= max_uploads) { err = -1; goto cleanup; }
+    uploads[idx++] = (dt_vk_upload_t){ dev_profile_info, profile_info_vk,
+                                       sizeof(*profile_info_vk) };
+
+    const size_t lut_bytes = sizeof(float) * 6 * profile_info->lutsize;
+    dev_profile_lut = dt_vulkan_alloc_buffer(devid, lut_bytes);
+    if(!dev_profile_lut) { err = -1; goto cleanup; }
+    if(profile_lut_vk)
+    {
+      if(idx >= max_uploads) { err = -1; goto cleanup; }
+      uploads[idx++] = (dt_vk_upload_t){ dev_profile_lut, profile_lut_vk, lut_bytes };
+    }
+  }
+  else
+  {
+    // No-profile placeholder; the kernel won't read it but a valid
+    // binding object is still required.
+    profile_lut_vk = calloc(1, sizeof(float) * 6);
+    if(!profile_lut_vk) { err = -1; goto cleanup; }
+    dev_profile_lut = dt_vulkan_alloc_buffer(devid, sizeof(float) * 6);
+    if(!dev_profile_lut) { err = -1; goto cleanup; }
+    if(idx >= max_uploads) { err = -1; goto cleanup; }
+    uploads[idx++] = (dt_vk_upload_t){ dev_profile_lut, profile_lut_vk,
+                                       sizeof(float) * 6 };
+  }
+
+cleanup:
+  if(err)
+    dt_print(DT_DEBUG_PIPE,
+             "[dt_ioppr_build_iccprofile_params_vk_deferred] failed to allocate profile buffers");
+  *_profile_info_vk  = profile_info_vk;
+  *_profile_lut_vk   = profile_lut_vk;
+  *_dev_profile_info = dev_profile_info;
+  *_dev_profile_lut  = dev_profile_lut;
+  if(upload_count) *upload_count = idx;
+  return err;
+}
+
 void dt_ioppr_free_iccprofile_params_vk(dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
                                         float **_profile_lut_vk,
                                         dt_vk_mem_t **_dev_profile_info,

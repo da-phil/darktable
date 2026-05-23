@@ -279,6 +279,31 @@ int dt_ioppr_build_iccprofile_params_vk
    dt_vk_mem_t **_dev_profile_info,
    dt_vk_mem_t **_dev_profile_lut);
 
+/** Deferred-upload variant: allocates and populates the host
+ *  structures, allocates the device buffers, but appends the two
+ *  uploads (info struct + LUT) to the caller-provided `uploads`
+ *  array rather than issuing them immediately. Lets a downstream
+ *  `dt_vulkan_dispatch_n_batched` bundle these uploads with the
+ *  module's own LUTs/matrices into a single command buffer,
+ *  saving 2 submit/wait round-trips per profile-using module.
+ *  `*upload_count` is the in/out write index into `uploads` (caller
+ *  passes the current fill level; the helper increments it by 1
+ *  or 2). `max_uploads` is the capacity of the array. Returns 0
+ *  on success. The caller still owns/frees everything via
+ *  dt_ioppr_free_iccprofile_params_vk; the host pointers stored
+ *  in the uploads array must stay alive until the batched
+ *  dispatch returns. */
+int dt_ioppr_build_iccprofile_params_vk_deferred
+  (const dt_iop_order_iccprofile_info_t *const profile_info,
+   const int devid,
+   dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
+   float **_profile_lut_vk,
+   dt_vk_mem_t **_dev_profile_info,
+   dt_vk_mem_t **_dev_profile_lut,
+   dt_vk_upload_t *uploads,
+   size_t max_uploads,
+   size_t *upload_count);
+
 void dt_ioppr_free_iccprofile_params_vk
   (dt_colorspaces_iccprofile_info_vk_t **_profile_info_vk,
    float **_profile_lut_vk,

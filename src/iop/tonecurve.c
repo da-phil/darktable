@@ -415,9 +415,16 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_L || !dev_a || !dev_b) goto cleanup;
 
-  if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
-                                         &profile_lut_vk, &dev_profile_info,
-                                         &dev_profile_lut) != 0)
+  dt_vk_upload_t uploads[5] = {
+    { dev_L, d->table[0], lut_bytes },
+    { dev_a, d->table[1], lut_bytes },
+    { dev_b, d->table[2], lut_bytes },
+  };
+  size_t upload_count = 3;
+  if(dt_ioppr_build_iccprofile_params_vk_deferred(
+       work_profile, devid, &profile_info_vk, &profile_lut_vk,
+       &dev_profile_info, &dev_profile_lut,
+       uploads, sizeof(uploads) / sizeof(uploads[0]), &upload_count) != 0)
     goto cleanup;
 
   const float low_approximation = d->table[0][(int)(0.01f * 0x10000ul)];
@@ -436,13 +443,8 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_L, dev_a, dev_b,
                           dev_profile_info, dev_profile_lut };
-  const dt_vk_upload_t uploads[] = {
-    { dev_L, d->table[0], lut_bytes },
-    { dev_a, d->table[1], lut_bytes },
-    { dev_b, d->table[2], lut_bytes },
-  };
   rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 7,
-                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    uploads, upload_count,
                                     width, height, &pc, sizeof(pc));
 
 cleanup:
