@@ -797,6 +797,14 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   {
     dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
     piece->process_cl_ready = FALSE;
+#ifdef HAVE_VULKAN
+    // process_vk's fast path also needs a valid matrix; without it
+    // we'd just return -1 from process_vk and force a wasted
+    // CL→VK→CPU round-trip via the chain-ahead heuristic. Better
+    // to mark the piece VK-ineligible up front so the chain logic
+    // doesn't route through Vulkan at all.
+    piece->process_vk_ready = FALSE;
+#endif
     d->xform = cmsCreateProofingTransform(Lab, TYPE_LabA_FLT, output, output_format, softproof,
                                           out_intent, INTENT_RELATIVE_COLORIMETRIC, transformFlags);
   }
