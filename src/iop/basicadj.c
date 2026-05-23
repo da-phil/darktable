@@ -1464,8 +1464,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_gamma = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_contrast = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_gamma || !dev_contrast) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_gamma, d->lut_gamma, lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_contrast, d->lut_contrast, lut_bytes) != 0) goto cleanup;
 
   if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
                                          &profile_lut_vk, &dev_profile_info,
@@ -1514,7 +1512,13 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_gamma, dev_contrast,
                               dev_profile_info, dev_profile_lut };
-  rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 6, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_gamma,    d->lut_gamma,    lut_bytes },
+    { dev_contrast, d->lut_contrast, lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, buffers, 6,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,

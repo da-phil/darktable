@@ -185,8 +185,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dt_vk_mem_t *dev_ctable = dt_vulkan_alloc_buffer(0, lut_bytes);
   dt_vk_mem_t *dev_ltable = dt_vulkan_alloc_buffer(0, lut_bytes);
   if(!dev_ctable || !dev_ltable) goto error;
-  if(dt_vulkan_write_to_device(0, dev_ctable, d->ctable, lut_bytes) != 0) goto error;
-  if(dt_vulkan_write_to_device(0, dev_ltable, d->ltable, lut_bytes) != 0) goto error;
 
   const vk_colisa_pc_t pc = {
     .width      = width,
@@ -200,7 +198,13 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     .la2 = d->lunbounded_coeffs[2],
   };
   dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_ctable, dev_ltable };
-  int rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 4, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_ctable, d->ctable, lut_bytes },
+    { dev_ltable, d->ltable, lut_bytes },
+  };
+  int rc = dt_vulkan_dispatch_n_batched(&gd->vk, buffers, 4,
+                                        uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                        width, height, &pc, sizeof(pc));
 
   dt_vulkan_free_buffer(0, dev_ctable);
   dt_vulkan_free_buffer(0, dev_ltable);

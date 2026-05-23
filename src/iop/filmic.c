@@ -626,8 +626,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_table = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_diff  = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_table || !dev_diff) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_table, d->table,  lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_diff,  d->grad_2, lut_bytes) != 0) goto cleanup;
 
   const vk_filmic_pc_t pc = {
     .width = roi_in->width, .height = roi_in->height,
@@ -641,8 +639,13 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   };
 
   dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_table, dev_diff };
-  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 4,
-                            roi_in->width, roi_in->height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_table, d->table,  lut_bytes },
+    { dev_diff,  d->grad_2, lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 4,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    roi_in->width, roi_in->height, &pc, sizeof(pc));
 
 cleanup:
   if(dev_table) dt_vulkan_free_buffer(devid, dev_table);

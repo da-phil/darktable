@@ -481,15 +481,16 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const size_t lut_bytes = sizeof(float) * 256 * 256;
   dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(0, lut_bytes);
   if(!dev_lut) return -1;
-  int rc = -1;
-  if(dt_vulkan_write_to_device(0, dev_lut, d->lut, lut_bytes) == 0)
-  {
-    struct { int w, h; float in_low, in_high, in_inv_gamma; } pc
-      = { roi_out->width, roi_out->height,
-          d->levels[0], d->levels[2], d->in_inv_gamma };
-    rc = dt_vulkan_dispatch_inout_lut(&gd->vk, dev_in, dev_out, dev_lut,
-                                      pc.w, pc.h, &pc, sizeof(pc));
-  }
+  struct { int w, h; float in_low, in_high, in_inv_gamma; } pc
+    = { roi_out->width, roi_out->height,
+        d->levels[0], d->levels[2], d->in_inv_gamma };
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_lut };
+  const dt_vk_upload_t uploads[] = {
+    { dev_lut, d->lut, lut_bytes },
+  };
+  const int rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 3,
+                                              uploads, 1,
+                                              pc.w, pc.h, &pc, sizeof(pc));
   dt_vulkan_free_buffer(0, dev_lut);
   return rc;
 }

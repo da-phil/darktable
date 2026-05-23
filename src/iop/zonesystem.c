@@ -350,13 +350,17 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dt_vk_mem_t *dev_zmo = dt_vulkan_alloc_buffer(0, map_bytes);
   dt_vk_mem_t *dev_zms = dt_vulkan_alloc_buffer(0, map_bytes);
   int rc = -1;
-  if(dev_zmo && dev_zms
-     && dt_vulkan_write_to_device(0, dev_zmo, zonemap_offset, map_bytes) == 0
-     && dt_vulkan_write_to_device(0, dev_zms, zonemap_scale,  map_bytes) == 0)
+  if(dev_zmo && dev_zms)
   {
     struct { int w, h, sz; } pc = { width, height, size };
     dt_vk_mem_t *bufs[4] = { dev_in, dev_out, dev_zmo, dev_zms };
-    rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 4, width, height, &pc, sizeof(pc));
+    const dt_vk_upload_t uploads[] = {
+      { dev_zmo, zonemap_offset, map_bytes },
+      { dev_zms, zonemap_scale,  map_bytes },
+    };
+    rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 4,
+                                      uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                      width, height, &pc, sizeof(pc));
   }
   dt_vulkan_free_buffer(0, dev_zmo);
   dt_vulkan_free_buffer(0, dev_zms);

@@ -719,15 +719,16 @@ int process_vk(dt_iop_module_t *self,
 
     dt_vk_mem_t *dev_xtrans = dt_vulkan_alloc_buffer(0, sizeof(xtrans_flat));
     if(!dev_xtrans) return -1;
-    int rc = -1;
-    if(dt_vulkan_write_to_device(0, dev_xtrans, xtrans_flat, sizeof(xtrans_flat)) == 0)
-    {
-      struct { int w, h; float c0, c1, c2, c3; } pc
-        = { width, height,
-            d->coeffs[0], d->coeffs[1], d->coeffs[2], d->coeffs[3] };
-      rc = dt_vulkan_dispatch_inout_lut(&gd->vk_1f_xtrans, dev_in, dev_out, dev_xtrans,
-                                        width, height, &pc, sizeof(pc));
-    }
+    struct { int w, h; float c0, c1, c2, c3; } pc
+      = { width, height,
+          d->coeffs[0], d->coeffs[1], d->coeffs[2], d->coeffs[3] };
+    dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_xtrans };
+    const dt_vk_upload_t uploads[] = {
+      { dev_xtrans, xtrans_flat, sizeof(xtrans_flat) },
+    };
+    const int rc = dt_vulkan_dispatch_n_batched(&gd->vk_1f_xtrans, bufs, 3,
+                                                uploads, 1,
+                                                width, height, &pc, sizeof(pc));
     dt_vulkan_free_buffer(0, dev_xtrans);
     return rc;
   }

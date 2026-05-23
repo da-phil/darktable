@@ -281,15 +281,15 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     const size_t lut_bytes = sizeof(float) * 256 * 256;
     dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(0, lut_bytes);
     if(!dev_lut) return -1;
-    if(dt_vulkan_write_to_device(0, dev_lut, d->table, lut_bytes) != 0)
-    {
-      dt_vulkan_free_buffer(0, dev_lut);
-      return -1;
-    }
     struct { int w, h; float ta0, ta1, ta2; } pc
       = { width, height,
           d->unbounded_coeffs[0], d->unbounded_coeffs[1], d->unbounded_coeffs[2] };
-    const int rc = dt_vulkan_dispatch_inout_lut(&gd->vk_gamma, dev_in, dev_out, dev_lut,
+    dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_lut };
+    const dt_vk_upload_t uploads[] = {
+      { dev_lut, d->table, lut_bytes },
+    };
+    const int rc = dt_vulkan_dispatch_n_batched(&gd->vk_gamma, bufs, 3,
+                                                uploads, 1,
                                                 width, height, &pc, sizeof(pc));
     dt_vulkan_free_buffer(0, dev_lut);
     return rc;
