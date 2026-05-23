@@ -245,11 +245,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const size_t lut_bytes = sizeof(float) * DT_IOP_LOWLIGHT_LUT_RES;
   dt_vk_mem_t *dev_lut = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_lut) return -1;
-  if(dt_vulkan_write_to_device(devid, dev_lut, d->lut, lut_bytes) != 0)
-  {
-    dt_vulkan_free_buffer(devid, dev_lut);
-    return -1;
-  }
 
   const vk_lowlight_pc_t pc = {
     .width = width, .height = height,
@@ -258,7 +253,12 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   };
 
   dt_vk_mem_t *buffers[] = { dev_in, dev_out, dev_lut };
-  const int rc = dt_vulkan_dispatch_n(&gd->vk, buffers, 3, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_lut, d->lut, lut_bytes },
+  };
+  const int rc = dt_vulkan_dispatch_n_batched(&gd->vk, buffers, 3,
+                                              uploads, 1,
+                                              width, height, &pc, sizeof(pc));
 
   dt_vulkan_free_buffer(devid, dev_lut);
   return rc;

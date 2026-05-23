@@ -572,10 +572,15 @@ The shared staging buffer is partitioned by 4-byte-aligned
 offsets (Vulkan's `vkCmdCopyBuffer` requirement), so all uploads
 share one DMA region without extra allocations. For a module
 with N small uploads, batching saves N submit/wait round-trips
-(~5-30 ms each on a discrete GPU). Modules currently on the
+(~5-30 ms each on a discrete GPU). All modules that used to call
+`dt_vulkan_write_to_device` before a dispatch are now on the
 batched path: `agx` (5 uploads — params + 4 matrices), `sigmoid`
-per_channel (3 matrices), `channelmixer` (2 matrices), `overlay`
-(1 Cairo ARGB buffer). For modules with zero uploads,
+per_channel (3 matrices), `rgbcurve` / `rgblevels` / `tonecurve`
+/ `colorout` (3 LUTs each), `channelmixer` / `colisa` / `filmic`
+/ `basicadj` / `lowpass` / `zonesystem` (2 uploads),
+`overlay` / `lowlight` / `profile_gamma` (gamma branch) /
+`levels` / `temperature` (1f X-Trans branch) /
+`channelmixerrgb` (1 upload). For modules with zero uploads,
 `dt_vulkan_dispatch_n_batched` short-circuits to
 `dt_vulkan_dispatch_n` so there's no overhead from picking the
 batched variant.
@@ -1514,17 +1519,23 @@ staging buffer is partitioned by 4-byte-aligned offsets (Vulkan's
 region. For N small uploads, this collapses N+1 submit/wait
 round-trips to 1.
 
-Modules migrated to the batched path: `agx` (5 uploads — the
-params storage buffer plus four 3×3 matrices), `sigmoid`
-per_channel (3 matrices), `channelmixer` (2 matrices), `overlay`
-(1 Cairo ARGB buffer). Modules with zero uploads short-circuit
-back to `dt_vulkan_dispatch_n`, so swapping in the batched call
-is always safe and never slower.
+Every iop module that used to call `dt_vulkan_write_to_device`
+before a dispatch is now on the batched path. The biggest payoffs
+are on multi-upload modules: `agx` (5 uploads — params + 4
+matrices), `sigmoid` per_channel (3 matrices), `rgbcurve` /
+`rgblevels` / `tonecurve` / `colorout` (3 LUTs each); plus the
+2-upload set `channelmixer` / `colisa` / `filmic` / `basicadj` /
+`lowpass` / `zonesystem`; and the 1-upload set `overlay` /
+`lowlight` / `profile_gamma` (gamma) / `levels` / `temperature`
+(1f X-Trans) / `channelmixerrgb`. Modules with zero uploads
+short-circuit back to `dt_vulkan_dispatch_n`, so swapping in the
+batched call is always safe and never slower.
 
 This compounds with the chain-ahead tightening: even when a VK
 chain is genuinely worth running, each module now pays less per
-dispatch. Expected ~25-150 ms saved per VK module that has
-matrix / LUT uploads, scaling with the upload count.
+dispatch. Expected saving scales with upload count — roughly
+`(N+1) × ~5-30 ms` becomes `1 × ~5-30 ms`, so an agx-class
+6-submit module saves ~25-150 ms per call.
 
 #### Recommended sequence
 

@@ -2553,25 +2553,26 @@ int process_vk(dt_iop_module_t *self,
 
   dt_vk_mem_t *dev_mat = dt_vulkan_alloc_buffer(0, sizeof(matrices));
   if(!dev_mat) return -1;
-  int rc = -1;
-  if(dt_vulkan_write_to_device(0, dev_mat, matrices, sizeof(matrices)) == 0)
-  {
-    vk_chmix_pc_t pc = { 0 };
-    pc.width      = roi_in->width;
-    pc.height     = roi_in->height;
-    pc.version    = (int)d->version;
-    pc.clip       = (int)d->clip;
-    pc.apply_grey = (int)d->apply_grey;
-    pc.p          = d->p;
-    pc.gamut      = d->gamut;
-    for(int i = 0; i < 4; i++) pc.illuminant[i] = d->illuminant[i];
-    for(int i = 0; i < 4; i++) pc.saturation[i] = d->saturation[i];
-    for(int i = 0; i < 4; i++) pc.lightness[i]  = d->lightness[i];
-    for(int i = 0; i < 4; i++) pc.grey[i]       = d->grey[i];
+  vk_chmix_pc_t pc = { 0 };
+  pc.width      = roi_in->width;
+  pc.height     = roi_in->height;
+  pc.version    = (int)d->version;
+  pc.clip       = (int)d->clip;
+  pc.apply_grey = (int)d->apply_grey;
+  pc.p          = d->p;
+  pc.gamut      = d->gamut;
+  for(int i = 0; i < 4; i++) pc.illuminant[i] = d->illuminant[i];
+  for(int i = 0; i < 4; i++) pc.saturation[i] = d->saturation[i];
+  for(int i = 0; i < 4; i++) pc.lightness[i]  = d->lightness[i];
+  for(int i = 0; i < 4; i++) pc.grey[i]       = d->grey[i];
 
-    rc = dt_vulkan_dispatch_inout_lut(k, dev_in, dev_out, dev_mat,
-                                      pc.width, pc.height, &pc, sizeof(pc));
-  }
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_mat };
+  const dt_vk_upload_t uploads[] = {
+    { dev_mat, matrices, sizeof(matrices) },
+  };
+  const int rc = dt_vulkan_dispatch_n_batched(k, bufs, 3,
+                                              uploads, 1,
+                                              pc.width, pc.height, &pc, sizeof(pc));
   dt_vulkan_free_buffer(0, dev_mat);
   return rc;
 }

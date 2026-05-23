@@ -1915,10 +1915,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_g = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_r || !dev_g || !dev_b) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_r, d->table[DT_IOP_RGBCURVE_R], lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_g, d->table[DT_IOP_RGBCURVE_G], lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_b, d->table[DT_IOP_RGBCURVE_B], lut_bytes) != 0) goto cleanup;
-
   if(dt_ioppr_build_iccprofile_params_vk(work_profile, devid, &profile_info_vk,
                                          &profile_lut_vk, &dev_profile_info,
                                          &dev_profile_lut) != 0)
@@ -1936,7 +1932,14 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_r, dev_g, dev_b,
                           dev_profile_info, dev_profile_lut };
-  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 7, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_r, d->table[DT_IOP_RGBCURVE_R], lut_bytes },
+    { dev_g, d->table[DT_IOP_RGBCURVE_G], lut_bytes },
+    { dev_b, d->table[DT_IOP_RGBCURVE_B], lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 7,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,

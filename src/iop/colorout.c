@@ -414,9 +414,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_g = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_r || !dev_g || !dev_b) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_r, d->lut[0], lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_g, d->lut[1], lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_b, d->lut[2], lut_bytes) != 0) goto cleanup;
 
   float m[9];
   pack_3xSSE_to_3x3(d->cmatrix, m);
@@ -431,8 +428,14 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   };
 
   dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_r, dev_g, dev_b };
-  rc = dt_vulkan_dispatch_n(&gd->vk, bufs, 5,
-                            roi_in->width, roi_in->height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_r, d->lut[0], lut_bytes },
+    { dev_g, d->lut[1], lut_bytes },
+    { dev_b, d->lut[2], lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 5,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    roi_in->width, roi_in->height, &pc, sizeof(pc));
 
 cleanup:
   if(dev_r) dt_vulkan_free_buffer(devid, dev_r);
