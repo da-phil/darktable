@@ -407,8 +407,6 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_cm = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_lm = dt_vulkan_alloc_buffer(devid, lut_bytes);
   if(!dev_cm || !dev_lm) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_cm, d->ctable, lut_bytes) != 0) goto cleanup;
-  if(dt_vulkan_write_to_device(devid, dev_lm, d->ltable, lut_bytes) != 0) goto cleanup;
 
   const vk_lowpass_mix_pc_t pc = {
     .width = width, .height = height,
@@ -422,7 +420,13 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     .la2 = d->lunbounded_coeffs[2],
   };
   dt_vk_mem_t *bufs[] = { dev_tmp, dev_out, dev_cm, dev_lm };
-  rc = dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 4, width, height, &pc, sizeof(pc));
+  const dt_vk_upload_t uploads[] = {
+    { dev_cm, d->ctable, lut_bytes },
+    { dev_lm, d->ltable, lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk_mix, bufs, 4,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
 
 cleanup:
   if(g) dt_gaussian_free_vk(g);
