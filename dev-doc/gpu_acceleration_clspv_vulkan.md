@@ -1531,6 +1531,16 @@ matrices), `sigmoid` per_channel (3 matrices), `rgbcurve` /
 short-circuit back to `dt_vulkan_dispatch_n`, so swapping in the
 batched call is always safe and never slower.
 
+`dt_ioppr_build_iccprofile_params_vk_deferred` is the matching
+helper for §5.11 plumbing: instead of immediately uploading the
+ICC `profile_info` + tone-curve LUT (2 separate `vkQueueSubmit`
+round-trips), it appends those uploads to the caller's
+`dt_vk_upload_t[]` so they roll into the same batched dispatch
+as the module's own LUTs. Currently used by `rgbcurve`,
+`rgblevels`, `tonecurve`, and `basicadj`. Saves 2 more
+submit/wait cycles per profile-using dispatch on top of the
+module-local upload batching.
+
 This compounds with the chain-ahead tightening: even when a VK
 chain is genuinely worth running, each module now pays less per
 dispatch. Expected saving scales with upload count — roughly
