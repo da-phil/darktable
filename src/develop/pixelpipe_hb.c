@@ -59,6 +59,26 @@ static inline gboolean _is_debug_pipe(dt_dev_pixelpipe_t *pipe)
   return (dt_pipe_is_full(pipe) || dt_pipe_is_export(pipe)) && !_pipe_has_shutdown(pipe);
 }
 
+#ifdef HAVE_VULKAN
+// Drop any pending §5.14 VK→VK hand-off buffer. Anyone about to mutate
+// the host input/output buffer in place must call this first: otherwise
+// the next module's process_vk would hit vin_from_cache and read the
+// pre-mutation GPU contents while its parameters were chosen against
+// the post-mutation host state (manifested as a black darkroom preview
+// when the chain hit colorout via an in-place RGB→Lab transform).
+static inline void _vk_handoff_invalidate(dt_dev_pixelpipe_t *pipe)
+{
+  if(!pipe->vk_handoff_buf) return;
+  const int vdev = dt_vulkan_lock_device();
+  if(vdev >= 0)
+  {
+    dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
+    dt_vulkan_unlock_device(vdev);
+  }
+  pipe->vk_handoff_buf  = NULL;
+  pipe->vk_handoff_size = 0;
+}
+#endif
 
 // forward declarations for mask cache helpers
 static void _clear_piece_mask_caches(dt_dev_pixelpipe_iop_t *piece);
@@ -403,17 +423,7 @@ void dt_dev_pixelpipe_cleanup(dt_dev_pixelpipe_t *pipe)
   // Drop any lingering VK hand-off buffer (§5.14). Normally
   // released by the last module's invalidation hook, but a
   // mid-pipeline abort can leave it dangling.
-  if(pipe->vk_handoff_buf)
-  {
-    const int devid = dt_vulkan_lock_device();
-    if(devid >= 0)
-    {
-      dt_vulkan_free_buffer(devid, pipe->vk_handoff_buf);
-      dt_vulkan_unlock_device(devid);
-    }
-    pipe->vk_handoff_buf  = NULL;
-    pipe->vk_handoff_size = 0;
-  }
+  _vk_handoff_invalidate(pipe);
 #endif
 
   pipe->icc_type = DT_COLORSPACE_NONE;
@@ -1424,6 +1434,14 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                   work_profile
                     ? dt_colorspaces_get_name(work_profile->type, work_profile->filename)
                     : "no work profile");
+#ifdef HAVE_VULKAN
+    // §5.14: the host buffer is about to be mutated in place. Any
+    // VK→VK hand-off cache from the previous module becomes stale —
+    // it still holds the pre-transform GPU contents, but the next
+    // module's parameters will be chosen against the post-transform
+    // host state. Drop it now so the next process_vk uploads fresh.
+    _vk_handoff_invalidate(pipe);
+#endif
   }
 
   // transform to module input colorspace
@@ -1604,17 +1622,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
         // §5.14: any VK→VK hand-off is stale once a CPU module
         // runs (output now lives in host memory, the cached VK
         // buffer no longer matches).
-        if(pipe->vk_handoff_buf)
-        {
-          const int vdev = dt_vulkan_lock_device();
-          if(vdev >= 0)
-          {
-            dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
-            dt_vulkan_unlock_device(vdev);
-          }
-          pipe->vk_handoff_buf  = NULL;
-          pipe->vk_handoff_size = 0;
-        }
+        _vk_handoff_invalidate(pipe);
 #endif
         if(darktable.bench_module && _is_debug_pipe(pipe) && dt_str_commasubstring(darktable.bench_module, module->op))
           _cpu_benchmark(pipe, module, piece, input, *output, roi_out, roi_in);
@@ -1682,6 +1690,15 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
   // blend needs input/output images with default colorspace
   if(_transform_for_blend(module, piece))
   {
+#ifdef HAVE_VULKAN
+    // §5.14: about to in-place transform host *output for blending.
+    // The previous process_vk staged its raw output into the hand-off
+    // cache; the upcoming module's vin_from_cache path would read the
+    // pre-blend-transform GPU data while host has already moved on.
+    // Drop the cache so the next process_vk re-uploads from the
+    // blend-transformed host buffer.
+    _vk_handoff_invalidate(pipe);
+#endif
     dt_ioppr_transform_image_colorspace(module, input, input,
                                         roi_in->width, roi_in->height,
                                         input_format->cst, blend_cst, &input_format->cst,
@@ -2389,17 +2406,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
       // §5.14: any prior VK→VK hand-off becomes stale once we
       // switch to the OpenCL chain. Release it so the buffer
       // memory comes back to the driver pool.
-      if(pipe->vk_handoff_buf)
-      {
-        const int vdev = dt_vulkan_lock_device();
-        if(vdev >= 0)
-        {
-          dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
-          dt_vulkan_unlock_device(vdev);
-        }
-        pipe->vk_handoff_buf  = NULL;
-        pipe->vk_handoff_size = 0;
-      }
+      _vk_handoff_invalidate(pipe);
 #endif
       const dt_iop_colorspace_type_t cst_from = input_cst_cl;
       const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
