@@ -546,3 +546,113 @@ static inline float4 vk_HSV_to_RGB(const float4 HSV)
     default: return (float4)(v, p, q, w);  // case 5 + wrap
   }
 }
+
+// dt UCS color appearance model — used by colorharmonizer (and any
+// future module that wants the JCH perceptual triple). Mirrors the
+// definitions in data/kernels/colorspace.h byte-for-byte.
+#define DT_UCS_L_STAR_RANGE         2.098883786377f
+#define DT_UCS_L_STAR_UPPER_LIMIT   2.09885f
+#define DT_UCS_Y_UPPER_LIMIT        1e8f
+
+static inline float4 vk_D65_XYZ_to_xyY(const float4 sXYZ)
+{
+  float4 XYZ = fmax(0.0f, sXYZ);
+  float4 xyY;
+  const float sum = XYZ.x + XYZ.y + XYZ.z;
+  if(sum > 0.0f) { xyY.x = XYZ.x / sum; xyY.y = XYZ.y / sum; }
+  else           { xyY.x = 0.31271f;   xyY.y = 0.32902f; }
+  xyY.z = XYZ.y;
+  xyY.w = sXYZ.w;
+  return xyY;
+}
+
+static inline float4 vk_xyY_to_XYZ(const float4 xyY)
+{
+  float4 XYZ = (float4)(0.0f, 0.0f, 0.0f, xyY.w);
+  if(xyY.y != 0.0f)
+  {
+    XYZ.x = xyY.z * xyY.x / xyY.y;
+    XYZ.y = xyY.z;
+    XYZ.z = xyY.z * (1.0f - xyY.x - xyY.y) / xyY.y;
+  }
+  return XYZ;
+}
+
+static inline float vk_Y_to_dt_UCS_L_star(const float Y)
+{
+  const float Y_hat = pow(Y, 0.631651345306265f);
+  return DT_UCS_L_STAR_RANGE * Y_hat / (Y_hat + 1.12426773749357f);
+}
+
+static inline float vk_dt_UCS_L_star_to_Y(const float L_star)
+{
+  return pow((1.12426773749357f * L_star / (DT_UCS_L_STAR_RANGE - L_star)),
+             1.5831518565279648f);
+}
+
+static inline float2 vk_xyY_to_dt_UCS_UV(const float4 xyY)
+{
+  const float4 x_factors = (float4)(-0.783941002840055f,  0.745273540913283f, 0.318707282433486f, 0.0f);
+  const float4 y_factors = (float4)( 0.277512987809202f, -0.205375866083878f, 2.16743692732158f,  0.0f);
+  const float4 offsets   = (float4)( 0.153836578598858f, -0.165478376301988f, 0.291320554395942f, 0.0f);
+
+  float4 UVD = x_factors * xyY.x + y_factors * xyY.y + offsets;
+  const float div = (UVD.z >= 0.0f) ? fmax(FLT_MIN, UVD.z) : fmin(-FLT_MIN, UVD.z);
+  UVD.x /= div;
+  UVD.y /= div;
+
+  const float2 factors     = (float2)(1.39656225667f, 1.4513954287f);
+  const float2 half_values = (float2)(1.49217352929f, 1.52488637914f);
+  const float2 UV_star = (float2)(
+    factors.x * UVD.x / (fabs(UVD.x) + half_values.x),
+    factors.y * UVD.y / (fabs(UVD.y) + half_values.y));
+  // Final 2x2 matrix product giving UV_star_prime.
+  return (float2)(
+    -1.124983854323892f * UV_star.x - 0.980483721769325f * UV_star.y,
+     1.86323315098672f  * UV_star.x + 1.971853092390862f * UV_star.y);
+}
+
+static inline float4 vk_xyY_to_dt_UCS_JCH(const float4 xyY, const float L_white)
+{
+  const float2 UV_star_prime = vk_xyY_to_dt_UCS_UV(xyY);
+
+  const float L_star = vk_Y_to_dt_UCS_L_star(clamp(xyY.z, 0.0f, DT_UCS_Y_UPPER_LIMIT));
+  const float M2 = UV_star_prime.x * UV_star_prime.x
+                 + UV_star_prime.y * UV_star_prime.y;
+
+  return (float4)(L_star / L_white,
+                  15.932993652962535f * pow(L_star, 0.6523997524738018f)
+                                      * pow(M2, 0.6007557017508491f) / L_white,
+                  atan2(UV_star_prime.y, UV_star_prime.x),
+                  0.0f);
+}
+
+static inline float4 vk_dt_UCS_JCH_to_xyY(const float4 JCH, const float L_white)
+{
+  const float L_star = clamp(JCH.x * L_white, 0.0f, DT_UCS_L_STAR_UPPER_LIMIT);
+  const float M = L_star != 0.0f
+    ? pow(JCH.y * L_white / (15.932993652962535f * pow(L_star, 0.6523997524738018f)),
+          0.8322850678616855f)
+    : 0.0f;
+
+  const float U_star_prime = M * cos(JCH.z);
+  const float V_star_prime = M * sin(JCH.z);
+
+  const float2 UV_star = (float2)(
+    -5.037522385190711f * U_star_prime - 2.504856328185843f * V_star_prime,
+     4.760029407436461f * U_star_prime + 2.874012963239247f * V_star_prime);
+
+  const float2 factors     = (float2)(1.39656225667f, 1.4513954287f);
+  const float2 half_values = (float2)(1.49217352929f, 1.52488637914f);
+  const float2 UV = (float2)(
+    -half_values.x * UV_star.x / (fabs(UV_star.x) - factors.x),
+    -half_values.y * UV_star.y / (fabs(UV_star.y) - factors.y));
+
+  const float4 U_factors = (float4)( 0.167171472114775f,   -0.150959086409163f,    0.940254742367256f,  0.0f);
+  const float4 V_factors = (float4)( 0.141299802443708f,   -0.155185060382272f,    1.000000000000000f,  0.0f);
+  const float4 offsets   = (float4)(-0.00801531300850582f, -0.00843312433578007f, -0.0256325967652889f, 0.0f);
+
+  const float4 xyD = U_factors * UV.x + V_factors * UV.y + offsets;
+  const float div = (xyD.z >= 0.0f) ? fmax(FLT_MIN, xyD.z) : fmin(-FLT_MIN, xyD.z);
+  return (float4)(xyD.x / div, xyD.y / div, vk_dt_UCS_L_star_to_Y(L_star), 0.0f);
+}
