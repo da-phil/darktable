@@ -893,6 +893,28 @@ failure can't double-free it. The cache is per-pipeline rather
 than global, which matches the OpenCL `cl_mem` chain semantics
 and means parallel preview/full/export pipelines don't interfere.
 
+**Host-mutation invariant.** The cache contains the previous
+module's *raw* `process_vk` output. The host buffer for the same
+pipe stage was written from that same data via
+`dt_vulkan_read_from_device`, so initially they are bit-identical.
+Anything that subsequently mutates the host buffer in place — the
+input-side colourspace transform in `_pixelpipe_process_on_CPU`
+when `cst_from != cst_to`, the blend-side input/output transforms
+when `_transform_for_blend` fires — desynchronises the two.
+`_vk_handoff_invalidate(pipe)` must run *before* every such
+mutation; otherwise the next module's `vin_from_cache` path
+silently feeds the kernel pre-mutation GPU bytes while the
+parameters were chosen against the post-mutation host state. The
+darkroom-only regression that motivated this rule was
+`agx → colorout` with an RGB→Lab host transform between them:
+colorout's VK kernel read RGB pixels but applied a Lab→RGB matrix,
+producing a uniformly black framebuffer. (Export was unaffected
+because `finalscale` runs in OpenCL between agx and colorout,
+breaking the chain via the existing CL-branch invalidation.) The
+CPU-fallback branch and the OpenCL branch already invalidate at
+their entry; the only previously-uncovered sites were the host
+colourspace transforms.
+
 For VK→VK pairs this halves the per-boundary host traffic. The
 asymmetric temperature→exposure timing reported in §10.1 was
 *not* caused by VK→VK transitions (other OpenCL modules ran in
