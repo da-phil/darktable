@@ -17,7 +17,9 @@
 */
 
 #include "common/iop_profile.h"
+#include "common/gaussian.h"
 #include "common/math.h"
+#include "common/vulkan.h"
 #include "bauhaus/bauhaus.h"
 #include "dtgtk/button.h"
 #include "dtgtk/paint.h"
@@ -111,7 +113,27 @@ typedef struct dt_iop_colorharmonizer_global_data_t
 {
   int kernel_colorharmonizer_map;
   int kernel_colorharmonizer_apply;
+  dt_vk_module_kernel_t vk_map;
+  dt_vk_module_kernel_t vk_apply;
 } dt_iop_colorharmonizer_global_data_t;
+
+typedef struct vk_colorharm_map_pc_t
+{
+  int   width;
+  int   height;
+  int   num_nodes;
+  float zone_width;
+  float L_white;
+} vk_colorharm_map_pc_t;
+
+typedef struct vk_colorharm_apply_pc_t
+{
+  int   width;
+  int   height;
+  float effect_strength;
+  float protect_neutral;
+  float L_white;
+} vk_colorharm_apply_pc_t;
 
 static float _ucs_hue_to_ryb_hue(const float ucs_hue);
 static float _ucs_to_ryb_fast(const float ucs);
@@ -565,18 +587,33 @@ static void _build_hue_luts(void)
 void init_global(dt_iop_module_so_t *self)
 {
   _build_hue_luts();
-  const int program = 40; // colorharmonizer.cl in programs.conf
   dt_iop_colorharmonizer_global_data_t *gd = malloc(sizeof(dt_iop_colorharmonizer_global_data_t));
   self->data = gd;
+#ifdef HAVE_OPENCL
+  const int program = 40; // colorharmonizer.cl in programs.conf
   gd->kernel_colorharmonizer_map    = dt_opencl_create_kernel(program, "colorharmonizer_map");
   gd->kernel_colorharmonizer_apply  = dt_opencl_create_kernel(program, "colorharmonizer_apply");
+#else
+  gd->kernel_colorharmonizer_map    = -1;
+  gd->kernel_colorharmonizer_apply  = -1;
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk_map,   "colorharmonizer_map",
+                               "colorharmonizer_map",   6,
+                               sizeof(vk_colorharm_map_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_apply, "colorharmonizer_apply",
+                               "colorharmonizer_apply", 4,
+                               sizeof(vk_colorharm_apply_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_colorharmonizer_global_data_t *gd = self->data;
+#ifdef HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_colorharmonizer_map);
   dt_opencl_free_kernel(gd->kernel_colorharmonizer_apply);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk_map);
+  dt_vulkan_module_kernel_unload(&gd->vk_apply);
   free(self->data);
   self->data = NULL;
 }
@@ -690,6 +727,124 @@ error:
   dt_opencl_release_mem_object(corrections_cl);
   dt_opencl_release_mem_object(jch_cl);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorharmonizer_data_t   *const d  = piece->data;
+  const dt_iop_colorharmonizer_params_t *const p  = &d->params;
+  const dt_iop_colorharmonizer_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  if(!work_profile) return -1;
+
+  dt_colormatrix_t input_matrix_t, output_matrix_t;
+  dt_colormatrix_mul(input_matrix_t,  XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix_t, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+  float matrix_in[9], matrix_out[9];
+  pack_3xSSE_to_3x3(input_matrix_t,  matrix_in);
+  pack_3xSSE_to_3x3(output_matrix_t, matrix_out);
+
+  float nodes[COLORHARMONIZER_MAX_NODES];
+  memcpy(nodes, d->nodes, sizeof(nodes));
+  const int num_nodes = d->num_nodes;
+  float node_saturation[COLORHARMONIZER_MAX_NODES];
+  for(int i = 0; i < COLORHARMONIZER_MAX_NODES; i++)
+    node_saturation[i] = p->node_saturation[i];
+  const float L_white = Y_to_dt_UCS_L_star(1.0f);
+
+  // Corrections is padded to float4 so we can run dt_gaussian_blur_vk
+  // (only the 4-channel path is wired in the HAL today). The kernels
+  // read .xy and write .xy + zero pad.
+  const size_t f4sz  = (size_t)width * height * 4 * sizeof(float);
+  const size_t mat9  = sizeof(matrix_in);
+  const size_t arrsz = sizeof(nodes);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_corr = NULL, *dev_jch = NULL;
+  dt_vk_mem_t *dev_min  = NULL, *dev_mout = NULL;
+  dt_vk_mem_t *dev_nodes = NULL, *dev_nsat = NULL;
+  dt_gaussian_vk_t *gauss = NULL;
+
+  dev_corr  = dt_vulkan_alloc_buffer(devid, f4sz);
+  dev_jch   = dt_vulkan_alloc_buffer(devid, f4sz);
+  dev_min   = dt_vulkan_alloc_buffer(devid, mat9);
+  dev_mout  = dt_vulkan_alloc_buffer(devid, mat9);
+  dev_nodes = dt_vulkan_alloc_buffer(devid, arrsz);
+  dev_nsat  = dt_vulkan_alloc_buffer(devid, arrsz);
+  if(!dev_corr || !dev_jch || !dev_min || !dev_mout || !dev_nodes || !dev_nsat)
+    goto cleanup;
+
+  // Pass 1 — map.
+  {
+    const vk_colorharm_map_pc_t pc = {
+      .width = width, .height = height,
+      .num_nodes = num_nodes,
+      .zone_width = p->pull_width,
+      .L_white = L_white,
+    };
+    dt_vk_mem_t *bufs[6] = { dev_in, dev_corr, dev_jch, dev_min, dev_nodes, dev_nsat };
+    const dt_vk_upload_t uploads[] = {
+      { dev_min,   matrix_in,        mat9  },
+      { dev_nodes, nodes,            arrsz },
+      { dev_nsat,  node_saturation,  arrsz },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_map, bufs, 6,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Pass 2 — Gaussian smoothing of corrections (4-channel helper; only
+  // .xy actually matter, .zw stays 0 throughout).
+  if(p->smoothing > 0.0f)
+  {
+    const float sigma = p->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale)
+                        * fmaxf(1.0f, p->pull_width);
+    const float rng[4] = { 1e9f, 1e9f, 1e9f, 1e9f };
+    const float mng[4] = { -1e9f, -1e9f, -1e9f, -1e9f };
+    gauss = dt_gaussian_init_vk(width, height, rng, mng, sigma, DT_IOP_GAUSSIAN_ZERO);
+    if(!gauss || dt_gaussian_blur_vk(gauss, dev_corr, dev_corr) != 0) goto cleanup;
+  }
+
+  // Pass 3 — apply.
+  {
+    const vk_colorharm_apply_pc_t pc = {
+      .width = width, .height = height,
+      .effect_strength = p->pull_strength,
+      .protect_neutral = p->neutral_protection,
+      .L_white = L_white,
+    };
+    dt_vk_mem_t *bufs[4] = { dev_out, dev_mout, dev_jch, dev_corr };
+    const dt_vk_upload_t uploads[] = {
+      { dev_mout, matrix_out, mat9 },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_apply, bufs, 4,
+                                    uploads, 1,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  rc = 0;
+
+cleanup:
+  if(gauss) dt_gaussian_free_vk(gauss);
+  dt_vulkan_free_buffer(devid, dev_corr);
+  dt_vulkan_free_buffer(devid, dev_jch);
+  dt_vulkan_free_buffer(devid, dev_min);
+  dt_vulkan_free_buffer(devid, dev_mout);
+  dt_vulkan_free_buffer(devid, dev_nodes);
+  dt_vulkan_free_buffer(devid, dev_nsat);
+  return rc;
 }
 #endif
 
