@@ -81,7 +81,9 @@ set(VK_KERNELS
     sigmoid_loglogistic_rgb_ratio:sigmoid_loglogistic_rgb_ratio
     sigmoid_loglogistic_per_channel:sigmoid_loglogistic_per_channel
     agx:kernel_agx
-    channelmixer:channelmixer)
+    channelmixer:channelmixer
+    colorharmonizer_map:colorharmonizer_map
+    colorharmonizer_apply:colorharmonizer_apply)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
