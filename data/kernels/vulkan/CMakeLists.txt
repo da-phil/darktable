@@ -83,7 +83,8 @@ set(VK_KERNELS
     agx:kernel_agx
     channelmixer:channelmixer
     colorharmonizer_map:colorharmonizer_map
-    colorharmonizer_apply:colorharmonizer_apply)
+    colorharmonizer_apply:colorharmonizer_apply
+    colorbalancergb:colorbalancergb)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
