@@ -1,0 +1,59 @@
+// GLSL fallback for colorchecker.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4 data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Par  { vec4 data[]; } params;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int num_patches;
+} pc;
+
+float cc_fastlog2(float x) {
+    uint xi = floatBitsToUint(x);
+    float mxf = uintBitsToFloat((xi & 0x007FFFFFu) | 0x3f000000u);
+    float y = float(xi);
+    y *= 1.1920928955078125e-7;
+    return y - 124.22551499
+        - 1.498030302 * mxf
+        - 1.72587999 / (0.3520887068 + mxf);
+}
+
+float cc_fastlog(float x) { return 0.69314718 * cc_fastlog2(x); }
+
+float cc_thinplate(vec4 x, vec4 y) {
+    float r2 = (x.x - y.x) * (x.x - y.x)
+             + (x.y - y.y) * (x.y - y.y)
+             + (x.z - y.z) * (x.z - y.z);
+    return r2 * cc_fastlog(max(1e-8, r2));
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    int np = pc.num_patches;
+    vec4 ipixel = in_buf.data[idx];
+    float w = ipixel.w;
+
+    // poly_Lab = params[2*np .. 2*np+4)
+    vec4 opixel = params.data[2 * np + 0]
+                + params.data[2 * np + 1] * ipixel.x
+                + params.data[2 * np + 2] * ipixel.y
+                + params.data[2 * np + 3] * ipixel.z;
+
+    for(int k = 0; k < np; k++) {
+        // source_Lab[k] = params[k]; coeff_Lab[k] = params[np + k]
+        float phi = cc_thinplate(ipixel, params.data[k]);
+        opixel += params.data[np + k] * phi;
+    }
+
+    opixel.w = w;
+    out_buf.data[idx] = opixel;
+}
