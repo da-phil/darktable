@@ -656,3 +656,235 @@ static inline float4 vk_dt_UCS_JCH_to_xyY(const float4 JCH, const float L_white)
   const float div = (xyD.z >= 0.0f) ? fmax(FLT_MIN, xyD.z) : fmin(-FLT_MIN, xyD.z);
   return (float4)(xyD.x / div, xyD.y / div, vk_dt_UCS_L_star_to_Y(L_star), 0.0f);
 }
+
+// dt UCS brightness/colorfulness cylindrical forms — used by
+// colorbalancergb's dt-UCS saturation branch. Mirror colorspace.h.
+static inline float4 vk_dt_UCS_JCH_to_HSB(const float4 JCH)
+{
+  float4 HSB;
+  HSB.z = JCH.x * (pow(JCH.y, 1.33654221029386f) + 1.0f);
+  HSB.y = (HSB.z > 0.0f) ? JCH.y / HSB.z : 0.0f;
+  HSB.x = JCH.z;
+  HSB.w = 0.0f;
+  return HSB;
+}
+
+static inline float4 vk_dt_UCS_HSB_to_JCH(const float4 HSB)
+{
+  float4 JCH;
+  JCH.z = HSB.x;
+  JCH.y = HSB.y * HSB.z;
+  JCH.x = HSB.z / (pow(JCH.y, 1.33654221029386f) + 1.0f);
+  JCH.w = 0.0f;
+  return JCH;
+}
+
+static inline float4 vk_dt_UCS_JCH_to_HCB(const float4 JCH)
+{
+  float4 HCB;
+  HCB.z = JCH.x * (pow(JCH.y, 1.33654221029386f) + 1.0f);
+  HCB.y = JCH.y;
+  HCB.x = JCH.z;
+  HCB.w = 0.0f;
+  return HCB;
+}
+
+static inline float4 vk_dt_UCS_HCB_to_JCH(const float4 HCB)
+{
+  float4 JCH;
+  JCH.z = HCB.x;
+  JCH.y = HCB.y;
+  JCH.x = HCB.z / (pow(HCB.y, 1.33654221029386f) + 1.0f);
+  JCH.w = 0.0f;
+  return JCH;
+}
+
+// ---- CIE 2006 LMS / Filmlight Yrg-Ych / JzAzBz colour science -------
+//
+// Ported byte-for-byte from data/kernels/colorspace.h (matrix_dot rows
+// inlined, dtcl_* -> std intrinsics). These back colorbalancergb and
+// are reusable by the future filmicrgb / sigmoid Yrg ports. Keep the
+// matrix coefficients identical to the OpenCL originals.
+
+#ifndef DT_2PI_F
+#define DT_2PI_F 6.28318530717958647692f
+#endif
+#ifndef LUT_ELEM
+#define LUT_ELEM 512  // gamut LUT element count; matches data/kernels/common.h
+#endif
+
+static inline float vk_dt_fast_hypot(const float x, const float y)
+{
+  return sqrt(x * x + y * y);
+}
+
+static inline float4 vk_LMS_to_XYZ(const float4 LMS)
+{
+  return (float4)( 1.80794659f * LMS.x - 1.29971660f * LMS.y + 0.34785879f * LMS.z,
+                   0.61783960f * LMS.x + 0.39595453f * LMS.y - 0.04104687f * LMS.z,
+                  -0.12546960f * LMS.x + 0.20478038f * LMS.y + 1.74274183f * LMS.z,
+                   LMS.w);
+}
+
+static inline float4 vk_gradingRGB_to_LMS(const float4 RGB)
+{
+  return (float4)(0.95f * RGB.x + 0.38f * RGB.y + 0.00f * RGB.z,
+                  0.05f * RGB.x + 0.62f * RGB.y + 0.03f * RGB.z,
+                  0.00f * RGB.x + 0.00f * RGB.y + 0.97f * RGB.z,
+                  RGB.w);
+}
+
+static inline float4 vk_LMS_to_gradingRGB(const float4 LMS)
+{
+  return (float4)( 1.0877193f  * LMS.x - 0.66666667f * LMS.y + 0.02061856f * LMS.z,
+                  -0.0877193f  * LMS.x + 1.66666667f * LMS.y - 0.05154639f * LMS.z,
+                                                              1.03092784f * LMS.z,
+                   LMS.w);
+}
+
+static inline float4 vk_LMS_to_Yrg(const float4 LMS)
+{
+  const float Y = 0.68990272f * LMS.x + 0.34832189f * LMS.y;
+  const float a = LMS.x + LMS.y + LMS.z;
+  const float4 lms = (a == 0.0f) ? (float4)(0.0f) : LMS / a;
+  const float4 rgb = vk_LMS_to_gradingRGB(lms);
+  return (float4)(Y, rgb.x, rgb.y, LMS.w);
+}
+
+static inline float4 vk_Yrg_to_LMS(const float4 Yrg)
+{
+  const float Y = Yrg.x;
+  const float r = Yrg.y;
+  const float g = Yrg.z;
+  const float b = 1.0f - r - g;
+  const float4 rgb = (float4)(r, g, b, 0.0f);
+  const float4 lms = vk_gradingRGB_to_LMS(rgb);
+  const float denom = (0.68990272f * lms.x + 0.34832189f * lms.y);
+  const float a = (denom == 0.0f) ? 0.0f : Y / denom;
+  return lms * a;
+}
+
+static inline float4 vk_Yrg_to_Ych(const float4 Yrg)
+{
+  const float Y = Yrg.x;
+  const float r = Yrg.y - 0.21902143f;
+  const float g = Yrg.z - 0.54371398f;
+  const float c = vk_dt_fast_hypot(g, r);
+  const float cos_h = c != 0.0f ? r / c : 1.0f;
+  const float sin_h = c != 0.0f ? g / c : 0.0f;
+  return (float4)(Y, c, cos_h, sin_h);
+}
+
+static inline float4 vk_Ych_to_Yrg(const float4 Ych)
+{
+  const float Y = Ych.x;
+  const float c = Ych.y;
+  const float cos_h = Ych.z;
+  const float sin_h = Ych.w;
+  const float r = c * cos_h + 0.21902143f;
+  const float g = c * sin_h + 0.54371398f;
+  return (float4)(Y, r, g, 0.0f);
+}
+
+static inline float4 vk_gamut_check_Yrg(float4 Ych)
+{
+  const float4 Yrg = vk_Ych_to_Yrg(Ych);
+  const float D65_r = 0.21902143f;
+  const float D65_g = 0.54371398f;
+  float max_c = Ych.y;
+  const float cos_h = Ych.z;
+  const float sin_h = Ych.w;
+
+  if(Yrg.y < 0.0f)
+    max_c = fmin(-D65_r / cos_h, max_c);
+  if(Yrg.z < 0.0f)
+    max_c = fmin(-D65_g / sin_h, max_c);
+  if(Yrg.y + Yrg.z > 1.0f)
+    max_c = fmin((1.0f - D65_r - D65_g) / (cos_h + sin_h), max_c);
+
+  Ych.y = max_c;
+  return Ych;
+}
+
+static inline float4 vk_XYZ_to_JzAzBz(const float4 XYZ_D65)
+{
+  float4 temp1, temp2;
+  // XYZ -> X'Y'Z
+  temp1.x = 1.15f * XYZ_D65.x - 0.15f * XYZ_D65.z;
+  temp1.y = 0.66f * XYZ_D65.y + 0.34f * XYZ_D65.x;
+  temp1.z = XYZ_D65.z;
+  temp1.w = 0.0f;
+  // X'Y'Z -> LMS
+  temp2.x =  0.41478972f * temp1.x + 0.579999f * temp1.y + 0.0146480f * temp1.z;
+  temp2.y = -0.2015100f  * temp1.x + 1.120649f * temp1.y + 0.0531008f * temp1.z;
+  temp2.z = -0.0166008f  * temp1.x + 0.264800f * temp1.y + 0.6684799f * temp1.z;
+  temp2.w = 0.0f;
+  // LMS -> L'M'S'
+  temp2 = pow(fmax(temp2 / 10000.0f, 0.0f), (float4)(0.159301758f));
+  temp2 = pow((0.8359375f + 18.8515625f * temp2) / (1.0f + 18.6875f * temp2), (float4)(134.034375f));
+  // L'M'S' -> Izazbz
+  temp1.x = 0.5f * temp2.x + 0.5f * temp2.y;
+  temp1.y = 3.524000f * temp2.x - 4.066708f * temp2.y + 0.542708f * temp2.z;
+  temp1.z = 0.199076f * temp2.x + 1.096799f * temp2.y - 1.295875f * temp2.z;
+  // Iz -> Jz
+  temp1.x = fmax(0.44f * temp1.x / (1.0f - 0.56f * temp1.x) - 1.6295499532821566e-11f, 0.0f);
+  return temp1;
+}
+
+static inline float4 vk_JzAzBz_2_XYZ(const float4 JzAzBz)
+{
+  const float b = 1.15f;
+  const float g = 0.66f;
+  const float c1 = 0.8359375f;
+  const float c2 = 18.8515625f;
+  const float c3 = 18.6875f;
+  const float n_inv = 1.0f / 0.159301758f;
+  const float p_inv = 1.0f / 134.034375f;
+  const float d = -0.56f;
+  const float d0 = 1.6295499532821566e-11f;
+
+  float4 XYZ, LMS, IzAzBz;
+  // Jz -> Iz
+  IzAzBz = JzAzBz;
+  IzAzBz.x += d0;
+  IzAzBz.x = fmax(IzAzBz.x / (1.0f + d - d * IzAzBz.x), 0.0f);
+  // IzAzBz -> L'M'S'
+  LMS.x = 1.0f * IzAzBz.x + 0.1386050432715393f * IzAzBz.y + 0.0580473161561189f * IzAzBz.z;
+  LMS.y = 1.0f * IzAzBz.x - 0.1386050432715393f * IzAzBz.y - 0.0580473161561189f * IzAzBz.z;
+  LMS.z = 1.0f * IzAzBz.x - 0.0960192420263190f * IzAzBz.y - 0.8118918960560390f * IzAzBz.z;
+  LMS.w = 0.0f;
+  // L'M'S' -> LMS
+  LMS = pow(fmax(LMS, 0.0f), (float4)(p_inv));
+  LMS = 10000.0f * pow(fmax((c1 - LMS) / (c3 * LMS - c2), 0.0f), (float4)(n_inv));
+  // LMS -> X'Y'Z
+  XYZ.x =  1.9242264357876067f * LMS.x - 1.0047923125953657f * LMS.y + 0.0376514040306180f * LMS.z;
+  XYZ.y =  0.3503167620949991f * LMS.x + 0.7264811939316552f * LMS.y - 0.0653844229480850f * LMS.z;
+  XYZ.z = -0.0909828109828475f * LMS.x - 0.3127282905230739f * LMS.y + 1.5227665613052603f * LMS.z;
+  XYZ.w = 0.0f;
+  // X'Y'Z -> XYZ_D65
+  float4 XYZ_D65;
+  XYZ_D65.x = (XYZ.x + (b - 1.0f) * XYZ.z) / b;
+  XYZ_D65.y = (XYZ.y + (g - 1.0f) * XYZ_D65.x) / g;
+  XYZ_D65.z = XYZ.z;
+  XYZ_D65.w = JzAzBz.w;
+  return XYZ_D65;
+}
+
+static inline float vk_soft_clip(const float x, const float soft_threshold, const float hard_threshold)
+{
+  // exponential soft clipping above soft_threshold (hard > soft)
+  const float norm = hard_threshold - soft_threshold;
+  return (x > soft_threshold) ? soft_threshold + (1.0f - exp(-(x - soft_threshold) / norm)) * norm : x;
+}
+
+static inline float vk_lookup_gamut(global const float *gamut_lut, const float x)
+{
+  // linearly interpolate the gamut LUT at the hue angle in radians
+  const float x_test = (float)LUT_ELEM * (x + M_PI_F) / DT_2PI_F;
+  const float x_prev = floor(x_test);
+  const float x_next = ceil(x_test);
+  const int xi  = ((int)x_prev) & (LUT_ELEM - 1);
+  const int xii = ((int)x_next) & (LUT_ELEM - 1);
+  const float y_prev = gamut_lut[xi];
+  return y_prev + ((xi != xii) ? (x_test - x_prev) * (gamut_lut[xii] - y_prev) : 0.0f);
+}

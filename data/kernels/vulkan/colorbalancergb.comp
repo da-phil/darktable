@@ -1,0 +1,522 @@
+// GLSL fallback for colorbalancergb.cl.
+//
+// Mirrors extended.cl::colorbalancergb. Helpers are inlined GLSL twins
+// of the dt_vulkan_common.h / colorspace.h versions; keep them in sync.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define DT_PI    3.14159265358979323846
+#define DT_2PI   6.28318530717958647692
+#define FLT_MIN  1.175494351e-38
+#define LUT_ELEM 512
+#define DT_UCS_L_STAR_RANGE       2.098883786377
+#define DT_UCS_L_STAR_UPPER_LIMIT 2.09885
+#define DT_UCS_Y_UPPER_LIMIT      1e8
+#define SAT_JZAZBZ 0
+
+struct Params {
+    float shadows_weight;
+    float highlights_weight;
+    float midtones_weight;
+    float mask_grey_fulcrum;
+    float chroma_global;
+    float chroma[4];
+    float vibrance;
+    float hue_rotation_matrix[4];
+    float global_offset[4];
+    float shadows[4];
+    float highlights[4];
+    float midtones[4];
+    float white_fulcrum;
+    float midtones_Y;
+    float grey_fulcrum;
+    float contrast;
+    float brilliance_global;
+    float brilliance[4];
+    float saturation_global;
+    float saturation[4];
+    float L_white;
+    int   saturation_formula;
+    int   mask_display;
+    int   mask_type;
+    int   checker_1;
+    int   checker_2;
+    float checker_color_1[4];
+    float checker_color_2[4];
+};
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer PBuf { Params p;    } params;
+layout(std430, binding = 3) readonly buffer Min  { float data[]; } matrix_in;
+layout(std430, binding = 4) readonly buffer Mout { float data[]; } matrix_out;
+layout(std430, binding = 5) readonly buffer Glut { float data[]; } gamut_lut;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+} pc;
+
+float fast_hypot(float a, float b) { return sqrt(a * a + b * b); }
+
+vec4 ld4(float a[4]) { return vec4(a[0], a[1], a[2], a[3]); }
+
+vec4 LMS_to_gradingRGB(vec4 LMS) {
+    return vec4( 1.0877193  * LMS.x - 0.66666667 * LMS.y + 0.02061856 * LMS.z,
+                -0.0877193  * LMS.x + 1.66666667 * LMS.y - 0.05154639 * LMS.z,
+                                                          1.03092784 * LMS.z,
+                 LMS.w);
+}
+
+vec4 gradingRGB_to_LMS(vec4 RGB) {
+    return vec4(0.95 * RGB.x + 0.38 * RGB.y + 0.00 * RGB.z,
+                0.05 * RGB.x + 0.62 * RGB.y + 0.03 * RGB.z,
+                0.00 * RGB.x + 0.00 * RGB.y + 0.97 * RGB.z,
+                RGB.w);
+}
+
+vec4 LMS_to_XYZ(vec4 LMS) {
+    return vec4( 1.80794659 * LMS.x - 1.29971660 * LMS.y + 0.34785879 * LMS.z,
+                 0.61783960 * LMS.x + 0.39595453 * LMS.y - 0.04104687 * LMS.z,
+                -0.12546960 * LMS.x + 0.20478038 * LMS.y + 1.74274183 * LMS.z,
+                 LMS.w);
+}
+
+vec4 LMS_to_Yrg(vec4 LMS) {
+    float Y = 0.68990272 * LMS.x + 0.34832189 * LMS.y;
+    float a = LMS.x + LMS.y + LMS.z;
+    vec4 lms = (a == 0.0) ? vec4(0.0) : LMS / a;
+    vec4 rgb = LMS_to_gradingRGB(lms);
+    return vec4(Y, rgb.x, rgb.y, LMS.w);
+}
+
+vec4 Yrg_to_LMS(vec4 Yrg) {
+    float Y = Yrg.x;
+    float r = Yrg.y;
+    float g = Yrg.z;
+    float b = 1.0 - r - g;
+    vec4 rgb = vec4(r, g, b, 0.0);
+    vec4 lms = gradingRGB_to_LMS(rgb);
+    float denom = (0.68990272 * lms.x + 0.34832189 * lms.y);
+    float a = (denom == 0.0) ? 0.0 : Y / denom;
+    return lms * a;
+}
+
+vec4 Yrg_to_Ych(vec4 Yrg) {
+    float Y = Yrg.x;
+    float r = Yrg.y - 0.21902143;
+    float g = Yrg.z - 0.54371398;
+    float c = fast_hypot(g, r);
+    float cos_h = c != 0.0 ? r / c : 1.0;
+    float sin_h = c != 0.0 ? g / c : 0.0;
+    return vec4(Y, c, cos_h, sin_h);
+}
+
+vec4 Ych_to_Yrg(vec4 Ych) {
+    float Y = Ych.x;
+    float c = Ych.y;
+    float cos_h = Ych.z;
+    float sin_h = Ych.w;
+    float r = c * cos_h + 0.21902143;
+    float g = c * sin_h + 0.54371398;
+    return vec4(Y, r, g, 0.0);
+}
+
+vec4 gamut_check_Yrg(vec4 Ych) {
+    vec4 Yrg = Ych_to_Yrg(Ych);
+    float D65_r = 0.21902143;
+    float D65_g = 0.54371398;
+    float max_c = Ych.y;
+    float cos_h = Ych.z;
+    float sin_h = Ych.w;
+    if(Yrg.y < 0.0)            max_c = min(-D65_r / cos_h, max_c);
+    if(Yrg.z < 0.0)            max_c = min(-D65_g / sin_h, max_c);
+    if(Yrg.y + Yrg.z > 1.0)    max_c = min((1.0 - D65_r - D65_g) / (cos_h + sin_h), max_c);
+    Ych.y = max_c;
+    return Ych;
+}
+
+vec4 XYZ_to_JzAzBz(vec4 XYZ_D65) {
+    vec4 temp1, temp2;
+    temp1.x = 1.15 * XYZ_D65.x - 0.15 * XYZ_D65.z;
+    temp1.y = 0.66 * XYZ_D65.y + 0.34 * XYZ_D65.x;
+    temp1.z = XYZ_D65.z;
+    temp1.w = 0.0;
+    temp2.x =  0.41478972 * temp1.x + 0.579999 * temp1.y + 0.0146480 * temp1.z;
+    temp2.y = -0.2015100  * temp1.x + 1.120649 * temp1.y + 0.0531008 * temp1.z;
+    temp2.z = -0.0166008  * temp1.x + 0.264800 * temp1.y + 0.6684799 * temp1.z;
+    temp2.w = 0.0;
+    temp2 = pow(max(temp2 / 10000.0, 0.0), vec4(0.159301758));
+    temp2 = pow((0.8359375 + 18.8515625 * temp2) / (1.0 + 18.6875 * temp2), vec4(134.034375));
+    temp1.x = 0.5 * temp2.x + 0.5 * temp2.y;
+    temp1.y = 3.524000 * temp2.x - 4.066708 * temp2.y + 0.542708 * temp2.z;
+    temp1.z = 0.199076 * temp2.x + 1.096799 * temp2.y - 1.295875 * temp2.z;
+    temp1.x = max(0.44 * temp1.x / (1.0 - 0.56 * temp1.x) - 1.6295499532821566e-11, 0.0);
+    return temp1;
+}
+
+vec4 JzAzBz_2_XYZ(vec4 JzAzBz) {
+    float b = 1.15;
+    float g = 0.66;
+    float c1 = 0.8359375;
+    float c2 = 18.8515625;
+    float c3 = 18.6875;
+    float n_inv = 1.0 / 0.159301758;
+    float p_inv = 1.0 / 134.034375;
+    float d = -0.56;
+    float d0 = 1.6295499532821566e-11;
+    vec4 XYZ, LMS, IzAzBz;
+    IzAzBz = JzAzBz;
+    IzAzBz.x += d0;
+    IzAzBz.x = max(IzAzBz.x / (1.0 + d - d * IzAzBz.x), 0.0);
+    LMS.x = 1.0 * IzAzBz.x + 0.1386050432715393 * IzAzBz.y + 0.0580473161561189 * IzAzBz.z;
+    LMS.y = 1.0 * IzAzBz.x - 0.1386050432715393 * IzAzBz.y - 0.0580473161561189 * IzAzBz.z;
+    LMS.z = 1.0 * IzAzBz.x - 0.0960192420263190 * IzAzBz.y - 0.8118918960560390 * IzAzBz.z;
+    LMS.w = 0.0;
+    LMS = pow(max(LMS, 0.0), vec4(p_inv));
+    LMS = 10000.0 * pow(max((c1 - LMS) / (c3 * LMS - c2), 0.0), vec4(n_inv));
+    XYZ.x =  1.9242264357876067 * LMS.x - 1.0047923125953657 * LMS.y + 0.0376514040306180 * LMS.z;
+    XYZ.y =  0.3503167620949991 * LMS.x + 0.7264811939316552 * LMS.y - 0.0653844229480850 * LMS.z;
+    XYZ.z = -0.0909828109828475 * LMS.x - 0.3127282905230739 * LMS.y + 1.5227665613052603 * LMS.z;
+    XYZ.w = 0.0;
+    vec4 XYZ_D65;
+    XYZ_D65.x = (XYZ.x + (b - 1.0) * XYZ.z) / b;
+    XYZ_D65.y = (XYZ.y + (g - 1.0) * XYZ_D65.x) / g;
+    XYZ_D65.z = XYZ.z;
+    XYZ_D65.w = JzAzBz.w;
+    return XYZ_D65;
+}
+
+vec4 D65_XYZ_to_xyY(vec4 sXYZ) {
+    vec4 XYZ = max(vec4(0.0), sXYZ);
+    vec4 xyY;
+    float sum = XYZ.x + XYZ.y + XYZ.z;
+    if(sum > 0.0) { xyY.x = XYZ.x / sum; xyY.y = XYZ.y / sum; }
+    else          { xyY.x = 0.31271; xyY.y = 0.32902; }
+    xyY.z = XYZ.y;
+    xyY.w = sXYZ.w;
+    return xyY;
+}
+
+vec4 xyY_to_XYZ(vec4 xyY) {
+    vec4 XYZ = vec4(0.0, 0.0, 0.0, xyY.w);
+    if(xyY.y != 0.0) {
+        XYZ.x = xyY.z * xyY.x / xyY.y;
+        XYZ.y = xyY.z;
+        XYZ.z = xyY.z * (1.0 - xyY.x - xyY.y) / xyY.y;
+    }
+    return XYZ;
+}
+
+float Y_to_L_star(float Y) {
+    float Y_hat = pow(Y, 0.631651345306265);
+    return DT_UCS_L_STAR_RANGE * Y_hat / (Y_hat + 1.12426773749357);
+}
+
+float L_star_to_Y(float L_star) {
+    return pow((1.12426773749357 * L_star / (DT_UCS_L_STAR_RANGE - L_star)), 1.5831518565279648);
+}
+
+vec2 xyY_to_UCS_UV(vec4 xyY) {
+    vec4 x_factors = vec4(-0.783941002840055,  0.745273540913283, 0.318707282433486, 0.0);
+    vec4 y_factors = vec4( 0.277512987809202, -0.205375866083878, 2.16743692732158,  0.0);
+    vec4 offsets   = vec4( 0.153836578598858, -0.165478376301988, 0.291320554395942, 0.0);
+    vec4 UVD = x_factors * xyY.x + y_factors * xyY.y + offsets;
+    float div = (UVD.z >= 0.0) ? max(FLT_MIN, UVD.z) : min(-FLT_MIN, UVD.z);
+    UVD.x /= div;
+    UVD.y /= div;
+    vec2 factors     = vec2(1.39656225667, 1.4513954287);
+    vec2 half_values = vec2(1.49217352929, 1.52488637914);
+    vec2 UV_star = vec2(
+        factors.x * UVD.x / (abs(UVD.x) + half_values.x),
+        factors.y * UVD.y / (abs(UVD.y) + half_values.y));
+    return vec2(
+        -1.124983854323892 * UV_star.x - 0.980483721769325 * UV_star.y,
+         1.86323315098672  * UV_star.x + 1.971853092390862 * UV_star.y);
+}
+
+vec4 xyY_to_UCS_JCH(vec4 xyY, float L_white) {
+    vec2 UV_star_prime = xyY_to_UCS_UV(xyY);
+    float L_star = Y_to_L_star(clamp(xyY.z, 0.0, DT_UCS_Y_UPPER_LIMIT));
+    float M2 = UV_star_prime.x * UV_star_prime.x + UV_star_prime.y * UV_star_prime.y;
+    return vec4(
+        L_star / L_white,
+        15.932993652962535 * pow(L_star, 0.6523997524738018) * pow(M2, 0.6007557017508491) / L_white,
+        atan(UV_star_prime.y, UV_star_prime.x),
+        0.0);
+}
+
+vec4 UCS_JCH_to_xyY(vec4 JCH, float L_white) {
+    float L_star = clamp(JCH.x * L_white, 0.0, DT_UCS_L_STAR_UPPER_LIMIT);
+    float M = L_star != 0.0
+        ? pow(JCH.y * L_white / (15.932993652962535 * pow(L_star, 0.6523997524738018)), 0.8322850678616855)
+        : 0.0;
+    float U_star_prime = M * cos(JCH.z);
+    float V_star_prime = M * sin(JCH.z);
+    vec2 UV_star = vec2(
+        -5.037522385190711 * U_star_prime - 2.504856328185843 * V_star_prime,
+         4.760029407436461 * U_star_prime + 2.874012963239247 * V_star_prime);
+    vec2 factors     = vec2(1.39656225667, 1.4513954287);
+    vec2 half_values = vec2(1.49217352929, 1.52488637914);
+    vec2 UV = vec2(
+        -half_values.x * UV_star.x / (abs(UV_star.x) - factors.x),
+        -half_values.y * UV_star.y / (abs(UV_star.y) - factors.y));
+    vec4 U_factors = vec4( 0.167171472114775,   -0.150959086409163,    0.940254742367256,  0.0);
+    vec4 V_factors = vec4( 0.141299802443708,   -0.155185060382272,    1.000000000000000,  0.0);
+    vec4 offsets   = vec4(-0.00801531300850582, -0.00843312433578007, -0.0256325967652889, 0.0);
+    vec4 xyD = U_factors * UV.x + V_factors * UV.y + offsets;
+    float div = (xyD.z >= 0.0) ? max(FLT_MIN, xyD.z) : min(-FLT_MIN, xyD.z);
+    return vec4(xyD.x / div, xyD.y / div, L_star_to_Y(L_star), 0.0);
+}
+
+vec4 UCS_JCH_to_HSB(vec4 JCH) {
+    vec4 HSB;
+    HSB.z = JCH.x * (pow(JCH.y, 1.33654221029386) + 1.0);
+    HSB.y = (HSB.z > 0.0) ? JCH.y / HSB.z : 0.0;
+    HSB.x = JCH.z;
+    HSB.w = 0.0;
+    return HSB;
+}
+
+vec4 UCS_HSB_to_JCH(vec4 HSB) {
+    vec4 JCH;
+    JCH.z = HSB.x;
+    JCH.y = HSB.y * HSB.z;
+    JCH.x = HSB.z / (pow(JCH.y, 1.33654221029386) + 1.0);
+    JCH.w = 0.0;
+    return JCH;
+}
+
+vec4 UCS_JCH_to_HCB(vec4 JCH) {
+    vec4 HCB;
+    HCB.z = JCH.x * (pow(JCH.y, 1.33654221029386) + 1.0);
+    HCB.y = JCH.y;
+    HCB.x = JCH.z;
+    HCB.w = 0.0;
+    return HCB;
+}
+
+vec4 UCS_HCB_to_JCH(vec4 HCB) {
+    vec4 JCH;
+    JCH.z = HCB.x;
+    JCH.y = HCB.y;
+    JCH.x = HCB.z / (pow(HCB.y, 1.33654221029386) + 1.0);
+    JCH.w = 0.0;
+    return JCH;
+}
+
+float soft_clip(float x, float soft_threshold, float hard_threshold) {
+    float norm = hard_threshold - soft_threshold;
+    return (x > soft_threshold) ? soft_threshold + (1.0 - exp(-(x - soft_threshold) / norm)) * norm : x;
+}
+
+float lookup_gamut(float x) {
+    float x_test = float(LUT_ELEM) * (x + DT_PI) / DT_2PI;
+    float x_prev = floor(x_test);
+    float x_next = ceil(x_test);
+    int xi  = int(x_prev) & (LUT_ELEM - 1);
+    int xii = int(x_next) & (LUT_ELEM - 1);
+    float y_prev = gamut_lut.data[xi];
+    return y_prev + ((xi != xii) ? (x_test - x_prev) * (gamut_lut.data[xii] - y_prev) : 0.0);
+}
+
+vec4 opacity_masks(float x, float sw, float hw, float mw, float grey) {
+    float x_offset = (x - grey);
+    float x_offset_norm = x_offset / grey;
+    float alpha = 1.0 / (1.0 + exp(x_offset_norm * sw));
+    float beta  = 1.0 / (1.0 + exp(-x_offset_norm * hw));
+    float gamma = exp(-x_offset * x_offset * mw / 4.0)
+                  * (1.0 - alpha) * (1.0 - alpha)
+                  * (1.0 - beta)  * (1.0 - beta) * 8.0;
+    return vec4(alpha, gamma, beta, 0.0);
+}
+
+vec4 matrix_in_product(vec4 v) {
+    float R = matrix_in.data[0] * v.x + matrix_in.data[1] * v.y + matrix_in.data[2]  * v.z;
+    float G = matrix_in.data[4] * v.x + matrix_in.data[5] * v.y + matrix_in.data[6]  * v.z;
+    float B = matrix_in.data[8] * v.x + matrix_in.data[9] * v.y + matrix_in.data[10] * v.z;
+    return vec4(R, G, B, v.w);
+}
+
+vec4 matrix_out_product(vec4 v) {
+    float R = matrix_out.data[0] * v.x + matrix_out.data[1] * v.y + matrix_out.data[2]  * v.z;
+    float G = matrix_out.data[4] * v.x + matrix_out.data[5] * v.y + matrix_out.data[6]  * v.z;
+    float B = matrix_out.data[8] * v.x + matrix_out.data[9] * v.y + matrix_out.data[10] * v.z;
+    return vec4(R, G, B, v.w);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pix_in = max(vec4(0.0), in_buf.data[idx]);
+
+    vec4 chroma        = ld4(params.p.chroma);
+    vec4 global_offset = ld4(params.p.global_offset);
+    vec4 shadows       = ld4(params.p.shadows);
+    vec4 highlights    = ld4(params.p.highlights);
+    vec4 midtones      = ld4(params.p.midtones);
+    vec4 brilliance    = ld4(params.p.brilliance);
+    vec4 saturation    = ld4(params.p.saturation);
+    float L_white      = params.p.L_white;
+
+    vec4 RGB = pix_in;
+    vec4 LMS = matrix_in_product(RGB);
+    vec4 Yrg = LMS_to_Yrg(LMS);
+    vec4 Ych = Yrg_to_Ych(Yrg);
+
+    Ych.x = max(Ych.x, 0.0);
+    vec4 opacities = opacity_masks(pow(Ych.x, 0.4101205819200422),
+                                   params.p.shadows_weight, params.p.highlights_weight,
+                                   params.p.midtones_weight, params.p.mask_grey_fulcrum);
+    vec4 opacities_comp = vec4(1.0) - opacities;
+
+    float cos_h = Ych.z;
+    float sin_h = Ych.w;
+    Ych.z = params.p.hue_rotation_matrix[0] * cos_h + params.p.hue_rotation_matrix[1] * sin_h;
+    Ych.w = params.p.hue_rotation_matrix[2] * cos_h + params.p.hue_rotation_matrix[3] * sin_h;
+
+    float chroma_boost = params.p.chroma_global + dot(opacities, chroma);
+    float vib = params.p.vibrance * (1.0 - pow(Ych.y, abs(params.p.vibrance)));
+    float chroma_factor = max(1.0 + chroma_boost + vib, 0.0);
+    Ych.y *= chroma_factor;
+
+    Ych = gamut_check_Yrg(Ych);
+
+    Yrg = Ych_to_Yrg(Ych);
+    LMS = Yrg_to_LMS(Yrg);
+    RGB = LMS_to_gradingRGB(LMS);
+
+    RGB += global_offset;
+    RGB *= opacities_comp.z * (opacities_comp.x + opacities.x * shadows) + opacities.z * highlights;
+    RGB = sign(RGB) * pow(abs(RGB) / params.p.white_fulcrum, midtones) * params.p.white_fulcrum;
+
+    LMS = gradingRGB_to_LMS(RGB);
+    Yrg = LMS_to_Yrg(LMS);
+    Yrg.x = pow(max(Yrg.x / params.p.white_fulcrum, 0.0), params.p.midtones_Y) * params.p.white_fulcrum;
+    Yrg.x = params.p.grey_fulcrum * pow(Yrg.x / params.p.grey_fulcrum, params.p.contrast);
+
+    LMS = Yrg_to_LMS(Yrg);
+    vec4 XYZ_D65 = LMS_to_XYZ(LMS);
+
+    if(params.p.saturation_formula == SAT_JZAZBZ) {
+        vec4 Jab = XYZ_to_JzAzBz(XYZ_D65);
+        float JC0 = Jab.x;
+        float JC1 = fast_hypot(Jab.y, Jab.z);
+        float h = atan(Jab.z, Jab.y);
+
+        float T = atan(JC1, JC0);
+        float sin_T = sin(T);
+        float cos_T = cos(T);
+
+        float boost0 = 1.0 + params.p.brilliance_global + dot(opacities, brilliance);
+        float boost1 = params.p.saturation_global + dot(opacities, saturation);
+
+        float SO0 = JC0 * cos_T + JC1 * sin_T;
+        float SO1 = SO0 * clamp(T * boost1, -T, DT_PI / 2.0 - T);
+        SO0 = max(SO0 * boost0, 0.0);
+
+        JC0 = max(SO0 * cos_T + SO1 * (-sin_T), 0.0);
+        JC1 = max(SO0 * sin_T + SO1 * cos_T, 0.0);
+
+        float out_max_sat_h = lookup_gamut(h);
+        float sat = (JC0 > 0.0) ? soft_clip(JC1 / JC0, 0.8 * out_max_sat_h, out_max_sat_h) : out_max_sat_h;
+        float max_C_at_sat = JC0 * sat;
+        float max_J_at_sat = (sat > 0.0) ? JC1 / sat : JC0;
+        JC0 = (JC0 + max_J_at_sat) / 2.0;
+        JC1 = (JC1 + max_C_at_sat) / 2.0;
+
+        float cos_H = cos(h);
+        float sin_H = sin(h);
+        float d0 = 1.6295499532821566e-11;
+        float d = -0.56;
+        float Iz = JC0 + d0;
+        Iz /= (1.0 + d - d * Iz);
+        Iz = max(Iz, 0.0);
+
+        vec4 AI0 = vec4(1.0,  0.1386050432715393,  0.0580473161561189, 0.0);
+        vec4 AI1 = vec4(1.0, -0.1386050432715393, -0.0580473161561189, 0.0);
+        vec4 AI2 = vec4(1.0, -0.0960192420263190, -0.8118918960560390, 0.0);
+
+        vec4 IzAzBz = vec4(Iz, JC1 * cos_H, JC1 * sin_H, 0.0);
+        LMS.x = dot(AI0, IzAzBz);
+        LMS.y = dot(AI1, IzAzBz);
+        LMS.z = dot(AI2, IzAzBz);
+
+        float max_C = JC1;
+        if(LMS.x < 0.0) max_C = min(-Iz / (AI0.y * cos_H + AI0.z * sin_H), max_C);
+        if(LMS.y < 0.0) max_C = min(-Iz / (AI1.y * cos_H + AI1.z * sin_H), max_C);
+        if(LMS.z < 0.0) max_C = min(-Iz / (AI2.y * cos_H + AI2.z * sin_H), max_C);
+
+        Jab.x = JC0;
+        Jab.y = max_C * cos_H;
+        Jab.z = max_C * sin_H;
+        XYZ_D65 = JzAzBz_2_XYZ(Jab);
+    } else {
+        vec4 xyY = D65_XYZ_to_xyY(XYZ_D65);
+        vec4 JCH = xyY_to_UCS_JCH(xyY, L_white);
+        vec4 HCB = UCS_JCH_to_HCB(JCH);
+
+        float radius = fast_hypot(HCB.y, HCB.z);
+        float sin_T = (radius > 0.0) ? HCB.y / radius : 0.0;
+        float cos_T = (radius > 0.0) ? HCB.z / radius : 0.0;
+
+        float P = max(FLT_MIN, HCB.y);
+        float W = sin_T * HCB.y + cos_T * HCB.z;
+
+        float a = max(1.0 + params.p.saturation_global + dot(opacities, saturation), 0.0);
+        float b = max(1.0 + params.p.brilliance_global + dot(opacities, brilliance), 0.0);
+
+        float max_a = fast_hypot(P, W) / P;
+        a = soft_clip(a, 0.5 * max_a, max_a);
+
+        float P_prime = (a - 1.0) * P;
+        float W_prime = sqrt(P * P * (1.0 - a * a) + W * W) * b;
+
+        HCB.y = max(cos_T * P_prime + sin_T * W_prime, 0.0);
+        HCB.z = max(-sin_T * P_prime + cos_T * W_prime, 0.0);
+
+        JCH = UCS_HCB_to_JCH(HCB);
+
+        float max_colorfulness = lookup_gamut(JCH.z);
+        float max_chroma = 15.932993652962535 * pow(JCH.x * L_white, 0.6523997524738018)
+                           * pow(max_colorfulness, 0.6007557017508491) / L_white;
+        vec4 JCH_gamut_boundary = vec4(JCH.x, max_chroma, JCH.z, 0.0);
+        vec4 HSB_gamut_boundary = UCS_JCH_to_HSB(JCH_gamut_boundary);
+
+        vec4 HSB = vec4(HCB.x, (HCB.z > 0.0) ? HCB.y / HCB.z : 0.0, HCB.z, 0.0);
+        HSB.y = soft_clip(HSB.y, 0.8 * HSB_gamut_boundary.y, HSB_gamut_boundary.y);
+
+        JCH = UCS_HSB_to_JCH(HSB);
+        xyY = UCS_JCH_to_xyY(JCH, L_white);
+        XYZ_D65 = xyY_to_XYZ(xyY);
+    }
+
+    RGB = matrix_out_product(XYZ_D65);
+
+    if(params.p.mask_display != 0) {
+        vec4 color;
+        if(x % params.p.checker_1 < x % params.p.checker_2) {
+            if(y % params.p.checker_1 < y % params.p.checker_2) color = ld4(params.p.checker_color_2);
+            else                                                color = ld4(params.p.checker_color_1);
+        } else {
+            if(y % params.p.checker_1 < y % params.p.checker_2) color = ld4(params.p.checker_color_1);
+            else                                                color = ld4(params.p.checker_color_2);
+        }
+        float opacity = (params.p.mask_type == 0) ? opacities.x
+                      : (params.p.mask_type == 1) ? opacities.y
+                      : (params.p.mask_type == 2) ? opacities.z
+                      :                             opacities.w;
+        float opacity_comp = 1.0 - opacity;
+        RGB = opacity_comp * color + opacity * max(RGB, 0.0);
+        RGB.w = 1.0;
+    } else {
+        RGB = max(RGB, 0.0);
+        RGB.w = pix_in.w;
+    }
+
+    out_buf.data[idx] = RGB;
+}

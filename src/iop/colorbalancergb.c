@@ -24,6 +24,7 @@
 #include "common/darktable_ucs_22_helpers.h"
 #include "common/gamut_mapping.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -161,6 +162,7 @@ typedef struct dt_iop_colorbalancergb_data_t
 typedef struct dt_iop_colorbalance_global_data_t
 {
   int kernel_colorbalance_rgb;
+  dt_vk_module_kernel_t vk;
 } dt_iop_colorbalancergb_global_data_t;
 
 
@@ -1064,25 +1066,182 @@ error:
   dt_opencl_release_mem_object(hue_rotation_matrix_cl);
   return err;
 }
+#endif // HAVE_OPENCL
+
+// Push constants for the Vulkan kernel (defined unconditionally so
+// init_global can size it even on HAVE_VULKAN=0 builds).
+typedef struct vk_colorbalancergb_pc_t
+{
+  int width;
+  int height;
+} vk_colorbalancergb_pc_t;
+
+#ifdef HAVE_VULKAN
+// Flat all-4-byte parameter block uploaded as a storage buffer (the
+// ~50 scalar/vector kernel args exceed the 128 B push-constant budget,
+// so we follow the agx params-struct-in-storage-buffer pattern). The
+// field order and std430 offsets are verified against
+// data/kernels/vulkan/colorbalancergb.{cl,comp} (spirv-dis: members at
+// consecutive 4-byte offsets, total 232 B).
+typedef struct vk_colorbalancergb_params_t
+{
+  float shadows_weight;
+  float highlights_weight;
+  float midtones_weight;
+  float mask_grey_fulcrum;
+  float chroma_global;
+  float chroma[4];
+  float vibrance;
+  float hue_rotation_matrix[4];
+  float global_offset[4];
+  float shadows[4];
+  float highlights[4];
+  float midtones[4];
+  float white_fulcrum;
+  float midtones_Y;
+  float grey_fulcrum;
+  float contrast;
+  float brilliance_global;
+  float brilliance[4];
+  float saturation_global;
+  float saturation[4];
+  float L_white;
+  int   saturation_formula;
+  int   mask_display;
+  int   mask_type;
+  int   checker_1;
+  int   checker_2;
+  float checker_color_1[4];
+  float checker_color_2[4];
+} vk_colorbalancergb_params_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorbalancergb_data_t *const d = piece->data;
+  const dt_iop_colorbalancergb_global_data_t *const gd = self->global_data;
+  const dt_iop_colorbalancergb_gui_data_t *g = self->gui_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile
+      = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(work_profile == NULL) return -1;
+
+  // Premultiply the conversion matrices host-side (work profile baked
+  // in), exactly like process_cl, so the kernel does one matmul per
+  // pixel and needs no ICC profile_info binding.
+  dt_colormatrix_t input_matrix;
+  dt_colormatrix_t output_matrix;
+  dt_colormatrix_mul(output_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in); // temp buffer
+  dt_colormatrix_mul(input_matrix, XYZ_D65_to_LMS_2006_D65, output_matrix);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  const gint mask_display
+      = dt_pipe_is_full(piece->pipe) && self->dev->gui_attached && g && g->mask_display;
+  const int checker_1 = (mask_display) ? DT_PIXEL_APPLY_DPI(d->checker_size) : 0;
+  const int checker_2 = 2 * checker_1;
+  const int mask_type = (mask_display) ? g->mask_type : 0;
+  const float L_white = Y_to_dt_UCS_L_star(d->white_fulcrum);
+
+  vk_colorbalancergb_params_t p;
+  memset(&p, 0, sizeof(p));
+  p.shadows_weight    = d->shadows_weight;
+  p.highlights_weight = d->highlights_weight;
+  p.midtones_weight   = d->midtones_weight;
+  p.mask_grey_fulcrum = d->mask_grey_fulcrum;
+  p.chroma_global     = d->chroma_global;
+  for(int c = 0; c < 4; c++) p.chroma[c] = d->chroma[c];
+  p.vibrance          = d->vibrance;
+  p.hue_rotation_matrix[0] = cosf(d->hue_angle);
+  p.hue_rotation_matrix[1] = -sinf(d->hue_angle);
+  p.hue_rotation_matrix[2] = sinf(d->hue_angle);
+  p.hue_rotation_matrix[3] = cosf(d->hue_angle);
+  for(int c = 0; c < 4; c++) p.global_offset[c] = d->global[c];
+  for(int c = 0; c < 4; c++) p.shadows[c]       = d->shadows[c];
+  for(int c = 0; c < 4; c++) p.highlights[c]    = d->highlights[c];
+  for(int c = 0; c < 4; c++) p.midtones[c]      = d->midtones[c];
+  p.white_fulcrum     = d->white_fulcrum;
+  p.midtones_Y        = d->midtones_Y;
+  p.grey_fulcrum      = d->grey_fulcrum;
+  p.contrast          = d->contrast;
+  p.brilliance_global = d->brilliance_global;
+  for(int c = 0; c < 4; c++) p.brilliance[c] = d->brilliance[c];
+  p.saturation_global = d->saturation_global;
+  for(int c = 0; c < 4; c++) p.saturation[c] = d->saturation[c];
+  p.L_white            = L_white;
+  p.saturation_formula = (int)d->saturation_formula;
+  p.mask_display       = mask_display ? 1 : 0;
+  p.mask_type          = mask_type;
+  p.checker_1          = checker_1;
+  p.checker_2          = checker_2;
+  for(int c = 0; c < 4; c++) p.checker_color_1[c] = d->checker_color_1[c];
+  for(int c = 0; c < 4; c++) p.checker_color_2[c] = d->checker_color_2[c];
+
+  int rc = -1;
+  dt_vk_mem_t *dev_params = dt_vulkan_alloc_buffer(devid, sizeof(p));
+  dt_vk_mem_t *dev_min    = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
+  dt_vk_mem_t *dev_mout   = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
+  dt_vk_mem_t *dev_gamut  = dt_vulkan_alloc_buffer(devid, LUT_ELEM * sizeof(float));
+  if(!dev_params || !dev_min || !dev_mout || !dev_gamut) goto cleanup;
+
+  const vk_colorbalancergb_pc_t pc = { .width = width, .height = height };
+  dt_vk_mem_t *bufs[6] = { dev_in, dev_out, dev_params, dev_min, dev_mout, dev_gamut };
+  const dt_vk_upload_t uploads[] = {
+    { dev_params, &p,            sizeof(p) },
+    { dev_min,    input_matrix,  12 * sizeof(float) },
+    { dev_mout,   output_matrix, 12 * sizeof(float) },
+    { dev_gamut,  d->gamut_LUT,  LUT_ELEM * sizeof(float) },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 6,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_params);
+  dt_vulkan_free_buffer(devid, dev_min);
+  dt_vulkan_free_buffer(devid, dev_mout);
+  dt_vulkan_free_buffer(devid, dev_gamut);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 8; // extended.cl in programs.conf
   dt_iop_colorbalancergb_global_data_t *gd = malloc(sizeof(dt_iop_colorbalancergb_global_data_t));
-
   self->data = gd;
+#if HAVE_OPENCL
+  const int program = 8; // extended.cl in programs.conf
   gd->kernel_colorbalance_rgb = dt_opencl_create_kernel(program, "colorbalancergb");
+#else
+  gd->kernel_colorbalance_rgb = -1;
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk, "colorbalancergb", "colorbalancergb",
+                               6, sizeof(vk_colorbalancergb_pc_t),
+                               16, 16, 1);
 }
 
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_colorbalancergb_global_data_t *gd = self->data;
-  dt_opencl_free_kernel(gd->kernel_colorbalance_rgb);
-  free(self->data);
-  self->data = NULL;
-}
+  dt_iop_colorbalancergb_global_data_t *gd = self->data;
+  if(gd)
+  {
+#if HAVE_OPENCL
+    dt_opencl_free_kernel(gd->kernel_colorbalance_rgb);
 #endif
+    dt_vulkan_module_kernel_unload(&gd->vk);
+    free(self->data);
+    self->data = NULL;
+  }
+}
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
