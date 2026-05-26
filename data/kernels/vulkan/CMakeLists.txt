@@ -86,7 +86,8 @@ set(VK_KERNELS
     colorharmonizer_apply:colorharmonizer_apply
     colorbalancergb:colorbalancergb
     basecurve_legacy_lut:basecurve_legacy_lut
-    basecurve_lut:basecurve_lut)
+    basecurve_lut:basecurve_lut
+    colorchecker:colorchecker)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
