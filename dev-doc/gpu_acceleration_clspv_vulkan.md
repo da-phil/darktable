@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 37 modules currently expose `process_vk`,
+**Per-module ports**: 38 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -229,6 +229,7 @@ in three categories.
 | `src/iop/channelmixer.c` | Legacy 3-channel mixer (the deprecated predecessor of `channelmixerrgb`). 4-binding dispatch (in, out, hsl_matrix, rgb_matrix — both 9-float storage buffers) and a single entry point that switches on `operation_mode` (RGB / GRAY / HSL_V1 / HSL_V2). 12 B PC (2 ints + 1 enum int). HSL_V1 and HSL_V2 paths reuse the existing `vk_RGB_to_HSL` / `vk_HSL_to_RGB` helpers from splittoning's color cohort. |
 | `src/iop/colorharmonizer.c` | Hue-harmonisation toward Gaussian-weighted nodes in dt UCS JCH space. First port to consume the new `vk_xyY_to_dt_UCS_JCH` / `vk_dt_UCS_JCH_to_xyY` helpers in `dt_vulkan_common.h`. Three-stage `process_vk`: a 6-binding **map** kernel (in, p_out, jch_out, matrix_in, nodes, node_saturation) converts to UCS, computes the per-pixel hue shift + saturation correction, and caches the forward UCS JCH so the apply pass doesn't redo it; the §5.10 `dt_gaussian_blur_vk` smooths the correction map (the `corrections` buffer is padded to float4 so the existing 4-channel Gaussian helper applies — only `.xy` carry data, `.zw` stays zero); a 4-binding **apply** kernel (out, matrix_out, jch_in, corrections) does the JCH→xyY→XYZ→work-profile RGB walk and writes the output. 20 B PC each. Both kernels are batched (matrix + node uploads piggyback the kernel dispatch). |
 | `src/iop/colorbalancergb.c` | Scene-referred color balance in CIE 2006 LMS / Filmlight Yrg-Ych, with a perceptual saturation/brilliance pass in either JzAzBz (2021) or darktable UCS (2022) — both branches in one entry point switched on `saturation_formula`. The ~50 scalar/vector kernel args exceed the 128 B push-constant budget, so (like `agx`) the parameter block migrates into a storage buffer: `vk_colorbalancergb_params_t` is a flat all-4-byte struct (std430 == the C struct, verified by `spirv-dis` — members at consecutive offsets, total 232 B). 6-binding dispatch (in, out, params, matrix_in, matrix_out, gamut_lut); 8 B PC (width, height). The work profile is baked into the two host-premultiplied 3×4 matrices, so no ICC `profile_info` binding is needed (the OpenCL kernel takes one but never reads it). Added a cohort of reusable colour-science helpers to `dt_vulkan_common.h` — `vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_LMS_to_gradingRGB` / `vk_gradingRGB_to_LMS` / `vk_LMS_to_XYZ` / `vk_gamut_check_Yrg` / `vk_XYZ_to_JzAzBz` / `vk_JzAzBz_2_XYZ` / `vk_dt_UCS_{JCH↔HCB,JCH↔HSB}` / `vk_soft_clip` / `vk_lookup_gamut` — ported byte-for-byte from `colorspace.h` (the future `filmicrgb` / Yrg ports reuse these). The mask-display checkerboard preview ports too; it only runs in the gui-attached full pipe. |
+| `src/iop/basecurve.c` | Base curve, non-fusion path only. Two kernels lifted straight off the curve-cohort template: `basecurve_legacy_lut` (3-binding per-channel `vk_lookup_unbounded`, 24 B PC) and `basecurve_lut` (5-binding norm-preserving via the §5.11 `vk_dt_rgb_norm` plumbing, 32 B PC); `process_vk` dispatches the matching slot on `d->preserve_colors`. The exposure-fusion path (Laplacian pyramids over `image2d`) needs §8.5 sampler support, so it stays on OpenCL/CPU — `commit_params` clears `process_vk_ready` when `exposure_fusion != 0` (the §10.2 predictive pattern), and `process_vk` belt-and-suspenders returns -1 for it. Validated end-to-end on lavapipe: an identity-ramp LUT round-trips to the input on both kernels (max error 1.3e-5 = LUT quantization), exercising the lookup + norm + ratio-scale paths. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -274,8 +275,11 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   profile plumbing §5.11), `lowlight` (template for the next LUT
   consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
-  LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
-  sampled image). Done in earlier passes:
+  LUTs: `lut3d` (3D LUT — needs a 256³ float buffer or sampled
+  image, blocked on §8.5). Done in earlier passes:
+  `basecurve` (non-fusion path — the two LUT kernels off the
+  curve-cohort template; the Laplacian-pyramid fusion path needs
+  §8.5 and stays on OpenCL via a `process_vk_ready` gate),
   `colorbalancergb` (LMS/Yrg/Ych/JzAzBz/dt-UCS scene-referred
   balance; `agx`-style params-struct-in-storage-buffer for the
   >128 B arg block + a reusable colour-science helper cohort added
@@ -1160,7 +1164,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   37 modules now expose `process_vk`, covering the simple per-pixel
+   38 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1175,7 +1179,9 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    shadhi — each chains §5.10 / §5.13 with a mix kernel), and the
    scene-referred Yrg/dt-UCS cohort (colorharmonizer, plus
    colorbalancergb — `agx`-style params struct + the LMS/Yrg/
-   JzAzBz/dt-UCS helper set in `dt_vulkan_common.h`). All are
+   JzAzBz/dt-UCS helper set in `dt_vulkan_common.h`), and the
+   non-fusion base curve (basecurve — its two LUT kernels, with
+   the exposure-fusion path gated to OpenCL). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives

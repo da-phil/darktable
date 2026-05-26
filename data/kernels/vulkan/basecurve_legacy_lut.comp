@@ -1,0 +1,42 @@
+// GLSL fallback for basecurve_legacy_lut.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Tbl  { float data[]; } table;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float mul;
+    float c0; float c1; float c2;
+} pc;
+
+#define VK_LUT_SIZE 0x10000
+
+float vk_lookup(float x) {
+    int xi = clamp(int(x * float(VK_LUT_SIZE)), 0, VK_LUT_SIZE - 1);
+    return table.data[xi];
+}
+
+float vk_unbounded(float x, float c0, float c1, float c2) {
+    if(c0 < 0.0) return x;
+    if(x < 1.0) return vk_lookup(x);
+    return c1 * pow(x * c0, c2);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    pixel.x = vk_unbounded(pc.mul * pixel.x, pc.c0, pc.c1, pc.c2);
+    pixel.y = vk_unbounded(pc.mul * pixel.y, pc.c0, pc.c1, pc.c2);
+    pixel.z = vk_unbounded(pc.mul * pixel.z, pc.c0, pc.c1, pc.c2);
+    pixel = max(pixel, 0.0);
+    out_buf.data[idx] = pixel;
+}
