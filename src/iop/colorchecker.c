@@ -20,6 +20,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/exif.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -110,6 +111,7 @@ typedef struct dt_iop_colorchecker_data_t
 typedef struct dt_iop_colorchecker_global_data_t
 {
   int kernel_colorchecker;
+  dt_vk_module_kernel_t vk;
 } dt_iop_colorchecker_global_data_t;
 
 
@@ -722,6 +724,66 @@ error:
 }
 #endif
 
+// Defined unconditionally so init_global can size it on HAVE_VULKAN=0 builds.
+typedef struct vk_colorchecker_pc_t
+{
+  int width;
+  int height;
+  int num_patches;
+} vk_colorchecker_pc_t;
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorchecker_data_t *const d = piece->data;
+  const dt_iop_colorchecker_global_data_t *const gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int num_patches = d->num_patches;
+
+  // Same packing as process_cl: float4[ source x N | coeff x (N+4) ].
+  const size_t params_floats = (size_t)(4 * (2 * num_patches + 4));
+  const size_t params_bytes  = params_floats * sizeof(float);
+  float *params = malloc(params_bytes);
+  if(!params) return -1;
+  float *idx = params;
+  for(int n = 0; n < num_patches; n++, idx += 4)
+  {
+    idx[0] = d->source_Lab[3 * n];
+    idx[1] = d->source_Lab[3 * n + 1];
+    idx[2] = d->source_Lab[3 * n + 2];
+    idx[3] = 0.0f;
+  }
+  for(int n = 0; n < num_patches + 4; n++, idx += 4)
+  {
+    idx[0] = d->coeff_L[n];
+    idx[1] = d->coeff_a[n];
+    idx[2] = d->coeff_b[n];
+    idx[3] = 0.0f;
+  }
+
+  int rc = -1;
+  dt_vk_mem_t *dev_params = dt_vulkan_alloc_buffer(devid, params_bytes);
+  if(!dev_params) goto cleanup;
+
+  const vk_colorchecker_pc_t pc = { .width = width, .height = height, .num_patches = num_patches };
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_params };
+  const dt_vk_upload_t uploads[] = { { dev_params, params, params_bytes } };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 3,
+                                    uploads, 1, width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(dev_params) dt_vulkan_free_buffer(devid, dev_params);
+  free(params);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 
 void commit_params(dt_iop_module_t *self,
                    dt_iop_params_t *p1,
@@ -1078,12 +1140,15 @@ void init_global(dt_iop_module_so_t *self)
 
   const int program = 8; // extended.cl, from programs.conf
   gd->kernel_colorchecker = dt_opencl_create_kernel(program, "colorchecker");
+  dt_vulkan_module_kernel_load(&gd->vk, "colorchecker", "colorchecker",
+                               3, sizeof(vk_colorchecker_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_colorchecker_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colorchecker);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
