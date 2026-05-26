@@ -22,6 +22,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/rgb_norms.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -354,6 +355,8 @@ typedef struct dt_iop_basecurve_global_data_t
   int kernel_basecurve_normalize;
   int kernel_basecurve_reconstruct;
   int kernel_basecurve_finalize;
+  dt_vk_module_kernel_t vk_legacy; // basecurve_legacy_lut (per-channel)
+  dt_vk_module_kernel_t vk_lut;    // basecurve_lut (norm-preserving)
 } dt_iop_basecurve_global_data_t;
 
 
@@ -959,6 +962,100 @@ int process_cl(dt_iop_module_t *self,
 
 #endif
 
+#ifdef HAVE_VULKAN
+// Push constants for the two non-fusion LUT kernels.
+typedef struct vk_basecurve_legacy_pc_t
+{
+  int   width;
+  int   height;
+  float mul;
+  float c0, c1, c2;
+} vk_basecurve_legacy_pc_t;
+
+typedef struct vk_basecurve_lut_pc_t
+{
+  int   width;
+  int   height;
+  int   preserve_colors;
+  int   use_work_profile;
+  float mul;
+  float c0, c1, c2;
+} vk_basecurve_lut_pc_t;
+
+// Non-fusion base curve only. The exposure-fusion path (Laplacian
+// pyramids over image2d) needs §8.5 sampler support, so it stays on
+// OpenCL/CPU; commit_params clears process_vk_ready when fusion is on
+// (the §10.2 predictive pattern), and we belt-and-suspenders return -1
+// here too.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_basecurve_data_t *const d = piece->data;
+  const dt_iop_basecurve_global_data_t *const gd = self->global_data;
+  if(d->exposure_fusion) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+
+  dt_vk_mem_t *dev_table = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_table) return -1;
+  int rc = -1;
+
+  if(d->preserve_colors == DT_RGB_NORM_NONE)
+  {
+    const vk_basecurve_legacy_pc_t pc = {
+      .width = width, .height = height, .mul = 1.0f,
+      .c0 = d->unbounded_coeffs[0], .c1 = d->unbounded_coeffs[1], .c2 = d->unbounded_coeffs[2],
+    };
+    dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_table };
+    const dt_vk_upload_t uploads[] = { { dev_table, d->table, lut_bytes } };
+    rc = dt_vulkan_dispatch_n_batched(&gd->vk_legacy, bufs, 3,
+                                      uploads, 1, width, height, &pc, sizeof(pc));
+    dt_vulkan_free_buffer(devid, dev_table);
+    return rc;
+  }
+
+  // norm-preserving: needs the §5.11 ICC profile plumbing
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_iop_work_profile_info(piece->module, piece->module->dev->iop);
+
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL, *dev_profile_lut = NULL;
+
+  dt_vk_upload_t uploads[3] = { { dev_table, d->table, lut_bytes } };
+  size_t upload_count = 1;
+  if(dt_ioppr_build_iccprofile_params_vk_deferred(
+       work_profile, devid, &profile_info_vk, &profile_lut_vk,
+       &dev_profile_info, &dev_profile_lut,
+       uploads, sizeof(uploads) / sizeof(uploads[0]), &upload_count) != 0)
+    goto cleanup;
+
+  const vk_basecurve_lut_pc_t pc = {
+    .width = width, .height = height,
+    .preserve_colors = d->preserve_colors,
+    .use_work_profile = (work_profile == NULL) ? 0 : 1,
+    .mul = 1.0f,
+    .c0 = d->unbounded_coeffs[0], .c1 = d->unbounded_coeffs[1], .c2 = d->unbounded_coeffs[2],
+  };
+  dt_vk_mem_t *bufs[5] = { dev_in, dev_out, dev_table, dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk_lut, bufs, 5,
+                                    uploads, upload_count,
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  dt_vulkan_free_buffer(devid, dev_table);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -1408,6 +1505,14 @@ void commit_params(dt_iop_module_t *self,
   d->exposure_bias = p->exposure_bias;
   d->preserve_colors = p->preserve_colors;
 
+#ifdef HAVE_VULKAN
+  // The exposure-fusion path (Laplacian pyramids over image2d) has no
+  // Vulkan port yet; mark the piece VK-ineligible so the chain-ahead
+  // heuristic doesn't route a wasted CL→VK→CPU round-trip through it.
+  if(d->exposure_fusion)
+    piece->process_vk_ready = FALSE;
+#endif
+
   const int ch = 0;
   // take care of possible change of curve type or number of nodes (not yet implemented in UI)
   if(d->basecurve_type != p->basecurve_type[ch] || d->basecurve_nodes != p->basecurve_nodes[ch])
@@ -1508,6 +1613,10 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_basecurve_normalize = dt_opencl_create_kernel(program, "basecurve_normalize");
   gd->kernel_basecurve_reconstruct = dt_opencl_create_kernel(program, "basecurve_reconstruct");
   gd->kernel_basecurve_finalize = dt_opencl_create_kernel(program, "basecurve_finalize");
+  dt_vulkan_module_kernel_load(&gd->vk_legacy, "basecurve_legacy_lut", "basecurve_legacy_lut",
+                               3, sizeof(vk_basecurve_legacy_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_lut, "basecurve_lut", "basecurve_lut",
+                               5, sizeof(vk_basecurve_lut_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -1528,6 +1637,8 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_basecurve_normalize);
   dt_opencl_free_kernel(gd->kernel_basecurve_reconstruct);
   dt_opencl_free_kernel(gd->kernel_basecurve_finalize);
+  dt_vulkan_module_kernel_unload(&gd->vk_legacy);
+  dt_vulkan_module_kernel_unload(&gd->vk_lut);
   free(self->data);
   self->data = NULL;
 }
