@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 36 modules currently expose `process_vk`,
+**Per-module ports**: 37 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -228,6 +228,7 @@ in three categories.
 | `src/iop/agx.c` | AgX-inspired tone mapper. First port to migrate a kernel parameter struct out of push-constants: the OpenCL signature took `dt_iop_agx_tone_mapping_params_t` by value (124 B = 27 floats + 4 ints), which exceeded the 128 B PC budget once `width`/`height`/`base_working_same_profile` were added. The Vulkan kernel binds the struct as a storage buffer instead; std430 layout matches the C struct's flat 4-byte-aligned scalar fields byte-for-byte (verified against `OpMemberDecorate ... Offset` chain — 31 fields at consecutive 4-byte offsets, total 124 B). 7-binding dispatch (in, out, params, m_pb, m_br, m_rp, m_rxyz — four matrices as 9-float storage buffers packed via `pack_3xSSE_to_3x3`); 12 B PC (3 ints). Uses the `vk_RGB_to_HSV` / `vk_HSV_to_RGB` helpers landed in the prior commit for the optional hue-restore step. The toe / linear / shoulder curve with fallback branches and the gamut-compression preroll are mirrored byte-for-byte from the OpenCL kernel. |
 | `src/iop/channelmixer.c` | Legacy 3-channel mixer (the deprecated predecessor of `channelmixerrgb`). 4-binding dispatch (in, out, hsl_matrix, rgb_matrix — both 9-float storage buffers) and a single entry point that switches on `operation_mode` (RGB / GRAY / HSL_V1 / HSL_V2). 12 B PC (2 ints + 1 enum int). HSL_V1 and HSL_V2 paths reuse the existing `vk_RGB_to_HSL` / `vk_HSL_to_RGB` helpers from splittoning's color cohort. |
 | `src/iop/colorharmonizer.c` | Hue-harmonisation toward Gaussian-weighted nodes in dt UCS JCH space. First port to consume the new `vk_xyY_to_dt_UCS_JCH` / `vk_dt_UCS_JCH_to_xyY` helpers in `dt_vulkan_common.h`. Three-stage `process_vk`: a 6-binding **map** kernel (in, p_out, jch_out, matrix_in, nodes, node_saturation) converts to UCS, computes the per-pixel hue shift + saturation correction, and caches the forward UCS JCH so the apply pass doesn't redo it; the §5.10 `dt_gaussian_blur_vk` smooths the correction map (the `corrections` buffer is padded to float4 so the existing 4-channel Gaussian helper applies — only `.xy` carry data, `.zw` stays zero); a 4-binding **apply** kernel (out, matrix_out, jch_in, corrections) does the JCH→xyY→XYZ→work-profile RGB walk and writes the output. 20 B PC each. Both kernels are batched (matrix + node uploads piggyback the kernel dispatch). |
+| `src/iop/colorbalancergb.c` | Scene-referred color balance in CIE 2006 LMS / Filmlight Yrg-Ych, with a perceptual saturation/brilliance pass in either JzAzBz (2021) or darktable UCS (2022) — both branches in one entry point switched on `saturation_formula`. The ~50 scalar/vector kernel args exceed the 128 B push-constant budget, so (like `agx`) the parameter block migrates into a storage buffer: `vk_colorbalancergb_params_t` is a flat all-4-byte struct (std430 == the C struct, verified by `spirv-dis` — members at consecutive offsets, total 232 B). 6-binding dispatch (in, out, params, matrix_in, matrix_out, gamut_lut); 8 B PC (width, height). The work profile is baked into the two host-premultiplied 3×4 matrices, so no ICC `profile_info` binding is needed (the OpenCL kernel takes one but never reads it). Added a cohort of reusable colour-science helpers to `dt_vulkan_common.h` — `vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_LMS_to_gradingRGB` / `vk_gradingRGB_to_LMS` / `vk_LMS_to_XYZ` / `vk_gamut_check_Yrg` / `vk_XYZ_to_JzAzBz` / `vk_JzAzBz_2_XYZ` / `vk_dt_UCS_{JCH↔HCB,JCH↔HSB}` / `vk_soft_clip` / `vk_lookup_gamut` — ported byte-for-byte from `colorspace.h` (the future `filmicrgb` / Yrg ports reuse these). The mask-display checkerboard preview ports too; it only runs in the gui-attached full pipe. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -274,8 +275,11 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
   LUTs: `basecurve`, `lut3d` (3D LUT — needs a 256³ float buffer or
-  sampled image), `colorbalancergb`. Each is ~50 LOC module + ~80
-  LOC kernel. Done in earlier passes:
+  sampled image). Done in earlier passes:
+  `colorbalancergb` (LMS/Yrg/Ych/JzAzBz/dt-UCS scene-referred
+  balance; `agx`-style params-struct-in-storage-buffer for the
+  >128 B arg block + a reusable colour-science helper cohort added
+  to `dt_vulkan_common.h`),
   `basicadj` (second consumer of the §5.11 plumbing; full
   6-feature ICC-aware kernel), `rgbcurve` / `rgblevels` /
   `tonecurve` (the Lab/RGB curve cohort, all sharing the 7-binding
@@ -528,6 +532,19 @@ The RGB↔HSL helpers (`vk_RGB_to_HSL`, `vk_HSL_to_RGB`,
 here. Keep additions to colour-space code byte-for-byte equivalent
 to the matching helpers in `data/kernels/colorspace.h`; the two
 files are an intentional duplicate that has to stay in sync.
+
+The dt UCS appearance model (`vk_xyY_to_dt_UCS_JCH`,
+`vk_dt_UCS_JCH_to_xyY`, and the `…_HCB`/`…_HSB` cylindrical forms)
+and the scene-referred CIE 2006 LMS / Filmlight Yrg-Ych cohort
+(`vk_LMS_to_Yrg`, `vk_Yrg_to_Ych`, `vk_Ych_to_Yrg`, `vk_Yrg_to_LMS`,
+`vk_LMS_to_gradingRGB`, `vk_gradingRGB_to_LMS`, `vk_LMS_to_XYZ`,
+`vk_gamut_check_Yrg`), plus `vk_XYZ_to_JzAzBz` / `vk_JzAzBz_2_XYZ`,
+`vk_soft_clip`, and `vk_lookup_gamut`, are also here. These were
+added incrementally by the `colorharmonizer` (UCS JCH) and
+`colorbalancergb` (the rest) ports and are reused by any future
+`filmicrgb` / Yrg-space port. Matrix rows are inlined (rather than
+the `matrix_dot(v, m[3])` array-arg form) to stay on clspv patterns
+that the rest of the header already uses.
 
 ### 5.8 The LUT-on-storage-buffer pattern
 
@@ -1143,7 +1160,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   34 modules now expose `process_vk`, covering the simple per-pixel
+   37 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1154,8 +1171,11 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    port (colisa), the first two ICC-profile-aware ports
    (overexposed, basicadj), the first bilateral-helper consumer
    (monochrome), the Lab/RGB-curve cohort (rgbcurve, rgblevels,
-   tonecurve), and the two combined-helper consumers (lowpass,
-   shadhi — each chains §5.10 / §5.13 with a mix kernel). All are
+   tonecurve), the two combined-helper consumers (lowpass,
+   shadhi — each chains §5.10 / §5.13 with a mix kernel), and the
+   scene-referred Yrg/dt-UCS cohort (colorharmonizer, plus
+   colorbalancergb — `agx`-style params struct + the LMS/Yrg/
+   JzAzBz/dt-UCS helper set in `dt_vulkan_common.h`). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
@@ -1435,12 +1455,13 @@ Each module ported brings two wins: (1) it removes its own host
 roundtrip when a chain reaches it, and (2) it expands chain
 boundaries so neighbour modules can stay on-device too. Highest-
 value targets in dependency order: `filmicrgb` (commonly used,
-single-pass), `colorbalancergb` (used in nearly every modern
-pipeline; ~500 LOC of LMS/Yrg/Ych/JzAzBz transforms — needs a
-chunk of new helpers in `dt_vulkan_common.h`), `colorequal` (uses
+single-pass; can now reuse the Yrg/LMS cohort
+`colorbalancergb` landed), `colorequal` (uses
 guided filter — overlaps with Path D groundwork), `lut3d` (needs
-§8.5 milestone: image2D + sampler), `colorharmonizer` (~157 LOC,
-2 kernels — needs UCS_JCH helpers in `dt_vulkan_common.h`).
+§8.5 milestone: image2D + sampler). Landed on this lane:
+`colorbalancergb` (used in nearly every modern pipeline; the
+LMS/Yrg/Ych/JzAzBz/dt-UCS helper cohort it added unblocks the
+remaining Yrg-space ports) and `colorharmonizer` (UCS JCH).
 Effort: medium per module (~100-200 LOC kernel + ~100 LOC host).
 Impact: cumulative — each port shaves ~50-200 ms once VK chains
 form around it; the leverage compounds with Path A.
@@ -1456,7 +1477,11 @@ to migrate a kernel param struct from PC into a storage-buffer
 binding so the 124 B struct fits — the pattern unlocks any
 future port whose param block exceeds the 128 B PC budget),
 `channelmixer` (legacy 4-mode mixer; reuses the HSL cohort
-helpers).
+helpers), `colorharmonizer` (UCS JCH hue/saturation; first
+consumer of the dt-UCS helper cohort), and `colorbalancergb`
+(scene-referred balance — reuses the `agx` params-struct pattern
+and adds the LMS/Yrg/Ych/JzAzBz/dt-UCS helper cohort the next
+Yrg-space ports build on).
 
 **Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
 host roundtrip at CL↔VK boundaries with a shared physical
@@ -1596,9 +1621,11 @@ dispatch. Expected saving scales with upload count — roughly
 1. **Path B continued** (this session and next) — every port
    compounds with future Path A and Path C work. Low risk, high
    reuse. The recent `colorout`, `filmic`, `overlay`, `sigmoid`,
-   `agx`, and `channelmixer` (legacy) landings are in this lane;
-   `colorbalancergb`, `colorharmonizer`, and `lut3d` (after §8.5)
-   are the next logical picks.
+   `agx`, `channelmixer` (legacy), `colorharmonizer`, and
+   `colorbalancergb` landings are in this lane; `filmicrgb`
+   (now that the Yrg/LMS helper cohort exists), `colorequal`
+   (guided filter), and `lut3d` (after §8.5) are the next logical
+   picks.
 2. **Path A** (multi-session) — start with the common-case
    blend ("normal mode, no blendif, no raster mask") which
    covers the bulk of real pipelines, then incrementally add the
