@@ -1,0 +1,66 @@
+// GLSL fallback for colorzones.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer TL   { float data[]; } table_L;
+layout(std430, binding = 3) readonly buffer TC   { float data[]; } table_C;
+layout(std430, binding = 4) readonly buffer TH   { float data[]; } table_h;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int channel;
+} pc;
+
+#define VK_LUT_SIZE     0x10000
+#define VK_COLORZONES_L 0
+#define VK_COLORZONES_C 1
+#define VK_COLORZONES_h 2
+#define DT_2PI          6.28318530717958647692
+#define M_SQRT2_F       1.41421356237309504880
+
+float lookup_L(float x) { return table_L.data[clamp(int(x*float(VK_LUT_SIZE)),0,VK_LUT_SIZE-1)]; }
+float lookup_C(float x) { return table_C.data[clamp(int(x*float(VK_LUT_SIZE)),0,VK_LUT_SIZE-1)]; }
+float lookup_h(float x) { return table_h.data[clamp(int(x*float(VK_LUT_SIZE)),0,VK_LUT_SIZE-1)]; }
+float clipf(float v) { return clamp(v, 0.0, 1.0); }
+
+vec4 Lab_2_LCH(vec4 Lab) {
+    float H = atan(Lab.z, Lab.y);
+    H = (H > 0.0) ? H / DT_2PI : 1.0 - abs(H) / DT_2PI;
+    float C = sqrt(Lab.y*Lab.y + Lab.z*Lab.z);
+    return vec4(Lab.x, C, H, Lab.w);
+}
+vec4 LCH_2_Lab(vec4 LCH) {
+    float a = cos(DT_2PI * LCH.z) * LCH.y;
+    float b = sin(DT_2PI * LCH.z) * LCH.y;
+    return vec4(LCH.x, a, b, LCH.w);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    float normalize_C = 1.0 / (128.0 * M_SQRT2_F);
+
+    vec4 LCh = Lab_2_LCH(pixel);
+
+    float select = 0.0;
+    if(pc.channel == VK_COLORZONES_L)      select = LCh.x * 0.01;
+    else if(pc.channel == VK_COLORZONES_C) select = LCh.y * normalize_C;
+    else                                   select = LCh.z;
+    select = clipf(select);
+
+    LCh.x *= pow(2.0, 4.0 * (lookup_L(select) - 0.5));
+    LCh.y *= 2.0 * lookup_C(select);
+    LCh.z += lookup_h(select) - 0.5;
+
+    vec4 lab = LCH_2_Lab(LCh);
+    pixel.x = lab.x; pixel.y = lab.y; pixel.z = lab.z;
+    out_buf.data[idx] = pixel;
+}

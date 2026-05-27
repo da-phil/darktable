@@ -888,3 +888,22 @@ static inline float vk_lookup_gamut(global const float *gamut_lut, const float x
   const float y_prev = gamut_lut[xi];
   return y_prev + ((xi != xii) ? (x_test - x_prev) * (gamut_lut[xii] - y_prev) : 0.0f);
 }
+
+// Lab <-> LCH (hue normalized to [0,1)) — used by colorzones. Mirrors
+// data/kernels/colorspace.h::Lab_2_LCH / LCH_2_Lab byte-for-byte.
+static inline float4 vk_Lab_2_LCH(const float4 Lab)
+{
+  float H = atan2(Lab.z, Lab.y);
+  H = (H > 0.0f) ? H / DT_2PI_F : 1.0f - fabs(H) / DT_2PI_F;
+  const float L = Lab.x;
+  const float C = vk_dt_fast_hypot(Lab.y, Lab.z);
+  return (float4)(L, C, H, Lab.w);
+}
+
+static inline float4 vk_LCH_2_Lab(const float4 LCH)
+{
+  const float L = LCH.x;
+  const float a = cos(DT_2PI_F * LCH.z) * LCH.y;
+  const float b = sin(DT_2PI_F * LCH.z) * LCH.y;
+  return (float4)(L, a, b, LCH.w);
+}
