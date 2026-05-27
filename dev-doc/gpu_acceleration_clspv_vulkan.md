@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 39 modules currently expose `process_vk`,
+**Per-module ports**: 40 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -231,6 +231,7 @@ in three categories.
 | `src/iop/colorbalancergb.c` | Scene-referred color balance in CIE 2006 LMS / Filmlight Yrg-Ych, with a perceptual saturation/brilliance pass in either JzAzBz (2021) or darktable UCS (2022) — both branches in one entry point switched on `saturation_formula`. The ~50 scalar/vector kernel args exceed the 128 B push-constant budget, so (like `agx`) the parameter block migrates into a storage buffer: `vk_colorbalancergb_params_t` is a flat all-4-byte struct (std430 == the C struct, verified by `spirv-dis` — members at consecutive offsets, total 232 B). 6-binding dispatch (in, out, params, matrix_in, matrix_out, gamut_lut); 8 B PC (width, height). The work profile is baked into the two host-premultiplied 3×4 matrices, so no ICC `profile_info` binding is needed (the OpenCL kernel takes one but never reads it). Added a cohort of reusable colour-science helpers to `dt_vulkan_common.h` — `vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_LMS_to_gradingRGB` / `vk_gradingRGB_to_LMS` / `vk_LMS_to_XYZ` / `vk_gamut_check_Yrg` / `vk_XYZ_to_JzAzBz` / `vk_JzAzBz_2_XYZ` / `vk_dt_UCS_{JCH↔HCB,JCH↔HSB}` / `vk_soft_clip` / `vk_lookup_gamut` — ported byte-for-byte from `colorspace.h` (the future `filmicrgb` / Yrg ports reuse these). The mask-display checkerboard preview ports too; it only runs in the gui-attached full pipe. |
 | `src/iop/basecurve.c` | Base curve, non-fusion path only. Two kernels lifted straight off the curve-cohort template: `basecurve_legacy_lut` (3-binding per-channel `vk_lookup_unbounded`, 24 B PC) and `basecurve_lut` (5-binding norm-preserving via the §5.11 `vk_dt_rgb_norm` plumbing, 32 B PC); `process_vk` dispatches the matching slot on `d->preserve_colors`. The exposure-fusion path (Laplacian pyramids over `image2d`) needs §8.5 sampler support, so it stays on OpenCL/CPU — `commit_params` clears `process_vk_ready` when `exposure_fusion != 0` (the §10.2 predictive pattern), and `process_vk` belt-and-suspenders returns -1 for it. Validated end-to-end on lavapipe: an identity-ramp LUT round-trips to the input on both kernels (max error 1.3e-5 = LUT quantization), exercising the lookup + norm + ratio-scale paths. |
 | `src/iop/colorchecker.c` | Thin-plate-spline colour correction in Lab. Already buffer-shaped in OpenCL, so the single kernel ports near-verbatim: 3-binding dispatch (in, out, params), 12 B PC (width, height, num_patches). The patch data packs into one `float4` storage buffer `[ source_Lab × N | coeff_Lab × (N+4) ]` exactly as `process_cl` builds it; the kernel slices it into `source_Lab` / `coeff_Lab` / `poly_Lab` via pointer offsets. `fastlog2`'s float↔uint bit-pun uses the same `union` idiom as `vk_atomic_add_f` (clspv-safe). Validated end-to-end on lavapipe against a CPU reference of the same math: identity transform is exact and a random 4-patch thin-plate transform matches bit-for-bit (max error 0.0). |
+| `src/iop/colorzones.c` | Per-zone Lab lightness/chroma/hue grading. Both process modes ported as separate kernels: `colorzones` (strong — works in LCH via the new `vk_Lab_2_LCH` / `vk_LCH_2_Lab` helpers) and `colorzones_v3` (smooth — works directly in polar (h, C) with a near-axis blend toward neutral). Each is a 5-binding dispatch (in, out, table_L, table_a/C, table_b/h) with a 12 B PC (width, height, channel); `process_vk` picks the slot on `d->mode`. The three 65536-entry curve LUTs go through `vk_lookup` (the flat-buffer twin of the OpenCL 256×256 `image2d_t` `lookup`, bit-identical). `commit_params` mirrors the existing `process_cl_ready` mask-display gate for `process_vk_ready` (the GUI selection-mask preview stays CPU-only). Validated end-to-end on lavapipe: identity LUTs round-trip to the input on both kernels (max 3.9e-4 = LCH trig precision) and a table_L=1.0 scale matches the analytic 4× on L with a/b untouched. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -302,7 +303,7 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   for future param-heavy ports), `channelmixer` (legacy 4-mode
   mixer reusing the existing HSL helpers).
 - **MODERATE** — multi-pass with intermediate buffers or
-  local-memory barriers: `blurs`, `colorzones`,
+  local-memory barriers: `blurs`,
   `sharpen`, `soften`, `highpass`, `highlights`. The Gaussian VK
   helper (§5.10) handles the separable-blur half; `sharpen` and
   the larger blurs still want workgroup-local-memory plumbing for
@@ -311,6 +312,9 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   the Deriche IIR `dt_gaussian_*`, so a faithful port can't just
   reuse `dt_gaussian_blur_vk` — it would drift like the removed
   diffuse approximation). Done in earlier passes:
+  `colorzones` (both process modes — strong via the new Lab↔LCH
+  helpers, smooth via polar (h, C); `process_vk` switches on
+  `d->mode` and the mask-preview is gated to CPU),
   `colorchecker` (single-kernel thin-plate spline — already
   buffer-shaped, ported near-verbatim with a packed `float4`
   params buffer),
@@ -1172,7 +1176,7 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   39 modules now expose `process_vk`, covering the simple per-pixel
+   40 modules now expose `process_vk`, covering the simple per-pixel
    bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
@@ -1189,9 +1193,10 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    colorbalancergb — `agx`-style params struct + the LMS/Yrg/
    JzAzBz/dt-UCS helper set in `dt_vulkan_common.h`), and the
    non-fusion base curve (basecurve — its two LUT kernels, with
-   the exposure-fusion path gated to OpenCL), and the thin-plate
-   colour checker (colorchecker — single buffer-shaped kernel).
-   All are
+   the exposure-fusion path gated to OpenCL), the thin-plate
+   colour checker (colorchecker — single buffer-shaped kernel),
+   and per-zone Lab grading (colorzones — both strong/smooth
+   modes, mask-preview gated to CPU). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
