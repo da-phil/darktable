@@ -21,6 +21,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/imagebuf.h"
 #include "common/math.h"
+#include "common/vulkan.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "dtgtk/drawingarea.h"
@@ -127,6 +128,8 @@ typedef struct dt_iop_colorzones_global_data_t
 {
   int kernel_colorzones;
   int kernel_colorzones_v3;
+  dt_vk_module_kernel_t vk;    // colorzones (strong)
+  dt_vk_module_kernel_t vk_v3; // colorzones_v3 (smooth)
 } dt_iop_colorzones_global_data_t;
 
 
@@ -631,6 +634,56 @@ error:
   return err;
 }
 #endif
+
+// Defined unconditionally so init_global can size it on HAVE_VULKAN=0 builds.
+typedef struct vk_colorzones_pc_t
+{
+  int width;
+  int height;
+  int channel;
+} vk_colorzones_pc_t;
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorzones_data_t *const d = piece->data;
+  const dt_iop_colorzones_global_data_t *const gd = self->global_data;
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t lut_bytes = sizeof(float) * DT_IOP_COLORZONES_LUT_RES;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_L = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dt_vk_mem_t *dev_a = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dt_vk_mem_t *dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  if(!dev_L || !dev_a || !dev_b) goto cleanup;
+
+  const dt_vk_module_kernel_t *k =
+    (d->mode == DT_IOP_COLORZONES_MODE_SMOOTH) ? &gd->vk_v3 : &gd->vk;
+
+  const vk_colorzones_pc_t pc = { .width = width, .height = height, .channel = d->channel };
+  dt_vk_mem_t *bufs[5] = { dev_in, dev_out, dev_L, dev_a, dev_b };
+  const dt_vk_upload_t uploads[] = {
+    { dev_L, d->lut[0], lut_bytes },
+    { dev_a, d->lut[1], lut_bytes },
+    { dev_b, d->lut[2], lut_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(k, bufs, 5,
+                                    uploads, sizeof(uploads) / sizeof(uploads[0]),
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(dev_L) dt_vulkan_free_buffer(devid, dev_L);
+  if(dev_a) dt_vulkan_free_buffer(devid, dev_a);
+  if(dev_b) dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 void init_presets(dt_iop_module_so_t *self)
 {
@@ -2766,6 +2819,10 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_colorzones = dt_opencl_create_kernel(program, "colorzones");
   gd->kernel_colorzones_v3 = dt_opencl_create_kernel(program, "colorzones_v3");
+  dt_vulkan_module_kernel_load(&gd->vk, "colorzones", "colorzones",
+                               5, sizeof(vk_colorzones_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_v3, "colorzones_v3", "colorzones_v3",
+                               5, sizeof(vk_colorzones_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -2774,6 +2831,8 @@ void cleanup_global(dt_iop_module_so_t *self)
 
   dt_opencl_free_kernel(gd->kernel_colorzones);
   dt_opencl_free_kernel(gd->kernel_colorzones_v3);
+  dt_vulkan_module_kernel_unload(&gd->vk);
+  dt_vulkan_module_kernel_unload(&gd->vk_v3);
 
   free(self->data);
   self->data = NULL;
@@ -2805,6 +2864,10 @@ void commit_params(dt_iop_module_t *self,
 
   // display selection don't work with opencl
   piece->process_cl_ready = (g && g->display_mask) ? FALSE : TRUE;
+#ifdef HAVE_VULKAN
+  // ... nor with the Vulkan path (the mask preview is CPU-only)
+  piece->process_vk_ready = (g && g->display_mask) ? FALSE : TRUE;
+#endif
   d->channel = (dt_iop_colorzones_channel_t)p->channel;
   d->mode = p->mode;
 
