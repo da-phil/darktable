@@ -90,7 +90,11 @@ set(VK_KERNELS
     basecurve_lut:basecurve_lut
     colorchecker:colorchecker
     colorzones:colorzones
-    colorzones_v3:colorzones_v3)
+    colorzones_v3:colorzones_v3
+    soften_overexposed:soften_overexposed
+    soften_hblur:soften_hblur
+    soften_vblur:soften_vblur
+    soften_mix:soften_mix)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
