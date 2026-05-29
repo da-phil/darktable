@@ -32,6 +32,7 @@
 #include "common/image.h"
 #include "common/dttypes.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -323,6 +324,7 @@ typedef struct dt_iop_filmicrgb_global_data_t
   int kernel_filmic_wavelets_reconstruct;
   int kernel_filmic_compute_ratios;
   int kernel_filmic_restore_ratios;
+  dt_vk_module_kernel_t vk;
 } dt_iop_filmicrgb_global_data_t;
 
 
@@ -2567,6 +2569,167 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernel (defined unconditionally so
+// init_global can size it even on HAVE_VULKAN=0 builds).
+typedef struct vk_filmicrgb_pc_t
+{
+  int width;
+  int height;
+} vk_filmicrgb_pc_t;
+
+#ifdef HAVE_VULKAN
+// Flat all-4-byte parameter block uploaded as a storage buffer (the
+// >128 B arg list won't fit in push constants — same agx pattern as
+// colorbalancergb). std430 layout == this struct, field for field.
+typedef struct vk_filmicrgb_params_t
+{
+  float dynamic_range;
+  float black_exposure;
+  float grey_value;
+  float sigma_toe;
+  float sigma_shoulder;
+  float saturation;
+  float latitude_min;
+  float latitude_max;
+  float output_power;
+  float display_black;
+  float display_white;
+  float norm_min;
+  float norm_max;
+  int   use_work_profile;
+  int   color_science;
+  int   variant;
+  int   type_1;
+  int   type_2;
+  int   use_output_profile;
+  float M1[4];
+  float M2[4];
+  float M3[4];
+  float M4[4];
+  float M5[4];
+} vk_filmicrgb_params_t;
+
+// Vulkan twin of process_cl's main tone-mapping path. The highlight-
+// reconstruction (a-trous wavelets over image2d) and clipped-mask
+// preview are gated to OpenCL/CPU in commit_params, so here we only
+// run the per-pixel split/chroma kernel — exactly what process_cl
+// emits when reconstruction is off.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_filmicrgb_data_t *const d = piece->data;
+  const dt_iop_filmicrgb_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const export_profile = dt_ioppr_get_pipe_output_profile_info(piece->pipe);
+  const int use_work_profile = (work_profile == NULL) ? 0 : 1;
+
+  // Same matrices process_cl builds (work / export profiles baked in).
+  dt_colormatrix_t input_matrix_trans;
+  dt_colormatrix_t output_matrix;
+  dt_colormatrix_t output_matrix_trans;
+  dt_colormatrix_t export_input_matrix_trans;
+  dt_colormatrix_t export_output_matrix;
+  dt_colormatrix_t export_output_matrix_trans;
+  const int use_output_profile
+    = filmic_v4_prepare_matrices(input_matrix_trans, output_matrix, output_matrix_trans,
+                                 export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
+                                 work_profile, export_profile);
+  dt_colormatrix_t input_matrix;
+  dt_colormatrix_transpose(input_matrix, input_matrix_trans);
+
+  // Pack the 4 colormatrices (each a 3x4 dt_colormatrix_t == 12 floats).
+  float mats[48];
+  memset(mats, 0, sizeof(mats));
+  memcpy(&mats[0],  &input_matrix[0][0],  12 * sizeof(float));
+  memcpy(&mats[12], &output_matrix[0][0], 12 * sizeof(float));
+  if(use_output_profile)
+  {
+    dt_colormatrix_t export_input_matrix;
+    dt_colormatrix_transpose(export_input_matrix, export_input_matrix_trans);
+    memcpy(&mats[24], &export_input_matrix[0][0],  12 * sizeof(float));
+    memcpy(&mats[36], &export_output_matrix[0][0], 12 * sizeof(float));
+  }
+
+  const dt_iop_filmic_rgb_spline_t spline = (dt_iop_filmic_rgb_spline_t)d->spline;
+  const float white_display = powf(spline.y[4], d->output_power);
+  const float black_display = powf(spline.y[0], d->output_power);
+  const float norm_min = exp_tonemapping_v2(0.f, d->grey_source, d->black_source, d->dynamic_range);
+  const float norm_max = exp_tonemapping_v2(1.f, d->grey_source, d->black_source, d->dynamic_range);
+
+  vk_filmicrgb_params_t p;
+  memset(&p, 0, sizeof(p));
+  p.dynamic_range      = d->dynamic_range;
+  p.black_exposure     = d->black_source;
+  p.grey_value         = d->grey_source;
+  p.sigma_toe          = d->sigma_toe;
+  p.sigma_shoulder     = d->sigma_shoulder;
+  p.saturation         = d->saturation;
+  p.latitude_min       = spline.latitude_min;
+  p.latitude_max       = spline.latitude_max;
+  p.output_power       = d->output_power;
+  p.display_black      = black_display;
+  p.display_white      = white_display;
+  p.norm_min           = norm_min;
+  p.norm_max           = norm_max;
+  p.use_work_profile   = use_work_profile;
+  p.color_science      = d->version;
+  p.variant            = d->preserve_color;
+  p.type_1             = spline.type[0];
+  p.type_2             = spline.type[1];
+  p.use_output_profile = use_output_profile;
+  for(int c = 0; c < 4; c++) p.M1[c] = spline.M1[c];
+  for(int c = 0; c < 4; c++) p.M2[c] = spline.M2[c];
+  for(int c = 0; c < 4; c++) p.M3[c] = spline.M3[c];
+  for(int c = 0; c < 4; c++) p.M4[c] = spline.M4[c];
+  for(int c = 0; c < 4; c++) p.M5[c] = spline.M5[c];
+
+  int rc = -1;
+  dt_colorspaces_iccprofile_info_vk_t *profile_info_vk = NULL;
+  float *profile_lut_vk = NULL;
+  dt_vk_mem_t *dev_profile_info = NULL;
+  dt_vk_mem_t *dev_profile_lut = NULL;
+
+  dt_vk_mem_t *dev_params = dt_vulkan_alloc_buffer(devid, sizeof(p));
+  dt_vk_mem_t *dev_mats   = dt_vulkan_alloc_buffer(devid, 48 * sizeof(float));
+  if(!dev_params || !dev_mats) goto cleanup;
+
+  dt_vk_upload_t uploads[4] = {
+    { dev_params, &p,   sizeof(p) },
+    { dev_mats,   mats, 48 * sizeof(float) },
+  };
+  size_t upload_count = 2;
+  if(dt_ioppr_build_iccprofile_params_vk_deferred(
+       work_profile, devid, &profile_info_vk, &profile_lut_vk,
+       &dev_profile_info, &dev_profile_lut,
+       uploads, sizeof(uploads) / sizeof(uploads[0]), &upload_count) != 0)
+    goto cleanup;
+
+  const vk_filmicrgb_pc_t pc = { .width = width, .height = height };
+  dt_vk_mem_t *buffers[6] = { dev_in, dev_out, dev_params, dev_mats,
+                              dev_profile_info, dev_profile_lut };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk, buffers, 6,
+                                    uploads, upload_count,
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,
+                                     &dev_profile_info, &dev_profile_lut, devid);
+  dt_vulkan_free_buffer(devid, dev_params);
+  dt_vulkan_free_buffer(devid, dev_mats);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 static inline void _compute_output_power(const dt_iop_module_t *self,
                                          dt_iop_filmicrgb_params_t *p)
 {
@@ -3099,6 +3262,16 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->reconstruct_grey_vs_color = (p->reconstruct_grey_vs_color / 100.0f + 1.f) / 2.f;
 
   d->enable_highlight_reconstruction = p->enable_highlight_reconstruction;
+
+#ifdef HAVE_VULKAN
+  // The highlight-reconstruction path (inpaint + a-trous wavelets over
+  // image2d) and the clipped-pixel mask preview have no Vulkan port yet
+  // (need §8.5 sampled images); keep the piece on OpenCL/CPU in those
+  // cases so the chain-ahead heuristic doesn't route a wasted round-trip.
+  const dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+  if(d->enable_highlight_reconstruction || (g && g->show_mask))
+    piece->process_vk_ready = FALSE;
+#endif
 }
 
 void gui_focus(dt_iop_module_t *self, gboolean in)
@@ -3219,11 +3392,15 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_filmic_bspline_horizontal = dt_opencl_create_kernel(wavelets, "blur_2D_Bspline_horizontal");
   gd->kernel_filmic_bspline_vertical = dt_opencl_create_kernel(wavelets, "blur_2D_Bspline_vertical");
   gd->kernel_filmic_wavelets_detail = dt_opencl_create_kernel(wavelets, "wavelets_detail_level");
+
+  dt_vulkan_module_kernel_load(&gd->vk, "filmicrgb", "filmicrgb",
+                               6, sizeof(vk_filmicrgb_pc_t),
+                               16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_filmicrgb_global_data_t *gd = self->data;
+  dt_iop_filmicrgb_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_filmic_rgb_split);
   dt_opencl_free_kernel(gd->kernel_filmic_rgb_chroma);
   dt_opencl_free_kernel(gd->kernel_filmic_mask);
@@ -3236,6 +3413,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_filmic_wavelets_reconstruct);
   dt_opencl_free_kernel(gd->kernel_filmic_compute_ratios);
   dt_opencl_free_kernel(gd->kernel_filmic_restore_ratios);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }

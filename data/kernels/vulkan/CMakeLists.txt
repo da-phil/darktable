@@ -77,6 +77,7 @@ set(VK_KERNELS
     colorbalance_cdl:colorbalance_cdl
     colorout:colorout
     filmic:filmic
+    filmicrgb:filmicrgb
     overlay:overlay_blend
     sigmoid_loglogistic_rgb_ratio:sigmoid_loglogistic_rgb_ratio
     sigmoid_loglogistic_per_channel:sigmoid_loglogistic_per_channel

@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 40 modules currently expose `process_vk`,
+**Per-module ports**: 41 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -232,6 +232,7 @@ in three categories.
 | `src/iop/basecurve.c` | Base curve, non-fusion path only. Two kernels lifted straight off the curve-cohort template: `basecurve_legacy_lut` (3-binding per-channel `vk_lookup_unbounded`, 24 B PC) and `basecurve_lut` (5-binding norm-preserving via the §5.11 `vk_dt_rgb_norm` plumbing, 32 B PC); `process_vk` dispatches the matching slot on `d->preserve_colors`. The exposure-fusion path (Laplacian pyramids over `image2d`) needs §8.5 sampler support, so it stays on OpenCL/CPU — `commit_params` clears `process_vk_ready` when `exposure_fusion != 0` (the §10.2 predictive pattern), and `process_vk` belt-and-suspenders returns -1 for it. Validated end-to-end on lavapipe: an identity-ramp LUT round-trips to the input on both kernels (max error 1.3e-5 = LUT quantization), exercising the lookup + norm + ratio-scale paths. |
 | `src/iop/colorchecker.c` | Thin-plate-spline colour correction in Lab. Already buffer-shaped in OpenCL, so the single kernel ports near-verbatim: 3-binding dispatch (in, out, params), 12 B PC (width, height, num_patches). The patch data packs into one `float4` storage buffer `[ source_Lab × N | coeff_Lab × (N+4) ]` exactly as `process_cl` builds it; the kernel slices it into `source_Lab` / `coeff_Lab` / `poly_Lab` via pointer offsets. `fastlog2`'s float↔uint bit-pun uses the same `union` idiom as `vk_atomic_add_f` (clspv-safe). Validated end-to-end on lavapipe against a CPU reference of the same math: identity transform is exact and a random 4-patch thin-plate transform matches bit-for-bit (max error 0.0). |
 | `src/iop/colorzones.c` | Per-zone Lab lightness/chroma/hue grading. Both process modes ported as separate kernels: `colorzones` (strong — works in LCH via the new `vk_Lab_2_LCH` / `vk_LCH_2_Lab` helpers) and `colorzones_v3` (smooth — works directly in polar (h, C) with a near-axis blend toward neutral). Each is a 5-binding dispatch (in, out, table_L, table_a/C, table_b/h) with a 12 B PC (width, height, channel); `process_vk` picks the slot on `d->mode`. The three 65536-entry curve LUTs go through `vk_lookup` (the flat-buffer twin of the OpenCL 256×256 `image2d_t` `lookup`, bit-identical). `commit_params` mirrors the existing `process_cl_ready` mask-display gate for `process_vk_ready` (the GUI selection-mask preview stays CPU-only). Validated end-to-end on lavapipe: identity LUTs round-trip to the input on both kernels (max 3.9e-4 = LCH trig precision) and a table_L=1.0 scale matches the analytic 4× on L with a/b untouched. |
+| `src/iop/filmicrgb.c` | Scene-referred filmic tone mapper, main per-pixel path. The OpenCL module has two kernels (`filmicrgb_split` for per-channel and `filmicrgb_chroma` for chroma-preserving) selected by `(preserve_color == NONE && version != V5)`, each switching on the colour-science version v1..v5; both fold into one Vulkan entry that reproduces the host's split-vs-chroma decision internally and dispatches on `color_science` exactly like `process_cl`. 6-binding dispatch (in, out, params, matrices, profile_info, profile_lut); 8 B PC (width, height). Like `agx`/`colorbalancergb`, the ~26 scalars + 5 spline `float4`s overflow the PC budget (164 B), so `vk_filmicrgb_params_t` migrates into a storage buffer (156 B, std430 == the C struct verified by `spirv-dis`). The four `dt_colormatrix_t` 3×4 matrices (input, output, export-in, export-out) pack into a single 48-float `matrices` buffer at fixed base offsets; helpers take an `int base` so the same code paths handle work and export gamut targets. The colour-science cohort (`vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_gamut_check_Yrg`) is reused from `dt_vulkan_common.h` — the helpers `colorbalancergb` landed. The filmic-specific gamut machinery — `clip_chroma_white_raw` / `clip_chroma_white` / `clip_chroma_black` / `clip_chroma` / `gamut_check_RGB` / `gamut_mapping` / `desaturate_v4` — and the v1..v5 split/chroma variants are inlined faithfully from `filmic.cl`. ICC luminance goes through the §5.11 deferred plumbing (`dt_ioppr_build_iccprofile_params_vk_deferred` appends the profile uploads in one batched submit). The highlight-reconstruction path (inpaint + a-trous wavelets over `image2d_t`) and the clipped-pixel mask preview need §8.5 sampled-image bindings; `commit_params` clears `process_vk_ready` when `enable_highlight_reconstruction` is on or the GUI mask is showing (the §10.2 predictive pattern — mirrors `basecurve`'s exposure-fusion gate). Validated end-to-end on lavapipe with an independent C reference derived directly from `filmic.cl` (not from the port): `split_v2_v3` is bit-equal (max 0.0) and `chroma_v4` matches at FP rounding (max 1e-6) — proving the matrices buffer packing, the Yrg/Ych conversions, the gamut-clip family and the std430 marshalling all reproduce the OpenCL math byte-for-byte. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -294,8 +295,9 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `.spv`), `colorout` (Lab→RGB matrix + 3 shaper LUTs, with the
   `DT_COLORSPACE_LAB` pass-through case routed through
   `dt_vulkan_copy_device_to_device`), `filmic` (legacy single-pass
-  variant; the newer `filmicrgb` is wavelet-based and pending
-  §8.5 image2d/sampler support), `sigmoid` (both color-processing
+  variant; the newer `filmicrgb` ports its main per-pixel tone
+  mapping path — see HARD bucket — and gates the wavelet
+  highlight reconstruction to OpenCL/CPU), `sigmoid` (both color-processing
   modes — `rgb_ratio` is push-constant-only, `per_channel` carries
   3 matrices as storage-buffer bindings packed by
   `pack_3xSSE_to_3x3`), `agx` (first to migrate a >128 B param
@@ -323,13 +325,22 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   consumer — chains §5.10 or §5.13 followed by a curve-mix
   kernel), `shadhi` (second combined-helper consumer — same shape
   + soft-light overlays).
-- **HARD** — atrous, bloom, denoiseprofile, filmicrgb,
+- **HARD** — atrous, bloom, denoiseprofile,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal,
   basecurve (full variants), colorreconstruction (atomics). Done
   in earlier passes: `agx` (params struct migrated from PC into a
   storage-buffer binding so the 124 B struct fits — the pattern is
   now available for any future port whose param block exceeds the
-  128 B PC budget). Multi-
+  128 B PC budget),
+  `filmicrgb` (main per-pixel split + chroma kernels folded into
+  one entry that reproduces the host's split-vs-chroma decision
+  internally and dispatches on the colour-science version v1..v5;
+  reuses `colorbalancergb`'s Yrg/Ych cohort and the §5.11 ICC
+  plumbing, adds the filmic-specific gamut-clip family
+  `clip_chroma_white/black/clip_chroma/gamut_check_RGB` for v4/v5;
+  the wavelet highlight-reconstruction path needs §8.5 sampler
+  support and is gated to OpenCL/CPU when `enable_highlight_reconstruction`
+  or the GUI mask is on). Multi-
   kernel pipelines or per-warp reductions. `lowpass`, `censorize`,
   `shadhi`, `retouch`, `monochrome`, `globaltonemap` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
@@ -1196,7 +1207,11 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    the exposure-fusion path gated to OpenCL), the thin-plate
    colour checker (colorchecker — single buffer-shaped kernel),
    and per-zone Lab grading (colorzones — both strong/smooth
-   modes, mask-preview gated to CPU). All are
+   modes, mask-preview gated to CPU), and the scene-referred
+   filmic tone mapper (filmicrgb — main per-pixel split/chroma
+   path with all v1..v5 colour-science variants and the v4/v5
+   gamut-clip family; the wavelet highlight-reconstruction path
+   is gated to OpenCL/CPU pending §8.5). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
@@ -1475,14 +1490,17 @@ rgb-blend, …}) plus ~500 LOC of host plumbing in
 Each module ported brings two wins: (1) it removes its own host
 roundtrip when a chain reaches it, and (2) it expands chain
 boundaries so neighbour modules can stay on-device too. Highest-
-value targets in dependency order: `filmicrgb` (commonly used,
-single-pass; can now reuse the Yrg/LMS cohort
-`colorbalancergb` landed), `colorequal` (uses
+value targets in dependency order: `colorequal` (uses
 guided filter — overlaps with Path D groundwork), `lut3d` (needs
 §8.5 milestone: image2D + sampler). Landed on this lane:
 `colorbalancergb` (used in nearly every modern pipeline; the
 LMS/Yrg/Ych/JzAzBz/dt-UCS helper cohort it added unblocks the
-remaining Yrg-space ports) and `colorharmonizer` (UCS JCH).
+remaining Yrg-space ports), `colorharmonizer` (UCS JCH), and
+`filmicrgb` (the main per-pixel split + chroma kernels folded
+into one entry that reproduces the host split-vs-chroma decision
+and dispatches on v1..v5 internally — reused the Yrg cohort, added
+the filmic-specific gamut-clip family, and gated the wavelet
+highlight reconstruction to OpenCL/CPU pending §8.5).
 Effort: medium per module (~100-200 LOC kernel + ~100 LOC host).
 Impact: cumulative — each port shaves ~50-200 ms once VK chains
 form around it; the leverage compounds with Path A.
@@ -1499,10 +1517,16 @@ binding so the 124 B struct fits — the pattern unlocks any
 future port whose param block exceeds the 128 B PC budget),
 `channelmixer` (legacy 4-mode mixer; reuses the HSL cohort
 helpers), `colorharmonizer` (UCS JCH hue/saturation; first
-consumer of the dt-UCS helper cohort), and `colorbalancergb`
+consumer of the dt-UCS helper cohort), `colorbalancergb`
 (scene-referred balance — reuses the `agx` params-struct pattern
 and adds the LMS/Yrg/Ych/JzAzBz/dt-UCS helper cohort the next
-Yrg-space ports build on).
+Yrg-space ports build on), and `filmicrgb` (the largest port to
+date — main split + chroma kernels with all v1..v5 colour-science
+variants and the v4/v5 gamut-mapping subsystem, reusing the
+`colorbalancergb` Yrg cohort and §5.11 ICC plumbing; validated
+end-to-end on lavapipe against an independent C reference derived
+from `filmic.cl` — `split_v2_v3` bit-equal, `chroma_v4` matches at
+FP precision).
 
 **Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
 host roundtrip at CL↔VK boundaries with a shared physical
