@@ -1,0 +1,608 @@
+// GLSL fallback for filmicrgb.cl.
+//
+// Mirrors filmic.cl::filmicrgb_split + filmicrgb_chroma (folded into a
+// single entry, branching split-vs-chroma exactly like the host). The
+// helpers are inlined GLSL twins of dt_vulkan_common.h / colorspace.h
+// (Yrg-Ych cohort cribbed from colorbalancergb.comp, ICC plumbing from
+// basicadj.comp); keep them in sync. The highlight-reconstruction and
+// clipped-mask paths are NOT here (gated to OpenCL/CPU host-side).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NORM_MIN        1.52587890625e-05
+#define INVERSE_SQRT_3  0.5773502691896258
+#define FLT_MAX         3.402823466e38
+#define CIE_Y_1931_TO_2006(x) (1.05785528 * (x))
+
+#define FR_METHOD_NONE          0
+#define FR_METHOD_MAX_RGB       1
+#define FR_METHOD_LUMINANCE     2
+#define FR_METHOD_POWER_NORM    3
+#define FR_METHOD_EUCLIDEAN_V1  4
+#define FR_METHOD_EUCLIDEAN_V2  5
+
+#define FR_SCIENCE_V1 0
+#define FR_SCIENCE_V2 1
+#define FR_SCIENCE_V3 2
+#define FR_SCIENCE_V4 3
+#define FR_SCIENCE_V5 4
+
+#define FR_CURVE_POLY_4   0
+#define FR_CURVE_POLY_3   1
+#define FR_CURVE_RATIONAL 2
+
+#define FR_MAT_IN    0
+#define FR_MAT_OUT   12
+#define FR_MAT_EXIN  24
+#define FR_MAT_EXOUT 36
+
+struct Params {
+    float dynamic_range;
+    float black_exposure;
+    float grey_value;
+    float sigma_toe;
+    float sigma_shoulder;
+    float saturation;
+    float latitude_min;
+    float latitude_max;
+    float output_power;
+    float display_black;
+    float display_white;
+    float norm_min;
+    float norm_max;
+    int   use_work_profile;
+    int   color_science;
+    int   variant;
+    int   type_1;
+    int   type_2;
+    int   use_output_profile;
+    float M1[4];
+    float M2[4];
+    float M3[4];
+    float M4[4];
+    float M5[4];
+};
+
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer PBuf { Params p;    } params;
+layout(std430, binding = 3) readonly buffer Mats { float data[]; } matrices;
+layout(std430, binding = 4) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+layout(std430, binding = 5) readonly buffer ProfLut { float data[]; } profile_lut;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+} pc;
+
+float fast_hypot(float a, float b) { return sqrt(a * a + b * b); }
+vec4  ld4(float a[4]) { return vec4(a[0], a[1], a[2], a[3]); }
+float clipf(float x) { return clamp(x, 0.0, 1.0); }
+
+// ---- ICC work-profile luminance (basicadj.comp twin) ----
+float lerp_lookup_unbounded(float x, float c0, float c1, float c2, int n_lut) {
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            float ft = clamp(x * float(profile_info.lutsize - 1),
+                             0.0, float(profile_info.lutsize - 1));
+            int   t  = (ft < float(profile_info.lutsize - 2)) ? int(ft) : profile_info.lutsize - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * profile_info.lutsize;
+            float l1 = profile_lut.data[base + t];
+            float l2 = profile_lut.data[base + t + 1];
+            return l1 * (1.0 - f) + l2 * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_in(vec4 rgb_in) {
+    float R = lerp_lookup_unbounded(rgb_in.x, profile_info.unbounded_coeffs_in[0],
+                                    profile_info.unbounded_coeffs_in[1], profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup_unbounded(rgb_in.y, profile_info.unbounded_coeffs_in[3],
+                                    profile_info.unbounded_coeffs_in[4], profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup_unbounded(rgb_in.z, profile_info.unbounded_coeffs_in[6],
+                                    profile_info.unbounded_coeffs_in[7], profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb_in.w);
+}
+
+float get_rgb_matrix_luminance(vec4 rgb) {
+    if(profile_info.nonlinearlut != 0) {
+        vec4 lin = apply_trc_in(rgb);
+        return profile_info.matrix_in[3] * lin.x + profile_info.matrix_in[4] * lin.y + profile_info.matrix_in[5] * lin.z;
+    }
+    return profile_info.matrix_in[3] * rgb.x + profile_info.matrix_in[4] * rgb.y + profile_info.matrix_in[5] * rgb.z;
+}
+
+float camera_rgb_luminance(vec4 rgb) {
+    return 0.2225045 * rgb.x + 0.7168786 * rgb.y + 0.0606169 * rgb.z;
+}
+
+// ---- Kirk/Filmlight Yrg-Ych cohort (colorbalancergb.comp twin) ----
+vec4 LMS_to_gradingRGB(vec4 LMS) {
+    return vec4( 1.0877193  * LMS.x - 0.66666667 * LMS.y + 0.02061856 * LMS.z,
+                -0.0877193  * LMS.x + 1.66666667 * LMS.y - 0.05154639 * LMS.z,
+                                                           1.03092784 * LMS.z,
+                 LMS.w);
+}
+
+vec4 gradingRGB_to_LMS(vec4 RGB) {
+    return vec4(0.95 * RGB.x + 0.38 * RGB.y + 0.00 * RGB.z,
+                0.05 * RGB.x + 0.62 * RGB.y + 0.03 * RGB.z,
+                0.00 * RGB.x + 0.00 * RGB.y + 0.97 * RGB.z,
+                RGB.w);
+}
+
+vec4 LMS_to_Yrg(vec4 LMS) {
+    float Y = 0.68990272 * LMS.x + 0.34832189 * LMS.y;
+    float a = LMS.x + LMS.y + LMS.z;
+    vec4 lms = (a == 0.0) ? vec4(0.0) : LMS / a;
+    vec4 rgb = LMS_to_gradingRGB(lms);
+    return vec4(Y, rgb.x, rgb.y, LMS.w);
+}
+
+vec4 Yrg_to_LMS(vec4 Yrg) {
+    float Y = Yrg.x;
+    float r = Yrg.y;
+    float g = Yrg.z;
+    float b = 1.0 - r - g;
+    vec4 rgb = vec4(r, g, b, 0.0);
+    vec4 lms = gradingRGB_to_LMS(rgb);
+    float denom = (0.68990272 * lms.x + 0.34832189 * lms.y);
+    float a = (denom == 0.0) ? 0.0 : Y / denom;
+    return lms * a;
+}
+
+vec4 Yrg_to_Ych(vec4 Yrg) {
+    float Y = Yrg.x;
+    float r = Yrg.y - 0.21902143;
+    float g = Yrg.z - 0.54371398;
+    float c = fast_hypot(g, r);
+    float cos_h = c != 0.0 ? r / c : 1.0;
+    float sin_h = c != 0.0 ? g / c : 0.0;
+    return vec4(Y, c, cos_h, sin_h);
+}
+
+vec4 Ych_to_Yrg(vec4 Ych) {
+    float Y = Ych.x;
+    float c = Ych.y;
+    float cos_h = Ych.z;
+    float sin_h = Ych.w;
+    float r = c * cos_h + 0.21902143;
+    float g = c * sin_h + 0.54371398;
+    return vec4(Y, r, g, 0.0);
+}
+
+vec4 gamut_check_Yrg(vec4 Ych) {
+    vec4 Yrg = Ych_to_Yrg(Ych);
+    float D65_r = 0.21902143;
+    float D65_g = 0.54371398;
+    float max_c = Ych.y;
+    float cos_h = Ych.z;
+    float sin_h = Ych.w;
+    if(Yrg.y < 0.0)         max_c = min(-D65_r / cos_h, max_c);
+    if(Yrg.z < 0.0)         max_c = min(-D65_g / sin_h, max_c);
+    if(Yrg.y + Yrg.z > 1.0) max_c = min((1.0 - D65_r - D65_g) / (cos_h + sin_h), max_c);
+    Ych.y = max_c;
+    return Ych;
+}
+
+// ---- 3x4 matrix product into the packed matrices buffer ----
+vec4 matrix_product(vec4 v, int base) {
+    float R = matrices.data[base + 0] * v.x + matrices.data[base + 1]  * v.y + matrices.data[base + 2]  * v.z;
+    float G = matrices.data[base + 4] * v.x + matrices.data[base + 5]  * v.y + matrices.data[base + 6]  * v.z;
+    float B = matrices.data[base + 8] * v.x + matrices.data[base + 9]  * v.y + matrices.data[base + 10] * v.z;
+    return vec4(R, G, B, v.w);
+}
+
+// ---- norms ----
+float norm_power(vec4 pixel) {
+    vec4 RGB = abs(pixel);
+    vec4 RGB_sq = RGB * RGB;
+    vec4 RGB_cu = RGB_sq * RGB;
+    return (RGB_cu.x + RGB_cu.y + RGB_cu.z) / max(RGB_sq.x + RGB_sq.y + RGB_sq.z, 1e-12);
+}
+
+float norm_euclidean(vec4 pixel) {
+    vec4 sq = pixel * pixel;
+    return sqrt(sq.x + sq.y + sq.z);
+}
+
+float get_pixel_norm(vec4 pixel, int variant) {
+    if(variant == FR_METHOD_MAX_RGB)     return max(max(pixel.x, pixel.y), pixel.z);
+    if(variant == FR_METHOD_POWER_NORM)  return norm_power(pixel);
+    if(variant == FR_METHOD_EUCLIDEAN_V1) return norm_euclidean(pixel);
+    if(variant == FR_METHOD_EUCLIDEAN_V2) return norm_euclidean(pixel) * INVERSE_SQRT_3;
+    // LUMINANCE / NONE / default
+    return (params.p.use_work_profile != 0) ? get_rgb_matrix_luminance(pixel) : camera_rgb_luminance(pixel);
+}
+
+// ---- saturation / spline / tone mapping ----
+float desaturate_v1(float x, float sigma_toe, float sigma_shoulder, float saturation) {
+    float radius_toe = x;
+    float radius_shoulder = 1.0 - x;
+    float key_toe = exp(-0.5 * radius_toe * radius_toe / sigma_toe);
+    float key_shoulder = exp(-0.5 * radius_shoulder * radius_shoulder / sigma_shoulder);
+    return 1.0 - clipf((key_toe + key_shoulder) / saturation);
+}
+
+float desaturate_v2(float x, float sigma_toe, float sigma_shoulder, float saturation) {
+    float radius_toe = x;
+    float radius_shoulder = 1.0 - x;
+    float sat2 = 0.5 / sqrt(saturation);
+    float key_toe = exp(-radius_toe * radius_toe / sigma_toe * sat2);
+    float key_shoulder = exp(-radius_shoulder * radius_shoulder / sigma_shoulder * sat2);
+    return (saturation - (key_toe + key_shoulder) * saturation);
+}
+
+vec4 linear_saturation(vec4 x, float luminance, float saturation) {
+    return vec4(luminance) + vec4(saturation) * (x - vec4(luminance));
+}
+
+float spline(float x, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5,
+             float latitude_min, float latitude_max, int type0, int type1) {
+    float result;
+    if(x < latitude_min) {
+        if(type0 == FR_CURVE_POLY_4)
+            result = M1.x + x * (M2.x + x * (M3.x + x * (M4.x + x * M5.x)));
+        else if(type0 == FR_CURVE_POLY_3)
+            result = M1.x + x * (M2.x + x * (M3.x + x * M4.x));
+        else {
+            float xi = latitude_min - x;
+            float rat = xi * (xi * M2.x + 1.0);
+            result = M4.x - M1.x * rat / (rat + M3.x);
+        }
+    } else if(x > latitude_max) {
+        if(type1 == FR_CURVE_POLY_4)
+            result = M1.y + x * (M2.y + x * (M3.y + x * (M4.y + x * M5.y)));
+        else if(type1 == FR_CURVE_POLY_3)
+            result = M1.y + x * (M2.y + x * (M3.y + x * M4.y));
+        else {
+            float xi = x - latitude_max;
+            float rat = xi * (xi * M2.y + 1.0);
+            result = M4.y + M1.y * rat / (rat + M3.y);
+        }
+    } else {
+        result = M1.z + x * M2.z;
+    }
+    return result;
+}
+
+float log_tonemapping_v1(float x, float grey, float black, float dynamic_range) {
+    float temp = (log2(x / grey) - black) / dynamic_range;
+    return clamp(temp, NORM_MIN, 1.0);
+}
+
+float log_tonemapping_v2(float x, float grey, float black, float dynamic_range) {
+    return clipf((log2(x / grey) - black) / dynamic_range);
+}
+
+vec4 pipe_RGB_to_Ych(vec4 v, int base) {
+    vec4 LMS = matrix_product(v, base);
+    vec4 Yrg = LMS_to_Yrg(LMS);
+    return Yrg_to_Ych(Yrg);
+}
+
+vec4 Ych_to_pipe_RGB(vec4 v, int base) {
+    vec4 Yrg = Ych_to_Yrg(v);
+    vec4 LMS = Yrg_to_LMS(Yrg);
+    return matrix_product(LMS, base);
+}
+
+vec4 desaturate_v4(vec4 Ych_original, vec4 Ych_final, float saturation) {
+    float chroma_original = Ych_original.y * Ych_original.x;
+    float chroma_final = Ych_final.y * Ych_final.x;
+    float delta_chroma = saturation * (chroma_original - chroma_final);
+
+    bool filmic_brightens = (Ych_final.x > Ych_original.x);
+    bool filmic_resat = (chroma_original < chroma_final);
+    bool filmic_desat = (chroma_original > chroma_final);
+    bool user_resat = (saturation > 0.0);
+    bool user_desat = (saturation < 0.0);
+
+    chroma_final = (filmic_brightens && filmic_resat)
+                       ? (chroma_original + chroma_final) / 2.0
+                   : ((user_resat && filmic_desat) || user_desat)
+                       ? chroma_final + delta_chroma
+                       : chroma_final;
+
+    Ych_final.y = max(chroma_final / Ych_final.x, 0.0);
+    return Ych_final;
+}
+
+// ---- gamut mapping (v4/v5) ----
+float clip_chroma_white_raw(int row, float target_white, float Y, float cos_h, float sin_h) {
+    float c0 = matrices.data[row + 0], c1 = matrices.data[row + 1], c2 = matrices.data[row + 2];
+    float denominator_Y_coeff = c0 * (0.979381443298969 * cos_h + 0.391752577319588 * sin_h)
+                              + c1 * (0.0206185567010309 * cos_h + 0.608247422680412 * sin_h)
+                              - c2 * (cos_h + sin_h);
+    float denominator_target_term = target_white * (0.68285981628866 * cos_h + 0.482137060515464 * sin_h);
+
+    if(denominator_Y_coeff == 0.0) return FLT_MAX;
+
+    float Y_asymptote = denominator_target_term / denominator_Y_coeff;
+    if(Y <= Y_asymptote) return FLT_MAX;
+
+    float denominator = Y * denominator_Y_coeff - denominator_target_term;
+    float numerator = -0.427506877216495
+                      * (Y * (c0 + 0.856492345150334 * c1 + 0.554995960637719 * c2)
+                         - 0.988237752433297 * target_white);
+    return numerator / denominator;
+}
+
+float clip_chroma_white(int row, float target_white, float Y, float cos_h, float sin_h) {
+    float eps = 1e-3;
+    float max_Y = CIE_Y_1931_TO_2006(target_white);
+    float delta_Y = max(max_Y - Y, 0.0);
+    float max_chroma;
+    if(delta_Y < eps)
+        max_chroma = delta_Y / (eps * max_Y) * clip_chroma_white_raw(row, target_white, (1.0 - eps) * max_Y, cos_h, sin_h);
+    else
+        max_chroma = clip_chroma_white_raw(row, target_white, Y, cos_h, sin_h);
+    return max_chroma >= 0.0 ? max_chroma : FLT_MAX;
+}
+
+float clip_chroma_black(int row, float cos_h, float sin_h) {
+    float c0 = matrices.data[row + 0], c1 = matrices.data[row + 1], c2 = matrices.data[row + 2];
+    float denominator = c0 * (0.979381443298969 * cos_h + 0.391752577319588 * sin_h)
+                      + c1 * (0.0206185567010309 * cos_h + 0.608247422680412 * sin_h)
+                      - c2 * (cos_h + sin_h);
+    if(denominator == 0.0) return FLT_MAX;
+    float numerator = -0.427506877216495 * (c0 + 0.856492345150334 * c1 + 0.554995960637719 * c2);
+    float max_chroma = numerator / denominator;
+    return max_chroma >= 0.0 ? max_chroma : FLT_MAX;
+}
+
+float clip_chroma(int out_base, float target_white, float Y, float cos_h, float sin_h, float chroma) {
+    float cRw = clip_chroma_white(out_base + 0, target_white, Y, cos_h, sin_h);
+    float cGw = clip_chroma_white(out_base + 4, target_white, Y, cos_h, sin_h);
+    float cBw = clip_chroma_white(out_base + 8, target_white, Y, cos_h, sin_h);
+    float max_white = min(min(cRw, cGw), cBw);
+
+    float cRb = clip_chroma_black(out_base + 0, cos_h, sin_h);
+    float cGb = clip_chroma_black(out_base + 4, cos_h, sin_h);
+    float cBb = clip_chroma_black(out_base + 8, cos_h, sin_h);
+    float max_black = min(min(cRb, cGb), cBb);
+
+    return min(min(chroma, max_black), max_white);
+}
+
+vec4 gamut_check_RGB(int in_base, int out_base, float display_black, float display_white, vec4 Ych_in) {
+    vec4 RGB_brightened = Ych_to_pipe_RGB(Ych_in, out_base);
+    float min_pix = min(min(RGB_brightened.x, RGB_brightened.y), RGB_brightened.z);
+    float black_offset = max(-min_pix, 0.0);
+    RGB_brightened += black_offset;
+    vec4 Ych_brightened = pipe_RGB_to_Ych(RGB_brightened, in_base);
+
+    float Y = clamp((Ych_in.x + Ych_brightened.x) / 2.0,
+                    CIE_Y_1931_TO_2006(display_black), CIE_Y_1931_TO_2006(display_white));
+
+    float cos_h = Ych_in.z;
+    float sin_h = Ych_in.w;
+    float new_chroma = clip_chroma(out_base, display_white, Y, cos_h, sin_h, Ych_in.y);
+
+    vec4 Ych = vec4(Y, new_chroma, cos_h, sin_h);
+    vec4 RGB_out = Ych_to_pipe_RGB(Ych, out_base);
+    return clamp(RGB_out, 0.0, display_white);
+}
+
+vec4 gamut_mapping(vec4 Ych_final, vec4 Ych_original, float display_black, float display_white,
+                   float saturation, int use_output_profile) {
+    Ych_final.z = Ych_original.z;
+    Ych_final.w = Ych_original.w;
+    Ych_final.x = clamp(Ych_final.x, CIE_Y_1931_TO_2006(display_black), CIE_Y_1931_TO_2006(display_white));
+    Ych_final = desaturate_v4(Ych_original, Ych_final, saturation);
+    Ych_final = gamut_check_Yrg(Ych_final);
+
+    vec4 outp;
+    if(use_output_profile == 0) {
+        outp = gamut_check_RGB(FR_MAT_IN, FR_MAT_OUT, display_black, display_white, Ych_final);
+    } else {
+        vec4 export_RGB = gamut_check_RGB(FR_MAT_EXIN, FR_MAT_EXOUT, display_black, display_white, Ych_final);
+        vec4 LMS = matrix_product(export_RGB, FR_MAT_EXIN);
+        outp = matrix_product(LMS, FR_MAT_OUT);
+    }
+    return outp;
+}
+
+// ---- colour-science variants ----
+vec4 chroma_v1(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    float norm = max(get_pixel_norm(i, params.p.variant), NORM_MIN);
+    vec4 o = i / vec4(norm);
+    float min_ratios = min(min(o.x, o.y), o.z);
+    if(min_ratios < 0.0) o -= vec4(min_ratios);
+
+    norm = log_tonemapping_v1(norm, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+
+    o *= vec4(norm);
+    float luminance = (params.p.use_work_profile != 0) ? get_rgb_matrix_luminance(o) : camera_rgb_luminance(o);
+    float desaturation = desaturate_v1(norm, params.p.sigma_toe, params.p.sigma_shoulder, params.p.saturation);
+    o = linear_saturation(o, luminance, desaturation);
+    o /= vec4(norm);
+
+    norm = pow(clipf(spline(norm, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max,
+                            params.p.type_1, params.p.type_2)), params.p.output_power);
+    return o * norm;
+}
+
+vec4 chroma_v2_v3(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    float norm = max(get_pixel_norm(i, params.p.variant), NORM_MIN);
+    vec4 ratios = i / vec4(norm);
+    float min_ratios = min(min(ratios.x, ratios.y), ratios.z);
+    if(min_ratios < 0.0) ratios -= vec4(min_ratios);
+
+    norm = log_tonemapping_v2(norm, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+
+    vec4 desaturation = vec4(desaturate_v2(norm, params.p.sigma_toe, params.p.sigma_shoulder, params.p.saturation));
+
+    norm = pow(clipf(spline(norm, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max,
+                            params.p.type_1, params.p.type_2)), params.p.output_power);
+
+    ratios = max(ratios + (vec4(1.0) - ratios) * (vec4(1.0) - desaturation), vec4(0.0));
+
+    if(params.p.color_science == FR_SCIENCE_V3)
+        norm /= max(get_pixel_norm(ratios, params.p.variant), NORM_MIN);
+
+    vec4 o = vec4(norm) * ratios;
+
+    float max_pix = max(max(o.x, o.y), o.z);
+    if(max_pix > 1.0) {
+        ratios = max(ratios + (vec4(1.0) - vec4(max_pix)), vec4(0.0));
+        o = clamp(vec4(norm) * ratios, vec4(0.0), vec4(1.0));
+    }
+    return o;
+}
+
+vec4 chroma_v4(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    float norm = clamp(get_pixel_norm(i, params.p.variant), params.p.norm_min, params.p.norm_max);
+    vec4 ratios = i / vec4(norm);
+
+    norm = log_tonemapping_v2(norm, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    norm = pow(clamp(spline(norm, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max,
+                            params.p.type_1, params.p.type_2),
+                     params.p.display_black, params.p.display_white), params.p.output_power);
+
+    vec4 o = norm * ratios;
+    vec4 Ych_original = pipe_RGB_to_Ych(i, FR_MAT_IN);
+    vec4 Ych_final = pipe_RGB_to_Ych(o, FR_MAT_IN);
+    return gamut_mapping(Ych_final, Ych_original, params.p.display_black, params.p.display_white,
+                         params.p.saturation, params.p.use_output_profile);
+}
+
+vec4 split_v4(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    vec4 o;
+    o.x = log_tonemapping_v2(i.x, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.y = log_tonemapping_v2(i.y, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.z = log_tonemapping_v2(i.z, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.w = 0.0;
+
+    o.x = spline(o.x, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.y = spline(o.y, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.z = spline(o.z, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+
+    o = pow(clamp(o, vec4(0.0), vec4(params.p.display_white)), vec4(params.p.output_power));
+
+    vec4 Ych_original = pipe_RGB_to_Ych(i, FR_MAT_IN);
+    vec4 Ych_final = pipe_RGB_to_Ych(o, FR_MAT_IN);
+    Ych_final.y = min(Ych_original.y, Ych_final.y);
+    return gamut_mapping(Ych_final, Ych_original, params.p.display_black, params.p.display_white,
+                         params.p.saturation, params.p.use_output_profile);
+}
+
+vec4 chroma_v5(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    float norm = clamp(get_pixel_norm(i, FR_METHOD_MAX_RGB), params.p.norm_min, params.p.norm_max);
+    vec4 ratios = i / vec4(norm);
+
+    norm = log_tonemapping_v2(norm, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    norm = pow(clamp(spline(norm, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max,
+                            params.p.type_1, params.p.type_2),
+                     params.p.display_black, params.p.display_white), params.p.output_power);
+    vec4 max_rgb = norm * ratios;
+
+    vec4 naive_rgb;
+    naive_rgb.x = log_tonemapping_v2(i.x, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    naive_rgb.y = log_tonemapping_v2(i.y, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    naive_rgb.z = log_tonemapping_v2(i.z, params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    naive_rgb.w = 0.0;
+
+    naive_rgb.x = spline(naive_rgb.x, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    naive_rgb.y = spline(naive_rgb.y, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    naive_rgb.z = spline(naive_rgb.z, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+
+    naive_rgb = pow(clamp(naive_rgb, vec4(0.0), vec4(params.p.display_white)), vec4(params.p.output_power));
+
+    vec4 o = (0.5 - params.p.saturation) * naive_rgb + (0.5 + params.p.saturation) * max_rgb;
+
+    vec4 Ych_original = pipe_RGB_to_Ych(i, FR_MAT_IN);
+    vec4 Ych_final = pipe_RGB_to_Ych(o, FR_MAT_IN);
+    Ych_final.y = min(Ych_original.y, Ych_final.y);
+    return gamut_mapping(Ych_final, Ych_original, params.p.display_black, params.p.display_white,
+                         0.0, params.p.use_output_profile);
+}
+
+vec4 split_v1(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    vec4 o;
+    o.x = log_tonemapping_v1(max(i.x, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.y = log_tonemapping_v1(max(i.y, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.z = log_tonemapping_v1(max(i.z, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.w = 0.0;
+
+    float luminance = (params.p.use_work_profile != 0) ? get_rgb_matrix_luminance(o) : camera_rgb_luminance(o);
+    float desaturation = desaturate_v1(luminance, params.p.sigma_toe, params.p.sigma_shoulder, params.p.saturation);
+    o = linear_saturation(o, luminance, desaturation);
+
+    o.x = spline(o.x, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.y = spline(o.y, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.z = spline(o.z, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+
+    o = pow(clamp(o, vec4(0.0), vec4(1.0)), vec4(params.p.output_power));
+    return o;
+}
+
+vec4 split_v2_v3(vec4 i, vec4 M1, vec4 M2, vec4 M3, vec4 M4, vec4 M5) {
+    vec4 o;
+    o.x = log_tonemapping_v2(max(i.x, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.y = log_tonemapping_v2(max(i.y, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.z = log_tonemapping_v2(max(i.z, NORM_MIN), params.p.grey_value, params.p.black_exposure, params.p.dynamic_range);
+    o.w = 0.0;
+
+    float luminance = (params.p.use_work_profile != 0) ? get_rgb_matrix_luminance(o) : camera_rgb_luminance(o);
+    float desaturation = desaturate_v2(luminance, params.p.sigma_toe, params.p.sigma_shoulder, params.p.saturation);
+    o = linear_saturation(o, luminance, desaturation);
+
+    o.x = spline(o.x, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.y = spline(o.y, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+    o.z = spline(o.z, M1, M2, M3, M4, M5, params.p.latitude_min, params.p.latitude_max, params.p.type_1, params.p.type_2);
+
+    o = pow(clamp(o, vec4(0.0), vec4(1.0)), vec4(params.p.output_power));
+    return o;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 i = in_buf.data[idx];
+
+    vec4 M1 = ld4(params.p.M1);
+    vec4 M2 = ld4(params.p.M2);
+    vec4 M3 = ld4(params.p.M3);
+    vec4 M4 = ld4(params.p.M4);
+    vec4 M5 = ld4(params.p.M5);
+
+    bool is_split = (params.p.variant == FR_METHOD_NONE && params.p.color_science != FR_SCIENCE_V5);
+
+    vec4 o;
+    if(is_split) {
+        if(params.p.color_science == FR_SCIENCE_V1)
+            o = split_v1(i, M1, M2, M3, M4, M5);
+        else if(params.p.color_science == FR_SCIENCE_V2 || params.p.color_science == FR_SCIENCE_V3)
+            o = split_v2_v3(i, M1, M2, M3, M4, M5);
+        else
+            o = split_v4(i, M1, M2, M3, M4, M5);
+    } else {
+        if(params.p.color_science == FR_SCIENCE_V1)
+            o = chroma_v1(i, M1, M2, M3, M4, M5);
+        else if(params.p.color_science == FR_SCIENCE_V2 || params.p.color_science == FR_SCIENCE_V3)
+            o = chroma_v2_v3(i, M1, M2, M3, M4, M5);
+        else if(params.p.color_science == FR_SCIENCE_V4)
+            o = chroma_v4(i, M1, M2, M3, M4, M5);
+        else
+            o = chroma_v5(i, M1, M2, M3, M4, M5);
+    }
+
+    o.w = i.w;
+    out_buf.data[idx] = o;
+}
