@@ -18,6 +18,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -62,6 +63,9 @@ typedef struct dt_iop_sharpen_global_data_t
   int kernel_sharpen_hblur;
   int kernel_sharpen_vblur;
   int kernel_sharpen_mix;
+  dt_vk_module_kernel_t vk_hblur;
+  dt_vk_module_kernel_t vk_vblur;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_sharpen_global_data_t;
 
 
@@ -231,6 +235,104 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_sharpen_blur_pc_t
+{
+  int width;
+  int height;
+  int rad;
+} vk_sharpen_blur_pc_t;
+
+typedef struct vk_sharpen_mix_pc_t
+{
+  int   width;
+  int   height;
+  float sharpen;
+  float threshold;
+  int   rad;
+} vk_sharpen_mix_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same Gaussian
+// kernel via init_gaussian_kernel, same skip-edge semantics
+// (output = input for the outermost rad pixels), same unsharp-mask
+// soft-threshold blend in sharpen_mix. The OpenCL kernels tile via
+// workgroup-local memory; the Vulkan twins read straight from the
+// global storage buffer (inside the convolution zone the indices
+// stay strictly in-bounds, so no clamp is needed).
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_sharpen_data_t *const d = piece->data;
+  const dt_iop_sharpen_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const int rad = MIN(MAXR, (int)ceilf(d->radius * roi_in->scale / piece->iscale));
+
+  // rad == 0 or image too small to convolve: pass-through (matches
+  // the OpenCL copy fast path).
+  if(rad == 0 || width < 2 * rad + 1 || height < 2 * rad + 1)
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+
+  const int wd = 2 * rad + 1;
+  const float sigma2 = (1.0f / (2.5f * 2.5f))
+                       * (d->radius * roi_in->scale / piece->iscale)
+                       * (d->radius * roi_in->scale / piece->iscale);
+  float *mat = init_gaussian_kernel(rad, wd, sigma2);
+  if(!mat) return -1;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  dt_vk_mem_t *dev_m   = dt_vulkan_alloc_buffer(devid, wd * sizeof(float));
+  if(!dev_tmp || !dev_m) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m, mat, wd * sizeof(float)) != 0) goto cleanup;
+
+  // hblur: in → out (writes blurred L into out.x, keeps other channels).
+  {
+    const vk_sharpen_blur_pc_t pc = { .width = width, .height = height, .rad = rad };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_hblur, bufs, 3, width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  // vblur: out → tmp (the OpenCL flow does this too; out is the
+  // intermediate, tmp is the final blurred reference).
+  {
+    const vk_sharpen_blur_pc_t pc = { .width = width, .height = height, .rad = rad };
+    dt_vk_mem_t *bufs[] = { dev_out, dev_tmp, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_vblur, bufs, 3, width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  // mix: (in, tmp) → out — unsharp-mask soft-threshold blend.
+  {
+    const vk_sharpen_mix_pc_t pc = {
+      .width = width, .height = height,
+      .sharpen = d->amount, .threshold = d->threshold, .rad = rad,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 3, width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_m)   dt_vulkan_free_buffer(devid, dev_m);
+  dt_free_align(mat);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
@@ -397,6 +499,13 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_sharpen_hblur = dt_opencl_create_kernel(program, "sharpen_hblur");
   gd->kernel_sharpen_vblur = dt_opencl_create_kernel(program, "sharpen_vblur");
   gd->kernel_sharpen_mix = dt_opencl_create_kernel(program, "sharpen_mix");
+
+  dt_vulkan_module_kernel_load(&gd->vk_hblur, "sharpen_hblur", "sharpen_hblur",
+                               3, sizeof(vk_sharpen_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_vblur, "sharpen_vblur", "sharpen_vblur",
+                               3, sizeof(vk_sharpen_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "sharpen_mix", "sharpen_mix",
+                               3, sizeof(vk_sharpen_mix_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -405,6 +514,9 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_sharpen_hblur);
   dt_opencl_free_kernel(gd->kernel_sharpen_vblur);
   dt_opencl_free_kernel(gd->kernel_sharpen_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_hblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_vblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }
