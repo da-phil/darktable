@@ -27,6 +27,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -68,6 +69,10 @@ typedef struct dt_iop_soften_global_data_t
   int kernel_soften_hblur;
   int kernel_soften_vblur;
   int kernel_soften_mix;
+  dt_vk_module_kernel_t vk_overexposed;
+  dt_vk_module_kernel_t vk_hblur;
+  dt_vk_module_kernel_t vk_vblur;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_soften_global_data_t;
 
 
@@ -285,6 +290,130 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_soften_overexposed_pc_t
+{
+  int   width;
+  int   height;
+  float saturation;
+  float brightness;
+} vk_soften_overexposed_pc_t;
+
+typedef struct vk_soften_blur_pc_t
+{
+  int width;
+  int height;
+  int rad;
+} vk_soften_blur_pc_t;
+
+typedef struct vk_soften_mix_pc_t
+{
+  int   width;
+  int   height;
+  float amount;
+} vk_soften_mix_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same HSL boost (via
+// the dt_vulkan_common HSL helpers), same explicit Gaussian
+// convolution with the host-computed normalised kernel, same
+// CLAMP_TO_EDGE boundary via int clamp on the source index. The
+// OpenCL kernel tiles the blur via workgroup-local memory; the
+// Vulkan twin reads from the global storage buffer directly — the
+// L1-cache pattern differs but the per-pixel sum is identical.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_soften_data_t *const d = piece->data;
+  const dt_iop_soften_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  // Match the OpenCL host-side preparation byte-for-byte.
+  const float brightness = 1.0f / exp2f(-d->brightness);
+  const float saturation = d->saturation / 100.0f;
+  const float amount     = d->amount / 100.0f;
+
+  const float wf = piece->iwidth * piece->iscale;
+  const float hf = piece->iheight * piece->iscale;
+  const int mrad = dt_fast_hypotf(wf, hf) * 0.01f;
+  const int rad_base = mrad * (fmin(100.0f, d->size + 1.0f) / 100.0f);
+  const int radius = MIN(mrad, (int)ceilf(rad_base * roi_in->scale / piece->iscale));
+
+  const float sigma = sqrtf((radius * (radius + 1) * BOX_ITERATIONS + 2) / 3.0f);
+  const int wdh = ceilf(3.0f * sigma);
+  const int mlen = 2 * wdh + 1;
+  const size_t mat_size = sizeof(float) * mlen;
+
+  float *mat = malloc(mat_size);
+  if(!mat) return -1;
+  float *m = mat + wdh;
+  float weight = 0.0f;
+  for(int l = -wdh; l <= wdh; l++) weight += m[l] = expf(-(l * l) / (2.f * sigma * sigma));
+  for(int l = -wdh; l <= wdh; l++) m[l] /= weight;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  dt_vk_mem_t *dev_m   = dt_vulkan_alloc_buffer(devid, mat_size);
+  if(!dev_tmp || !dev_m) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m, mat, mat_size) != 0) goto cleanup;
+
+  // Step 1: HSL boost into dev_tmp.
+  {
+    const vk_soften_overexposed_pc_t pc = {
+      .width = width, .height = height,
+      .saturation = saturation, .brightness = brightness,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp };
+    if(dt_vulkan_dispatch_n(&gd->vk_overexposed, bufs, 2,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 2: horizontal + vertical Gaussian (skipped when rad == 0,
+  // matching the OpenCL fast path).
+  if(rad_base != 0)
+  {
+    const vk_soften_blur_pc_t pc = { .width = width, .height = height, .rad = wdh };
+    dt_vk_mem_t *bufs_h[] = { dev_tmp, dev_out, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_hblur, bufs_h, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+    dt_vk_mem_t *bufs_v[] = { dev_out, dev_tmp, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_vblur, bufs_v, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 3: blend the (blurred) overexposed reference back over the
+  // original at `amount` and write to dev_out.
+  {
+    const vk_soften_mix_pc_t pc = { .width = width, .height = height, .amount = amount };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_m)   dt_vulkan_free_buffer(devid, dev_m);
+  free(mat);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -323,6 +452,15 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_soften_hblur = dt_opencl_create_kernel(program, "soften_hblur");
   gd->kernel_soften_vblur = dt_opencl_create_kernel(program, "soften_vblur");
   gd->kernel_soften_mix = dt_opencl_create_kernel(program, "soften_mix");
+
+  dt_vulkan_module_kernel_load(&gd->vk_overexposed, "soften_overexposed", "soften_overexposed",
+                               2, sizeof(vk_soften_overexposed_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_hblur, "soften_hblur", "soften_hblur",
+                               3, sizeof(vk_soften_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_vblur, "soften_vblur", "soften_vblur",
+                               3, sizeof(vk_soften_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "soften_mix", "soften_mix",
+                               3, sizeof(vk_soften_mix_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -332,6 +470,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_soften_hblur);
   dt_opencl_free_kernel(gd->kernel_soften_vblur);
   dt_opencl_free_kernel(gd->kernel_soften_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_overexposed);
+  dt_vulkan_module_kernel_unload(&gd->vk_hblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_vblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }
