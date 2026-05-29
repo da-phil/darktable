@@ -94,7 +94,10 @@ set(VK_KERNELS
     soften_overexposed:soften_overexposed
     soften_hblur:soften_hblur
     soften_vblur:soften_vblur
-    soften_mix:soften_mix)
+    soften_mix:soften_mix
+    sharpen_hblur:sharpen_hblur
+    sharpen_vblur:sharpen_vblur
+    sharpen_mix:sharpen_mix)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

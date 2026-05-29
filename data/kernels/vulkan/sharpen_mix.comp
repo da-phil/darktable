@@ -1,0 +1,31 @@
+// GLSL fallback for sharpen_mix.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer InA { vec4 data[]; } in_a;
+layout(std430, binding = 1) readonly buffer InB { vec4 data[]; } in_b;
+layout(std430, binding = 2)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float sharpen;
+    float threshold;
+    int   rad;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_a.data[idx];
+    if (x >= pc.rad && y >= pc.rad && x < pc.width - pc.rad && y < pc.height - pc.rad) {
+        float blurredx = in_b.data[idx].x;
+        float delta = pixel.x - blurredx;
+        float mag = max(0.0, abs(delta) - pc.threshold);
+        float amount = pc.sharpen * ((delta >= 0.0) ? mag : -mag);
+        pixel.x = pixel.x + amount;
+    }
+    out_buf.data[idx] = pixel;
+}
