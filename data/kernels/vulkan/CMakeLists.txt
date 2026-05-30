@@ -104,7 +104,11 @@ set(VK_KERNELS
     highpass_mix:highpass_mix
     blurs_convolve:convolve
     blurs_convolve_sparse:convolve_sparse
-    blurs_restore_alpha:restore_alpha)
+    blurs_restore_alpha:restore_alpha
+    bloom_threshold:bloom_threshold
+    bloom_hblur:bloom_hblur
+    bloom_vblur:bloom_vblur
+    bloom_mix:bloom_mix)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
