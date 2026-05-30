@@ -20,6 +20,7 @@
 #include "common/eaw.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/imageop.h"
@@ -107,6 +108,8 @@ typedef struct dt_iop_atrous_global_data_t
   int kernel_decompose;
   int kernel_synthesize;
   int kernel_addbuffers;
+  dt_vk_module_kernel_t vk_decompose;
+  dt_vk_module_kernel_t vk_synthesize;
 } dt_iop_atrous_global_data_t;
 
 typedef struct dt_iop_atrous_data_t
@@ -581,6 +584,120 @@ error:
 
 #endif // HAVE_OPENCL
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_atrous_decompose_pc_t
+{
+  int   width;
+  int   height;
+  int   scale;
+  float sharpen;
+} vk_atrous_decompose_pc_t;
+
+typedef struct vk_atrous_synthesize_pc_t
+{
+  int   width;
+  int   height;
+  float threshold[4];
+  float boost[4];
+} vk_atrous_synthesize_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl (the active, "old memory-hungry" path —
+// the USE_NEW_CL variant is disabled at the top of the file). Math is
+// bit-equal: same edge-aware à-trous wavelet decomposition with a 5x5
+// stencil and host-built 1/16-4/16-6/16 separable B3-spline filter,
+// same per-scale ping-pong between dev_tmp and dev_out, same soft-
+// thresholded detail accumulation on the synthesize sweep.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_atrous_data_t *d = piece->data;
+  const dt_iop_atrous_global_data_t *gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  dt_aligned_pixel_t thrs[MAX_NUM_SCALES];
+  dt_aligned_pixel_t boost[MAX_NUM_SCALES];
+  float sharp[MAX_NUM_SCALES];
+  const int max_scale = get_scales(thrs, boost, sharp, d, roi_in, piece);
+
+  // Host-built separable B3-spline filter (matches process_cl).
+  const float m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+  float mm[25];
+  for(int j = 0; j < 5; j++)
+    for(int i = 0; i < 5; i++)
+      mm[j * 5 + i] = m[i] * m[j];
+
+  int rc = -1;
+  dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  dt_vk_mem_t *dev_filter = dt_vulkan_alloc_buffer(devid, 25 * sizeof(float));
+  dt_vk_mem_t **dev_detail = calloc(max_scale, sizeof(*dev_detail));
+  if(!dev_tmp || !dev_filter || !dev_detail) goto cleanup;
+  for(int k = 0; k < max_scale; k++)
+  {
+    dev_detail[k] = dt_vulkan_alloc_buffer(devid, img_bytes);
+    if(!dev_detail[k]) goto cleanup;
+  }
+  if(dt_vulkan_write_to_device(devid, dev_filter, mm, sizeof(mm)) != 0) goto cleanup;
+
+  // Seed dev_out with the input — the ping-pong starts here.
+  if(dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes) != 0) goto cleanup;
+
+  // Decompose sweep: alternates dev_out / dev_tmp as in/out to match
+  // process_cl's even/odd parity exactly.
+  for(int s = 0; s < max_scale; s++)
+  {
+    const vk_atrous_decompose_pc_t pc = {
+      .width = width, .height = height, .scale = s, .sharpen = sharp[s],
+    };
+    dt_vk_mem_t *src = (s & 1) ? dev_tmp : dev_out;
+    dt_vk_mem_t *dst = (s & 1) ? dev_out : dev_tmp;
+    dt_vk_mem_t *bufs[] = { src, dst, dev_detail[s], dev_filter };
+    if(dt_vulkan_dispatch_n(&gd->vk_decompose, bufs, 4,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Synthesize sweep (reverse): src and dst swap parity to match.
+  for(int s = max_scale - 1; s >= 0; s--)
+  {
+    vk_atrous_synthesize_pc_t pc;
+    memset(&pc, 0, sizeof(pc));
+    pc.width = width; pc.height = height;
+    for(int c = 0; c < 4; c++) pc.threshold[c] = thrs[s][c];
+    for(int c = 0; c < 4; c++) pc.boost[c]     = boost[s][c];
+    dt_vk_mem_t *src = (s & 1) ? dev_tmp : dev_out;
+    dt_vk_mem_t *dst = (s & 1) ? dev_out : dev_tmp;
+    dt_vk_mem_t *bufs[] = { dst, src, dev_detail[s] };
+    if(dt_vulkan_dispatch_n(&gd->vk_synthesize, bufs, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_filter) dt_vulkan_free_buffer(devid, dev_filter);
+  if(dev_detail)
+  {
+    for(int k = 0; k < max_scale; k++)
+      if(dev_detail[k]) dt_vulkan_free_buffer(devid, dev_detail[k]);
+    free(dev_detail);
+  }
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -630,6 +747,10 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_zero = dt_opencl_create_kernel(program, "eaw_zero");
   gd->kernel_addbuffers = dt_opencl_create_kernel(program, "eaw_addbuffers");
 #endif
+  dt_vulkan_module_kernel_load(&gd->vk_decompose, "eaw_decompose", "eaw_decompose",
+                               4, sizeof(vk_atrous_decompose_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_synthesize, "eaw_synthesize", "eaw_synthesize",
+                               3, sizeof(vk_atrous_synthesize_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -641,6 +762,8 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_zero);
   dt_opencl_free_kernel(gd->kernel_addbuffers);
 #endif
+  dt_vulkan_module_kernel_unload(&gd->vk_decompose);
+  dt_vulkan_module_kernel_unload(&gd->vk_synthesize);
   free(self->data);
   self->data = NULL;
 }
