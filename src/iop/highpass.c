@@ -23,6 +23,7 @@
 #include "common/box_filters.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -61,6 +62,10 @@ typedef struct dt_iop_highpass_global_data_t
   int kernel_highpass_hblur;
   int kernel_highpass_vblur;
   int kernel_highpass_mix;
+  dt_vk_module_kernel_t vk_invert;
+  dt_vk_module_kernel_t vk_hblur;
+  dt_vk_module_kernel_t vk_vblur;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_highpass_global_data_t;
 
 
@@ -231,6 +236,118 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_highpass_invert_pc_t
+{
+  int width;
+  int height;
+} vk_highpass_invert_pc_t;
+
+typedef struct vk_highpass_blur_pc_t
+{
+  int width;
+  int height;
+  int rad;
+} vk_highpass_blur_pc_t;
+
+typedef struct vk_highpass_mix_pc_t
+{
+  int   width;
+  int   height;
+  float contrast_scale;
+} vk_highpass_mix_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same invert
+// (out.L = clamp(100 - in.L, 0, 100), chroma passes through),
+// same explicit 2*wdh+1 Gaussian convolution with CLAMP_TO_EDGE
+// on the source index (matches OpenCL's sampler-clamp on the
+// local-mem wing reads), same desaturating mix that pulls a/b to
+// zero and applies contrast around L=50.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_highpass_data_t *const d = piece->data;
+  const dt_iop_highpass_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const int rad = MAX_RADIUS * (fmin(100.0f, d->sharpness + 1) / 100.0f);
+  const int radius = MIN(MAX_RADIUS, (int)ceilf(rad * roi_in->scale / piece->iscale));
+  const float sigma = sqrtf((radius * (radius + 1) * BOX_ITERATIONS + 2) / 3.0f);
+  const int wdh = ceilf(3.0f * sigma);
+  const int wd = 2 * wdh + 1;
+  const size_t mat_size = (size_t)wd * sizeof(float);
+
+  float *mat = malloc(mat_size);
+  if(!mat) return -1;
+  float *m = mat + wdh;
+  float weight = 0.0f;
+  for(int l = -wdh; l <= wdh; l++) weight += m[l] = expf(-(l * l) / (2.f * sigma * sigma));
+  for(int l = -wdh; l <= wdh; l++) m[l] /= weight;
+  const float contrast_scale = ((d->contrast / 100.0f) * 7.5f);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  dt_vk_mem_t *dev_m   = dt_vulkan_alloc_buffer(devid, mat_size);
+  if(!dev_tmp || !dev_m) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_m, mat, mat_size) != 0) goto cleanup;
+
+  // Step 1: invert (in → tmp).
+  {
+    const vk_highpass_invert_pc_t pc = { .width = width, .height = height };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp };
+    if(dt_vulkan_dispatch_n(&gd->vk_invert, bufs, 2,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 2: separable Gaussian (tmp → out → tmp); skipped at rad == 0
+  // so the mix below sees the un-blurred inverted reference, matching
+  // the OpenCL fast path.
+  if(rad != 0)
+  {
+    const vk_highpass_blur_pc_t pc = { .width = width, .height = height, .rad = wdh };
+    dt_vk_mem_t *bufs_h[] = { dev_tmp, dev_out, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_hblur, bufs_h, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+    dt_vk_mem_t *bufs_v[] = { dev_out, dev_tmp, dev_m };
+    if(dt_vulkan_dispatch_n(&gd->vk_vblur, bufs_v, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 3: desaturating mix(in, tmp → out).
+  {
+    const vk_highpass_mix_pc_t pc = {
+      .width = width, .height = height, .contrast_scale = contrast_scale,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_m)   dt_vulkan_free_buffer(devid, dev_m);
+  free(mat);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 static void _blend(const float *const restrict in,
                    float *const restrict out,
                    const double contrast_scale,
@@ -331,6 +448,15 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_highpass_hblur = dt_opencl_create_kernel(program, "highpass_hblur");
   gd->kernel_highpass_vblur = dt_opencl_create_kernel(program, "highpass_vblur");
   gd->kernel_highpass_mix = dt_opencl_create_kernel(program, "highpass_mix");
+
+  dt_vulkan_module_kernel_load(&gd->vk_invert, "highpass_invert", "highpass_invert",
+                               2, sizeof(vk_highpass_invert_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_hblur, "highpass_hblur", "highpass_hblur",
+                               3, sizeof(vk_highpass_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_vblur, "highpass_vblur", "highpass_vblur",
+                               3, sizeof(vk_highpass_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "highpass_mix", "highpass_mix",
+                               3, sizeof(vk_highpass_mix_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -340,6 +466,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_highpass_hblur);
   dt_opencl_free_kernel(gd->kernel_highpass_vblur);
   dt_opencl_free_kernel(gd->kernel_highpass_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_invert);
+  dt_vulkan_module_kernel_unload(&gd->vk_hblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_vblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }
