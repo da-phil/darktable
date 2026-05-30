@@ -21,6 +21,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -68,6 +69,10 @@ typedef struct dt_iop_bloom_global_data_t
   int kernel_bloom_hblur;
   int kernel_bloom_vblur;
   int kernel_bloom_mix;
+  dt_vk_module_kernel_t vk_threshold;
+  dt_vk_module_kernel_t vk_hblur;
+  dt_vk_module_kernel_t vk_vblur;
+  dt_vk_module_kernel_t vk_mix;
 } dt_iop_bloom_global_data_t;
 
 const char *name()
@@ -303,6 +308,111 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_bloom_threshold_pc_t
+{
+  int   width;
+  int   height;
+  float scale;
+  float threshold;
+} vk_bloom_threshold_pc_t;
+
+typedef struct vk_bloom_blur_pc_t
+{
+  int width;
+  int height;
+  int rad;
+} vk_bloom_blur_pc_t;
+
+typedef struct vk_bloom_mix_pc_t
+{
+  int width;
+  int height;
+} vk_bloom_mix_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same threshold,
+// same BOX_ITERATIONS-iterated uniform 2*rad+1 box average over a
+// single-channel float scratch (ping-pong between two buffers, no
+// shared memory), same screen-blend mix back over the L channel.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_bloom_data_t *const d = piece->data;
+  const dt_iop_bloom_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t f_bytes = (size_t)width * height * sizeof(float);
+
+  const float threshold = d->threshold;
+  const int rad_unscaled = 256.0f * (fmin(100.0f, d->size + 1.0f) / 100.0f);
+  const float _r = ceilf(rad_unscaled * roi_in->scale / piece->iscale);
+  const int radius = MIN(256, (int)_r);
+  const float scale = 1.0f / exp2f(-1.0f * (fmin(100.0f, d->strength + 1.0f) / 100.0f));
+
+  int rc = -1;
+  // Two single-channel float scratch buffers (minimum NUM_BUCKETS = 2
+  // for the bucket chain; we just ping-pong between them).
+  dt_vk_mem_t *dev_a = dt_vulkan_alloc_buffer(devid, f_bytes);
+  dt_vk_mem_t *dev_b = dt_vulkan_alloc_buffer(devid, f_bytes);
+  if(!dev_a || !dev_b) goto cleanup;
+
+  // Step 1: threshold(dev_in → dev_a).
+  {
+    const vk_bloom_threshold_pc_t pc = {
+      .width = width, .height = height, .scale = scale, .threshold = threshold,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_a };
+    if(dt_vulkan_dispatch_n(&gd->vk_threshold, bufs, 2,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Step 2: BOX_ITERATIONS iterations of separable box blur, ping-pong
+  // a→b (hblur), b→a (vblur), so after the loop the result sits in dev_a
+  // — exactly matching the OpenCL bucket-chain final destination.
+  if(radius != 0)
+  {
+    const vk_bloom_blur_pc_t pc = { .width = width, .height = height, .rad = radius };
+    for(int i = 0; i < BOX_ITERATIONS; i++)
+    {
+      dt_vk_mem_t *bufs_h[] = { dev_a, dev_b };
+      if(dt_vulkan_dispatch_n(&gd->vk_hblur, bufs_h, 2,
+                              width, height, &pc, sizeof(pc)) != 0)
+        goto cleanup;
+      dt_vk_mem_t *bufs_v[] = { dev_b, dev_a };
+      if(dt_vulkan_dispatch_n(&gd->vk_vblur, bufs_v, 2,
+                              width, height, &pc, sizeof(pc)) != 0)
+        goto cleanup;
+    }
+  }
+
+  // Step 3: screen-blend mix(dev_in, dev_a → dev_out).
+  {
+    const vk_bloom_mix_pc_t pc = { .width = width, .height = height };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_a, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_mix, bufs, 3,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_a) dt_vulkan_free_buffer(devid, dev_a);
+  if(dev_b) dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -334,15 +444,28 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_bloom_hblur = dt_opencl_create_kernel(program, "bloom_hblur");
   gd->kernel_bloom_vblur = dt_opencl_create_kernel(program, "bloom_vblur");
   gd->kernel_bloom_mix = dt_opencl_create_kernel(program, "bloom_mix");
+
+  dt_vulkan_module_kernel_load(&gd->vk_threshold, "bloom_threshold", "bloom_threshold",
+                               2, sizeof(vk_bloom_threshold_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_hblur, "bloom_hblur", "bloom_hblur",
+                               2, sizeof(vk_bloom_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_vblur, "bloom_vblur", "bloom_vblur",
+                               2, sizeof(vk_bloom_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_mix, "bloom_mix", "bloom_mix",
+                               3, sizeof(vk_bloom_mix_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_bloom_global_data_t *gd = self->data;
+  dt_iop_bloom_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_bloom_threshold);
   dt_opencl_free_kernel(gd->kernel_bloom_hblur);
   dt_opencl_free_kernel(gd->kernel_bloom_vblur);
   dt_opencl_free_kernel(gd->kernel_bloom_mix);
+  dt_vulkan_module_kernel_unload(&gd->vk_threshold);
+  dt_vulkan_module_kernel_unload(&gd->vk_hblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_vblur);
+  dt_vulkan_module_kernel_unload(&gd->vk_mix);
   free(self->data);
   self->data = NULL;
 }
