@@ -26,6 +26,7 @@
 // #include <fftw3.h> // one day, include FFT convolution
 #include "common/gaussian.h"
 #include "common/math.h"
+#include "common/vulkan.h"
 #include "develop/tiling.h"
 #include <gtk/gtk.h>
 #include <stdlib.h>
@@ -74,6 +75,9 @@ typedef struct dt_iop_blurs_global_data_t
   int kernel_blurs_convolve;
   int kernel_blurs_convolve_sparse;
   int kernel_blurs_restore_alpha;
+  dt_vk_module_kernel_t vk_convolve;
+  dt_vk_module_kernel_t vk_convolve_sparse;
+  dt_vk_module_kernel_t vk_restore_alpha;
 } dt_iop_blurs_global_data_t;
 
 
@@ -840,28 +844,193 @@ cleanup_cl:
   dt_opencl_release_mem_object(dev_kernel);
   return err;
 }
+#endif // HAVE_OPENCL
+
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_blurs_convolve_pc_t
+{
+  int width;
+  int height;
+  int radius;
+  int kernel_width;
+} vk_blurs_convolve_pc_t;
+
+typedef struct vk_blurs_convolve_sparse_pc_t
+{
+  int width;
+  int height;
+  int n_entries;
+} vk_blurs_convolve_sparse_pc_t;
+
+typedef struct vk_blurs_restore_alpha_pc_t
+{
+  int width;
+  int height;
+} vk_blurs_restore_alpha_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same _build_pixel_kernel
+// host-side, same sparse-then-dense fallback. The DT_BLUR_GAUSSIAN
+// fast path goes through dt_gaussian_blur_vk (the Deriche IIR helper)
+// followed by restore_alpha to put the original mask channel back.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_blurs_params_t *const p = piece->data;
+  const dt_iop_blurs_global_data_t *const gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid  = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const int radius = MAX((int)roundf(p->radius / scale), 2);
+
+  // ── Gaussian fast path: IIR separable filter + restore alpha ──
+  if(p->type == DT_BLUR_GAUSSIAN)
+  {
+    const float sigma = (float)(radius - 1) / (2.0f * sqrtf(2.0f));
+    const float range = 1.0e9f;
+    const dt_aligned_pixel_t maxv = { range, range, range, range };
+    const dt_aligned_pixel_t minv = { -range, -range, -range, -range };
+
+    int rc = -1;
+    dt_vk_mem_t *dev_blurred = dt_vulkan_alloc_buffer(devid, img_bytes);
+    dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, maxv, minv, sigma, DT_IOP_GAUSSIAN_ZERO);
+    if(!dev_blurred || !g) goto gauss_cleanup;
+    if(dt_gaussian_blur_vk(g, dev_in, dev_blurred) != 0) goto gauss_cleanup;
+
+    const vk_blurs_restore_alpha_pc_t pc = { .width = width, .height = height };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_blurred, dev_out };
+    rc = dt_vulkan_dispatch_n(&gd->vk_restore_alpha, bufs, 3,
+                              width, height, &pc, sizeof(pc));
+  gauss_cleanup:
+    if(g) dt_gaussian_free_vk(g);
+    if(dev_blurred) dt_vulkan_free_buffer(devid, dev_blurred);
+    return rc;
+  }
+
+  // ── Lens / motion: build PSF, then sparse (try) or dense (fallback) ──
+  const size_t kernel_width = 2 * radius + 1;
+  const size_t max_entries = kernel_width * kernel_width;
+
+  float *const restrict kern = dt_alloc_align_float(max_entries);
+  int   *const restrict offsets_x = dt_alloc_aligned(max_entries * sizeof(int));
+  int   *const restrict offsets_y = dt_alloc_aligned(max_entries * sizeof(int));
+  float *const restrict values    = dt_alloc_align_float(max_entries);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_kernel = NULL;
+  dt_vk_mem_t *dev_offsets_x = NULL;
+  dt_vk_mem_t *dev_offsets_y = NULL;
+  dt_vk_mem_t *dev_values = NULL;
+
+  if(!kern || !offsets_x || !offsets_y || !values) goto conv_cleanup;
+
+  _build_pixel_kernel(kern, kernel_width, kernel_width, p);
+
+  // Build sparse list (entries with |k| > 1e-6f).
+  int n_nonzero = 0;
+  for(int l = -radius; l <= radius; l++)
+    for(int m = -radius; m <= radius; m++)
+    {
+      const float k = kern[(l + radius) * kernel_width + (m + radius)];
+      if(k > 1e-6f)
+      {
+        offsets_x[n_nonzero] = m;
+        offsets_y[n_nonzero] = l;
+        values[n_nonzero] = k;
+        n_nonzero++;
+      }
+    }
+
+  dev_offsets_x = dt_vulkan_alloc_buffer(devid, n_nonzero * sizeof(int));
+  dev_offsets_y = dt_vulkan_alloc_buffer(devid, n_nonzero * sizeof(int));
+  dev_values    = dt_vulkan_alloc_buffer(devid, n_nonzero * sizeof(float));
+  if(dev_offsets_x && dev_offsets_y && dev_values
+     && dt_vulkan_write_to_device(devid, dev_offsets_x, offsets_x, n_nonzero * sizeof(int)) == 0
+     && dt_vulkan_write_to_device(devid, dev_offsets_y, offsets_y, n_nonzero * sizeof(int)) == 0
+     && dt_vulkan_write_to_device(devid, dev_values,    values,    n_nonzero * sizeof(float)) == 0)
+  {
+    const vk_blurs_convolve_sparse_pc_t pc = {
+      .width = width, .height = height, .n_entries = n_nonzero,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_offsets_x, dev_offsets_y, dev_values, dev_out };
+    rc = dt_vulkan_dispatch_n(&gd->vk_convolve_sparse, bufs, 5,
+                              width, height, &pc, sizeof(pc));
+  }
+  else
+  {
+    // Dense fallback.
+    dev_kernel = dt_vulkan_alloc_buffer(devid, max_entries * sizeof(float));
+    if(dev_kernel && dt_vulkan_write_to_device(devid, dev_kernel, kern, max_entries * sizeof(float)) == 0)
+    {
+      const vk_blurs_convolve_pc_t pc = {
+        .width = width, .height = height, .radius = radius, .kernel_width = (int)kernel_width,
+      };
+      dt_vk_mem_t *bufs[] = { dev_in, dev_kernel, dev_out };
+      rc = dt_vulkan_dispatch_n(&gd->vk_convolve, bufs, 3,
+                                width, height, &pc, sizeof(pc));
+    }
+  }
+
+conv_cleanup:
+  dt_free_align(kern);
+  dt_free_align(offsets_x);
+  dt_free_align(offsets_y);
+  dt_free_align(values);
+  if(dev_offsets_x) dt_vulkan_free_buffer(devid, dev_offsets_x);
+  if(dev_offsets_y) dt_vulkan_free_buffer(devid, dev_offsets_y);
+  if(dev_values)    dt_vulkan_free_buffer(devid, dev_values);
+  if(dev_kernel)    dt_vulkan_free_buffer(devid, dev_kernel);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 34; // blurs.cl
   dt_iop_blurs_global_data_t *gd = malloc(sizeof(dt_iop_blurs_global_data_t));
   self->data = gd;
+#if HAVE_OPENCL
+  const int program = 34; // blurs.cl
   gd->kernel_blurs_convolve = dt_opencl_create_kernel(program, "convolve");
   gd->kernel_blurs_convolve_sparse = dt_opencl_create_kernel(program, "convolve_sparse");
   gd->kernel_blurs_restore_alpha = dt_opencl_create_kernel(program, "restore_alpha");
+#else
+  gd->kernel_blurs_convolve = -1;
+  gd->kernel_blurs_convolve_sparse = -1;
+  gd->kernel_blurs_restore_alpha = -1;
+#endif
+  dt_vulkan_module_kernel_load(&gd->vk_convolve, "blurs_convolve", "convolve",
+                               3, sizeof(vk_blurs_convolve_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_convolve_sparse, "blurs_convolve_sparse", "convolve_sparse",
+                               5, sizeof(vk_blurs_convolve_sparse_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_restore_alpha, "blurs_restore_alpha", "restore_alpha",
+                               3, sizeof(vk_blurs_restore_alpha_pc_t), 16, 16, 1);
 }
 
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_blurs_global_data_t *gd = self->data;
+  dt_iop_blurs_global_data_t *gd = self->data;
+#if HAVE_OPENCL
   dt_opencl_free_kernel(gd->kernel_blurs_convolve);
   dt_opencl_free_kernel(gd->kernel_blurs_convolve_sparse);
   dt_opencl_free_kernel(gd->kernel_blurs_restore_alpha);
+#endif
+  dt_vulkan_module_kernel_unload(&gd->vk_convolve);
+  dt_vulkan_module_kernel_unload(&gd->vk_convolve_sparse);
+  dt_vulkan_module_kernel_unload(&gd->vk_restore_alpha);
   free(self->data);
   self->data = NULL;
 }
-#endif
 
 
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
