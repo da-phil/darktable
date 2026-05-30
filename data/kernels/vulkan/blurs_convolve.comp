@@ -1,0 +1,33 @@
+// GLSL fallback for blurs_convolve.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer Kern { float data[]; } kern;
+layout(std430, binding = 2)          buffer Out  { vec4  data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int radius;
+    int kernel_width;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pix_in = in_buf.data[idx];
+    vec4 acc = vec4(0.0);
+    for (int l = -pc.radius; l <= pc.radius; l++)
+        for (int m = -pc.radius; m <= pc.radius; m++) {
+            int ii = clamp(y + l, 0, pc.height - 1);
+            int jj = clamp(x + m, 0, pc.width  - 1);
+            int ik = l + pc.radius;
+            int jk = m + pc.radius;
+            acc += kern.data[ik * pc.kernel_width + jk] * in_buf.data[ii * pc.width + jj];
+        }
+    acc.w = pix_in.w;
+    out_buf.data[idx] = acc;
+}

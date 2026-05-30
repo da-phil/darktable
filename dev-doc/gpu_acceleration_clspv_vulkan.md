@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 44 modules currently expose `process_vk`,
+**Per-module ports**: 45 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -235,6 +235,7 @@ in three categories.
 | `src/iop/soften.c` | The Orton soft-focus effect: HSL saturation/brightness boost (the "overexposed" reference), explicit separable Gaussian blur over that reference, then a blend with the original at `amount`. Ported as 4 small kernels — `soften_overexposed` (2-binding, 16 B PC; uses the `vk_RGB_to_HSL` / `vk_HSL_to_RGB` cohort), `soften_hblur` / `soften_vblur` (3-binding, 12 B PC; explicit 2*rad+1 Gaussian convolution against a host-uploaded normalised kernel buffer) and `soften_mix` (3-binding, 12 B PC; per-pixel blend). The OpenCL hblur/vblur tile via workgroup-local memory; the Vulkan twins read straight from the global storage buffer — math is bit-equal (same CLAMP_TO_EDGE via `clamp(x+i, 0, w-1)`, same Gaussian weights), only the L1 cache pattern differs. First MODERATE-bucket consumer to chain its own explicit convolution (not `dt_gaussian_blur_vk` Deriche — see §5.10 caveat); the chain dispatches 4 `dt_vulkan_dispatch_n` calls in sequence with a single scratch buffer + the Gaussian kernel buffer, mirroring `process_cl` byte-for-byte. Validated end-to-end on lavapipe against an independent C reference of the same data flow: max error 1.2e-7 = single-bit FP precision over the whole chain. |
 | `src/iop/sharpen.c` | Unsharp mask. Operates in Lab and blurs only the L channel — the chroma plane passes through untouched. Three small kernels: `sharpen_hblur` / `sharpen_vblur` (3-binding, 12 B PC; same explicit 2*rad+1 Gaussian as soften, but reads `.x` only and writes back the full pixel) and `sharpen_mix` (3-binding, 20 B PC; soft-threshold unsharp mask `delta = orig.L - blurred.L`, `out.L = orig.L + amount * copysign(max(0, |delta| - thrs), delta)`). The OpenCL kernels skip the convolution for the outermost rad pixels (leaving them as the input); the Vulkan twins use the same `if(x >= rad && x < width-rad)` guard, so inside the convolution zone the i-shifts stay strictly in-bounds and no clamp is needed. `process_vk` mirrors `process_cl` byte-for-byte: copy-only fallback when `rad == 0` or the image is smaller than 2*rad+1 (via `dt_vulkan_copy_device_to_device`), same `init_gaussian_kernel` host-side, then hblur(in→out) / vblur(out→tmp) / mix(in, tmp → out) chained as three `dt_vulkan_dispatch_n` calls. Validated end-to-end on lavapipe against an independent C reference of the same data flow: max error **0.0** (bit-equal). |
 | `src/iop/highpass.c` | Lab high-pass filter. Four kernels: `highpass_invert` (2-binding, 8 B PC; L → clamp(100 − L, 0, 100), chroma passes through), `highpass_hblur` / `highpass_vblur` (3-binding, 12 B PC; same explicit Gaussian as soften — convolves L everywhere with CLAMP_TO_EDGE on the source index, no skip-edge guard like sharpen has, matching the OpenCL sampler-clamped local-mem tile fill), and `highpass_mix` (3-binding, 12 B PC; `out.L = 50 + ((0.5·a.L + 0.5·b.L) − 50)·contrast_scale`, `out.a = out.b = 0`, then clamp to the Lab range — `±FLT_MAX` substitutes for OpenCL's `±INFINITY` on alpha and is identity for any finite value). `process_vk` mirrors `process_cl` byte-for-byte: same `BOX_ITERATIONS` sigma derivation, invert(in → tmp) / hblur(tmp → out) / vblur(out → tmp) / mix(in, tmp → out) chained as four `dt_vulkan_dispatch_n` calls (blur skipped at `rad == 0` so the mix sees the un-blurred inverted reference, exactly like the OpenCL fast path). Validated end-to-end on lavapipe against an independent C reference of the same data flow: max error 1.5e-5 = single-bit FP precision over the L ∈ [0, 100] range. |
+| `src/iop/blurs.c` | Lens / motion / Gaussian blur. The OpenCL has three kernels (`convolve` for dense 2D convolution against a (2·r+1)² PSF, `convolve_sparse` for sparse 2D convolution against an `(offset_x, offset_y, weight)` list, and `restore_alpha` for the Gaussian post-pass); all three port one-for-one. The Gaussian fast path reuses `dt_gaussian_blur_vk` (the Deriche IIR helper landed earlier for shadhi/lowpass) and chains `restore_alpha` (3-binding, 8 B PC) to put the original mask channel back — `dt_gaussian_blur_vk` smears alpha along with RGB. The lens/motion path reuses the existing `_build_pixel_kernel` host helper to compute the PSF, builds the sparse list (entries with `|k| > 1e-6f`) and dispatches `convolve_sparse` (5-binding, 12 B PC); if the sparse allocations fail it falls back to `convolve` (3-binding, 16 B PC) byte-for-byte like `process_cl`. The kernels themselves are tiny and read directly from the global storage buffer with `clamp(x+m, 0, w-1)` boundaries — bit-equal to the OpenCL sampler-clamped reads. `init_global` / `cleanup_global` were restructured to live outside the existing `#if HAVE_OPENCL` block so the VK kernel slots can load even on OpenCL-disabled builds. Validated end-to-end on lavapipe against an independent C reference: all three kernels (`convolve`, `convolve_sparse`, `restore_alpha`) are bit-equal (max error 0.0). |
 | `src/iop/filmicrgb.c` | Scene-referred filmic tone mapper, main per-pixel path. The OpenCL module has two kernels (`filmicrgb_split` for per-channel and `filmicrgb_chroma` for chroma-preserving) selected by `(preserve_color == NONE && version != V5)`, each switching on the colour-science version v1..v5; both fold into one Vulkan entry that reproduces the host's split-vs-chroma decision internally and dispatches on `color_science` exactly like `process_cl`. 6-binding dispatch (in, out, params, matrices, profile_info, profile_lut); 8 B PC (width, height). Like `agx`/`colorbalancergb`, the ~26 scalars + 5 spline `float4`s overflow the PC budget (164 B), so `vk_filmicrgb_params_t` migrates into a storage buffer (156 B, std430 == the C struct verified by `spirv-dis`). The four `dt_colormatrix_t` 3×4 matrices (input, output, export-in, export-out) pack into a single 48-float `matrices` buffer at fixed base offsets; helpers take an `int base` so the same code paths handle work and export gamut targets. The colour-science cohort (`vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_gamut_check_Yrg`) is reused from `dt_vulkan_common.h` — the helpers `colorbalancergb` landed. The filmic-specific gamut machinery — `clip_chroma_white_raw` / `clip_chroma_white` / `clip_chroma_black` / `clip_chroma` / `gamut_check_RGB` / `gamut_mapping` / `desaturate_v4` — and the v1..v5 split/chroma variants are inlined faithfully from `filmic.cl`. ICC luminance goes through the §5.11 deferred plumbing (`dt_ioppr_build_iccprofile_params_vk_deferred` appends the profile uploads in one batched submit). The highlight-reconstruction path (inpaint + a-trous wavelets over `image2d_t`) and the clipped-pixel mask preview need §8.5 sampled-image bindings; `commit_params` clears `process_vk_ready` when `enable_highlight_reconstruction` is on or the GUI mask is showing (the §10.2 predictive pattern — mirrors `basecurve`'s exposure-fusion gate). Validated end-to-end on lavapipe with an independent C reference derived directly from `filmic.cl` (not from the port): `split_v2_v3` is bit-equal (max 0.0) and `chroma_v4` matches at FP rounding (max 1e-6) — proving the matrices buffer packing, the Yrg/Ych conversions, the gamut-clip family and the std430 marshalling all reproduce the OpenCL math byte-for-byte. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
@@ -308,16 +309,19 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   for future param-heavy ports), `channelmixer` (legacy 4-mode
   mixer reusing the existing HSL helpers).
 - **MODERATE** — multi-pass with intermediate buffers or
-  local-memory barriers: `blurs`,
-  `highlights`. The Gaussian VK
-  helper (§5.10) handles the separable-blur half; the larger blurs
-  still want workgroup-local-memory plumbing for the cache-friendly
-  kernels (note: `soften`, `sharpen`, and `highpass` do their own
-  explicit Gaussian convolution in OpenCL rather than the Deriche
-  IIR `dt_gaussian_*`, so a faithful port can't just reuse
-  `dt_gaussian_blur_vk` — it would drift like the removed diffuse
-  approximation; all three are now done — see below).
+  local-memory barriers: `highlights`. The Gaussian VK
+  helper (§5.10) handles the separable-blur half (`blurs` uses
+  it for its DT_BLUR_GAUSSIAN fast path); the explicit-convolution
+  modules (`soften`, `sharpen`, `highpass`) have their own
+  Gaussian in OpenCL and don't reuse `dt_gaussian_blur_vk`, so
+  they were ported with a direct global-storage convolution that
+  is bit-equal to the OpenCL math.
   Done in earlier passes:
+  `blurs` (lens / motion / Gaussian: 3-kernel port with the dense
+  `convolve`, the sparse `convolve_sparse`, and the
+  `restore_alpha` post-pass for the Gaussian path; bit-equal to
+  the C reference on all three kernels, reuses `dt_gaussian_blur_vk`
+  for the Gaussian-type fast path),
   `highpass` (Lab high-pass: invert L + same Gaussian as soften
   + a desaturating contrast mix around L = 50; 4-kernel chain,
   bit-equal to a C reference modulo single-bit FP in the L range),
@@ -1234,10 +1238,14 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    a C reference of process_cl), the Lab-L-channel unsharp
    mask (sharpen — 3-kernel chain that mirrors soften's convolution
    shape but operates on luminance only and uses a soft-threshold
-   blend; bit-equal to the C reference), and the Lab high-pass
+   blend; bit-equal to the C reference), the Lab high-pass
    filter (highpass — 4-kernel chain: invert L, separable Gaussian
    on L, then a desaturating contrast mix around L = 50;
-   single-bit FP precision against the C reference). All are
+   single-bit FP precision against the C reference), and the
+   lens/motion/Gaussian blur module (blurs — dense + sparse 2D
+   convolution kernels for lens/motion PSFs plus a restore_alpha
+   post-pass for the Gaussian-via-dt_gaussian_blur_vk fast path;
+   bit-equal on all three kernels). All are
    bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives

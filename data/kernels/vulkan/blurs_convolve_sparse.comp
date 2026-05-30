@@ -1,0 +1,31 @@
+// GLSL fallback for blurs_convolve_sparse.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer OX   { int   data[]; } offsets_x;
+layout(std430, binding = 2) readonly buffer OY   { int   data[]; } offsets_y;
+layout(std430, binding = 3) readonly buffer Val  { float data[]; } values;
+layout(std430, binding = 4)          buffer Out  { vec4  data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int n_entries;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pix_in = in_buf.data[idx];
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < pc.n_entries; i++) {
+        int jj = clamp(x + offsets_x.data[i], 0, pc.width  - 1);
+        int ii = clamp(y + offsets_y.data[i], 0, pc.height - 1);
+        acc += values.data[i] * in_buf.data[ii * pc.width + jj];
+    }
+    acc.w = pix_in.w;
+    out_buf.data[idx] = acc;
+}
