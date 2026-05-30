@@ -1,0 +1,35 @@
+// GLSL fallback for highpass_mix.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer InA { vec4 data[]; } in_a;
+layout(std430, binding = 1) readonly buffer InB { vec4 data[]; } in_b;
+layout(std430, binding = 2)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float contrast_scale;
+} pc;
+
+#define FLT_MAX 3.402823466e38
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 a = in_a.data[idx];
+    vec4 b = in_b.data[idx];
+    vec4 o;
+    o.x = 50.0 + ((0.5 * a.x + 0.5 * b.x) - 50.0) * pc.contrast_scale;
+    o.y = 0.0;
+    o.z = 0.0;
+    o.w = a.w;
+    // Match the OpenCL clamp range: a/b ∈ [-128, 128], L ∈ [0, 100],
+    // alpha is effectively unbounded (OpenCL uses ±INFINITY; we use
+    // ±FLT_MAX, which is identity for any finite alpha).
+    out_buf.data[idx] = clamp(o,
+                              vec4(0.0,  -128.0, -128.0, -FLT_MAX),
+                              vec4(100.0, 128.0,  128.0,  FLT_MAX));
+}

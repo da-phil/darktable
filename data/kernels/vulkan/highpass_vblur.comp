@@ -1,0 +1,28 @@
+// GLSL fallback for highpass_vblur.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Mker { float data[]; } m;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int rad;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 pixel = in_buf.data[idx];
+    float sum = 0.0;
+    for (int i = -pc.rad; i <= pc.rad; i++) {
+        int yy = clamp(y + i, 0, pc.height - 1);
+        sum += in_buf.data[yy * pc.width + x].x * m.data[i + pc.rad];
+    }
+    pixel.x = sum;
+    out_buf.data[idx] = pixel;
+}
