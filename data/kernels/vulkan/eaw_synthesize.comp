@@ -1,0 +1,35 @@
+// GLSL fallback for eaw_synthesize.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0)          buffer Out  { vec4 data[]; } out_buf;
+layout(std430, binding = 1) readonly buffer Coa  { vec4 data[]; } coarse_buf;
+layout(std430, binding = 2) readonly buffer Det  { vec4 data[]; } detail_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float threshold0; float threshold1; float threshold2; float threshold3;
+    float boost0;     float boost1;     float boost2;     float boost3;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 c = coarse_buf.data[idx];
+    vec4 d = detail_buf.data[idx];
+    vec4 threshold = vec4(pc.threshold0, pc.threshold1, pc.threshold2, pc.threshold3);
+    vec4 boost     = vec4(pc.boost0,     pc.boost1,     pc.boost2,     pc.boost3);
+
+    vec4 amount = max(vec4(0.0), abs(d) - threshold);
+    // copysign(amount, d) — preserve the sign of d.
+    amount = vec4(d.x >= 0.0 ? amount.x : -amount.x,
+                  d.y >= 0.0 ? amount.y : -amount.y,
+                  d.z >= 0.0 ? amount.z : -amount.z,
+                  d.w >= 0.0 ? amount.w : -amount.w);
+    vec4 sum = c + boost * amount;
+    sum.w = c.w;
+    out_buf.data[idx] = sum;
+}

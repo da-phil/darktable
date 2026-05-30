@@ -108,7 +108,9 @@ set(VK_KERNELS
     bloom_threshold:bloom_threshold
     bloom_hblur:bloom_hblur
     bloom_vblur:bloom_vblur
-    bloom_mix:bloom_mix)
+    bloom_mix:bloom_mix
+    eaw_decompose:eaw_decompose
+    eaw_synthesize:eaw_synthesize)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

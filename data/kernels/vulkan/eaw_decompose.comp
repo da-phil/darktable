@@ -1,0 +1,46 @@
+// GLSL fallback for eaw_decompose.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Coa  { vec4  data[]; } coarse_buf;
+layout(std430, binding = 2)          buffer Det  { vec4  data[]; } detail_buf;
+layout(std430, binding = 3) readonly buffer Flt  { float data[]; } flt;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   scale;
+    float sharpen;
+} pc;
+
+vec4 weight(vec4 c1, vec4 c2, float sharpen) {
+    float wc = exp(-((c1.y - c2.y) * (c1.y - c2.y) + (c1.z - c2.z) * (c1.z - c2.z)) * sharpen);
+    float wl = exp(- (c1.x - c2.x) * (c1.x - c2.x) * sharpen);
+    return vec4(wl, wc, wc, 1.0);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    int mult = 1 << pc.scale;
+    vec4 pixel = in_buf.data[idx];
+    vec4 sum = vec4(0.0);
+    vec4 wgt = vec4(0.0);
+    for (int j = 0; j < 5; j++)
+        for (int i = 0; i < 5; i++) {
+            int xx = clamp(mult * (i - 2) + x, 0, pc.width  - 1);
+            int yy = clamp(mult * (j - 2) + y, 0, pc.height - 1);
+            vec4 px = in_buf.data[yy * pc.width + xx];
+            vec4 w = flt.data[j * 5 + i] * weight(pixel, px, pc.sharpen);
+            sum += w * px;
+            wgt += w;
+        }
+    sum /= wgt;
+    sum.w = pixel.w;
+
+    detail_buf.data[idx] = pixel - sum;
+    coarse_buf.data[idx] = sum;
+}
