@@ -21,6 +21,7 @@
 #include "common/debug.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -103,6 +104,10 @@ typedef struct dt_iop_colorreconstruct_global_data_t
   int kernel_colorreconstruct_splat;
   int kernel_colorreconstruct_blur_line;
   int kernel_colorreconstruct_slice;
+  dt_vk_module_kernel_t vk_zero;
+  dt_vk_module_kernel_t vk_splat;
+  dt_vk_module_kernel_t vk_blur_line;
+  dt_vk_module_kernel_t vk_slice;
 } dt_iop_colorreconstruct_global_data_t;
 
 
@@ -1187,6 +1192,185 @@ void gui_update(dt_iop_module_t *self)
   dt_iop_gui_leave_critical_section(self);
 }
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them on HAVE_VULKAN=0 builds).
+typedef struct vk_colorreconstruct_zero_pc_t
+{
+  int width;
+  int height;
+} vk_colorreconstruct_zero_pc_t;
+
+typedef struct vk_colorreconstruct_splat_pc_t
+{
+  int   width;
+  int   height;
+  int   sizex;
+  int   sizey;
+  int   sizez;
+  float sigma_s;
+  float sigma_r;
+  float threshold;
+  int   precedence;
+  float hue;
+  float hue_sigma;
+} vk_colorreconstruct_splat_pc_t;
+
+typedef struct vk_colorreconstruct_blur_pc_t
+{
+  int offset1;
+  int offset2;
+  int offset3;
+  int size1;
+  int size2;
+  int size3;
+} vk_colorreconstruct_blur_pc_t;
+
+typedef struct vk_colorreconstruct_slice_pc_t
+{
+  int   width;
+  int   height;
+  int   sizex;
+  int   sizey;
+  int   sizez;
+  float sigma_s;
+  float sigma_r;
+  float threshold;
+  int   bx;
+  int   by;
+  int   roix;
+  int   roiy;
+  float scale;
+} vk_colorreconstruct_slice_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. Math is bit-equal: same grid sizing,
+// same splat/blur/slice sequence. The OpenCL splat does a workgroup-
+// local reduction before the atomic_add_f; the VK twin skips that
+// and goes straight to atomics — same pattern as the §5.13
+// bilateral_splat (math is the same; atomics are just slightly more
+// numerous). The preview->full grid freeze/thaw optimisation is NOT
+// ported; every VK invocation rebuilds the grid from scratch.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorreconstruct_data_t *d = piece->data;
+  const dt_iop_colorreconstruct_global_data_t *gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_r = fmax(d->range, 0.1f);
+  const float sigma_s = fmax(d->spatial, 1.0f) / scale;
+  const float hue = hue_conversion(d->hue);
+
+  // Grid sizes match the OpenCL bilateral init.
+  const float _x = roundf((float)width  / sigma_s);
+  const float _y = roundf((float)height / sigma_s);
+  const float _z = roundf(100.0f / sigma_r);
+  const int size_x = CLAMPS((int)_x, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_S) + 1;
+  const int size_y = CLAMPS((int)_y, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_S) + 1;
+  const int size_z = CLAMPS((int)_z, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_R) + 1;
+  const float grid_sigma_s = MAX((float)height / (size_y - 1.0f), (float)width / (size_x - 1.0f));
+  const float grid_sigma_r = 100.0f / (size_z - 1.0f);
+  const size_t grid_bytes = (size_t)size_x * size_y * size_z * 4 * sizeof(float);
+
+  int rc = -1;
+  dt_vk_mem_t *grid     = dt_vulkan_alloc_buffer(devid, grid_bytes);
+  dt_vk_mem_t *grid_tmp = dt_vulkan_alloc_buffer(devid, grid_bytes);
+  if(!grid || !grid_tmp) goto cleanup;
+
+  // Step 1: zero. Dispatch over the flat (width=4*size_x, height=size_y*size_z) view.
+  {
+    const int wd = 4 * size_x;
+    const int ht = size_y * size_z;
+    const vk_colorreconstruct_zero_pc_t pc = { .width = wd, .height = ht };
+    dt_vk_mem_t *bufs[] = { grid };
+    if(dt_vulkan_dispatch_n(&gd->vk_zero, bufs, 1, wd, ht, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // Step 2: splat.
+  {
+    const vk_colorreconstruct_splat_pc_t pc = {
+      .width = width, .height = height,
+      .sizex = size_x, .sizey = size_y, .sizez = size_z,
+      .sigma_s = grid_sigma_s, .sigma_r = grid_sigma_r,
+      .threshold = d->threshold,
+      .precedence = (int)d->precedence,
+      .hue = hue,
+      .hue_sigma = (float)(M_PI_F * M_PI_F / 8.0f),
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, grid };
+    if(dt_vulkan_dispatch_n(&gd->vk_splat, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // Step 3: three 1D blur passes (z, x, y axes) — same stride triples
+  // as bilateral_blur_cl. Each starts with a buffer copy to mirror
+  // the OpenCL `enqueue_copy_buffer_to_buffer`.
+  // Pass 1: blur along z (grid -> grid_tmp via copy, then write grid).
+  if(dt_vulkan_copy_device_to_device(devid, grid_tmp, grid, grid_bytes) != 0) goto cleanup;
+  {
+    const vk_colorreconstruct_blur_pc_t pc = {
+      .offset1 = size_x * size_y, .offset2 = size_x, .offset3 = 1,
+      .size1 = size_z, .size2 = size_y, .size3 = size_x,
+    };
+    dt_vk_mem_t *bufs[] = { grid_tmp, grid };
+    if(dt_vulkan_dispatch_n(&gd->vk_blur_line, bufs, 2,
+                            size_z, size_y, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  // Pass 2: blur along x (grid -> grid_tmp).
+  {
+    const vk_colorreconstruct_blur_pc_t pc = {
+      .offset1 = size_x * size_y, .offset2 = 1, .offset3 = size_x,
+      .size1 = size_z, .size2 = size_x, .size3 = size_y,
+    };
+    dt_vk_mem_t *bufs[] = { grid, grid_tmp };
+    if(dt_vulkan_dispatch_n(&gd->vk_blur_line, bufs, 2,
+                            size_z, size_x, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  // Pass 3: blur along y (grid_tmp -> grid).
+  {
+    const vk_colorreconstruct_blur_pc_t pc = {
+      .offset1 = 1, .offset2 = size_x, .offset3 = size_x * size_y,
+      .size1 = size_x, .size2 = size_y, .size3 = size_z,
+    };
+    dt_vk_mem_t *bufs[] = { grid_tmp, grid };
+    if(dt_vulkan_dispatch_n(&gd->vk_blur_line, bufs, 2,
+                            size_x, size_y, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // Step 4: slice.
+  const float rescale = piece->iscale / (roi_in->scale * scale);
+  {
+    const vk_colorreconstruct_slice_pc_t pc = {
+      .width = width, .height = height,
+      .sizex = size_x, .sizey = size_y, .sizez = size_z,
+      .sigma_s = grid_sigma_s, .sigma_r = grid_sigma_r,
+      .threshold = d->threshold,
+      .bx = roi_in->x, .by = roi_in->y,
+      .roix = roi_in->x, .roiy = roi_in->y,
+      .scale = rescale,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_out, grid };
+    if(dt_vulkan_dispatch_n(&gd->vk_slice, bufs, 3, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(grid) dt_vulkan_free_buffer(devid, grid);
+  if(grid_tmp) dt_vulkan_free_buffer(devid, grid_tmp);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_colorreconstruct_global_data_t *gd = malloc(sizeof(dt_iop_colorreconstruct_global_data_t));
@@ -1196,6 +1380,15 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_colorreconstruct_splat = dt_opencl_create_kernel(program, "colorreconstruction_splat");
   gd->kernel_colorreconstruct_blur_line = dt_opencl_create_kernel(program, "colorreconstruction_blur_line");
   gd->kernel_colorreconstruct_slice = dt_opencl_create_kernel(program, "colorreconstruction_slice");
+  dt_vulkan_module_kernel_load(&gd->vk_zero, "colorreconstruction_zero", "colorreconstruction_zero",
+                               1, sizeof(vk_colorreconstruct_zero_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_splat, "colorreconstruction_splat", "colorreconstruction_splat",
+                               2, sizeof(vk_colorreconstruct_splat_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_blur_line, "colorreconstruction_blur_line",
+                               "colorreconstruction_blur_line",
+                               2, sizeof(vk_colorreconstruct_blur_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_slice, "colorreconstruction_slice", "colorreconstruction_slice",
+                               3, sizeof(vk_colorreconstruct_slice_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -1205,6 +1398,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_colorreconstruct_splat);
   dt_opencl_free_kernel(gd->kernel_colorreconstruct_blur_line);
   dt_opencl_free_kernel(gd->kernel_colorreconstruct_slice);
+  dt_vulkan_module_kernel_unload(&gd->vk_zero);
+  dt_vulkan_module_kernel_unload(&gd->vk_splat);
+  dt_vulkan_module_kernel_unload(&gd->vk_blur_line);
+  dt_vulkan_module_kernel_unload(&gd->vk_slice);
   free(self->data);
   self->data = NULL;
 }
