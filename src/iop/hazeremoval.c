@@ -46,6 +46,8 @@
 #ifdef HAVE_OPENCL
 #include "common/opencl.h"
 #endif
+#include "common/vulkan.h"
+#include "common/guided_filter.h"
 
 #include <float.h>
 #include <gtk/gtk.h>
@@ -90,6 +92,12 @@ typedef struct dt_iop_hazeremoval_global_data_t
   int kernel_hazeremoval_box_max_x;
   int kernel_hazeremoval_box_max_y;
   int kernel_hazeremoval_dehaze;
+  dt_vk_module_kernel_t vk_transision_map;
+  dt_vk_module_kernel_t vk_box_min_x;
+  dt_vk_module_kernel_t vk_box_min_y;
+  dt_vk_module_kernel_t vk_box_max_x;
+  dt_vk_module_kernel_t vk_box_max_y;
+  dt_vk_module_kernel_t vk_dehaze;
 } dt_iop_hazeremoval_global_data_t;
 
 
@@ -200,6 +208,35 @@ int legacy_params(dt_iop_module_t *self,
   return 1;
 }
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them even on HAVE_VULKAN=0 builds).
+typedef struct vk_hazeremoval_box_pc_t
+{
+  int width;
+  int height;
+  int w;
+} vk_hazeremoval_box_pc_t;
+
+typedef struct vk_hazeremoval_tmap_pc_t
+{
+  int   width;
+  int   height;
+  float strength;
+  float A0_r;
+  float A0_g;
+  float A0_b;
+} vk_hazeremoval_tmap_pc_t;
+
+typedef struct vk_hazeremoval_dehaze_pc_t
+{
+  int   width;
+  int   height;
+  float t_min;
+  float A0_x;
+  float A0_y;
+  float A0_z;
+} vk_hazeremoval_dehaze_pc_t;
+
 void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_hazeremoval_global_data_t *gd = malloc(sizeof(*gd));
@@ -216,6 +253,18 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(program, "hazeremoval_box_max_y");
   gd->kernel_hazeremoval_dehaze =
     dt_opencl_create_kernel(program, "hazeremoval_dehaze");
+  dt_vulkan_module_kernel_load(&gd->vk_transision_map, "hazeremoval_transision_map",
+                               "hazeremoval_transision_map", 2, sizeof(vk_hazeremoval_tmap_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_box_min_x, "hazeremoval_box_min_x",
+                               "hazeremoval_box_min_x", 2, sizeof(vk_hazeremoval_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_box_min_y, "hazeremoval_box_min_y",
+                               "hazeremoval_box_min_y", 2, sizeof(vk_hazeremoval_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_box_max_x, "hazeremoval_box_max_x",
+                               "hazeremoval_box_max_x", 2, sizeof(vk_hazeremoval_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_box_max_y, "hazeremoval_box_max_y",
+                               "hazeremoval_box_max_y", 2, sizeof(vk_hazeremoval_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_dehaze, "hazeremoval_dehaze",
+                               "hazeremoval_dehaze", 3, sizeof(vk_hazeremoval_dehaze_pc_t), 16, 16, 1);
   self->data = gd;
 }
 
@@ -229,6 +278,12 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_hazeremoval_box_max_x);
   dt_opencl_free_kernel(gd->kernel_hazeremoval_box_max_y);
   dt_opencl_free_kernel(gd->kernel_hazeremoval_dehaze);
+  dt_vulkan_module_kernel_unload(&gd->vk_transision_map);
+  dt_vulkan_module_kernel_unload(&gd->vk_box_min_x);
+  dt_vulkan_module_kernel_unload(&gd->vk_box_min_y);
+  dt_vulkan_module_kernel_unload(&gd->vk_box_max_x);
+  dt_vulkan_module_kernel_unload(&gd->vk_box_max_y);
+  dt_vulkan_module_kernel_unload(&gd->vk_dehaze);
   free(self->data);
   self->data = NULL;
 }
@@ -971,6 +1026,169 @@ error:
   return err;
 }
 #endif
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl. The 6 hazeremoval-own kernels port
+// one-for-one; the guided-filter step delegates to
+// dt_guided_filter_vk (§5.15). Ambient light A0 is still computed
+// on the host (matches the OpenCL flow's read-back; the value is
+// either cached on g from the preview pipe or freshly computed by
+// reading the input back).
+//
+// Falls through to -1 (caller -> OpenCL/CPU) if Vulkan isn't running,
+// allocations fail, or the guided-filter helper fails.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *img_in,
+               dt_vk_mem_t *img_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_hazeremoval_gui_data_t *const g = (dt_iop_hazeremoval_gui_data_t *)self->gui_data;
+  dt_iop_hazeremoval_params_t *d = piece->data;
+  const dt_iop_hazeremoval_global_data_t *gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t f_bytes = (size_t)width * height * sizeof(float);
+  const size_t f4_bytes = f_bytes * 4;
+
+  const float wscale = d->adaptive ? CLIP((float)roi_in->scale / (float)piece->pipe->iscale) : 1.0f;
+  const int w1 = 2 + (int)ceilf(4.0f * wscale);
+  const int w2 = 3 + (int)ceilf(6.0f * wscale);
+
+  const float strength = d->strength;
+  const float distance = d->distance;
+  const float eps = sqrtf(0.025f);
+  const gboolean compatibility_mode = d->compatibility_mode;
+  const gboolean gui = self->dev->gui_attached && g;
+  const gboolean fullpipes = dt_pipe_is_canvas(piece->pipe);
+  const gboolean hq = darktable.develop->late_scaling.enabled;
+  const gboolean fullhq = hq && dt_pipe_is_full(piece->pipe);
+  const gboolean storing = gui && (dt_pipe_is_preview(piece->pipe) || fullhq);
+
+  rgb_pixel A0 = { NAN, NAN, NAN, 0.0f };
+  float distance_max = NAN;
+
+  // Same gui-cached-A0 path as process_cl: try the preview-pipe stash
+  // first when running a non-HQ full pipe.
+  if(gui && fullpipes && !hq)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const dt_hash_t hash = g->hash;
+    dt_iop_gui_leave_critical_section(self);
+    if(hash != DT_INVALID_HASH
+       && !dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe,
+                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL,
+                                      &self->gui_lock, &g->hash))
+    {
+      dt_control_log(_("inconsistent output"));
+    }
+    dt_iop_gui_enter_critical_section(self);
+    A0[0] = g->A0[0];
+    A0[1] = g->A0[1];
+    A0[2] = g->A0[2];
+    distance_max = g->distance_max;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  if(dt_pipe_is_image(piece->pipe) && !hq)
+    dt_control_log(_("inconsistent output"));
+
+  // Fall back: read img_in to host and run the CPU _ambient_light.
+  if(dt_isnan(distance_max))
+  {
+    float *host = dt_alloc_aligned(f4_bytes);
+    if(!host) return -1;
+    if(dt_vulkan_read_from_device(devid, host, img_in, f4_bytes) != 0)
+    {
+      dt_free_align(host);
+      return -1;
+    }
+    const const_rgb_image img_in_cpu = (const_rgb_image){ host, width, height, 4 };
+    distance_max = _ambient_light(img_in_cpu, w1, &A0, compatibility_mode);
+    dt_free_align(host);
+  }
+
+  if(storing)
+  {
+    dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe,
+                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL);
+    dt_iop_gui_enter_critical_section(self);
+    g->A0[0] = A0[0];
+    g->A0[1] = A0[1];
+    g->A0[2] = A0[2];
+    g->distance_max = distance_max;
+    g->hash = hash;
+    dt_iop_gui_leave_critical_section(self);
+    if(distance_max <= 0.0f)
+      dt_control_log(_("haze removal could not calculate ambient light due to image content"));
+  }
+
+  int rc = -1;
+  dt_vk_mem_t *trans_map = dt_vulkan_alloc_buffer(devid, f_bytes);
+  dt_vk_mem_t *trans_map_filtered = dt_vulkan_alloc_buffer(devid, f_bytes);
+  dt_vk_mem_t *temp = dt_vulkan_alloc_buffer(devid, f_bytes);
+  if(!trans_map || !trans_map_filtered || !temp) goto cleanup;
+
+  // Step 1: transition map from the dark-channel prior.
+  {
+    const vk_hazeremoval_tmap_pc_t pc = {
+      .width = width, .height = height,
+      .strength = strength,
+      .A0_r = A0[0], .A0_g = A0[1], .A0_b = A0[2],
+    };
+    dt_vk_mem_t *bufs[] = { img_in, trans_map };
+    if(dt_vulkan_dispatch_n(&gd->vk_transision_map, bufs, 2,
+                            width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  // Step 1b: refine with box-max (separable) — exactly the OpenCL
+  // _transition_map_cl tail.
+  {
+    const vk_hazeremoval_box_pc_t pc = { .width = width, .height = height, .w = w1 };
+    dt_vk_mem_t *bx[] = { trans_map, temp };
+    if(dt_vulkan_dispatch_n(&gd->vk_box_max_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    dt_vk_mem_t *by[] = { temp, trans_map };
+    if(dt_vulkan_dispatch_n(&gd->vk_box_max_y, by, 2, width, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  // Step 2: refine the transition map with box-min (separable).
+  {
+    const vk_hazeremoval_box_pc_t pc = { .width = width, .height = height, .w = w1 };
+    dt_vk_mem_t *bx[] = { trans_map, temp };
+    if(dt_vulkan_dispatch_n(&gd->vk_box_min_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    dt_vk_mem_t *by[] = { temp, trans_map };
+    if(dt_vulkan_dispatch_n(&gd->vk_box_min_y, by, 2, width, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // Step 3: guided filter using the input image as the colour guide.
+  if(dt_guided_filter_vk(devid, img_in, trans_map, trans_map_filtered,
+                         width, height, w2, eps, 1.f, -FLT_MAX, FLT_MAX) != 0)
+    goto cleanup;
+
+  // Step 4: dehaze.
+  const float t_min = CLAMP(expf(-distance * distance_max), 1.0f / 1024.0f, 1.0f);
+  {
+    const vk_hazeremoval_dehaze_pc_t pc = {
+      .width = width, .height = height,
+      .t_min = t_min,
+      .A0_x = A0[0], .A0_y = A0[1], .A0_z = A0[2],
+    };
+    dt_vk_mem_t *bufs[] = { img_in, trans_map_filtered, img_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_dehaze, bufs, 3,
+                            width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(trans_map) dt_vulkan_free_buffer(devid, trans_map);
+  if(trans_map_filtered) dt_vulkan_free_buffer(devid, trans_map_filtered);
+  if(temp) dt_vulkan_free_buffer(devid, temp);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

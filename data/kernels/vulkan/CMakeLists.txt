@@ -118,7 +118,13 @@ set(VK_KERNELS
     guided_filter_variances:guided_filter_variances
     guided_filter_update_covariance:guided_filter_update_covariance
     guided_filter_solve:guided_filter_solve
-    guided_filter_generate_result:guided_filter_generate_result)
+    guided_filter_generate_result:guided_filter_generate_result
+    hazeremoval_box_min_x:hazeremoval_box_min_x
+    hazeremoval_box_min_y:hazeremoval_box_min_y
+    hazeremoval_box_max_x:hazeremoval_box_max_x
+    hazeremoval_box_max_y:hazeremoval_box_max_y
+    hazeremoval_transision_map:hazeremoval_transision_map
+    hazeremoval_dehaze:hazeremoval_dehaze)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
