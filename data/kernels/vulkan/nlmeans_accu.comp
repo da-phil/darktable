@@ -1,0 +1,48 @@
+// GLSL fallback for nlmeans_accu.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer U2 { vec4  data[]; } u2_buf;
+layout(std430, binding = 2) readonly buffer U4 { float data[]; } u4_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int qx;
+    int qy;
+} pc;
+
+float ddirac(int qx, int qy) {
+    return ((qx != 0) || (qy != 0)) ? 1.0 : 0.0;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int gidx = y * pc.width + x;
+
+    int wpq = 1, wmq = 1;
+    wpq *= (x + pc.qx < pc.width)  ? 1 : 0;
+    wmq *= (x - pc.qx < pc.width)  ? 1 : 0;
+    wpq *= (x + pc.qx >= 0)        ? 1 : 0;
+    wmq *= (x - pc.qx >= 0)        ? 1 : 0;
+    wpq *= (y + pc.qy >= 0)        ? 1 : 0;
+    wmq *= (y - pc.qy >= 0)        ? 1 : 0;
+    wpq *= (y + pc.qy < pc.height) ? 1 : 0;
+    wmq *= (y - pc.qy < pc.height) ? 1 : 0;
+
+    vec4 u1_pq = (wpq != 0) ? in_buf.data[(y + pc.qy) * pc.width + (x + pc.qx)] : vec4(0.0);
+    vec4 u1_mq = (wmq != 0) ? in_buf.data[(y - pc.qy) * pc.width + (x - pc.qx)] : vec4(0.0);
+
+    float u4    = u4_buf.data[gidx];
+    int   mx    = clamp(x - pc.qx, 0, pc.width - 1);
+    int   my    = clamp(y - pc.qy, 0, pc.height - 1);
+    float u4_mq = u4_buf.data[my * pc.width + mx];
+    float u4_mq_dd = u4_mq * ddirac(pc.qx, pc.qy);
+
+    vec4 accu = (u4 * u1_pq) + (u4_mq_dd * u1_mq);
+    accu.w = float(wpq) * u4 + float(wmq) * u4_mq_dd;
+
+    u2_buf.data[gidx] += accu;
+}

@@ -1,0 +1,37 @@
+// GLSL fallback for nlmeans_dist.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer U4 { float data[]; } u4_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   qx;
+    int   qy;
+    float nL2;
+    float nC2;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int gidx = y * pc.width + x;
+
+    vec4 norm2 = vec4(pc.nL2, pc.nC2, pc.nC2, 1.0);
+
+    int xpq = x + pc.qx;
+    int ypq = y + pc.qy;
+    int inb = (x + pc.qx < pc.width && x + pc.qx >= 0 && y + pc.qy < pc.height && y + pc.qy >= 0) ? 1 : 0;
+    xpq *= (x + pc.qx < pc.width  && x + pc.qx >= 0) ? 1 : 0;
+    ypq *= (y + pc.qy < pc.height && y + pc.qy >= 0) ? 1 : 0;
+
+    vec4 p1 = in_buf.data[gidx];
+    vec4 p2 = in_buf.data[ypq * pc.width + xpq];
+    vec4 tmp = (p1 - p2) * (p1 - p2) * norm2;
+    float dist = tmp.x + tmp.y + tmp.z;
+    dist *= (inb != 0) ? 1.0 : 0.0;
+
+    u4_buf.data[gidx] = dist;
+}

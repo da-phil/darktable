@@ -128,7 +128,13 @@ set(VK_KERNELS
     colorreconstruction_zero:colorreconstruction_zero
     colorreconstruction_splat:colorreconstruction_splat
     colorreconstruction_blur_line:colorreconstruction_blur_line
-    colorreconstruction_slice:colorreconstruction_slice)
+    colorreconstruction_slice:colorreconstruction_slice
+    nlmeans_init:nlmeans_init
+    nlmeans_dist:nlmeans_dist
+    nlmeans_horiz:nlmeans_horiz
+    nlmeans_vert:nlmeans_vert
+    nlmeans_accu:nlmeans_accu
+    nlmeans_finish:nlmeans_finish)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

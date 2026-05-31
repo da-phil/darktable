@@ -1,0 +1,31 @@
+// GLSL fallback for nlmeans_finish.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer U2  { vec4 data[]; } u2_buf;
+layout(std430, binding = 2)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float weight_x;
+    float weight_y;
+    float weight_z;
+    float weight_w;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int gidx = y * pc.width + x;
+
+    vec4 weight = vec4(pc.weight_x, pc.weight_y, pc.weight_z, pc.weight_w);
+    vec4 i  = in_buf.data[gidx];
+    vec4 u2 = u2_buf.data[gidx];
+    float u3 = u2.w;
+
+    vec4 o = i * (vec4(1.0) - weight) + u2 / vec4(u3) * weight;
+    o.w = i.w;
+    out_buf.data[gidx] = o;
+}
