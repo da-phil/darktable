@@ -1,0 +1,51 @@
+// GLSL fallback for gaussian_2c.cl :: gaussian_row_2c.
+
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec2 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec2 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float a0; float a1; float a2; float a3;
+    float b1; float b2;
+    float coefp; float coefn;
+    float Labmax_x; float Labmax_y;
+    float Labmin_x; float Labmin_y;
+} pc;
+
+void main() {
+    int y = int(gl_GlobalInvocationID.x);
+    if (y >= pc.height) return;
+    int row = y * pc.width;
+
+    vec2 Labmax = vec2(pc.Labmax_x, pc.Labmax_y);
+    vec2 Labmin = vec2(pc.Labmin_x, pc.Labmin_y);
+
+    vec2 xp = clamp(in_buf.data[row], Labmin, Labmax);
+    vec2 yb = xp * pc.coefp;
+    vec2 yp = yb;
+
+    for (int x = 0; x < pc.width; x++) {
+        int idx = row + x;
+        vec2 xc = clamp(in_buf.data[idx], Labmin, Labmax);
+        vec2 yc = (pc.a0 * xc) + (pc.a1 * xp) - (pc.b1 * yp) - (pc.b2 * yb);
+        xp = xc; yb = yp; yp = yc;
+        out_buf.data[idx] = yc;
+    }
+
+    vec2 xn = clamp(in_buf.data[row + (pc.width - 1)], Labmin, Labmax);
+    vec2 xa = xn;
+    vec2 yn = xn * pc.coefn;
+    vec2 ya = yn;
+
+    for (int x = pc.width - 1; x >= 0; x--) {
+        int idx = row + x;
+        vec2 xc = clamp(in_buf.data[idx], Labmin, Labmax);
+        vec2 yc = (pc.a2 * xn) + (pc.a3 * xa) - (pc.b1 * yn) - (pc.b2 * ya);
+        xa = xn; xn = xc;
+        ya = yn; yn = yc;
+        out_buf.data[idx] += yc;
+    }
+}
