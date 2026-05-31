@@ -18,6 +18,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/nlmeans_core.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -69,6 +70,12 @@ typedef struct dt_iop_nlmeans_global_data_t
   int kernel_nlmeans_vert;
   int kernel_nlmeans_accu;
   int kernel_nlmeans_finish;
+  dt_vk_module_kernel_t vk_init;
+  dt_vk_module_kernel_t vk_dist;
+  dt_vk_module_kernel_t vk_horiz;
+  dt_vk_module_kernel_t vk_vert;
+  dt_vk_module_kernel_t vk_accu;
+  dt_vk_module_kernel_t vk_finish;
 } dt_iop_nlmeans_global_data_t;
 
 
@@ -327,6 +334,115 @@ error:
 }
 #endif
 
+// Push constants for the Vulkan kernels (defined unconditionally so
+// init_global can size them on HAVE_VULKAN=0 builds).
+typedef struct vk_nlmeans_init_pc_t   { int width, height; } vk_nlmeans_init_pc_t;
+typedef struct vk_nlmeans_dist_pc_t   { int width, height, qx, qy; float nL2, nC2; } vk_nlmeans_dist_pc_t;
+typedef struct vk_nlmeans_box_pc_t    { int width, height, P; } vk_nlmeans_box_pc_t;
+typedef struct vk_nlmeans_vert_pc_t   { int width, height, P; float sharpness; } vk_nlmeans_vert_pc_t;
+typedef struct vk_nlmeans_accu_pc_t   { int width, height, qx, qy; } vk_nlmeans_accu_pc_t;
+typedef struct vk_nlmeans_finish_pc_t { int width, height; float wx, wy, wz, ww; } vk_nlmeans_finish_pc_t;
+
+#ifdef HAVE_VULKAN
+// Vulkan twin of process_cl (the active, non-USE_NEW_IMPL path). Math
+// is bit-equal: the same shift-and-accumulate non-local-means over
+// the q-offset grid [-K,0] × [-K,K]. The OpenCL horiz/vert tile via
+// workgroup-local memory and rotate 4 buckets for async overlap; the
+// VK twin reads from global storage with the same clamp-to-edge and
+// ping-pongs between just two single-channel scratch buffers (the
+// bucket rotation is only an overlap optimisation). U2 is a float4
+// accumulator; nlmeans_accu's `U2[gidx] += accu` needs no atomics
+// because each invocation owns its gidx and the host serialises the
+// q-loop.
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in,
+               dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_nlmeans_params_t *d = piece->data;
+  const dt_iop_nlmeans_global_data_t *gd = self->global_data;
+
+  if(piece->colors != 4) return -1;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t f1 = (size_t)width * height * sizeof(float);
+  const size_t f4 = f1 * 4;
+
+  const float scale = fminf(roi_in->scale, 2.0f) / fmaxf(piece->iscale, 1.0f);
+  const int P = ceilf(d->radius * scale);
+  const int K = ceilf(7 * scale);
+  const float sharpness = 3000.0f / (1.0f + d->strength);
+
+  const float max_L = 120.0f, max_C = 512.0f;
+  const float nL = 1.0f / max_L, nC = 1.0f / max_C;
+  const float nL2 = nL * nL, nC2 = nC * nC;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_U2 = dt_vulkan_alloc_buffer(devid, f4);
+  dt_vk_mem_t *dev_a  = dt_vulkan_alloc_buffer(devid, f1);
+  dt_vk_mem_t *dev_b  = dt_vulkan_alloc_buffer(devid, f1);
+  if(!dev_U2 || !dev_a || !dev_b) goto cleanup;
+
+  // init U2 = 0
+  {
+    const vk_nlmeans_init_pc_t pc = { .width = width, .height = height };
+    dt_vk_mem_t *bufs[] = { dev_U2 };
+    if(dt_vulkan_dispatch_n(&gd->vk_init, bufs, 1, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // accumulate over the q-offset half-grid
+  for(int j = -K; j <= 0; j++)
+    for(int i = -K; i <= K; i++)
+    {
+      // dist: dev_in -> dev_a
+      {
+        const vk_nlmeans_dist_pc_t pc = { .width = width, .height = height,
+                                          .qx = i, .qy = j, .nL2 = nL2, .nC2 = nC2 };
+        dt_vk_mem_t *bufs[] = { dev_in, dev_a };
+        if(dt_vulkan_dispatch_n(&gd->vk_dist, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+      }
+      // horiz: dev_a -> dev_b
+      {
+        const vk_nlmeans_box_pc_t pc = { .width = width, .height = height, .P = P };
+        dt_vk_mem_t *bufs[] = { dev_a, dev_b };
+        if(dt_vulkan_dispatch_n(&gd->vk_horiz, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+      }
+      // vert (+ gh weight): dev_b -> dev_a
+      {
+        const vk_nlmeans_vert_pc_t pc = { .width = width, .height = height, .P = P, .sharpness = sharpness };
+        dt_vk_mem_t *bufs[] = { dev_b, dev_a };
+        if(dt_vulkan_dispatch_n(&gd->vk_vert, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+      }
+      // accu: (dev_in, dev_U2, dev_a) -> dev_U2
+      {
+        const vk_nlmeans_accu_pc_t pc = { .width = width, .height = height, .qx = i, .qy = j };
+        dt_vk_mem_t *bufs[] = { dev_in, dev_U2, dev_a };
+        if(dt_vulkan_dispatch_n(&gd->vk_accu, bufs, 3, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+      }
+    }
+
+  // normalize + blend
+  {
+    const vk_nlmeans_finish_pc_t pc = { .width = width, .height = height,
+                                        .wx = d->luma, .wy = d->chroma, .wz = d->chroma, .ww = 1.0f };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_U2, dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_finish, bufs, 3, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_U2) dt_vulkan_free_buffer(devid, dev_U2);
+  if(dev_a)  dt_vulkan_free_buffer(devid, dev_a);
+  if(dev_b)  dt_vulkan_free_buffer(devid, dev_b);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
@@ -395,6 +511,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_nlmeans_vert = dt_opencl_create_kernel(program, "nlmeans_vert");
   gd->kernel_nlmeans_accu = dt_opencl_create_kernel(program, "nlmeans_accu");
   gd->kernel_nlmeans_finish = dt_opencl_create_kernel(program, "nlmeans_finish");
+  dt_vulkan_module_kernel_load(&gd->vk_init, "nlmeans_init", "nlmeans_init",
+                               1, sizeof(vk_nlmeans_init_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_dist, "nlmeans_dist", "nlmeans_dist",
+                               2, sizeof(vk_nlmeans_dist_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_horiz, "nlmeans_horiz", "nlmeans_horiz",
+                               2, sizeof(vk_nlmeans_box_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_vert, "nlmeans_vert", "nlmeans_vert",
+                               2, sizeof(vk_nlmeans_vert_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_accu, "nlmeans_accu", "nlmeans_accu",
+                               3, sizeof(vk_nlmeans_accu_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_finish, "nlmeans_finish", "nlmeans_finish",
+                               3, sizeof(vk_nlmeans_finish_pc_t), 16, 16, 1);
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -406,6 +534,12 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_nlmeans_vert);
   dt_opencl_free_kernel(gd->kernel_nlmeans_accu);
   dt_opencl_free_kernel(gd->kernel_nlmeans_finish);
+  dt_vulkan_module_kernel_unload(&gd->vk_init);
+  dt_vulkan_module_kernel_unload(&gd->vk_dist);
+  dt_vulkan_module_kernel_unload(&gd->vk_horiz);
+  dt_vulkan_module_kernel_unload(&gd->vk_vert);
+  dt_vulkan_module_kernel_unload(&gd->vk_accu);
+  dt_vulkan_module_kernel_unload(&gd->vk_finish);
   free(self->data);
   self->data = NULL;
 }

@@ -1,0 +1,36 @@
+// GLSL fallback for nlmeans_vert.cl. fast_mexp2f mirrors
+// common.h::fast_mexp2f via a bit-pun (floatBitsToUint /
+// uintBitsToFloat).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } u4_in;
+layout(std430, binding = 1)          buffer Out { float data[]; } u4_out;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   P;
+    float sharpness;
+} pc;
+
+float fast_mexp2f(float x) {
+    float i1 = float(0x3f800000u); // 2^0
+    float i2 = float(0x3f000000u); // 2^-1
+    float k0 = i1 + x * (i2 - i1);
+    uint ki = (k0 >= float(0x800000u)) ? uint(k0) : 0u;
+    return uintBitsToFloat(ki);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    float distacc = 0.0;
+    for (int pj = -pc.P; pj <= pc.P; pj++) {
+        int yy = clamp(y + pj, 0, pc.height - 1);
+        distacc += u4_in.data[yy * pc.width + x];
+    }
+    distacc = fast_mexp2f(distacc * pc.sharpness);
+    u4_out.data[y * pc.width + x] = distacc;
+}

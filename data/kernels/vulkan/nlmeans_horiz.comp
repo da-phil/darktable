@@ -1,0 +1,24 @@
+// GLSL fallback for nlmeans_horiz.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } u4_in;
+layout(std430, binding = 1)          buffer Out { float data[]; } u4_out;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int P;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    float distacc = 0.0;
+    for (int pi = -pc.P; pi <= pc.P; pi++) {
+        int xx = clamp(x + pi, 0, pc.width - 1);
+        distacc += u4_in.data[y * pc.width + xx];
+    }
+    u4_out.data[y * pc.width + x] = distacc;
+}
