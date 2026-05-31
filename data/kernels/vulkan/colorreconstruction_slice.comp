@@ -1,0 +1,73 @@
+// GLSL fallback for colorreconstruction_slice.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Grid { float data[]; } grid;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   sizex;
+    int   sizey;
+    int   sizez;
+    float sigma_s;
+    float sigma_r;
+    float threshold;
+    int   bx;
+    int   by;
+    int   roix;
+    int   roiy;
+    float scale;
+} pc;
+
+vec4 load4(int gi) {
+    return vec4(grid.data[4*gi + 0], grid.data[4*gi + 1],
+                grid.data[4*gi + 2], grid.data[4*gi + 3]);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    int ox = 1;
+    int oy = pc.sizex;
+    int oz = pc.sizey * pc.sizex;
+
+    vec4 pixel = in_buf.data[idx];
+    float blend = clamp(20.0 / pc.threshold * pixel.x - 19.0, 0.0, 1.0);
+
+    float pxy_x = float(pc.roix + x) * pc.scale - float(pc.bx);
+    float pxy_y = float(pc.roiy + y) * pc.scale - float(pc.by);
+
+    float gpx = clamp(pxy_x / pc.sigma_s,    0.0, float(pc.sizex - 1));
+    float gpy = clamp(pxy_y / pc.sigma_s,    0.0, float(pc.sizey - 1));
+    float gpz = clamp(pixel.x / pc.sigma_r,  0.0, float(pc.sizez - 1));
+
+    int gix = min(pc.sizex - 2, int(gpx));
+    int giy = min(pc.sizey - 2, int(gpy));
+    int giz = min(pc.sizez - 2, int(gpz));
+    float fx = gpx - float(gix);
+    float fy = gpy - float(giy);
+    float fz = gpz - float(giz);
+
+    int gi = gix + pc.sizex * (giy + pc.sizey * giz);
+
+    vec4 opixel =
+          load4(gi)               * (1.0 - fx) * (1.0 - fy) * (1.0 - fz)
+        + load4(gi + ox)          * (      fx) * (1.0 - fy) * (1.0 - fz)
+        + load4(gi + oy)          * (1.0 - fx) * (      fy) * (1.0 - fz)
+        + load4(gi + ox + oy)     * (      fx) * (      fy) * (1.0 - fz)
+        + load4(gi + oz)          * (1.0 - fx) * (1.0 - fy) * (      fz)
+        + load4(gi + ox + oz)     * (      fx) * (1.0 - fy) * (      fz)
+        + load4(gi + oy + oz)     * (1.0 - fx) * (      fy) * (      fz)
+        + load4(gi + ox + oy + oz)* (      fx) * (      fy) * (      fz);
+
+    float opixelx = max(opixel.x, 0.01);
+    pixel.y = (opixel.w > 0.0) ? pixel.y * (1.0 - blend) + opixel.y * pixel.x / opixelx * blend : pixel.y;
+    pixel.z = (opixel.w > 0.0) ? pixel.z * (1.0 - blend) + opixel.z * pixel.x / opixelx * blend : pixel.z;
+
+    out_buf.data[idx] = pixel;
+}
