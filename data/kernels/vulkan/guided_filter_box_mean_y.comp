@@ -1,0 +1,49 @@
+// GLSL fallback for guided_filter_box_mean_y.cl.
+
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { float data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int w;
+} pc;
+
+#define KSUM(m, c, add) { float _t1 = (add) - (c); float _t2 = (m) + _t1; (c) = (_t2 - (m)) - _t1; (m) = _t2; }
+#define IDX(xx, yy) ((yy) * pc.width + (xx))
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    if (x >= pc.width) return;
+    int w = pc.w;
+
+    float m = 0.0, n_box = 0.0, c = 0.0;
+    if (pc.height > 2 * w) {
+        for (int i = 0, i_end = w + 1; i < i_end; i++) {
+            KSUM(m, c, in_buf.data[IDX(x, i)]); n_box += 1.0;
+        }
+        for (int i = 0, i_end = w; i < i_end; i++) {
+            out_buf.data[IDX(x, i)] = m / n_box;
+            KSUM(m, c, in_buf.data[IDX(x, i + w + 1)]); n_box += 1.0;
+        }
+        for (int i = w, i_end = pc.height - w - 1; i < i_end; i++) {
+            out_buf.data[IDX(x, i)] = m / n_box;
+            KSUM(m, c, in_buf.data[IDX(x, i + w + 1)]);
+            KSUM(m, c, -in_buf.data[IDX(x, i - w)]);
+        }
+        for (int i = pc.height - w - 1, i_end = pc.height; i < i_end; i++) {
+            out_buf.data[IDX(x, i)] = m / n_box;
+            KSUM(m, c, -in_buf.data[IDX(x, i - w)]); n_box -= 1.0;
+        }
+    } else {
+        for (int i = 0, i_end = min(w + 1, pc.height); i < i_end; i++) {
+            KSUM(m, c, in_buf.data[IDX(x, i)]); n_box += 1.0;
+        }
+        for (int i = 0; i < pc.height; i++) {
+            out_buf.data[IDX(x, i)] = m / n_box;
+            if (i - w >= 0)         { KSUM(m, c, -in_buf.data[IDX(x, i - w)]);     n_box -= 1.0; }
+            if (i + w + 1 < pc.height) { KSUM(m, c, in_buf.data[IDX(x, i + w + 1)]); n_box += 1.0; }
+        }
+    }
+}

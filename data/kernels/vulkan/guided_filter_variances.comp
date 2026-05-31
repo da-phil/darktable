@@ -1,0 +1,35 @@
+// GLSL fallback for guided_filter_variances.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer Guide { vec4  data[]; } guide;
+layout(std430, binding = 1)          buffer VRR   { float data[]; } var_rr;
+layout(std430, binding = 2)          buffer VRG   { float data[]; } var_rg;
+layout(std430, binding = 3)          buffer VRB   { float data[]; } var_rb;
+layout(std430, binding = 4)          buffer VGG   { float data[]; } var_gg;
+layout(std430, binding = 5)          buffer VGB   { float data[]; } var_gb;
+layout(std430, binding = 6)          buffer VBB   { float data[]; } var_bb;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   first;
+    float guide_weight;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 g = min(vec4(100.0), guide.data[(y + pc.first) * pc.width + x]);
+    float r  = pc.guide_weight * g.x;
+    float gg = pc.guide_weight * g.y;
+    float b  = pc.guide_weight * g.z;
+    var_rr.data[idx] = r  * r;
+    var_rg.data[idx] = r  * gg;
+    var_rb.data[idx] = r  * b;
+    var_gg.data[idx] = gg * gg;
+    var_gb.data[idx] = gg * b;
+    var_bb.data[idx] = b  * b;
+}

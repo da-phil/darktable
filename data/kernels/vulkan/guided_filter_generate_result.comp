@@ -1,0 +1,29 @@
+// GLSL fallback for guided_filter_generate_result.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer Guide { vec4  data[]; } guide;
+layout(std430, binding = 1) readonly buffer AR    { float data[]; } a_r;
+layout(std430, binding = 2) readonly buffer AG    { float data[]; } a_g;
+layout(std430, binding = 3) readonly buffer AB    { float data[]; } a_b;
+layout(std430, binding = 4) readonly buffer B     { float data[]; } b_buf;
+layout(std430, binding = 5)          buffer Res   { float data[]; } res;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   first;
+    float guide_weight;
+    float minval;
+    float maxval;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 g = min(vec4(100.0), guide.data[(y + pc.first) * pc.width + x]);
+    float v = pc.guide_weight * (g.x * a_r.data[idx] + g.y * a_g.data[idx] + g.z * a_b.data[idx]) + b_buf.data[idx];
+    res.data[idx] = min(pc.maxval, max(pc.minval, v));
+}

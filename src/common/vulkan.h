@@ -47,7 +47,11 @@
 
 #define DT_VULKAN_MAX_PROGRAMS 64
 #define DT_VULKAN_MAX_KERNELS  256
-#define DT_VULKAN_MAX_BINDINGS 16
+// 20 lets the guided-filter `solve` kernel bind its 13 inputs + 4
+// outputs (17) in a single dispatch. Real targets (RADV, lavapipe,
+// MoltenVK→Metal ~30 buffers/stage) all allow well over this; the
+// Vulkan spec floor of 4 is academic on any darktable-capable GPU.
+#define DT_VULKAN_MAX_BINDINGS 20
 #define DT_VULKAN_MAX_PUSH_CONSTANTS 128
 
 G_BEGIN_DECLS
