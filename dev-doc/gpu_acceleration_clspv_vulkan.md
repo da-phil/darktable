@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 48 modules currently expose `process_vk`,
+**Per-module ports**: 49 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -239,6 +239,7 @@ in three categories.
 | `src/iop/bloom.c` | Bloom (the soft-glow lights-screen effect). Four small kernels: `bloom_threshold` (2-binding, 16 B PC; `L = pixel.x * scale`, set to 0 if ≤ threshold — writes a single-channel float scratch matching the OpenCL CL_R image), `bloom_hblur` / `bloom_vblur` (2-binding, 12 B PC; uniform 2·rad+1 box average — `sum / (2*rad+1)` — on the single-channel float scratch, no weights, CLAMP_TO_EDGE via the standard `clamp(x+i, 0, w-1)` idiom), and `bloom_mix` (3-binding, 8 B PC; screen blend `out.L = 100 − ((100 − in_a.L)·(100 − in_b))/100`, chroma + alpha pass through). First port to use **single-channel float scratch buffers** rather than float4 — saves 75 % of the working-set memory for the 8 box-blur iterations and matches the OpenCL allocation byte-for-byte. `process_vk` mirrors `process_cl` exactly: threshold(in → a), then `BOX_ITERATIONS` (= 8) ping-pongs of hblur(a → b) / vblur(b → a) on a 2-buffer scratch (the minimum bucket-chain length the OpenCL code documents), then mix(in, a → out). Validated end-to-end on lavapipe through the full 8-iteration chain against an independent C reference: max error **0.0** (bit-equal). |
 | `src/iop/atrous.c` | Edge-aware à-trous wavelet decomposition with per-band thresholding + boost (the contrast-equalizer module). Two small kernels: `eaw_decompose` (4-binding, 16 B PC; 5×5 stencil with sample spacing `1 << scale`, per-channel exponential weights based on Lab L/a/b deltas, writes both the low-pass `coarse` and the high-frequency `detail = in − coarse`) and `eaw_synthesize` (3-binding, 40 B PC; soft-threshold accumulation `amount = copysign(max(0, |detail| − threshold), detail); out = coarse + boost · amount`). The disabled `USE_NEW_CL` `eaw_zero` / `eaw_addbuffers` kernels aren't ported (matching the active host path). `process_vk` mirrors `process_cl` byte-for-byte: same host-built separable B3-spline filter `mm[5][5]` uploaded once, seed dev_out with dev_in via `dt_vulkan_copy_device_to_device`, then `max_scale` decompose passes followed by `max_scale` synthesize passes — both ping-ponging between `dev_out` and `dev_tmp` on the same even/odd parity the OpenCL flow uses. Each scale needs its own `detail` buffer (allocated as a `max_scale`-deep array). The OpenCL `sampleri` CLAMP_TO_EDGE on the sparse stencil reads becomes an explicit `clamp(mult·(i−2)+x, 0, w−1)` per coordinate. Validated end-to-end on lavapipe across a 3-scale ping-pong chain (6 dispatches): max error 3.8e-5 = single-bit FP precision over the Lab L ∈ [0, 100] range. |
 | `src/iop/hazeremoval.c` | Dark-channel-prior haze removal. First consumer of `dt_guided_filter_vk` (§5.15). The six module-own kernels port one-for-one (`transision_map` + 4× separable box min/max for refining the transition map + `dehaze` for the final atmospheric inversion); the guided-filter step delegates to the helper, so the module-side code is small. PC layouts: 24 B `tmap` (width, height, strength, A0_{r,g,b}); 12 B `box_min/max_{x,y}` (width, height, w); 24 B `dehaze` (width, height, t_min, A0_{x,y,z}). The dehaze kernel drops the unused `A0.w` from the OpenCL `float4` to keep the PC tight. `process_vk` mirrors `process_cl` byte-for-byte: the GUI-cached A0 fast path is preserved (preview pipe stashes A0 + distance_max for the full pipe); when no cache is available the input is read back via `dt_vulkan_read_from_device` and the existing CPU `_ambient_light` runs on the host buffer — no kernel needed for the global max-RGB reduction, matching the OpenCL `_ambient_light_cl` flow. Then: transition_map → box_max_x/y to refine → box_min_x/y to soften → `dt_guided_filter_vk(img_in, trans_map, trans_map_filtered)` → dehaze. Validated end-to-end on lavapipe: all six module-own kernels are bit-equal (max error 0.0) against the C reference, and the guided-filter helper has its own dedicated test (§5.15). |
+| `src/iop/colorreconstruction.c` | Clipped-highlight colour reconstruction via a 3-D bilateral-grid splat/blur/slice pipeline (similar shape to the §5.13 bilateral helper but with chroma-blend slicing). Four small kernels: `colorreconstruction_zero` (1-binding, 8 B PC; zeros the flat grid view), `colorreconstruction_splat` (2-binding, 44 B PC; atomic-add float into the 3-D grid via the CAS-loop `vk_atomic_add_f` — same pattern as bilateral_splat — and the OpenCL workgroup-local pre-reduction is **dropped**, math stays bit-equal since the local reduction is just a batching optimisation), `colorreconstruction_blur_line` (2-binding, 24 B PC; 3 host-issued 1-D B3-spline passes — z/x/y — with drop-missing-samples boundary handling) and `colorreconstruction_slice` (3-binding, 52 B PC; trilinear lookup into the grid + chroma blend back into the output around the threshold). **Subtle rounding gotcha**: the OpenCL `round()` is half-away-from-zero, but GLSL `round()` is implementation-defined (often banker's rounding to even) — both `.cl` and `.comp` use the explicit form `floor(x + 0.5)` so the splat cell index is identical across both compilers and matches OpenCL byte-for-byte (the test caught this with the diagnostic-printing harness when `round(0.5)` produced different yi values). The OpenCL freeze/thaw preview→full grid reuse optimisation is **not ported**; the VK twin always rebuilds the grid from scratch in `process_vk` (alloc grid + tmp → zero → splat → 3-axis blur → slice → free). Validated end-to-end on lavapipe against a C reference of the identical math: all 4 kernels match (`zero` exact; `splat` max 3e-5 over the float-atomic accumulation; `blur_line` exact; `slice` ~4e-6 = trilinear-lookup FP precision). |
 | `src/iop/filmicrgb.c` | Scene-referred filmic tone mapper, main per-pixel path. The OpenCL module has two kernels (`filmicrgb_split` for per-channel and `filmicrgb_chroma` for chroma-preserving) selected by `(preserve_color == NONE && version != V5)`, each switching on the colour-science version v1..v5; both fold into one Vulkan entry that reproduces the host's split-vs-chroma decision internally and dispatches on `color_science` exactly like `process_cl`. 6-binding dispatch (in, out, params, matrices, profile_info, profile_lut); 8 B PC (width, height). Like `agx`/`colorbalancergb`, the ~26 scalars + 5 spline `float4`s overflow the PC budget (164 B), so `vk_filmicrgb_params_t` migrates into a storage buffer (156 B, std430 == the C struct verified by `spirv-dis`). The four `dt_colormatrix_t` 3×4 matrices (input, output, export-in, export-out) pack into a single 48-float `matrices` buffer at fixed base offsets; helpers take an `int base` so the same code paths handle work and export gamut targets. The colour-science cohort (`vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_gamut_check_Yrg`) is reused from `dt_vulkan_common.h` — the helpers `colorbalancergb` landed. The filmic-specific gamut machinery — `clip_chroma_white_raw` / `clip_chroma_white` / `clip_chroma_black` / `clip_chroma` / `gamut_check_RGB` / `gamut_mapping` / `desaturate_v4` — and the v1..v5 split/chroma variants are inlined faithfully from `filmic.cl`. ICC luminance goes through the §5.11 deferred plumbing (`dt_ioppr_build_iccprofile_params_vk_deferred` appends the profile uploads in one batched submit). The highlight-reconstruction path (inpaint + a-trous wavelets over `image2d_t`) and the clipped-pixel mask preview need §8.5 sampled-image bindings; `commit_params` clears `process_vk_ready` when `enable_highlight_reconstruction` is on or the GUI mask is showing (the §10.2 predictive pattern — mirrors `basecurve`'s exposure-fusion gate). Validated end-to-end on lavapipe with an independent C reference derived directly from `filmic.cl` (not from the port): `split_v2_v3` is bit-equal (max 0.0) and `chroma_v4` matches at FP rounding (max 1e-6) — proving the matrices buffer packing, the Yrg/Ych conversions, the gamut-clip family and the std430 marshalling all reproduce the OpenCL math byte-for-byte. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
@@ -350,7 +351,7 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   + soft-light overlays).
 - **HARD** — denoiseprofile,
   globaltonemap, nlmeans, retouch, colorequal,
-  basecurve (full variants), colorreconstruction (atomics).
+  basecurve (full variants).
   `colorequal` is now **unblocked at the helper level** by
   `dt_guided_filter_vk` (§5.15) — it still needs its own per-module
   `process_vk` to wire the guide image up. Done
@@ -377,7 +378,13 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `hazeremoval` (dark-channel prior + box min/max refinement +
   guided-filter delegation to `dt_guided_filter_vk` (§5.15) — the
   first consumer of the new helper; 6 module-own kernels, all
-  bit-equal). Multi-
+  bit-equal),
+  `colorreconstruction` (3-D bilateral-grid splat/blur/slice with
+  CAS-loop float atomics for the splat; second VK consumer of the
+  `vk_atomic_add_f` pattern after the §5.13 bilateral helper.
+  Surfaced an OpenCL-vs-GLSL `round()` divergence — both `.cl` and
+  `.comp` now use the explicit `floor(x + 0.5)` form to guarantee
+  identical cell indices). Multi-
   kernel pipelines or per-warp reductions. `lowpass`, `censorize`,
   `shadhi`, `retouch`, `monochrome`, `globaltonemap` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
@@ -609,6 +616,19 @@ added incrementally by the `colorharmonizer` (UCS JCH) and
 `filmicrgb` / Yrg-space port. Matrix rows are inlined (rather than
 the `matrix_dot(v, m[3])` array-arg form) to stay on clspv patterns
 that the rest of the header already uses.
+
+**Portability gotcha — `round()`**: OpenCL's `round()` rounds half-
+away-from-zero (`round(0.5) == 1`, `round(-0.5) == -1`); GLSL's
+`round()` is **implementation-defined** for fractional 0.5 values
+and the popular Mesa / glslang implementations pick banker's
+rounding to even (`round(0.5) == 0`). When a kernel uses `round()`
+to compute an integer index (closest-integer splatting, nearest-cell
+lookup, etc.) and a sample lands exactly on .5, the two compilers
+will disagree by one cell. The `colorreconstruction` splat caught
+this in testing. **Fix in both `.cl` and `.comp`**: use the
+explicit `floor(x + 0.5)` form instead of `round(x)`. This is
+unambiguous in both languages and matches the OpenCL semantics
+byte-for-byte.
 
 ### 5.8 The LUT-on-storage-buffer pattern
 
@@ -1333,12 +1353,16 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    the full 8-iteration chain), the edge-aware à-trous wavelet
    equalizer (atrous — 2-kernel decompose/synthesize ping-pong
    over max_scale scratch detail buffers; single-bit FP precision
-   against a C reference), and the dark-channel-prior haze removal
+   against a C reference), the dark-channel-prior haze removal
    (hazeremoval — 6 module-own kernels for transition map + box
    min/max + dehaze, plus the new `dt_guided_filter_vk` helper for
    the guided-filter refinement step; first consumer of the §5.15
-   guided-filter helper, all 6 module-own kernels bit-equal). All are
-   bit-equal to their OpenCL counterparts for the supported paths.
+   guided-filter helper, all 6 module-own kernels bit-equal), and the
+   clipped-highlight colour reconstruction (colorreconstruction — 3-D
+   bilateral-grid splat/blur/slice with CAS-loop float atomics, second
+   `vk_atomic_add_f` consumer after the §5.13 bilateral helper; surfaced
+   the OpenCL-vs-GLSL `round()` divergence the docs now warn about).
+   All are bit-equal to their OpenCL counterparts for the supported paths.
 4a. ✅ **`dt_vk_module_kernel_t` abstraction** (landed; see §5.6).
     Cuts the per-module wiring boilerplate by ~30 LOC each and gives
     a uniform shape for every future port.

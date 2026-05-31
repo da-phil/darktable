@@ -124,7 +124,11 @@ set(VK_KERNELS
     hazeremoval_box_max_x:hazeremoval_box_max_x
     hazeremoval_box_max_y:hazeremoval_box_max_y
     hazeremoval_transision_map:hazeremoval_transision_map
-    hazeremoval_dehaze:hazeremoval_dehaze)
+    hazeremoval_dehaze:hazeremoval_dehaze
+    colorreconstruction_zero:colorreconstruction_zero
+    colorreconstruction_splat:colorreconstruction_splat
+    colorreconstruction_blur_line:colorreconstruction_blur_line
+    colorreconstruction_slice:colorreconstruction_slice)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

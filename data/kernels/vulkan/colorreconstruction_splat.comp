@@ -1,0 +1,76 @@
+// GLSL fallback for colorreconstruction_splat.cl. Uses atomicCompSwap
+// on a uint-aliased grid buffer to implement atomic-add on float
+// (same pattern as bilateral_splat.comp / vk_atomic_add_f).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Grid { uint data[]; } grid_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   sizex;
+    int   sizey;
+    int   sizez;
+    float sigma_s;
+    float sigma_r;
+    float threshold;
+    int   precedence;
+    float hue;
+    float hue_sigma;
+} pc;
+
+#define CR_PRECEDENCE_NONE   0
+#define CR_PRECEDENCE_CHROMA 1
+#define CR_PRECEDENCE_HUE    2
+#define M_PI_F    3.14159265358979323846
+#define DT_2PI_F  6.28318530717958647692
+
+void atomic_add_f(int idx, float delta) {
+    uint old_i = grid_buf.data[idx];
+    while(true) {
+        float f = uintBitsToFloat(old_i);
+        uint new_i = floatBitsToUint(f + delta);
+        uint witness = atomicCompSwap(grid_buf.data[idx], old_i, new_i);
+        if(witness == old_i) break;
+        old_i = witness;
+    }
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    vec4 pixel = in_buf.data[y * pc.width + x];
+    if (pixel.x >= pc.threshold) return;
+
+    float weight;
+    if (pc.precedence == CR_PRECEDENCE_CHROMA) {
+        weight = sqrt(pixel.y * pixel.y + pixel.z * pixel.z);
+    } else if (pc.precedence == CR_PRECEDENCE_HUE) {
+        float m = atan(pixel.z, pixel.y) - pc.hue;
+        m = m > M_PI_F ? m - DT_2PI_F : (m < -M_PI_F ? m + DT_2PI_F : m);
+        weight = exp(-m * m / pc.hue_sigma);
+    } else {
+        weight = 1.0;
+    }
+
+    float gpx = clamp(float(x) / pc.sigma_s,    0.0, float(pc.sizex - 1));
+    float gpy = clamp(float(y) / pc.sigma_s,    0.0, float(pc.sizey - 1));
+    float gpz = clamp(pixel.x / pc.sigma_r,     0.0, float(pc.sizez - 1));
+
+    // Explicit half-up rounding to match OpenCL `round()` exactly
+    // (GLSL round() is implementation-defined for .5 values).
+    int xi = clamp(int(floor(gpx + 0.5)), 0, pc.sizex - 1);
+    int yi = clamp(int(floor(gpy + 0.5)), 0, pc.sizey - 1);
+    int zi = clamp(int(floor(gpz + 0.5)), 0, pc.sizez - 1);
+    int gi = xi + pc.sizex * (yi + pc.sizey * zi);
+
+    atomic_add_f(4 * gi + 0, weight * pixel.x);
+    atomic_add_f(4 * gi + 1, weight * pixel.y);
+    atomic_add_f(4 * gi + 2, weight * pixel.z);
+    atomic_add_f(4 * gi + 3, weight);
+}
