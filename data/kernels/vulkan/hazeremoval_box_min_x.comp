@@ -1,0 +1,33 @@
+// GLSL fallback for hazeremoval_box_min_x.cl.
+
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { float data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int w;
+} pc;
+
+#define FLT_INF uintBitsToFloat(0x7F800000u)
+
+void main() {
+    int y = int(gl_GlobalInvocationID.x);
+    if (y >= pc.height) return;
+    int row = y * pc.width;
+    int w = pc.w;
+
+    float m = FLT_INF;
+    for (int i = 0, i_end = min(w + 1, pc.width); i < i_end; ++i)
+        m = min(in_buf.data[row + i], m);
+    for (int i = 0; i < pc.width; i++) {
+        out_buf.data[row + i] = m;
+        if (i - w >= 0 && in_buf.data[row + i - w] == m) {
+            m = FLT_INF;
+            for (int j = max(i - w + 1, 0), j_end = min(i + w + 2, pc.width); j < j_end; ++j)
+                m = min(in_buf.data[row + j], m);
+        }
+        if (i + w + 1 < pc.width) m = min(in_buf.data[row + i + w + 1], m);
+    }
+}
