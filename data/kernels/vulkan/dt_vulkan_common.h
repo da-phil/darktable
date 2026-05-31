@@ -448,6 +448,19 @@ static inline void vk_atomic_add_f(global float *val, const float delta)
   }
 }
 
+// Fast 2^-x approximation. Matches data/kernels/common.h::fast_mexp2f
+// byte-for-byte (the union bit-pun is clspv-safe — same idiom as
+// vk_atomic_add_f / colorchecker's fastlog2). Used by nlmeans.
+static inline float vk_fast_mexp2f(const float x)
+{
+  const float i1 = (float)0x3f800000u; // 2^0
+  const float i2 = (float)0x3f000000u; // 2^-1
+  const float k0 = i1 + x * (i2 - i1);
+  union { float f; uint i; } k;
+  k.i = (k0 >= (float)0x800000u) ? (uint)k0 : 0u;
+  return k.f;
+}
+
 // RGB <-> HSL — needed by splittoning et al. Matches the OpenCL
 // implementations in data/kernels/colorspace.h byte-for-byte.
 
