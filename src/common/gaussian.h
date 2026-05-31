@@ -136,19 +136,20 @@ static inline int dt_gaussian_mean_blur_cl(const int devid,
 #endif
 
 // Vulkan recursive Gaussian. Mirrors the OpenCL surface above but
-// operates on flat float4 storage buffers and runs row-then-column
-// instead of column+transpose (the transpose would need workgroup-
-// local memory plumbing we don't have yet, and the IIR cost
-// dominates the per-pixel walk regardless of dispatch shape).
+// operates on flat storage buffers and runs row-then-column instead
+// of column+transpose (the transpose would need workgroup-local
+// memory plumbing we don't have yet, and the IIR cost dominates the
+// per-pixel walk regardless of dispatch shape).
 //
-// Only the 4-channel path is wired up for now — the modules that
-// need 1- or 2-channel Gaussian blur (a small minority) stay on
-// OpenCL/CPU until the kernel set grows.
+// Three channel paths are wired up: 1-channel (float), 2-channel
+// (float2) and 4-channel (float4). The channel count is passed at
+// init time and selects the matching kernel pair internally.
 #include "common/vulkan.h"
 
 typedef struct dt_gaussian_vk_t
 {
   int width, height;
+  int channels;          // 1, 2 or 4
   float sigma;
   int order;
   float max[4], min[4];
@@ -157,26 +158,54 @@ typedef struct dt_gaussian_vk_t
 } dt_gaussian_vk_t;
 
 #ifdef HAVE_VULKAN
-dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height,
+/** Allocate a Gaussian context for a width × height buffer of
+ *  `channels` floats per pixel (1, 2 or 4). `max` / `min` are the
+ *  per-channel clamp envelopes (read first `channels` entries).
+ *  Returns NULL if Vulkan isn't running, the kernel set isn't loaded,
+ *  or scratch allocation fails. */
+dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height, int channels,
                                       const float *max, const float *min,
                                       float sigma, int order);
 
-/** Blur dev_in (binding 0, float4-per-pixel, sized width*height) into
- *  dev_out using the two internal scratch buffers. dev_in and dev_out
- *  may alias. Returns 0 on success or -1 if Vulkan isn't running /
- *  the kernels aren't loaded / dispatch failed. */
+/** Blur dev_in (binding 0, `channels`-floats-per-pixel, sized
+ *  width*height) into dev_out using the two internal scratch buffers.
+ *  dev_in and dev_out may alias. Returns 0 on success or -1 if
+ *  Vulkan isn't running / the kernels aren't loaded / dispatch failed. */
 int dt_gaussian_blur_vk(dt_gaussian_vk_t *g,
                         dt_vk_mem_t *dev_in,
                         dt_vk_mem_t *dev_out);
 
 void dt_gaussian_free_vk(dt_gaussian_vk_t *g);
+
+/** One-shot in-place blur convenience matching dt_gaussian_mean_blur_cl.
+ *  Allocates a context, runs the two-axis blur with dev_buf as both
+ *  source and destination, and frees the context. Returns 0 on success
+ *  or -1 on any failure. */
+static inline int dt_gaussian_mean_blur_vk(int devid,
+                                           dt_vk_mem_t *dev_buf,
+                                           int width, int height, int channels,
+                                           float sigma)
+{
+  (void)devid;
+  const float range = 1.0e9f;
+  const dt_aligned_pixel_t mx = { range, range, range, range };
+  const dt_aligned_pixel_t mn = { -range, -range, -range, -range };
+  dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, channels, mx, mn, sigma,
+                                            DT_IOP_GAUSSIAN_ZERO);
+  if(!g) return -1;
+  const int err = dt_gaussian_blur_vk(g, dev_buf, dev_buf);
+  dt_gaussian_free_vk(g);
+  return err;
+}
 #else
-static inline dt_gaussian_vk_t *dt_gaussian_init_vk(int w, int h, const float *mx,
+static inline dt_gaussian_vk_t *dt_gaussian_init_vk(int w, int h, int ch, const float *mx,
                                                     const float *mn, float s, int o)
-{ (void)w; (void)h; (void)mx; (void)mn; (void)s; (void)o; return NULL; }
+{ (void)w; (void)h; (void)ch; (void)mx; (void)mn; (void)s; (void)o; return NULL; }
 static inline int dt_gaussian_blur_vk(dt_gaussian_vk_t *g, dt_vk_mem_t *i, dt_vk_mem_t *o)
 { (void)g; (void)i; (void)o; return -1; }
 static inline void dt_gaussian_free_vk(dt_gaussian_vk_t *g) { (void)g; }
+static inline int dt_gaussian_mean_blur_vk(int devid, dt_vk_mem_t *b, int w, int h, int ch, float s)
+{ (void)devid; (void)b; (void)w; (void)h; (void)ch; (void)s; return -1; }
 #endif
 
 // clang-format off

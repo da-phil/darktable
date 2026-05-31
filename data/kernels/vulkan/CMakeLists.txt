@@ -50,6 +50,10 @@ set(VK_KERNELS
     relight:relight
     vignette:vignette
     gaussian:gaussian_column_4c
+    gaussian_row_1c:gaussian_row_1c
+    gaussian_column_1c:gaussian_column_1c
+    gaussian_row_2c:gaussian_row_2c
+    gaussian_column_2c:gaussian_column_2c
     splittoning:splittoning
     zonesystem:zonesystem
     levels:levels

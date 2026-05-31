@@ -813,7 +813,7 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                         * fmaxf(1.0f, p->pull_width);
     const float rng[4] = { 1e9f, 1e9f, 1e9f, 1e9f };
     const float mng[4] = { -1e9f, -1e9f, -1e9f, -1e9f };
-    gauss = dt_gaussian_init_vk(width, height, rng, mng, sigma, DT_IOP_GAUSSIAN_ZERO);
+    gauss = dt_gaussian_init_vk(width, height, 4, rng, mng, sigma, DT_IOP_GAUSSIAN_ZERO);
     if(!gauss || dt_gaussian_blur_vk(gauss, dev_corr, dev_corr) != 0) goto cleanup;
   }
 

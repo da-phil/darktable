@@ -1139,7 +1139,8 @@ void dt_gaussian_free_cl_global(dt_gaussian_cl_global_t *g)
 // them avoids repeated SPV reads.
 
 #ifdef HAVE_VULKAN
-typedef struct vk_gauss_pc_t
+// PC layouts match the .cl/.comp byte-for-byte; one per channel count.
+typedef struct vk_gauss_pc_4c_t
 {
   int   width;
   int   height;
@@ -1148,42 +1149,84 @@ typedef struct vk_gauss_pc_t
   float coefp, coefn;
   float Labmax[4];
   float Labmin[4];
-} vk_gauss_pc_t;
+} vk_gauss_pc_4c_t;
+
+typedef struct vk_gauss_pc_2c_t
+{
+  int   width;
+  int   height;
+  float a0, a1, a2, a3;
+  float b1, b2;
+  float coefp, coefn;
+  float Labmax_x, Labmax_y;
+  float Labmin_x, Labmin_y;
+} vk_gauss_pc_2c_t;
+
+typedef struct vk_gauss_pc_1c_t
+{
+  int   width;
+  int   height;
+  float a0, a1, a2, a3;
+  float b1, b2;
+  float coefp, coefn;
+  float Labmax;
+  float Labmin;
+} vk_gauss_pc_1c_t;
 
 static dt_vk_module_kernel_t _vk_gauss_row_4c = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t _vk_gauss_col_4c = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gauss_row_2c = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gauss_col_2c = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gauss_row_1c = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gauss_col_1c = DT_VK_MODULE_KERNEL_INIT;
 static gboolean              _vk_gauss_loaded = FALSE;
 
 static void _vk_gauss_ensure_kernels(void)
 {
   if(_vk_gauss_loaded) return;
   if(!dt_vulkan_running()) return;
-  const int prog = dt_vulkan_load_program_by_name("gaussian");
-  if(prog < 0) return;
-  const uint32_t pcs = sizeof(vk_gauss_pc_t);
-  dt_vulkan_module_kernel_create_from(&_vk_gauss_row_4c, prog,
-                                      "gaussian_row_4c", 2, pcs, 64, 1, 1);
-  dt_vulkan_module_kernel_create_from(&_vk_gauss_col_4c, prog,
-                                      "gaussian_column_4c", 2, pcs, 64, 1, 1);
+  // 4-channel pair lives in the multi-entry "gaussian" program (loaded
+  // via create_from). 1c and 2c sit in their own single-entry .spv
+  // modules — glslang fallback can't multi-entry, and splitting also
+  // keeps the PC blob sized to the channel count.
+  const int prog4 = dt_vulkan_load_program_by_name("gaussian");
+  if(prog4 >= 0)
+  {
+    const uint32_t pcs = sizeof(vk_gauss_pc_4c_t);
+    dt_vulkan_module_kernel_create_from(&_vk_gauss_row_4c, prog4,
+                                        "gaussian_row_4c", 2, pcs, 64, 1, 1);
+    dt_vulkan_module_kernel_create_from(&_vk_gauss_col_4c, prog4,
+                                        "gaussian_column_4c", 2, pcs, 64, 1, 1);
+  }
+  dt_vulkan_module_kernel_load(&_vk_gauss_row_1c, "gaussian_row_1c",
+                               "gaussian_row_1c", 2, sizeof(vk_gauss_pc_1c_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&_vk_gauss_col_1c, "gaussian_column_1c",
+                               "gaussian_column_1c", 2, sizeof(vk_gauss_pc_1c_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&_vk_gauss_row_2c, "gaussian_row_2c",
+                               "gaussian_row_2c", 2, sizeof(vk_gauss_pc_2c_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&_vk_gauss_col_2c, "gaussian_column_2c",
+                               "gaussian_column_2c", 2, sizeof(vk_gauss_pc_2c_t), 64, 1, 1);
   _vk_gauss_loaded = TRUE;
 }
 
-dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height,
+dt_gaussian_vk_t *dt_gaussian_init_vk(int width, int height, int channels,
                                       const float *max, const float *min,
                                       float sigma, int order)
 {
   if(!dt_vulkan_running()) return NULL;
+  if(channels != 1 && channels != 2 && channels != 4) return NULL;
   _vk_gauss_ensure_kernels();
 
   dt_gaussian_vk_t *g = calloc(1, sizeof(*g));
   if(!g) return NULL;
-  g->width  = width;
-  g->height = height;
-  g->sigma  = sigma;
-  g->order  = order;
-  for(int k = 0; k < 4; k++) { g->max[k] = max[k]; g->min[k] = min[k]; }
+  g->width    = width;
+  g->height   = height;
+  g->channels = channels;
+  g->sigma    = sigma;
+  g->order    = order;
+  for(int k = 0; k < channels; k++) { g->max[k] = max[k]; g->min[k] = min[k]; }
 
-  const size_t bytes = (size_t)width * height * 4 * sizeof(float);
+  const size_t bytes = (size_t)width * height * channels * sizeof(float);
   g->dev_temp1 = dt_vulkan_alloc_buffer(0, bytes);
   g->dev_temp2 = dt_vulkan_alloc_buffer(0, bytes);
   if(!g->dev_temp1 || !g->dev_temp2)
@@ -1199,30 +1242,57 @@ int dt_gaussian_blur_vk(dt_gaussian_vk_t *g,
                         dt_vk_mem_t *dev_out)
 {
   if(!g || !dev_in || !dev_out) return -1;
-  if(_vk_gauss_row_4c.kernel < 0 || _vk_gauss_col_4c.kernel < 0)
-    return -1;
 
   float a0, a1, a2, a3, b1, b2, coefp, coefn;
   _compute_gauss_params(g->sigma, g->order, &a0, &a1, &a2, &a3, &b1, &b2,
                         &coefp, &coefn);
 
-  vk_gauss_pc_t pc = {
-    .width  = g->width,
-    .height = g->height,
-    .a0 = a0, .a1 = a1, .a2 = a2, .a3 = a3,
-    .b1 = b1, .b2 = b2,
-    .coefp = coefp, .coefn = coefn,
-  };
-  for(int k = 0; k < 4; k++) { pc.Labmax[k] = g->max[k]; pc.Labmin[k] = g->min[k]; }
-
-  // row pass: dev_in -> dev_temp1, dispatched 1D over `height`.
-  int rc = dt_vulkan_dispatch_inout(&_vk_gauss_row_4c, dev_in, g->dev_temp1,
-                                    g->height, 1, &pc, sizeof(pc));
-  if(rc != 0) return rc;
-
-  // column pass: dev_temp1 -> dev_out, dispatched 1D over `width`.
-  return dt_vulkan_dispatch_inout(&_vk_gauss_col_4c, g->dev_temp1, dev_out,
-                                  g->width, 1, &pc, sizeof(pc));
+  if(g->channels == 4)
+  {
+    if(_vk_gauss_row_4c.kernel < 0 || _vk_gauss_col_4c.kernel < 0) return -1;
+    vk_gauss_pc_4c_t pc = {
+      .width = g->width, .height = g->height,
+      .a0 = a0, .a1 = a1, .a2 = a2, .a3 = a3,
+      .b1 = b1, .b2 = b2, .coefp = coefp, .coefn = coefn,
+    };
+    for(int k = 0; k < 4; k++) { pc.Labmax[k] = g->max[k]; pc.Labmin[k] = g->min[k]; }
+    int rc = dt_vulkan_dispatch_inout(&_vk_gauss_row_4c, dev_in, g->dev_temp1,
+                                      g->height, 1, &pc, sizeof(pc));
+    if(rc != 0) return rc;
+    return dt_vulkan_dispatch_inout(&_vk_gauss_col_4c, g->dev_temp1, dev_out,
+                                    g->width, 1, &pc, sizeof(pc));
+  }
+  else if(g->channels == 2)
+  {
+    if(_vk_gauss_row_2c.kernel < 0 || _vk_gauss_col_2c.kernel < 0) return -1;
+    vk_gauss_pc_2c_t pc = {
+      .width = g->width, .height = g->height,
+      .a0 = a0, .a1 = a1, .a2 = a2, .a3 = a3,
+      .b1 = b1, .b2 = b2, .coefp = coefp, .coefn = coefn,
+      .Labmax_x = g->max[0], .Labmax_y = g->max[1],
+      .Labmin_x = g->min[0], .Labmin_y = g->min[1],
+    };
+    int rc = dt_vulkan_dispatch_inout(&_vk_gauss_row_2c, dev_in, g->dev_temp1,
+                                      g->height, 1, &pc, sizeof(pc));
+    if(rc != 0) return rc;
+    return dt_vulkan_dispatch_inout(&_vk_gauss_col_2c, g->dev_temp1, dev_out,
+                                    g->width, 1, &pc, sizeof(pc));
+  }
+  else // channels == 1
+  {
+    if(_vk_gauss_row_1c.kernel < 0 || _vk_gauss_col_1c.kernel < 0) return -1;
+    vk_gauss_pc_1c_t pc = {
+      .width = g->width, .height = g->height,
+      .a0 = a0, .a1 = a1, .a2 = a2, .a3 = a3,
+      .b1 = b1, .b2 = b2, .coefp = coefp, .coefn = coefn,
+      .Labmax = g->max[0], .Labmin = g->min[0],
+    };
+    int rc = dt_vulkan_dispatch_inout(&_vk_gauss_row_1c, dev_in, g->dev_temp1,
+                                      g->height, 1, &pc, sizeof(pc));
+    if(rc != 0) return rc;
+    return dt_vulkan_dispatch_inout(&_vk_gauss_col_1c, g->dev_temp1, dev_out,
+                                    g->width, 1, &pc, sizeof(pc));
+  }
 }
 
 void dt_gaussian_free_vk(dt_gaussian_vk_t *g)
