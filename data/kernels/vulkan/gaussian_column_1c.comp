@@ -1,0 +1,47 @@
+// GLSL fallback for gaussian_1c.cl :: gaussian_column_1c.
+
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { float data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float a0; float a1; float a2; float a3;
+    float b1; float b2;
+    float coefp; float coefn;
+    float Labmax;
+    float Labmin;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    if (x >= pc.width) return;
+
+    float xp = clamp(in_buf.data[x], pc.Labmin, pc.Labmax);
+    float yb = xp * pc.coefp;
+    float yp = yb;
+
+    for (int y = 0; y < pc.height; y++) {
+        int idx = y * pc.width + x;
+        float xc = clamp(in_buf.data[idx], pc.Labmin, pc.Labmax);
+        float yc = (pc.a0 * xc) + (pc.a1 * xp) - (pc.b1 * yp) - (pc.b2 * yb);
+        xp = xc; yb = yp; yp = yc;
+        out_buf.data[idx] = yc;
+    }
+
+    float xn = clamp(in_buf.data[(pc.height - 1) * pc.width + x], pc.Labmin, pc.Labmax);
+    float xa = xn;
+    float yn = xn * pc.coefn;
+    float ya = yn;
+
+    for (int y = pc.height - 1; y >= 0; y--) {
+        int idx = y * pc.width + x;
+        float xc = clamp(in_buf.data[idx], pc.Labmin, pc.Labmax);
+        float yc = (pc.a2 * xn) + (pc.a3 * xa) - (pc.b1 * yn) - (pc.b2 * ya);
+        xa = xn; xn = xc;
+        ya = yn; yn = yc;
+        out_buf.data[idx] += yc;
+    }
+}

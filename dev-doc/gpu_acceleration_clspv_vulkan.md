@@ -353,9 +353,12 @@ the user out-of-container on AMD RX 9060 XT (RADV).
 - **HARD** — denoiseprofile,
   globaltonemap, retouch, colorequal,
   basecurve (full variants).
-  `colorequal` is now **unblocked at the helper level** by
-  `dt_guided_filter_vk` (§5.15) — it still needs its own per-module
-  `process_vk` to wire the guide image up. Done
+  `colorequal` is now **unblocked at the helper level** by the
+  `dt_gaussian_*_vk` 1/2/4-channel extension (§5.10) — it builds its
+  own multi-pass filter (not He-Sun-Tang guided), so it doesn't
+  consume `dt_guided_filter_vk` (§5.15) but does need the mixed
+  1c/2c/4c Gaussian. It still needs its own per-module `process_vk`
+  to orchestrate the ~16 kernels and the bilinear up/downsamples. Done
   in earlier passes: `agx` (params struct migrated from PC into a
   storage-buffer binding so the 124 B struct fits — the pattern is
   now available for any future port whose param block exceeds the
@@ -758,11 +761,17 @@ existing `dt_gaussian_*_cl` surface used by `lowpass`, `censorize`,
 IIR blur for arbitrary sigma. Shape:
 
 ```c
-dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, max, min,
-                                          sigma, order);
+dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, channels,
+                                          max, min, sigma, order);
 int rc = dt_gaussian_blur_vk(g, dev_in, dev_out);
 dt_gaussian_free_vk(g);
 ```
+
+`channels` is 1, 2 or 4 — `dt_gaussian_init_vk` picks the matching
+kernel pair internally. The OpenCL convenience wrapper
+`dt_gaussian_mean_blur_cl(devid, buf, w, h, ch, sigma)` has a VK
+twin `dt_gaussian_mean_blur_vk(devid, buf, w, h, ch, sigma)` that
+does init + in-place blur + free in one call.
 
 The OpenCL build runs column-blur + transpose + column-blur +
 transpose with a workgroup-local-memory transpose. The Vulkan port
@@ -773,19 +782,30 @@ work-item per row/column, not per pixel. The local-memory transpose
 would be a meaningful speedup at large image sizes but needs
 clspv/glslang local-memory plumbing the HAL doesn't expose yet.
 
-The two kernels (`gaussian_row_4c`, `gaussian_column_4c`) live in
-one shared `.spv`. The host loads the program once and caches the
-kernel slots in module-level statics so every IOP that uses the
-helper amortises the SPV read across the process lifetime. Only the
-4-channel path is wired up so far; the OpenCL 1c/2c variants serve a
-small minority of modules and can be added on demand.
+The 4-channel pair (`gaussian_row_4c`, `gaussian_column_4c`) lives
+in one shared multi-entry `.spv` (`gaussian.spv`) — the host extracts
+both entries via `dt_vulkan_module_kernel_create_from`. The 1c and
+2c kernels are split across four single-entry `.spv` modules
+(`gaussian_row_1c`, `gaussian_column_1c`, `gaussian_row_2c`,
+`gaussian_column_2c`) because the glslang fallback can only expose
+one entry per `.spv`. Splitting also keeps the push-constant blob
+sized to the channel count (1c PC = 48 B, 2c = 56 B, 4c = 72 B —
+each carries channel-many `Labmax`/`Labmin` floats). The 4c row
+blur is **unreachable from the glslang path** (a pre-existing
+limitation of the multi-entry approach for 4c); 1c and 2c row blurs
+work in both builds since each has its own dedicated `.comp` file.
+The host caches all six kernel slots in module-level statics so
+every IOP that uses the helper amortises the SPV read across the
+process lifetime.
 
 `dt_gaussian_blur_vk` returns -1 on any failure (Vulkan not running,
 program load failed, dispatch error). Callers should always check
 the return value and fall through to `dt_gaussian_blur_cl` /
 `dt_gaussian_blur` (CPU) on -1, in the same shape as the existing
 CPU/OpenCL fallback pattern in the lowpass / shadhi / retouch
-modules.
+modules. Validated on lavapipe: 1c and 2c column outputs are
+**bit-equal** to the corresponding channels of the existing 4c
+column blur on the same input.
 
 ### 5.11 ICC profile info storage-buffer plumbing
 
@@ -1386,7 +1406,10 @@ a `USE_*` option; see the inline `case` in `build.sh`).
     `dt_gaussian_*_vk` row-then-column IIR blur. Substrate for
     porting lowpass, censorize, shadhi, retouch (each also needs at
     least one of: LUT plumbing, work-profile struct plumbing,
-    bilateral helper).
+    bilateral helper). Extended later to 1- and 2-channel buffers
+    (and a `dt_gaussian_mean_blur_vk` one-shot convenience) — the
+    full channel set (1, 2, 4) the OpenCL surface offers; unblocks
+    `colorequal`'s mixed 1c/2c/4c Gaussian use.
 4d. ✅ **LUT-on-storage-buffer pattern** (landed; see §5.8).
     Worked example in `src/iop/colisa.c`; template for the remaining
     curve-based colour modules (`tonecurve`, `rgbcurve`, `rgblevels`,

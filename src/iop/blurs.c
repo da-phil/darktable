@@ -903,7 +903,7 @@ int process_vk(dt_iop_module_t *self,
 
     int rc = -1;
     dt_vk_mem_t *dev_blurred = dt_vulkan_alloc_buffer(devid, img_bytes);
-    dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, maxv, minv, sigma, DT_IOP_GAUSSIAN_ZERO);
+    dt_gaussian_vk_t *g = dt_gaussian_init_vk(width, height, 4, maxv, minv, sigma, DT_IOP_GAUSSIAN_ZERO);
     if(!dev_blurred || !g) goto gauss_cleanup;
     if(dt_gaussian_blur_vk(g, dev_in, dev_blurred) != 0) goto gauss_cleanup;
 

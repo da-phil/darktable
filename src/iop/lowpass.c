@@ -376,7 +376,7 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   // Step 1: low-pass filter (Gaussian or bilateral), dev_in → dev_out
   if(d->lowpass_algo == LOWPASS_ALGO_GAUSSIAN)
   {
-    g = dt_gaussian_init_vk(width, height, Labmax, Labmin, sigma, order);
+    g = dt_gaussian_init_vk(width, height, 4, Labmax, Labmin, sigma, order);
     if(!g) goto cleanup;
     if(dt_gaussian_blur_vk(g, dev_in, dev_out) != 0) goto cleanup;
     dt_gaussian_free_vk(g);
