@@ -1,0 +1,28 @@
+// GLSL fallback for guided_filter_covariances.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer Guide { vec4  data[]; } guide;
+layout(std430, binding = 1) readonly buffer Img   { float data[]; } img;
+layout(std430, binding = 2)          buffer CovR  { float data[]; } cov_r;
+layout(std430, binding = 3)          buffer CovG  { float data[]; } cov_g;
+layout(std430, binding = 4)          buffer CovB  { float data[]; } cov_b;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    int   first;
+    float guide_weight;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    float img_ = img.data[idx];
+    vec4 g = min(vec4(100.0), guide.data[(y + pc.first) * pc.width + x]);
+    cov_r.data[idx] = img_ * pc.guide_weight * g.x;
+    cov_g.data[idx] = img_ * pc.guide_weight * g.y;
+    cov_b.data[idx] = img_ * pc.guide_weight * g.z;
+}

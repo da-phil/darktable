@@ -349,7 +349,10 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   + soft-light overlays).
 - **HARD** — denoiseprofile,
   globaltonemap, hazeremoval, nlmeans, retouch, colorequal,
-  basecurve (full variants), colorreconstruction (atomics). Done
+  basecurve (full variants), colorreconstruction (atomics).
+  `hazeremoval` and `colorequal` are now **unblocked at the helper
+  level** by `dt_guided_filter_vk` (§5.15) — they each still need
+  their own per-module `process_vk` to wire the guide image up. Done
   in earlier passes: `agx` (params struct migrated from PC into a
   storage-buffer binding so the 124 B struct fits — the pattern is
   now available for any future port whose param block exceeds the
@@ -997,6 +1000,70 @@ enough modules in the default pipeline expose `process_vk` to
 form chains. The infrastructure is in place now; module coverage
 catches up incrementally as more modules port.
 
+### 5.15 Guided-filter helper (`dt_guided_filter_vk`)
+
+Third multi-kernel device helper (after §5.10 Gaussian and §5.13
+bilateral). The guided filter is a local linear regression of the
+input onto the (clipped, weighted) RGB guide; box-meaning the
+per-pixel products plus a 3×3 Cramer solve yields a smoothed
+coefficient field, which is then applied back to the guide.
+Used by `hazeremoval` and (pending) `colorequal` — single
+shared implementation, one helper to keep in sync.
+
+```c
+int dt_guided_filter_vk(int devid,
+                        dt_vk_mem_t *guide, dt_vk_mem_t *in, dt_vk_mem_t *out,
+                        int width, int height, int w,
+                        float sqrt_eps, float guide_weight, float min, float max);
+```
+
+Eight kernels (1:1 with `guided_filter.cl`):
+
+- `guided_filter_split_rgb` — guide → three weighted single-channel
+  float buffers. 4 bindings, 16 B PC.
+- `guided_filter_box_mean_x` / `_y` — separable box mean via a
+  Kahan-compensated sliding sum. 1D dispatch (over rows / columns).
+  2 bindings, 12 B PC. A new `vk_kahan_sum(m, c, add)` lvalue macro
+  in `dt_vulkan_common.h` matches `common.h::Kahan_sum` byte-for-byte.
+- `guided_filter_covariances` — per-pixel `img · weighted guide`. 5
+  bindings, 16 B PC.
+- `guided_filter_variances` — per-pixel symmetric guide cov (6 terms).
+  7 bindings, 16 B PC.
+- `guided_filter_update_covariance` — `out = in − a·b + eps`. 4
+  bindings, 12 B PC.
+- `guided_filter_solve` — per-pixel 3×3 Cramer solve. **17 bindings**
+  (13 read + 4 write), 8 B PC. This is the reason
+  `DT_VULKAN_MAX_BINDINGS` was bumped from 16 to 20 (the Vulkan spec
+  floor is 4 but every real desktop / mobile GPU plus MoltenVK→Metal
+  allows well above 20; clspv's argument-flattening makes hitting 16
+  trivial on multi-channel solves).
+- `guided_filter_generate_result` — clamp(`gw · (guide · a) + b`).
+  6 bindings, 24 B PC.
+
+Storage model: the **guide is a `float4`** flat buffer; `in`, `out`
+and all ~20 scratch buffers are **single-channel float** —
+matches the OpenCL `CL_R` allocation and saves 75 % of the
+working-set memory vs. the float4 default. The helper allocates the
+scratch internally on each call; no per-instance handle needed
+(unlike Gaussian/bilateral) — the helper signature is stateless.
+
+The orchestration follows `_guided_filter_cl_impl` byte-for-byte:
+split → 4× box-mean → covariances + variances → 9× (box-mean +
+update_covariance) → solve → 4× box-mean (`a_{r,g,b}`, `b`) →
+generate_result. Single-tile only — the tiled variant for very
+large images is deferred (the OpenCL fallback handles it; a future
+Path C zero-copy round would also remove most of the motivation).
+Returns 0 on success or -1 on any failure (Vulkan not running,
+kernel load failed, allocation failed, dispatch error). Callers
+should fall through to `guided_filter_cl` / CPU `guided_filter`
+on -1, same pattern as the gaussian / bilateral helpers.
+
+Validated end-to-end on lavapipe against an independent C reference
+of the same dataflow (a separable clamped-window box mean stands in
+for the kernels' Kahan running sum — same math to FP precision):
+max error 1.2e-4 over a 40×32 patch through the full 8-kernel
+sequence.
+
 ## 6. Per-OS picture
 
 ### Linux
@@ -1296,6 +1363,14 @@ a `USE_*` option; see the inline `case` in `build.sh`).
     is `overexposed`; unblocks `basicadj`, `basecurve`, `rgbcurve`,
     `rgblevels`, and the work-profile branches of several colour
     modules.
+4h. ✅ **Guided-filter helper** (landed; see §5.15).
+    `dt_guided_filter_vk` orchestrates 8 single-channel-float kernels
+    (split + box-mean x/y + covariances + variances + update_covariance
+    + 3×3 Cramer solve + generate_result). Required bumping
+    `DT_VULKAN_MAX_BINDINGS` from 16 to 20 for the 17-binding solve.
+    Unblocks `hazeremoval` and `colorequal` at the helper level —
+    each still needs a per-module `process_vk` to provide the guide
+    image and dispatch the helper.
 4g. ⏳ **diffuse multi-scale wavelet pipeline** (§8.9 below) —
     pending. The OpenCL kernel chain (6 kernels × up to 10 scales ×
     N iterations) needs (a) the 6 kernel translations, (b) a

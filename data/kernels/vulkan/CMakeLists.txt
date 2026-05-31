@@ -110,7 +110,15 @@ set(VK_KERNELS
     bloom_vblur:bloom_vblur
     bloom_mix:bloom_mix
     eaw_decompose:eaw_decompose
-    eaw_synthesize:eaw_synthesize)
+    eaw_synthesize:eaw_synthesize
+    guided_filter_split_rgb:guided_filter_split_rgb_image
+    guided_filter_box_mean_x:guided_filter_box_mean_x
+    guided_filter_box_mean_y:guided_filter_box_mean_y
+    guided_filter_covariances:guided_filter_covariances
+    guided_filter_variances:guided_filter_variances
+    guided_filter_update_covariance:guided_filter_update_covariance
+    guided_filter_solve:guided_filter_solve
+    guided_filter_generate_result:guided_filter_generate_result)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

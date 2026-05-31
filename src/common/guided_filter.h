@@ -78,6 +78,19 @@ int guided_filter_cl(int devid, cl_mem guide, cl_mem in, cl_mem out, int width, 
                       float sqrt_eps, float guide_weight, float min, float max);
 
 #endif
+
+#ifdef HAVE_VULKAN
+#include "common/vulkan.h"
+
+/** Vulkan guided filter. `guide` is a float4 RGBA storage buffer;
+ *  `in` / `out` are single-channel float buffers, all width*height.
+ *  Non-tiled: allocates ~20 scratch buffers internally. Returns 0 on
+ *  success or -1 (caller should fall back to OpenCL/CPU) if Vulkan
+ *  isn't running, the kernels aren't available, or allocation fails. */
+int dt_guided_filter_vk(int devid, dt_vk_mem_t *guide, dt_vk_mem_t *in, dt_vk_mem_t *out,
+                        int width, int height, int w,
+                        float sqrt_eps, float guide_weight, float min, float max);
+#endif
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
