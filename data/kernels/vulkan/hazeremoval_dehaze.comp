@@ -1,0 +1,29 @@
+// GLSL fallback for hazeremoval_dehaze.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4  data[]; } in_buf;
+layout(std430, binding = 1) readonly buffer TM  { float data[]; } trans_map;
+layout(std430, binding = 2)          buffer Out { vec4  data[]; } out_buf;
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float t_min;
+    float A0_x;
+    float A0_y;
+    float A0_z;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 p = in_buf.data[idx];
+    float t = max(trans_map.data[idx], pc.t_min);
+    out_buf.data[idx] = vec4((p.x - pc.A0_x) / t + pc.A0_x,
+                             (p.y - pc.A0_y) / t + pc.A0_y,
+                             (p.z - pc.A0_z) / t + pc.A0_z,
+                             p.w);
+}
