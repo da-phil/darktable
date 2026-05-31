@@ -1,0 +1,73 @@
+// GLSL fallback for guided_filter_solve.cl.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding =  0) readonly buffer ImgMean { float data[]; } img_mean;
+layout(std430, binding =  1) readonly buffer MMR { float data[]; } imgg_mean_r;
+layout(std430, binding =  2) readonly buffer MMG { float data[]; } imgg_mean_g;
+layout(std430, binding =  3) readonly buffer MMB { float data[]; } imgg_mean_b;
+layout(std430, binding =  4) readonly buffer CovR { float data[]; } cov_imgg_img_r;
+layout(std430, binding =  5) readonly buffer CovG { float data[]; } cov_imgg_img_g;
+layout(std430, binding =  6) readonly buffer CovB { float data[]; } cov_imgg_img_b;
+layout(std430, binding =  7) readonly buffer VRR { float data[]; } var_imgg_rr;
+layout(std430, binding =  8) readonly buffer VRG { float data[]; } var_imgg_rg;
+layout(std430, binding =  9) readonly buffer VRB { float data[]; } var_imgg_rb;
+layout(std430, binding = 10) readonly buffer VGG { float data[]; } var_imgg_gg;
+layout(std430, binding = 11) readonly buffer VGB { float data[]; } var_imgg_gb;
+layout(std430, binding = 12) readonly buffer VBB { float data[]; } var_imgg_bb;
+layout(std430, binding = 13)          buffer AR  { float data[]; } a_r;
+layout(std430, binding = 14)          buffer AG  { float data[]; } a_g;
+layout(std430, binding = 15)          buffer AB  { float data[]; } a_b;
+layout(std430, binding = 16)          buffer B   { float data[]; } b_buf;
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+} pc;
+
+#define FLT_EPSILON 1.192092896e-07
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    float Sigma_0_0 = var_imgg_rr.data[idx];
+    float Sigma_0_1 = var_imgg_rg.data[idx];
+    float Sigma_0_2 = var_imgg_rb.data[idx];
+    float Sigma_1_1 = var_imgg_gg.data[idx];
+    float Sigma_1_2 = var_imgg_gb.data[idx];
+    float Sigma_2_2 = var_imgg_bb.data[idx];
+    float cov0 = cov_imgg_img_r.data[idx];
+    float cov1 = cov_imgg_img_g.data[idx];
+    float cov2 = cov_imgg_img_b.data[idx];
+
+    float det0 = Sigma_0_0 * (Sigma_1_1 * Sigma_2_2 - Sigma_1_2 * Sigma_1_2)
+               - Sigma_0_1 * (Sigma_0_1 * Sigma_2_2 - Sigma_0_2 * Sigma_1_2)
+               + Sigma_0_2 * (Sigma_0_1 * Sigma_1_2 - Sigma_0_2 * Sigma_1_1);
+    float a_r_ = 0.0, a_g_ = 0.0, a_b_ = 0.0;
+    float b_ = img_mean.data[idx];
+    if (abs(det0) > 4.0 * FLT_EPSILON) {
+        float det1 = cov0 * (Sigma_1_1 * Sigma_2_2 - Sigma_1_2 * Sigma_1_2)
+                   - Sigma_0_1 * (cov1 * Sigma_2_2 - cov2 * Sigma_1_2)
+                   + Sigma_0_2 * (cov1 * Sigma_1_2 - cov2 * Sigma_1_1);
+        float det2 = Sigma_0_0 * (cov1 * Sigma_2_2 - cov2 * Sigma_1_2)
+                   - cov0 * (Sigma_0_1 * Sigma_2_2 - Sigma_0_2 * Sigma_1_2)
+                   + Sigma_0_2 * (Sigma_0_1 * cov2 - Sigma_0_2 * cov1);
+        float det3 = Sigma_0_0 * (Sigma_1_1 * cov2 - Sigma_1_2 * cov1)
+                   - Sigma_0_1 * (Sigma_0_1 * cov2 - Sigma_0_2 * cov1)
+                   + cov0 * (Sigma_0_1 * Sigma_1_2 - Sigma_0_2 * Sigma_1_1);
+        a_r_ = det1 / det0;
+        a_g_ = det2 / det0;
+        a_b_ = det3 / det0;
+        b_ = b_
+           - a_r_ * imgg_mean_r.data[idx]
+           - a_g_ * imgg_mean_g.data[idx]
+           - a_b_ * imgg_mean_b.data[idx];
+    }
+
+    a_r.data[idx] = a_r_;
+    a_g.data[idx] = a_g_;
+    a_b.data[idx] = a_b_;
+    b_buf.data[idx] = b_;
+}

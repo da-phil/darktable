@@ -32,6 +32,7 @@
 #include "common/guided_filter.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include <assert.h>
 #include <float.h>
 #include <stdlib.h>
@@ -718,6 +719,200 @@ int guided_filter_cl(int devid,
 }
 
 #endif
+
+#ifdef HAVE_VULKAN
+// ---- Vulkan guided filter -------------------------------------------------
+//
+// Faithful, non-tiled port of _guided_filter_cl_impl. The guide is a
+// float4 storage buffer; in/out and all ~20 scratch buffers are
+// single-channel float. Eight kernels (split_rgb, box_mean_x/y,
+// covariances, variances, update_covariance, solve, generate_result)
+// run the identical fixed sequence of dispatches. Returns 0 on success
+// or -1 (caller falls back to OpenCL/CPU) if Vulkan isn't running or a
+// buffer allocation fails.
+
+typedef struct vk_gf_split_pc_t   { int width, height, first; float guide_weight; } vk_gf_split_pc_t;
+typedef struct vk_gf_box_pc_t     { int width, height, w; } vk_gf_box_pc_t;
+typedef struct vk_gf_cov_pc_t     { int width, height, first; float guide_weight; } vk_gf_cov_pc_t;
+typedef struct vk_gf_var_pc_t     { int width, height, first; float guide_weight; } vk_gf_var_pc_t;
+typedef struct vk_gf_updcov_pc_t  { int width, height; float eps; } vk_gf_updcov_pc_t;
+typedef struct vk_gf_solve_pc_t   { int width, height; } vk_gf_solve_pc_t;
+typedef struct vk_gf_result_pc_t  { int width, height, first; float guide_weight, minval, maxval; } vk_gf_result_pc_t;
+
+static dt_vk_module_kernel_t _vk_gf_split   = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_box_x   = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_box_y   = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_cov     = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_var     = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_updcov  = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_solve   = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_gf_result  = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_gf_loaded  = FALSE;
+
+static void _vk_gf_ensure_kernels(void)
+{
+  if(_vk_gf_loaded) return;
+  if(!dt_vulkan_running()) return;
+  dt_vulkan_module_kernel_load(&_vk_gf_split, "guided_filter_split_rgb",
+                               "guided_filter_split_rgb_image", 4, sizeof(vk_gf_split_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_box_x, "guided_filter_box_mean_x",
+                               "guided_filter_box_mean_x", 2, sizeof(vk_gf_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_box_y, "guided_filter_box_mean_y",
+                               "guided_filter_box_mean_y", 2, sizeof(vk_gf_box_pc_t), 64, 1, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_cov, "guided_filter_covariances",
+                               "guided_filter_covariances", 5, sizeof(vk_gf_cov_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_var, "guided_filter_variances",
+                               "guided_filter_variances", 7, sizeof(vk_gf_var_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_updcov, "guided_filter_update_covariance",
+                               "guided_filter_update_covariance", 4, sizeof(vk_gf_updcov_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_solve, "guided_filter_solve",
+                               "guided_filter_solve", 17, sizeof(vk_gf_solve_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_gf_result, "guided_filter_generate_result",
+                               "guided_filter_generate_result", 6, sizeof(vk_gf_result_pc_t), 16, 16, 1);
+  _vk_gf_loaded = TRUE;
+}
+
+// box_mean(src -> dst) via temp: x-pass src->temp (1D over rows),
+// y-pass temp->dst (1D over columns). src and dst may alias.
+static int _vk_gf_box_mean(dt_vk_mem_t *src, dt_vk_mem_t *dst, dt_vk_mem_t *temp,
+                           int width, int height, int w)
+{
+  const vk_gf_box_pc_t pc = { .width = width, .height = height, .w = w };
+  int rc = dt_vulkan_dispatch_inout(&_vk_gf_box_x, src, temp, height, 1, &pc, sizeof(pc));
+  if(rc != 0) return rc;
+  return dt_vulkan_dispatch_inout(&_vk_gf_box_y, temp, dst, width, 1, &pc, sizeof(pc));
+}
+
+int dt_guided_filter_vk(int devid,
+                        dt_vk_mem_t *guide,
+                        dt_vk_mem_t *in,
+                        dt_vk_mem_t *out,
+                        int width,
+                        int height,
+                        int w,
+                        float sqrt_eps,
+                        float guide_weight,
+                        float min,
+                        float max)
+{
+  if(!dt_vulkan_running()) return -1;
+  _vk_gf_ensure_kernels();
+  if(_vk_gf_split.kernel < 0 || _vk_gf_box_x.kernel < 0 || _vk_gf_box_y.kernel < 0
+     || _vk_gf_cov.kernel < 0 || _vk_gf_var.kernel < 0 || _vk_gf_updcov.kernel < 0
+     || _vk_gf_solve.kernel < 0 || _vk_gf_result.kernel < 0)
+    return -1;
+
+  const float eps = sqrt_eps * sqrt_eps;
+  const size_t bytes = (size_t)width * height * sizeof(float);
+
+  // 20 single-channel scratch buffers.
+  dt_vk_mem_t *bufs[20] = { NULL };
+  for(int i = 0; i < 20; i++)
+  {
+    bufs[i] = dt_vulkan_alloc_buffer(devid, bytes);
+    if(!bufs[i])
+    {
+      for(int k = 0; k < i; k++) dt_vulkan_free_buffer(devid, bufs[k]);
+      return -1;
+    }
+  }
+  dt_vk_mem_t *temp1       = bufs[0];
+  dt_vk_mem_t *temp2       = bufs[1];
+  dt_vk_mem_t *imgg_mean_r = bufs[2];
+  dt_vk_mem_t *imgg_mean_g = bufs[3];
+  dt_vk_mem_t *imgg_mean_b = bufs[4];
+  dt_vk_mem_t *img_mean    = bufs[5];
+  dt_vk_mem_t *cov_r       = bufs[6];
+  dt_vk_mem_t *cov_g       = bufs[7];
+  dt_vk_mem_t *cov_b       = bufs[8];
+  dt_vk_mem_t *var_rr      = bufs[9];
+  dt_vk_mem_t *var_rg      = bufs[10];
+  dt_vk_mem_t *var_rb      = bufs[11];
+  dt_vk_mem_t *var_gg      = bufs[12];
+  dt_vk_mem_t *var_gb      = bufs[13];
+  dt_vk_mem_t *var_bb      = bufs[14];
+  dt_vk_mem_t *a_r         = bufs[15];
+  dt_vk_mem_t *a_g         = bufs[16];
+  dt_vk_mem_t *a_b         = bufs[17];
+  dt_vk_mem_t *b           = bufs[18];
+  dt_vk_mem_t *temp_solve  = bufs[19]; // unused spare kept for symmetry / future tiling
+  (void)temp_solve;
+
+  int rc = -1;
+  const int first = 0; // non-tiled: guide is the full image
+
+  // split guide -> imgg_mean_{r,g,b}
+  {
+    const vk_gf_split_pc_t pc = { .width = width, .height = height, .first = first, .guide_weight = guide_weight };
+    dt_vk_mem_t *b4[] = { guide, imgg_mean_r, imgg_mean_g, imgg_mean_b };
+    if(dt_vulkan_dispatch_n(&_vk_gf_split, b4, 4, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  if(_vk_gf_box_mean(in,          img_mean,    temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(imgg_mean_r, imgg_mean_r, temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(imgg_mean_g, imgg_mean_g, temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(imgg_mean_b, imgg_mean_b, temp1, width, height, w) != 0) goto cleanup;
+
+  // covariances + variances from the (un-meaned) guide and input
+  {
+    const vk_gf_cov_pc_t pc = { .width = width, .height = height, .first = first, .guide_weight = guide_weight };
+    dt_vk_mem_t *b5[] = { guide, in, cov_r, cov_g, cov_b };
+    if(dt_vulkan_dispatch_n(&_vk_gf_cov, b5, 5, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+  {
+    const vk_gf_var_pc_t pc = { .width = width, .height = height, .first = first, .guide_weight = guide_weight };
+    dt_vk_mem_t *b7[] = { guide, var_rr, var_rg, var_rb, var_gg, var_gb, var_bb };
+    if(dt_vulkan_dispatch_n(&_vk_gf_var, b7, 7, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // box-mean each product then centre it (update_covariance).
+  struct { dt_vk_mem_t *buf, *a, *b; float eps; } upd[9] = {
+    { cov_r,  imgg_mean_r, img_mean,    0.f },
+    { cov_g,  imgg_mean_g, img_mean,    0.f },
+    { cov_b,  imgg_mean_b, img_mean,    0.f },
+    { var_rr, imgg_mean_r, imgg_mean_r, eps },
+    { var_rg, imgg_mean_r, imgg_mean_g, 0.f },
+    { var_rb, imgg_mean_r, imgg_mean_b, 0.f },
+    { var_gg, imgg_mean_g, imgg_mean_g, eps },
+    { var_gb, imgg_mean_g, imgg_mean_b, 0.f },
+    { var_bb, imgg_mean_b, imgg_mean_b, eps },
+  };
+  for(int i = 0; i < 9; i++)
+  {
+    if(_vk_gf_box_mean(upd[i].buf, temp2, temp1, width, height, w) != 0) goto cleanup;
+    const vk_gf_updcov_pc_t pc = { .width = width, .height = height, .eps = upd[i].eps };
+    dt_vk_mem_t *b4[] = { temp2, upd[i].buf, upd[i].a, upd[i].b };
+    if(dt_vulkan_dispatch_n(&_vk_gf_updcov, b4, 4, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // per-pixel 3x3 solve
+  {
+    const vk_gf_solve_pc_t pc = { .width = width, .height = height };
+    dt_vk_mem_t *b17[] = { img_mean, imgg_mean_r, imgg_mean_g, imgg_mean_b,
+                           cov_r, cov_g, cov_b,
+                           var_rr, var_rg, var_rb, var_gg, var_gb, var_bb,
+                           a_r, a_g, a_b, b };
+    if(dt_vulkan_dispatch_n(&_vk_gf_solve, b17, 17, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  // box-mean the coefficients then apply to the guide.
+  if(_vk_gf_box_mean(a_r, a_r, temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(a_g, a_g, temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(a_b, a_b, temp1, width, height, w) != 0) goto cleanup;
+  if(_vk_gf_box_mean(b,   b,   temp1, width, height, w) != 0) goto cleanup;
+  {
+    const vk_gf_result_pc_t pc = { .width = width, .height = height, .first = first,
+                                   .guide_weight = guide_weight, .minval = min, .maxval = max };
+    dt_vk_mem_t *b6[] = { guide, a_r, a_g, a_b, b, out };
+    if(dt_vulkan_dispatch_n(&_vk_gf_result, b6, 6, width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  for(int i = 0; i < 20; i++) dt_vulkan_free_buffer(devid, bufs[i]);
+  return rc;
+}
+#endif // HAVE_VULKAN
 
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

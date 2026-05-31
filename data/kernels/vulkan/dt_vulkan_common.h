@@ -53,6 +53,18 @@ static inline int idx2d(const int x, const int y, const int width)
   return y * width + x;
 }
 
+// Kahan-compensated running sum, lvalue form (matches common.h::Kahan_sum).
+// Used by the guided-filter box-mean kernels.
+#ifndef vk_kahan_sum
+#define vk_kahan_sum(m, c, add)       \
+  {                                   \
+    const float _kt1 = (add) - (c);   \
+    const float _kt2 = (m) + _kt1;    \
+    (c) = (_kt2 - (m)) - _kt1;        \
+    (m) = _kt2;                       \
+  }
+#endif
+
 // Bayer filter-color-at helper. Matches data/kernels/common.h::FC
 // byte-for-byte; the `filters` bitmask comes from the camera RAW
 // metadata. Returns one of {0=R, 1=G, 2=B}.
