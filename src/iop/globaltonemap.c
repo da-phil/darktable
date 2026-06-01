@@ -18,6 +18,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/math.h"
 #include "common/opencl.h"
 #include "control/control.h"
@@ -89,6 +90,11 @@ typedef struct dt_iop_global_tonemap_global_data_t
   int kernel_global_tonemap_reinhard;
   int kernel_global_tonemap_drago;
   int kernel_global_tonemap_filmic;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_reinhard;
+  dt_vk_module_kernel_t vk_drago;
+  dt_vk_module_kernel_t vk_filmic;
+#endif
 } dt_iop_global_tonemap_global_data_t;
 
 
@@ -511,6 +517,161 @@ finally:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layout shared by all three tonemap kernels — 2 ints + 4 floats.
+// reinhard / filmic ignore the float fields; drago reads
+// (eps, ldc, bl, lwmax).
+typedef struct
+{
+  int   width;
+  int   height;
+  float p0;
+  float p1;
+  float p2;
+  float p3;
+} vk_gtm_pc_t;
+
+// CPU max-finder for the rare Drago cache-miss path. Mirrors what the
+// pixelmax_first + pixelmax_second OpenCL reductions compute. Same
+// pattern hazeremoval uses for its `_ambient_light` global-max
+// readback (see §4.2 hazeremoval row + §5.16 retouch note for the
+// readback-instead-of-reduction trade-off).
+static float _vk_gtm_compute_lwmax(const float *buf, int n)
+{
+  float m = -FLT_MAX;
+  for(int k = 0; k < n; k++)
+    if(buf[4 * k + 0] > m) m = buf[4 * k + 0];
+  return m;
+}
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_global_tonemap_data_t *d = piece->data;
+  const dt_iop_global_tonemap_global_data_t *gd = self->global_data;
+  dt_iop_global_tonemap_gui_data_t *g = self->gui_data;
+  const int devid = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const dt_vk_module_kernel_t *gtkernel = NULL;
+  vk_gtm_pc_t pc = { .width = width, .height = height,
+                     .p0 = 0.f, .p1 = 0.f, .p2 = 0.f, .p3 = 0.f };
+
+  switch(d->operator)
+  {
+    case OPERATOR_REINHARD: gtkernel = &gd->vk_reinhard; break;
+    case OPERATOR_DRAGO:    gtkernel = &gd->vk_drago;    break;
+    case OPERATOR_FILMIC:   gtkernel = &gd->vk_filmic;   break;
+  }
+  if(!gtkernel) return -1;
+
+  // Drago needs lwmax; everything else uses defaults.
+  if(d->operator == OPERATOR_DRAGO)
+  {
+    const float eps = 0.0001f;
+    float tmp_lwmax = -FLT_MAX;
+
+    if(self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe))
+    {
+      dt_iop_gui_enter_critical_section(self);
+      const dt_hash_t hash = g->hash;
+      dt_iop_gui_leave_critical_section(self);
+      if(hash != DT_INVALID_HASH
+         && !dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe,
+                                        self->iop_order,
+                                        DT_DEV_TRANSFORM_DIR_BACK_INCL,
+                                        &self->gui_lock, &g->hash))
+        dt_control_log(_("inconsistent output"));
+
+      dt_iop_gui_enter_critical_section(self);
+      tmp_lwmax = g->lwmax;
+      dt_iop_gui_leave_critical_section(self);
+    }
+
+    if(tmp_lwmax == -FLT_MAX)
+    {
+      // Cache miss → read back dev_in to host and CPU-reduce. Matches
+      // the hazeremoval pattern (§4.2): the GPU reduction was a
+      // separate-kernel optimisation, not a correctness requirement,
+      // so we skip the shared-memory work until the §8.5 sampler /
+      // workgroup-shared milestone lands.
+      float *host = dt_alloc_align_float((size_t)width * height * 4);
+      if(!host) return -1;
+      if(dt_vulkan_read_from_device(devid, host, dev_in, img_bytes) != 0)
+      {
+        dt_free_align(host);
+        return -1;
+      }
+      tmp_lwmax = _vk_gtm_compute_lwmax(host, width * height);
+      dt_free_align(host);
+    }
+
+    const float lwmax = tmp_lwmax;
+    const float ldc = d->drago.max_light * 0.01f / log10f(lwmax + 1.0f);
+    const float bl  = logf(MAX(eps, d->drago.bias)) / logf(0.5f);
+    pc.p0 = eps; pc.p1 = ldc; pc.p2 = bl; pc.p3 = lwmax;
+
+    if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
+    {
+      dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe,
+                                        self->iop_order,
+                                        DT_DEV_TRANSFORM_DIR_BACK_INCL);
+      dt_iop_gui_enter_critical_section(self);
+      g->lwmax = lwmax;
+      g->hash = hash;
+      dt_iop_gui_leave_critical_section(self);
+    }
+  }
+
+  // Detail-recovery via the bilateral helper, same sigma derivation
+  // as process_cl.
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_r = 8.0f;
+  const float iw = piece->buf_in.width / scale;
+  const float ih = piece->buf_in.height / scale;
+  const float sigma_s = fminf(iw, ih) * 0.03f;
+
+  dt_bilateral_vk_t *b = NULL;
+  dt_vk_mem_t *dev_tmp = NULL;
+  int rc = -1;
+
+  if(d->detail != 0.0f)
+  {
+    b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+    if(!b) goto cleanup;
+    if(dt_bilateral_splat_vk(b, dev_in) != 0) goto cleanup;
+  }
+
+  if(dt_vulkan_dispatch_inout(gtkernel, dev_in, dev_out,
+                              width, height, &pc, sizeof(pc)) != 0)
+    goto cleanup;
+
+  if(d->detail != 0.0f)
+  {
+    if(dt_bilateral_blur_vk(b) != 0) goto cleanup;
+    // slice_to_output_vk needs both the original input (for the
+    // pixel's L lookup) and a snapshot of the *current* dev_out so it
+    // can blend the bilateral correction into it without aliasing.
+    dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+    if(!dev_tmp) goto cleanup;
+    if(dt_vulkan_copy_device_to_device(devid, dev_tmp, dev_out, img_bytes) != 0)
+      goto cleanup;
+    if(dt_bilateral_slice_to_output_vk(b, dev_in, dev_tmp, dev_out, d->detail) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(b) dt_bilateral_free_vk(b);
+  if(dev_tmp) dt_vulkan_free_buffer(devid, dev_tmp);
+  return rc;
+}
+#endif
+
 
 void tiling_callback(dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
@@ -580,6 +741,16 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_global_tonemap_reinhard = dt_opencl_create_kernel(program, "global_tonemap_reinhard");
   gd->kernel_global_tonemap_drago = dt_opencl_create_kernel(program, "global_tonemap_drago");
   gd->kernel_global_tonemap_filmic = dt_opencl_create_kernel(program, "global_tonemap_filmic");
+#ifdef HAVE_VULKAN
+  // 2 ints + 4 floats = 24 B PC, 2 storage bindings.
+  const uint32_t pcsize = 2 * sizeof(int) + 4 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_reinhard, "global_tonemap_reinhard",
+                               "global_tonemap_reinhard", 2, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_drago,    "global_tonemap_drago",
+                               "global_tonemap_drago",    2, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_filmic,   "global_tonemap_filmic",
+                               "global_tonemap_filmic",   2, pcsize, 16, 16, 1);
+#endif
 }
 
 
@@ -591,6 +762,11 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_global_tonemap_reinhard);
   dt_opencl_free_kernel(gd->kernel_global_tonemap_drago);
   dt_opencl_free_kernel(gd->kernel_global_tonemap_filmic);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_reinhard);
+  dt_vulkan_module_kernel_unload(&gd->vk_drago);
+  dt_vulkan_module_kernel_unload(&gd->vk_filmic);
+#endif
   free(self->data);
   self->data = NULL;
 }
