@@ -142,6 +142,64 @@ cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func);
 
 #endif
 
+// Vulkan twin of the OpenCL surface above. Mirrors the same
+// init / decompose / free shape; the layer_func callback is invoked
+// once per scale (and for the residual / reconstructed image) so
+// callers re-use the same per-form processing they already have in
+// the OpenCL path. See dev-doc/gpu_acceleration_clspv_vulkan.md
+// §5.16 for the design.
+#include "common/vulkan.h"
+
+#ifdef HAVE_VULKAN
+typedef struct dwt_params_vk_t dwt_params_vk_t;
+
+typedef int(_dwt_layer_func_vk)(dt_vk_mem_t *layer, dwt_params_vk_t *const p, const int scale);
+
+struct dwt_params_vk_t
+{
+  int devid;
+  dt_vk_mem_t *image;
+  int width;
+  int height;
+  int ch;          // always 4 — every CL caller hard-codes float4
+  int scales;
+  int return_layer;
+  int merge_from_scale;
+  void *user_data;
+  float preview_scale;
+};
+
+dwt_params_vk_t *dt_dwt_init_vk(int devid, dt_vk_mem_t *image,
+                                int width, int height,
+                                int scales, int return_layer,
+                                int merge_from_scale, void *user_data,
+                                float preview_scale);
+void dt_dwt_free_vk(dwt_params_vk_t *p);
+
+int dwt_get_max_scale_vk(dwt_params_vk_t *p);
+int dt_dwt_first_scale_visible_vk(dwt_params_vk_t *p);
+
+/** Decompose `p->image` into `p->scales` à-trous wavelet scales.
+ *  Calls `layer_func` once for the input image, once per detail
+ *  scale (with the high-pass detail buffer), and once for the
+ *  residual / reconstructed image, matching dwt_decompose_cl
+ *  semantics byte-for-byte. Returns 0 on success or -1 if Vulkan
+ *  isn't running / the kernel set isn't loaded / a dispatch
+ *  failed. */
+int dwt_decompose_vk(dwt_params_vk_t *p, _dwt_layer_func_vk layer_func);
+#else
+typedef struct dwt_params_vk_t dwt_params_vk_t;
+typedef int(_dwt_layer_func_vk)(dt_vk_mem_t *layer, dwt_params_vk_t *const p, const int scale);
+static inline dwt_params_vk_t *dt_dwt_init_vk(int devid, dt_vk_mem_t *i, int w, int h,
+                                              int s, int r, int m, void *u, float ps)
+{ (void)devid; (void)i; (void)w; (void)h; (void)s; (void)r; (void)m; (void)u; (void)ps; return NULL; }
+static inline void dt_dwt_free_vk(dwt_params_vk_t *p) { (void)p; }
+static inline int dwt_get_max_scale_vk(dwt_params_vk_t *p) { (void)p; return 0; }
+static inline int dt_dwt_first_scale_visible_vk(dwt_params_vk_t *p) { (void)p; return 0; }
+static inline int dwt_decompose_vk(dwt_params_vk_t *p, _dwt_layer_func_vk f)
+{ (void)p; (void)f; return -1; }
+#endif
+
 #endif
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0)           buffer LP { vec4 data[]; } lpass;
+layout(std430, binding = 1) readonly  buffer HP { vec4 data[]; } hpass;
+layout(push_constant) uniform PC { int width; int height; int sc; } pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(y >= pc.height) return;
+
+  const float hat_mult = 2.0;
+  int size = pc.width;
+  int row  = y * pc.width;
+
+  if(x < pc.sc) {
+    lpass.data[row + x] = hat_mult * hpass.data[row + x]
+                        + hpass.data[row + (pc.sc - x)]
+                        + hpass.data[row + (x + pc.sc)];
+  } else if(x + pc.sc < size) {
+    lpass.data[row + x] = hat_mult * hpass.data[row + x]
+                        + hpass.data[row + (x - pc.sc)]
+                        + hpass.data[row + (x + pc.sc)];
+  } else if(x < size) {
+    lpass.data[row + x] = hat_mult * hpass.data[row + x]
+                        + hpass.data[row + (x - pc.sc)]
+                        + hpass.data[row + (2 * size - 2 - (x + pc.sc))];
+  }
+}

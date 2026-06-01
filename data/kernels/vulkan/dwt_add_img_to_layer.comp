@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer Img   { vec4 data[]; } img_buf;
+layout(std430, binding = 1)           buffer Layer { vec4 data[]; } layer_buf;
+layout(push_constant) uniform PC { int width; int height; } pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+  layer_buf.data[idx] += img_buf.data[idx];
+}

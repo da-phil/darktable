@@ -363,7 +363,14 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `dt_gaussian_*_vk` 1/2/4-channel extension (§5.10) — it builds its
   own multi-pass filter (not He-Sun-Tang guided), so it doesn't
   consume `dt_guided_filter_vk` (§5.15) but does need the mixed
-  1c/2c/4c Gaussian. It still needs its own per-module `process_vk`
+  1c/2c/4c Gaussian. `retouch` is now **helper-unblocked** by the
+  `dt_dwt_*_vk` à-trous helper (§5.16) — its OpenCL path drives the
+  a-trous decomposition through a per-form callback (clone / fill /
+  blur / heal); the same callback shape ports to Vulkan with
+  `_dwt_layer_func_vk`. The remaining work for retouch is the per-
+  form kernels themselves (the largest is `heal` with its Poisson
+  iteration).
+  `colorequal` still needs its own per-module `process_vk`
   to orchestrate the ~16 kernels and the bilinear up/downsamples. Done
   in earlier passes: `agx` (params struct migrated from PC into a
   storage-buffer binding so the 124 B struct fits — the pattern is
@@ -1123,6 +1130,71 @@ of the same dataflow (a separable clamped-window box mean stands in
 for the kernels' Kahan running sum — same math to FP precision):
 max error 1.2e-4 over a 40×32 patch through the full 8-kernel
 sequence.
+
+### 5.16 À-trous wavelet helper (`dt_dwt_*_vk`)
+
+Fourth multi-kernel device helper (after §5.10 Gaussian, §5.13
+bilateral and §5.15 guided filter). Mirrors `dt_dwt_*_cl` from
+`src/common/dwt.{c,h}` byte-for-byte: an iterative a-trous
+B3-spline hat transform that decomposes a float4 image into N
+detail scales plus a residual, with a user-supplied per-scale
+callback that lets the consumer post-process each band (denoise,
+recompose, mask, …) before the next iteration runs. Used by
+`retouch` (pending port — clone / heal / fill / blur all consume
+the decomposed scales).
+
+```c
+dwt_params_vk_t *p = dt_dwt_init_vk(devid, image, w, h,
+                                    scales, return_layer,
+                                    merge_from_scale, user_data,
+                                    preview_scale);
+dwt_decompose_vk(p, layer_callback);   // calls callback per scale
+dt_dwt_free_vk(p);
+```
+
+Five kernels (1:1 with `dwt.cl`):
+
+| kernel                    | bindings | PC (bytes) |
+|---------------------------|:--------:|:----------:|
+| `dwt_init_buffer`         |        1 |          8 |
+| `dwt_add_img_to_layer`    |        2 |          8 |
+| `dwt_subtract_layer`      |        2 |          8 |
+| `dwt_hat_transform_row`   |        2 |         12 |
+| `dwt_hat_transform_col`   |        2 |         16 |
+
+Two minor differences vs the OpenCL surface (all transparent to
+callers):
+
+- `dwt_subtract_layer.cl` takes an unused `const float lpass_mult`
+  argument; the Vulkan twin drops it to keep PC at 8 B. The host
+  helper never reads it either, so no caller observes a change.
+- The OpenCL `dwt_hat_transform_col` PC is laid out as
+  (width, height, sc, lpass_mult) — same 16 B layout — so the
+  Vulkan port keeps the field order verbatim.
+
+The host-side decomposition driver lives next to the existing
+`dwt_wavelet_decompose_cl` in `src/common/dwt.c` and reproduces
+the same ping-pong-over-`buffer[2]` loop with `temp` allocated +
+freed per scale (same as OpenCL — the per-scale alloc/free was
+the OpenCL helper's way of dodging a -4 OOM on tiny GPUs; we
+keep it for memory parity). `_get_max_scale` and
+`_first_scale_visible` are shared with the OpenCL path so the
+two backends always agree on scale count.
+
+The callback returns `int` (0 = success, non-zero = abort the
+decomposition) instead of `cl_int`. Retouch's eventual port will
+typedef `_dwt_layer_func_vk` for its per-form processing and
+re-use the same per-form code paths the CL helper drives.
+
+Validated end-to-end on lavapipe against an independent C
+reference that recreates the row/col hat transforms and the
+subtract/accumulate flow: full decomposition + recomposition is
+**bit-equal** (max 0.0) against the C reference, and the identity
+round-trip — input → 3-scale decompose → 3-scale recompose —
+matches the input at single-bit FP precision (1.9e-6). Confirms
+the dispatch chain, the PC layouts, the ping-pong buffer wiring
+and the `(1/16)` `lpass_mult` normalisation all reproduce the
+OpenCL helper byte-for-byte.
 
 ## 6. Per-OS picture
 

@@ -138,7 +138,12 @@ set(VK_KERNELS
     nlmeans_horiz:nlmeans_horiz
     nlmeans_vert:nlmeans_vert
     nlmeans_accu:nlmeans_accu
-    nlmeans_finish:nlmeans_finish)
+    nlmeans_finish:nlmeans_finish
+    dwt_init_buffer:dwt_init_buffer
+    dwt_add_img_to_layer:dwt_add_img_to_layer
+    dwt_subtract_layer:dwt_subtract_layer
+    dwt_hat_transform_row:dwt_hat_transform_row
+    dwt_hat_transform_col:dwt_hat_transform_col)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

@@ -872,6 +872,301 @@ cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func)
 }
 
 #endif
+
+#ifdef HAVE_VULKAN
+// ---- Vulkan twin of the OpenCL helper ----
+//
+// Kernel slots loaded lazily on first dt_dwt_init_vk call. Same shape
+// as bilateralvk.c — one slot per .spv, no host-side global struct,
+// so the helper stays toolchain-uniform and works even when the
+// caller hasn't run a global init.
+
+static dt_vk_module_kernel_t _vk_dwt_init     = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_dwt_add      = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_dwt_sub      = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_dwt_row      = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_dwt_col      = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_dwt_loaded   = FALSE;
+
+typedef struct { int width; int height; } pc_zero_t;
+typedef struct { int width; int height; } pc_add_t;
+typedef struct { int width; int height; } pc_sub_t;
+typedef struct { int width; int height; int sc; } pc_row_t;
+typedef struct { int width; int height; int sc; float lpass_mult; } pc_col_t;
+
+static void _vk_dwt_ensure_kernels(void)
+{
+  if(_vk_dwt_loaded) return;
+  if(!dt_vulkan_running()) return;
+  dt_vulkan_module_kernel_load(&_vk_dwt_init, "dwt_init_buffer",        "dwt_init_buffer",
+                               1, sizeof(pc_zero_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_dwt_add,  "dwt_add_img_to_layer",   "dwt_add_img_to_layer",
+                               2, sizeof(pc_add_t),  16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_dwt_sub,  "dwt_subtract_layer",     "dwt_subtract_layer",
+                               2, sizeof(pc_sub_t),  16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_dwt_row,  "dwt_hat_transform_row",  "dwt_hat_transform_row",
+                               2, sizeof(pc_row_t),  16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_dwt_col,  "dwt_hat_transform_col",  "dwt_hat_transform_col",
+                               2, sizeof(pc_col_t),  16, 16, 1);
+  _vk_dwt_loaded = TRUE;
+}
+
+static gboolean _vk_dwt_ready(void)
+{
+  return _vk_dwt_init.kernel >= 0
+      && _vk_dwt_add.kernel  >= 0
+      && _vk_dwt_sub.kernel  >= 0
+      && _vk_dwt_row.kernel  >= 0
+      && _vk_dwt_col.kernel  >= 0;
+}
+
+dwt_params_vk_t *dt_dwt_init_vk(int devid, dt_vk_mem_t *image,
+                                int width, int height,
+                                int scales, int return_layer,
+                                int merge_from_scale, void *user_data,
+                                float preview_scale)
+{
+  if(!dt_vulkan_running()) return NULL;
+  _vk_dwt_ensure_kernels();
+  if(!_vk_dwt_ready()) return NULL;
+
+  dwt_params_vk_t *p = malloc(sizeof(*p));
+  if(!p) return NULL;
+  p->devid = devid;
+  p->image = image;
+  p->ch = 4;
+  p->width = width;
+  p->height = height;
+  p->scales = scales;
+  p->return_layer = return_layer;
+  p->merge_from_scale = merge_from_scale;
+  p->user_data = user_data;
+  p->preview_scale = preview_scale;
+  return p;
+}
+
+void dt_dwt_free_vk(dwt_params_vk_t *p)
+{
+  free(p);
+}
+
+int dwt_get_max_scale_vk(dwt_params_vk_t *p)
+{
+  return _get_max_scale((int)(p->width / p->preview_scale),
+                        (int)(p->height / p->preview_scale),
+                        p->preview_scale);
+}
+
+int dt_dwt_first_scale_visible_vk(dwt_params_vk_t *p)
+{
+  return _first_scale_visible(p->scales, p->preview_scale);
+}
+
+static int _vk_dwt_init_buffer(dwt_params_vk_t *p, dt_vk_mem_t *buf)
+{
+  const pc_zero_t pc = { .width = p->width, .height = p->height };
+  dt_vk_mem_t *bufs[] = { buf };
+  return dt_vulkan_dispatch_n(&_vk_dwt_init, bufs, 1,
+                              p->width, p->height, &pc, sizeof(pc));
+}
+
+static int _vk_dwt_add_layer(dwt_params_vk_t *p,
+                             dt_vk_mem_t *img, dt_vk_mem_t *layers)
+{
+  const pc_add_t pc = { .width = p->width, .height = p->height };
+  dt_vk_mem_t *bufs[] = { img, layers };
+  return dt_vulkan_dispatch_n(&_vk_dwt_add, bufs, 2,
+                              p->width, p->height, &pc, sizeof(pc));
+}
+
+static int _vk_dwt_subtract(dwt_params_vk_t *p,
+                            dt_vk_mem_t *bl, dt_vk_mem_t *bh)
+{
+  const pc_sub_t pc = { .width = p->width, .height = p->height };
+  dt_vk_mem_t *bufs[] = { bl, bh };
+  return dt_vulkan_dispatch_n(&_vk_dwt_sub, bufs, 2,
+                              p->width, p->height, &pc, sizeof(pc));
+}
+
+static int _vk_dwt_row_pass(dwt_params_vk_t *p,
+                            dt_vk_mem_t *lpass, dt_vk_mem_t *hpass,
+                            int sc)
+{
+  const pc_row_t pc = { .width = p->width, .height = p->height, .sc = sc };
+  dt_vk_mem_t *bufs[] = { lpass, hpass };
+  return dt_vulkan_dispatch_n(&_vk_dwt_row, bufs, 2,
+                              p->width, p->height, &pc, sizeof(pc));
+}
+
+static int _vk_dwt_col_pass(dwt_params_vk_t *p,
+                            dt_vk_mem_t *in, dt_vk_mem_t *out,
+                            int sc, float lpass_mult)
+{
+  const pc_col_t pc = { .width = p->width, .height = p->height,
+                        .sc = sc, .lpass_mult = lpass_mult };
+  dt_vk_mem_t *bufs[] = { in, out };
+  return dt_vulkan_dispatch_n(&_vk_dwt_col, bufs, 2,
+                              p->width, p->height, &pc, sizeof(pc));
+}
+
+static int _vk_dwt_get_image_layer(dwt_params_vk_t *p, dt_vk_mem_t *layer)
+{
+  if(p->image == layer) return 0;
+  const size_t bytes = (size_t)p->width * p->height * p->ch * sizeof(float);
+  return dt_vulkan_copy_device_to_device(p->devid, p->image, layer, bytes);
+}
+
+static int _vk_dwt_wavelet_decompose(dt_vk_mem_t *img, dwt_params_vk_t *p,
+                                     _dwt_layer_func_vk layer_func)
+{
+  int rc = -1;
+  dt_vk_mem_t *temp = NULL;
+  dt_vk_mem_t *layers = NULL;
+  dt_vk_mem_t *merged_layers = NULL;
+  dt_vk_mem_t *buffer[2] = { NULL, NULL };
+  unsigned int lpass, hpass;
+  int bcontinue = 1;
+  const size_t bytes = (size_t)p->width * p->height * p->ch * sizeof(float);
+
+  if(layer_func)
+  {
+    if(layer_func(img, p, 0) != 0) goto cleanup;
+  }
+  if(p->scales <= 0) { rc = 0; goto cleanup; }
+
+  buffer[0] = img;
+  buffer[1] = dt_vulkan_alloc_buffer(p->devid, bytes);
+  if(!buffer[1]) goto cleanup;
+
+  layers = dt_vulkan_alloc_buffer(p->devid, bytes);
+  if(!layers) goto cleanup;
+  if(_vk_dwt_init_buffer(p, layers) != 0) goto cleanup;
+
+  if(p->merge_from_scale > 0)
+  {
+    merged_layers = dt_vulkan_alloc_buffer(p->devid, bytes);
+    if(!merged_layers) goto cleanup;
+    if(_vk_dwt_init_buffer(p, merged_layers) != 0) goto cleanup;
+  }
+
+  lpass = 1;
+  hpass = 0;
+  for(unsigned int lev = 0; lev < (unsigned)p->scales && bcontinue; lev++)
+  {
+    lpass = (1 - (lev & 1));
+
+    temp = dt_vulkan_alloc_buffer(p->devid, bytes);
+    if(!temp) goto cleanup;
+
+    // hat row
+    {
+      int sc = 1 << lev;
+      sc = (int)(sc * p->preview_scale);
+      if(sc > p->width) sc = p->width;
+      if(_vk_dwt_row_pass(p, temp, buffer[hpass], sc) != 0) goto cleanup;
+    }
+    // hat col
+    {
+      int sc = 1 << lev;
+      sc = (int)(sc * p->preview_scale);
+      if(sc > p->height) sc = p->height;
+      const float lpass_mult = (1.f / 16.f);
+      if(_vk_dwt_col_pass(p, temp, buffer[lpass], sc, lpass_mult) != 0) goto cleanup;
+    }
+
+    dt_vulkan_free_buffer(p->devid, temp);
+    temp = NULL;
+
+    if(_vk_dwt_subtract(p, buffer[lpass], buffer[hpass]) != 0) goto cleanup;
+
+    if(p->merge_from_scale == 0 || (unsigned)p->merge_from_scale > lev + 1)
+    {
+      if(layer_func)
+      {
+        if(layer_func(buffer[hpass], p, lev + 1) != 0) goto cleanup;
+      }
+      if((unsigned)p->return_layer == lev + 1)
+      {
+        if(_vk_dwt_get_image_layer(p, buffer[hpass]) != 0) goto cleanup;
+        bcontinue = 0;
+      }
+      else if(p->return_layer == 0)
+      {
+        if(_vk_dwt_add_layer(p, buffer[hpass], layers) != 0) goto cleanup;
+      }
+    }
+    else
+    {
+      if(_vk_dwt_add_layer(p, buffer[hpass], merged_layers) != 0) goto cleanup;
+      if(layer_func)
+      {
+        if(layer_func(merged_layers, p, lev + 1) != 0) goto cleanup;
+      }
+      if((unsigned)p->return_layer == lev + 1)
+      {
+        if(_vk_dwt_get_image_layer(p, merged_layers) != 0) goto cleanup;
+        bcontinue = 0;
+      }
+    }
+
+    hpass = lpass;
+  }
+
+  if(bcontinue)
+  {
+    if(layer_func)
+    {
+      if(layer_func(buffer[hpass], p, p->scales + 1) != 0) goto cleanup;
+    }
+    if(p->return_layer == p->scales + 1)
+    {
+      if(_vk_dwt_get_image_layer(p, buffer[hpass]) != 0) goto cleanup;
+    }
+    else if(p->return_layer == 0)
+    {
+      if(p->merge_from_scale > 0)
+      {
+        if(_vk_dwt_add_layer(p, merged_layers, layers) != 0) goto cleanup;
+      }
+      if(_vk_dwt_add_layer(p, buffer[hpass], layers) != 0) goto cleanup;
+      if(layer_func)
+      {
+        if(layer_func(layers, p, p->scales + 2) != 0) goto cleanup;
+      }
+      if(_vk_dwt_get_image_layer(p, layers) != 0) goto cleanup;
+    }
+  }
+
+  rc = 0;
+
+cleanup:
+  if(temp)          dt_vulkan_free_buffer(p->devid, temp);
+  if(buffer[1])     dt_vulkan_free_buffer(p->devid, buffer[1]);
+  if(layers)        dt_vulkan_free_buffer(p->devid, layers);
+  if(merged_layers) dt_vulkan_free_buffer(p->devid, merged_layers);
+  return rc;
+}
+
+int dwt_decompose_vk(dwt_params_vk_t *p, _dwt_layer_func_vk layer_func)
+{
+  if(p->preview_scale <= 0.f) p->preview_scale = 1.f;
+
+  if(p->return_layer > p->scales + 1)
+    p->return_layer = p->scales + 1;
+
+  const int max_scale = dwt_get_max_scale_vk(p);
+  if(p->scales > max_scale)
+  {
+    if(p->return_layer > p->scales) p->return_layer = max_scale + 1;
+    else if(p->return_layer > max_scale) p->return_layer = max_scale;
+    p->scales = max_scale;
+  }
+
+  return _vk_dwt_wavelet_decompose(p->image, p, layer_func);
+}
+
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
