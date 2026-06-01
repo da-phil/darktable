@@ -143,7 +143,10 @@ set(VK_KERNELS
     dwt_add_img_to_layer:dwt_add_img_to_layer
     dwt_subtract_layer:dwt_subtract_layer
     dwt_hat_transform_row:dwt_hat_transform_row
-    dwt_hat_transform_col:dwt_hat_transform_col)
+    dwt_hat_transform_col:dwt_hat_transform_col
+    global_tonemap_reinhard:global_tonemap_reinhard
+    global_tonemap_drago:global_tonemap_drago
+    global_tonemap_filmic:global_tonemap_filmic)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
