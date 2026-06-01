@@ -242,7 +242,7 @@ in three categories.
 | `src/iop/colorreconstruction.c` | Clipped-highlight colour reconstruction via a 3-D bilateral-grid splat/blur/slice pipeline (similar shape to the §5.13 bilateral helper but with chroma-blend slicing). Four small kernels: `colorreconstruction_zero` (1-binding, 8 B PC; zeros the flat grid view), `colorreconstruction_splat` (2-binding, 44 B PC; atomic-add float into the 3-D grid via the CAS-loop `vk_atomic_add_f` — same pattern as bilateral_splat — and the OpenCL workgroup-local pre-reduction is **dropped**, math stays bit-equal since the local reduction is just a batching optimisation), `colorreconstruction_blur_line` (2-binding, 24 B PC; 3 host-issued 1-D B3-spline passes — z/x/y — with drop-missing-samples boundary handling) and `colorreconstruction_slice` (3-binding, 52 B PC; trilinear lookup into the grid + chroma blend back into the output around the threshold). **Subtle rounding gotcha**: the OpenCL `round()` is half-away-from-zero, but GLSL `round()` is implementation-defined (often banker's rounding to even) — both `.cl` and `.comp` use the explicit form `floor(x + 0.5)` so the splat cell index is identical across both compilers and matches OpenCL byte-for-byte (the test caught this with the diagnostic-printing harness when `round(0.5)` produced different yi values). The OpenCL freeze/thaw preview→full grid reuse optimisation is **not ported**; the VK twin always rebuilds the grid from scratch in `process_vk` (alloc grid + tmp → zero → splat → 3-axis blur → slice → free). Validated end-to-end on lavapipe against a C reference of the identical math: all 4 kernels match (`zero` exact; `splat` max 3e-5 over the float-atomic accumulation; `blur_line` exact; `slice` ~4e-6 = trilinear-lookup FP precision). |
 | `src/iop/nlmeans.c` | Non-local-means denoising (the GPU shift-and-accumulate variant from Goossens et al.). Six small kernels port one-for-one and all reads are flat-buffer (the OpenCL `image2d_t` reads are in-bounds-masked via the multiply-by-0 trick, so no sampler needed): `nlmeans_init` (1-binding, 8 B PC; zero the float4 accumulator U2), `nlmeans_dist` (2-binding, 24 B PC; per-pixel L/C-weighted squared distance to the q-shifted pixel), `nlmeans_horiz` / `nlmeans_vert` (2-binding, 12/16 B PC; separable box-sum of the distance with clamp-to-edge; vert also applies the patch weight `gh(d) = vk_fast_mexp2f(d·sharpness)`), `nlmeans_accu` (3-binding, 16 B PC; accumulate the ±q weighted neighbours into U2) and `nlmeans_finish` (3-binding, 24 B PC; normalise by the weight channel and blend). Added `vk_fast_mexp2f` to `dt_vulkan_common.h` — the `common.h::fast_mexp2f` bit-pun 2^-x approximation (clspv-safe union, same idiom as `vk_atomic_add_f`; the `.comp` twin uses `uintBitsToFloat`). The OpenCL horiz/vert tile via workgroup-local memory and rotate 4 buckets for async overlap; the VK twin reads from global storage with the same clamp-to-edge and ping-pongs just two single-channel scratch buffers (the bucket rotation is only an overlap optimisation). `nlmeans_accu`'s `U2[gidx] += accu` needs **no atomics** — each invocation owns its gidx and `process_vk` serialises the q-loop. `process_vk` mirrors the active (non-`USE_NEW_IMPL_CL`) `process_cl` byte-for-byte: init → for q ∈ [-K,0]×[-K,K] { dist → horiz → vert → accu } → finish. Validated end-to-end on lavapipe through the full 28-offset q-loop (~140 dispatches) against an independent C reference of the NLM math (including the bit-pun weight): max error 1.5e-5 = single-bit FP precision. |
 | `src/iop/filmicrgb.c` | Scene-referred filmic tone mapper, main per-pixel path. The OpenCL module has two kernels (`filmicrgb_split` for per-channel and `filmicrgb_chroma` for chroma-preserving) selected by `(preserve_color == NONE && version != V5)`, each switching on the colour-science version v1..v5; both fold into one Vulkan entry that reproduces the host's split-vs-chroma decision internally and dispatches on `color_science` exactly like `process_cl`. 6-binding dispatch (in, out, params, matrices, profile_info, profile_lut); 8 B PC (width, height). Like `agx`/`colorbalancergb`, the ~26 scalars + 5 spline `float4`s overflow the PC budget (164 B), so `vk_filmicrgb_params_t` migrates into a storage buffer (156 B, std430 == the C struct verified by `spirv-dis`). The four `dt_colormatrix_t` 3×4 matrices (input, output, export-in, export-out) pack into a single 48-float `matrices` buffer at fixed base offsets; helpers take an `int base` so the same code paths handle work and export gamut targets. The colour-science cohort (`vk_LMS_to_Yrg` / `vk_Yrg_to_Ych` / `vk_Ych_to_Yrg` / `vk_Yrg_to_LMS` / `vk_gamut_check_Yrg`) is reused from `dt_vulkan_common.h` — the helpers `colorbalancergb` landed. The filmic-specific gamut machinery — `clip_chroma_white_raw` / `clip_chroma_white` / `clip_chroma_black` / `clip_chroma` / `gamut_check_RGB` / `gamut_mapping` / `desaturate_v4` — and the v1..v5 split/chroma variants are inlined faithfully from `filmic.cl`. ICC luminance goes through the §5.11 deferred plumbing (`dt_ioppr_build_iccprofile_params_vk_deferred` appends the profile uploads in one batched submit). The highlight-reconstruction path (inpaint + a-trous wavelets over `image2d_t`) and the clipped-pixel mask preview need §8.5 sampled-image bindings; `commit_params` clears `process_vk_ready` when `enable_highlight_reconstruction` is on or the GUI mask is showing (the §10.2 predictive pattern — mirrors `basecurve`'s exposure-fusion gate). Validated end-to-end on lavapipe with an independent C reference derived directly from `filmic.cl` (not from the port): `split_v2_v3` is bit-equal (max 0.0) and `chroma_v4` matches at FP rounding (max 1e-6) — proving the matrices buffer packing, the Yrg/Ych conversions, the gamut-clip family and the std430 marshalling all reproduce the OpenCL math byte-for-byte. |
-| `src/iop/bilat.c` | "Local contrast" — has two modes selected by `d->mode`. **Bilateral grid** is a direct one-shot consumer of the §5.13 helper: `process_vk` is just `dt_bilateral_init_vk → splat → blur → slice_vk(detail) → free` mirroring `process_cl` byte-for-byte (no module-own kernels). **Local Laplacian** ports the `dt_local_laplacian_cl` helper which is OpenCL-only — multi-level pyramid orchestration with 12 kernels and no Vulkan twin yet; `commit_params` clears `process_vk_ready` for that mode (the §10.2 predictive gate — same shape as `basecurve` fusion, `filmicrgb` highlight reconstruction, `colorzones` mask preview) so the pipeline transparently falls back to OpenCL / CPU. The `process_vk` belt-and-suspenders returns -1 if it's ever called for the wrong mode. Validated end-to-end on lavapipe against an independent C reference that recreates the bilateral-grid splat / 5-tap blur (X, Y, derivative-Z) / trilinear-slice math: the L-channel output max error is 7.6e-6 (single-bit FP over L ∈ [0, 100]) and a/b/alpha pass through bit-exactly. |
+| `src/iop/bilat.c` | "Local contrast" — has two modes selected by `d->mode`. **Bilateral grid** consumes the §5.13 helper directly: `process_vk` is just `dt_bilateral_init_vk → splat → blur → slice_vk(detail) → free` mirroring `process_cl` byte-for-byte. **Local Laplacian** (the default mode — `s_mode_local_laplacian` is the `$DEFAULT` for the params struct) consumes the new `dt_local_laplacian_*_vk` helper (§5.17) — same `init → apply → free` shape as the OpenCL surface. Validated end-to-end on lavapipe against independent C references: the bilateral chain matches at 7.6e-6 on L (a/b/alpha pass through bit-exactly), and the local-laplacian helper's 5 kernels match per-kernel at single-bit FP precision (pad_input + gauss_reduce bit-equal, process_curve + laplacian_assemble at 6e-8, write_back exact). |
 | `src/iop/globaltonemap.c` | Three classic global tone mappers (Reinhard, Drago, Hejl/Burgess-Dawson "filmic"), all picked by `d->operator` and dispatched on a 2-binding (in, out), 24-byte PC (`width`, `height`, 4 floats) shape. Reinhard and Filmic ignore the float fields; Drago carries `(eps, ldc, bl, lwmax)` to drive its adaptive logarithmic curve. The OpenCL path computes `lwmax` via a two-stage `pixelmax_first` + `pixelmax_second` workgroup-local reduction; the Vulkan port follows the §4.2 `hazeremoval` precedent and **drops the GPU reduction** — when the GUI cache for `lwmax` is empty the input is read back via `dt_vulkan_read_from_device` and the max is found on the host. The full Drago fast-path (preview pipe primes `g->lwmax`/`g->hash`, full pipe re-uses) is preserved byte-for-byte, so the readback only triggers on a fresh module instance in the full pipe. Detail recovery uses the §5.13 bilateral helper: `splat → tonemap → blur → snapshot dev_out → slice_to_output_vk(in, snapshot, out, detail)`, matching `process_cl` exactly. Drago's `process_tiling_ready = FALSE` gate is the existing global flag and applies to Vulkan unchanged (the readback would give a per-tile max otherwise — same correctness issue OpenCL has). Validated end-to-end on lavapipe against independent C references of all three operators: reinhard and filmic are bit-equal (max 0.0), drago matches at 2.3e-5 over the log/pow chain. |
 | `src/iop/colormapping.c` | Hertzmann-style colour-transfer mapping: equalised L histogram remap + soft-cluster-weighted Lab a/b remap from target to source statistics. Both kernels (`colormapping_histogram` and `colormapping_mapping`) port via the standard image-shortcut (the OpenCL `image2d_t` reads only use integer fixed coords, equivalent to flat `in[y*width + x]`). Histogram has 4 bindings (in, out, target_hist `int[2048]`, source_ihist `float[2048]`) with a 12 B PC (width, height, equalization); mapping has 7 bindings (in, tmp, out, target_mean `float2[5]`, source_mean `float2[5]`, var_ratio `float2[5]`, mapio `int[5]`) with a 12 B PC (width, height, clusters). `get_clusters` (chroma-distance soft membership) is inlined into the mapping kernel. The ACQUIRE preview-pipe input snapshot for host-side cluster training (`_get_cluster_mapping`) reads back via `dt_vulkan_read_from_device` — same precedent as `globaltonemap`'s lwmax cache miss and `hazeremoval`'s ambient-light snapshot. The bilateral-smoothed dL path reuses the §5.13 helper; the `equalization < 0.001` shortcut skips the bilateral and copies dev_out → dev_tmp via `dt_vulkan_copy_device_to_device`. When no source/target stats are present yet (the default-pass-through state) `process_vk` shortcuts to a single `dt_vulkan_copy_device_to_device` like `process_cl`'s `enqueue_copy_image` shortcut. Validated end-to-end on lavapipe with both kernels against an independent C reference: histogram matches at 3.8e-6, mapping at 1.5e-5 — single-bit FP precision over the cluster-weighted sum. |
 
@@ -353,11 +353,10 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   consumer — chains §5.10 or §5.13 followed by a curve-mix
   kernel), `shadhi` (second combined-helper consumer — same shape
   + soft-light overlays),
-  `bilat` (bilateral-grid arm only — direct §5.13 helper
-  consumer, three-call chain `init_vk → splat → blur → slice_vk`;
-  the local-laplacian arm is gated to OpenCL via the §10.2
-  predictive `process_vk_ready = FALSE` until `dt_local_laplacian_vk`
-  lands),
+  `bilat` (both modes — bilateral-grid arm uses §5.13 directly,
+  local-laplacian arm uses the new §5.17 helper; the gate that
+  previously routed the local-laplacian arm to OpenCL is now
+  removed),
   `colormapping` (Hertzmann colour-transfer histogram + cluster
   mapping; both kernels port via the image-shortcut, ACQUIRE
   preview-pipe input snapshot reads back via
@@ -1210,6 +1209,82 @@ matches the input at single-bit FP precision (1.9e-6). Confirms
 the dispatch chain, the PC layouts, the ping-pong buffer wiring
 and the `(1/16)` `lpass_mult` normalisation all reproduce the
 OpenCL helper byte-for-byte.
+
+### 5.17 Local Laplacian pyramid helper (`dt_local_laplacian_*_vk`)
+
+Fifth multi-kernel device helper (after §5.10 Gaussian, §5.13
+bilateral, §5.15 guided filter and §5.16 DWT). Local Laplacian
+filtering for HDR-style local tone mapping: builds a multi-scale
+Gaussian pyramid over the L channel, evaluates the user-supplied
+shadow/highlight/clarity curve at 6 evenly-spaced reference
+brightnesses, then assembles the final pyramid by interpolating
+between the two laplacian pyramids nearest the local brightness.
+
+Used by `bilat` (HDR local tone-mapping / "clarity" arm — see §4.2
+update). The OpenCL surface is `dt_local_laplacian_cl`; the Vulkan
+twin lives in `src/common/locallaplacianvk.{c,h}` and mirrors it
+init / apply / free byte-for-byte:
+
+```c
+dt_local_laplacian_vk_t *l = dt_local_laplacian_init_vk(
+    devid, width, height, sigma, shadows, highlights, clarity);
+dt_local_laplacian_vk(l, dev_in, dev_out);
+dt_local_laplacian_free_vk(l);
+```
+
+Five kernels (1:1 with `locallaplacian.cl`):
+
+| kernel                  | bindings | PC (bytes) |
+|-------------------------|:--------:|:----------:|
+| `ll_pad_input`          |        2 |         20 |
+| `ll_gauss_reduce`       |        2 |         16 |
+| `ll_process_curve`      |        2 |         28 |
+| `ll_laplacian_assemble` |       15 |         16 |
+| `ll_write_back`         |        3 |         16 |
+
+All `image2d_t` reads in `locallaplacian.cl` use sampler-clamp
+integer coords — no actual filtering — so the same image-shortcut
+pattern used by `overlay`/`sigmoid`/`agx`/`colormapping` applies,
+and every binding becomes a flat float (or float4) storage buffer
+with explicit `clamp` in the kernel. The OpenCL `gauss_reduce`
+implicit CLAMP_TO_EDGE on the fine buffer becomes an explicit
+`clamp(2*cx+ii, 0, fine_w-1)` in both the `.cl` and `.comp` —
+otherwise reads near the bottom-right corner of the padded buffer
+could go one row past in row-major flat-buffer addressing.
+
+`ll_laplacian_assemble`'s 15 bindings fit the bumped 20-binding
+ceiling (`DT_VULKAN_MAX_BINDINGS` was raised 16→20 for
+`guided_filter_solve`). The OpenCL kernel includes an `#ifdef AMD`
+branch that uses `select(…)` instead of `switch(lo)` to work
+around a driver bug (issue #3756); the Vulkan port keeps the
+`switch` form for both clspv and glslang since the AMD workaround
+is OpenCL-specific.
+
+Per-level dimensions `(lwidth[l], lheight[l])` are cached at init
+time using the same `_dl()` "downsample-by-2 with ceiling" recurrence
+as the CL helper. Each level allocates one `dev_padded`, one
+`dev_output` and six `dev_processed[gamma]` float buffers — same
+2 + num_gamma = 8 buffers per level as OpenCL. The "AMD-issue
+workaround branch" in `locallaplacian.cl` is omitted from the
+Vulkan port (the GLSL switch-based form is fine on all drivers
+we've tested).
+
+Note: this is the first helper with a write-image-back step that
+copies chroma + alpha from the input buffer to the output, mirroring
+the OpenCL kernel's `pixel.x = 100.0f * processed; write_imagef(out)`
+pattern. The output buffer's chroma channels come from the *original*
+float4 input, not from any padded intermediate.
+
+`bilat.c` previously gated its `s_mode_local_laplacian` arm to
+OpenCL/CPU via `process_vk_ready = FALSE`; with this helper in
+place, the gate is removed and the Vulkan path covers both modes
+of "local contrast" — bilateral and local Laplacian (the default).
+
+Validated end-to-end on lavapipe with per-kernel tests against
+independent C references: pad_input and gauss_reduce are bit-equal
+(max 0.0), process_curve and laplacian_assemble match at 6e-8
+(single-bit FP), write_back round-trips exactly (L scale + chroma
+passthrough).
 
 ## 6. Per-OS picture
 

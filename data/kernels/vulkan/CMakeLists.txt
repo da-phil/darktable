@@ -148,7 +148,12 @@ set(VK_KERNELS
     global_tonemap_drago:global_tonemap_drago
     global_tonemap_filmic:global_tonemap_filmic
     colormapping_histogram:colormapping_histogram
-    colormapping_mapping:colormapping_mapping)
+    colormapping_mapping:colormapping_mapping
+    ll_pad_input:ll_pad_input
+    ll_gauss_reduce:ll_gauss_reduce
+    ll_process_curve:ll_process_curve
+    ll_laplacian_assemble:ll_laplacian_assemble
+    ll_write_back:ll_write_back)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
