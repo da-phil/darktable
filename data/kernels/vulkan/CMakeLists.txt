@@ -146,7 +146,9 @@ set(VK_KERNELS
     dwt_hat_transform_col:dwt_hat_transform_col
     global_tonemap_reinhard:global_tonemap_reinhard
     global_tonemap_drago:global_tonemap_drago
-    global_tonemap_filmic:global_tonemap_filmic)
+    global_tonemap_filmic:global_tonemap_filmic
+    colormapping_histogram:colormapping_histogram
+    colormapping_mapping:colormapping_mapping)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
