@@ -70,6 +70,7 @@ FILE(GLOB SOURCE_FILES
   "common/l10n.c"
   "common/locallaplacian.c"
   "common/locallaplaciancl.c"
+  "common/locallaplacianvk.c"
   "common/map_locations.c"
   "common/matrices.c"
   "common/metadata.c"
