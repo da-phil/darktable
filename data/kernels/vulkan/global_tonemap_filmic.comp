@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+  int width; int height;
+  float p0; float p1; float p2; float p3;  // unused
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+  vec4 pixel = in_buf.data[idx];
+  float l = pixel.x * 0.01;
+  float m = max(0.0, l - 0.004);
+  pixel.x = 100.0 * ((m * (6.2 * m + 0.5))
+                     / (m * (6.2 * m + 1.7) + 0.06));
+  out_buf.data[idx] = pixel;
+}
