@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/colorspaces.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
@@ -137,6 +138,10 @@ typedef struct dt_iop_colormapping_global_data_t
 {
   int kernel_histogram;
   int kernel_mapping;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_histogram;
+  dt_vk_module_kernel_t vk_mapping;
+#endif
 } dt_iop_colormapping_global_data_t;
 
 
@@ -703,6 +708,171 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+typedef struct
+{
+  int width;
+  int height;
+  float equalization;
+} vk_cm_hist_pc_t;
+
+typedef struct
+{
+  int width;
+  int height;
+  int clusters;
+} vk_cm_map_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_colormapping_data_t *data = piece->data;
+  const dt_iop_colormapping_global_data_t *gd = self->global_data;
+  dt_iop_colormapping_gui_data_t *g = self->gui_data;
+  const int devid = piece->pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const int ch     = piece->colors;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_s = 50.0f / scale;
+  const float sigma_r = 8.0f;
+  const float dominance = data->dominance / 100.0f;
+  const float equalization = data->equalization / 100.0f;
+
+  // ACQUIRE: preview pipe stashes the input so the host-side cluster
+  // training can read it. Mirrors process_cl's GUI critical section;
+  // dt_vulkan_read_from_device replaces the OpenCL copy_device_to_host.
+  if(self->dev->gui_attached && g
+     && dt_pipe_is_preview(piece->pipe) && (data->flag & ACQUIRE))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    dt_free_align(g->buffer);
+    g->buffer = dt_iop_image_alloc(width, height, ch);
+    g->width = width;
+    g->height = height;
+    g->ch = ch;
+
+    int copy_err = 0;
+    if(g->buffer)
+      copy_err = dt_vulkan_read_from_device(devid, g->buffer, dev_in, img_bytes);
+    dt_iop_gui_leave_critical_section(self);
+    if(copy_err != 0) return -1;
+  }
+
+  // Pass-through when no cluster training has run yet.
+  if(!((data->flag & HAS_TARGET) && (data->flag & HAS_SOURCE)))
+  {
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+  }
+
+  // Host-side mapio + var_ratio derivation, byte-for-byte process_cl.
+  int mapio[MAXN];
+  get_cluster_mapping(data->n, data->target_mean, data->target_weight,
+                      data->source_mean, data->source_weight, dominance, mapio);
+  float var_ratio[MAXN][2];
+  for(int i = 0; i < data->n; i++)
+  {
+    var_ratio[i][0] = (data->target_var[i][0] > 0.0f)
+      ? data->source_var[mapio[i]][0] / data->target_var[i][0] : 0.0f;
+    var_ratio[i][1] = (data->target_var[i][1] > 0.0f)
+      ? data->source_var[mapio[i]][1] / data->target_var[i][1] : 0.0f;
+  }
+
+  dt_bilateral_vk_t *b = NULL;
+  dt_vk_mem_t *dev_tmp           = NULL;
+  dt_vk_mem_t *dev_target_hist   = NULL;
+  dt_vk_mem_t *dev_source_ihist  = NULL;
+  dt_vk_mem_t *dev_target_mean   = NULL;
+  dt_vk_mem_t *dev_source_mean   = NULL;
+  dt_vk_mem_t *dev_var_ratio     = NULL;
+  dt_vk_mem_t *dev_mapio         = NULL;
+  int rc = -1;
+
+  const size_t hist_bytes  = sizeof(int)   * HISTN;
+  const size_t ihist_bytes = sizeof(float) * HISTN;
+  const size_t mean_bytes  = sizeof(float) * MAXN * 2;
+  const size_t mapio_bytes = sizeof(int)   * MAXN;
+
+  dev_tmp          = dt_vulkan_alloc_buffer(devid, img_bytes);
+  dev_target_hist  = dt_vulkan_alloc_buffer(devid, hist_bytes);
+  dev_source_ihist = dt_vulkan_alloc_buffer(devid, ihist_bytes);
+  dev_target_mean  = dt_vulkan_alloc_buffer(devid, mean_bytes);
+  dev_source_mean  = dt_vulkan_alloc_buffer(devid, mean_bytes);
+  dev_var_ratio    = dt_vulkan_alloc_buffer(devid, mean_bytes);
+  dev_mapio        = dt_vulkan_alloc_buffer(devid, mapio_bytes);
+  if(!dev_tmp || !dev_target_hist || !dev_source_ihist || !dev_target_mean
+     || !dev_source_mean || !dev_var_ratio || !dev_mapio)
+    goto cleanup;
+
+  // colormapping_histogram (in → out): 4 bindings, 12 B PC.
+  {
+    const vk_cm_hist_pc_t pc = {
+      .width = width, .height = height, .equalization = equalization,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_target_hist, dev_source_ihist };
+    const dt_vk_upload_t uploads[] = {
+      { dev_target_hist,  data->target_hist,  hist_bytes  },
+      { dev_source_ihist, data->source_ihist, ihist_bytes },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_histogram, bufs, 4,
+                                    uploads, 2,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Smoothed dL → dev_tmp (bilateral or plain copy).
+  if(equalization > 0.001f)
+  {
+    b = dt_bilateral_init_vk(width, height, sigma_s, sigma_r);
+    if(!b) goto cleanup;
+    if(dt_bilateral_splat_vk(b, dev_out)         != 0) goto cleanup;
+    if(dt_bilateral_blur_vk(b)                    != 0) goto cleanup;
+    if(dt_bilateral_slice_vk(b, dev_out, dev_tmp, -1.0f) != 0) goto cleanup;
+  }
+  else
+  {
+    if(dt_vulkan_copy_device_to_device(devid, dev_tmp, dev_out, img_bytes) != 0)
+      goto cleanup;
+  }
+
+  // colormapping_mapping: 7 bindings, 12 B PC.
+  {
+    const vk_cm_map_pc_t pc = {
+      .width = width, .height = height, .clusters = data->n,
+    };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_tmp, dev_out,
+                            dev_target_mean, dev_source_mean,
+                            dev_var_ratio, dev_mapio };
+    const dt_vk_upload_t uploads[] = {
+      { dev_target_mean, data->target_mean, mean_bytes },
+      { dev_source_mean, data->source_mean, mean_bytes },
+      { dev_var_ratio,   var_ratio,         mean_bytes },
+      { dev_mapio,       mapio,             mapio_bytes },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_mapping, bufs, 7,
+                                    uploads, 4,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(b) dt_bilateral_free_vk(b);
+  if(dev_tmp)          dt_vulkan_free_buffer(devid, dev_tmp);
+  if(dev_target_hist)  dt_vulkan_free_buffer(devid, dev_target_hist);
+  if(dev_source_ihist) dt_vulkan_free_buffer(devid, dev_source_ihist);
+  if(dev_target_mean)  dt_vulkan_free_buffer(devid, dev_target_mean);
+  if(dev_source_mean)  dt_vulkan_free_buffer(devid, dev_source_mean);
+  if(dev_var_ratio)    dt_vulkan_free_buffer(devid, dev_var_ratio);
+  if(dev_mapio)        dt_vulkan_free_buffer(devid, dev_mapio);
+  return rc;
+}
+#endif
+
 
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
@@ -801,6 +971,16 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_histogram = dt_opencl_create_kernel(program, "colormapping_histogram");
   gd->kernel_mapping = dt_opencl_create_kernel(program, "colormapping_mapping");
+#ifdef HAVE_VULKAN
+  // histogram: 4 storage bindings, 2 ints + 1 float = 12 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_histogram, "colormapping_histogram",
+                               "colormapping_histogram", 4,
+                               2 * sizeof(int) + sizeof(float), 16, 16, 1);
+  // mapping: 7 storage bindings, 3 ints = 12 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_mapping, "colormapping_mapping",
+                               "colormapping_mapping", 7,
+                               3 * sizeof(int), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -808,6 +988,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_iop_colormapping_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_histogram);
   dt_opencl_free_kernel(gd->kernel_mapping);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_histogram);
+  dt_vulkan_module_kernel_unload(&gd->vk_mapping);
+#endif
   free(self->data);
   self->data = NULL;
 }

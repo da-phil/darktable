@@ -1,0 +1,52 @@
+#version 450
+#define MAXN 5
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1) readonly  buffer Tmp  { vec4 data[]; } tmp_buf;
+layout(std430, binding = 2)           buffer Out  { vec4 data[]; } out_buf;
+layout(std430, binding = 3) readonly  buffer TM   { vec2 data[]; } target_mean;
+layout(std430, binding = 4) readonly  buffer SM   { vec2 data[]; } source_mean;
+layout(std430, binding = 5) readonly  buffer VR   { vec2 data[]; } var_ratio;
+layout(std430, binding = 6) readonly  buffer MIO  { int  data[]; } mapio;
+layout(push_constant) uniform PC {
+  int width; int height; int clusters;
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  int idx = y * pc.width + x;
+  vec4 ipixel = in_buf.data[idx];
+  float dL = tmp_buf.data[idx].x;
+
+  float w[MAXN];
+  float mdist = 3.4028234e38;  // FLT_MAX
+  for(int k = 0; k < pc.clusters; k++) {
+    float dx = ipixel.y - target_mean.data[k].x;
+    float dy = ipixel.z - target_mean.data[k].y;
+    float dist2 = dx * dx + dy * dy;
+    w[k] = dist2 > 1.0e-6 ? 1.0 / dist2 : -1.0;
+    if(dist2 < mdist) mdist = dist2;
+  }
+  if(mdist < 1.0e-6)
+    for(int k = 0; k < pc.clusters; k++)
+      w[k] = w[k] < 0.0 ? 1.0 : 0.0;
+  float sum = 0.0;
+  for(int k = 0; k < pc.clusters; k++) sum += w[k];
+  if(sum > 0.0)
+    for(int k = 0; k < pc.clusters; k++) w[k] /= sum;
+
+  vec4 opixel = vec4(0.0);
+  opixel.x = clamp(2.0 * (dL - 50.0) + ipixel.x, 0.0, 100.0);
+  for(int c = 0; c < pc.clusters; c++) {
+    opixel.y += w[c] * ((ipixel.y - target_mean.data[c].x) * var_ratio.data[c].x
+                        + source_mean.data[mapio.data[c]].x);
+    opixel.z += w[c] * ((ipixel.z - target_mean.data[c].y) * var_ratio.data[c].y
+                        + source_mean.data[mapio.data[c]].y);
+  }
+  opixel.w = ipixel.w;
+
+  out_buf.data[idx] = opixel;
+}
