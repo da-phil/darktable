@@ -20,6 +20,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/imagebuf.h"
 #include "common/locallaplacian.h"
 #include "common/locallaplaciancl.h"
@@ -243,6 +244,43 @@ error_ll:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Bilateral arm only — the local-laplacian arm relies on
+// dt_local_laplacian_cl which has no Vulkan counterpart yet (the CL
+// helper drives 12 kernels over a multi-level pyramid with its own
+// orchestration). commit_params clears process_vk_ready for that mode
+// so the pipeline transparently falls back to OpenCL / CPU; the
+// belt-and-suspenders return -1 here matches the §10.2 predictive
+// pattern (basecurve fusion, filmicrgb highlight reconstruction).
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_bilat_data_t *d = piece->data;
+  if(d->mode != s_mode_bilateral) return -1;
+
+  const float scale   = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma_r = d->sigma_r;
+  const float sigma_s = d->sigma_s / scale;
+
+  dt_bilateral_vk_t *b = dt_bilateral_init_vk(roi_in->width, roi_in->height,
+                                              sigma_s, sigma_r);
+  if(!b) return -1;
+
+  int rc = -1;
+  if(dt_bilateral_splat_vk(b, dev_in)              != 0) goto cleanup;
+  if(dt_bilateral_blur_vk(b)                       != 0) goto cleanup;
+  if(dt_bilateral_slice_vk(b, dev_in, dev_out, d->detail) != 0) goto cleanup;
+  rc = 0;
+
+cleanup:
+  dt_bilateral_free_vk(b);
+  return rc;
+}
+#endif
+
 
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
@@ -303,6 +341,14 @@ void commit_params(dt_iop_module_t *self,
   if(d->mode == s_mode_bilateral)
     piece->process_cl_ready =
       (piece->process_cl_ready && !dt_opencl_avoid_atomics(pipe->devid));
+#endif
+#ifdef HAVE_VULKAN
+  // Only the bilateral arm is wired up on Vulkan; the local-laplacian
+  // pyramid helper is OpenCL-only. Predictive gate (§10.2) so the
+  // pipeline avoids the Vulkan host stage and falls back to the
+  // OpenCL / CPU path for that mode.
+  if(d->mode == s_mode_local_laplacian)
+    piece->process_vk_ready = FALSE;
 #endif
   if(d->mode == s_mode_local_laplacian)
     piece->process_tiling_ready = FALSE; // can't deal with tiles, sorry.
