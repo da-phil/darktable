@@ -92,6 +92,10 @@ typedef struct dt_iop_colorin_global_data_t
 {
   int kernel_colorin_unbound;
   int kernel_colorin_clipping;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_unbound;
+  dt_vk_module_kernel_t vk_clipping;
+#endif
 } dt_iop_colorin_global_data_t;
 
 typedef struct dt_iop_colorin_data_t
@@ -479,6 +483,14 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_colorin_unbound = dt_opencl_create_kernel(program, "colorin_unbound");
   gd->kernel_colorin_clipping = dt_opencl_create_kernel(program, "colorin_clipping");
+#ifdef HAVE_VULKAN
+  // 7 storage bindings (in, out, lutr/g/b, cmat, lmat), 64 B PC.
+  const uint32_t pcsize = 3 * sizeof(int) + 13 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_unbound,  "colorin_unbound",
+                               "colorin_unbound",  7, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_clipping, "colorin_clipping",
+                               "colorin_clipping", 7, pcsize, 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -486,6 +498,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_iop_colorin_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colorin_unbound);
   dt_opencl_free_kernel(gd->kernel_colorin_clipping);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_unbound);
+  dt_vulkan_module_kernel_unload(&gd->vk_clipping);
+#endif
   free(self->data);
   self->data = NULL;
 }
@@ -725,6 +741,126 @@ error:
   dt_opencl_release_mem_object(dev_coeffs);
   dt_opencl_release_mem_object(dev_corr);
   return err;
+}
+#endif
+
+#ifdef HAVE_VULKAN
+// PC layout shared by both colorin kernels: 3 ints + 13 floats = 64 B.
+// (width, height, blue_mapping, corr.xyzw, a_r[0..2], a_g[0..2], a_b[0..2]).
+typedef struct
+{
+  int   width;
+  int   height;
+  int   blue_mapping;
+  float corr_x, corr_y, corr_z, corr_w;
+  float a_r0, a_r1, a_r2;
+  float a_g0, a_g1, a_g2;
+  float a_b0, a_b1, a_b2;
+} vk_colorin_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorin_data_t *d = piece->data;
+  const dt_iop_colorin_global_data_t *gd = self->global_data;
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const int devid = pipe->devid;
+  const int width  = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  // DT_COLORSPACE_LAB: identity pass-through (the OpenCL fast path
+  // uses enqueue_copy_image; the Vulkan twin is a buffer-to-buffer
+  // copy via the HAL primitive, same shape as colorout).
+  if(d->type == DT_COLORSPACE_LAB)
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+
+  // Chroma-correction coeffs, byte-for-byte process_cl.
+  const dt_dev_chroma_t *chr = &self->dev->chroma;
+  const gboolean corrected = chr->late_correction;
+  const dt_aligned_pixel_t coeffs = {
+      corrected ? chr->D65coeffs[0] / chr->as_shot[0] : 1.0f,
+      corrected ? chr->D65coeffs[1] / chr->as_shot[1] : 1.0f,
+      corrected ? chr->D65coeffs[2] / chr->as_shot[2] : 1.0f,
+      corrected ? chr->D65coeffs[3] / chr->as_shot[3] : 1.0f };
+  if(corrected)
+  {
+    for_four_channels(k)
+    {
+      pipe->dsc.temperature.coeffs[k] *= coeffs[k];
+      pipe->dsc.processed_maximum[k] *= coeffs[k];
+    }
+  }
+
+  float cmat[9], lmat[9];
+  const dt_vk_module_kernel_t *kernel;
+  if(d->nrgb)
+  {
+    kernel = &gd->vk_clipping;
+    pack_3xSSE_to_3x3(d->nmatrix, cmat);
+    pack_3xSSE_to_3x3(d->lmatrix, lmat);
+  }
+  else
+  {
+    kernel = &gd->vk_unbound;
+    pack_3xSSE_to_3x3(d->cmatrix, cmat);
+    pack_3xSSE_to_3x3(d->lmatrix, lmat);
+  }
+
+  const gboolean blue_mapping = d->blue_mapping
+    && dt_image_is_matrix_correction_supported(&pipe->image);
+
+  // 3 LUTs + 2 matrices upload as one batched submit (vk_dispatch_n_batched).
+  dt_vk_mem_t *dev_r = NULL, *dev_g = NULL, *dev_b = NULL;
+  dt_vk_mem_t *dev_cm = NULL, *dev_lm = NULL;
+  int rc = -1;
+  const size_t lut_bytes = sizeof(float) * 0x10000;
+  const size_t mat_bytes = sizeof(float) * 9;
+
+  dev_r  = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_g  = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_b  = dt_vulkan_alloc_buffer(devid, lut_bytes);
+  dev_cm = dt_vulkan_alloc_buffer(devid, mat_bytes);
+  dev_lm = dt_vulkan_alloc_buffer(devid, mat_bytes);
+  if(!dev_r || !dev_g || !dev_b || !dev_cm || !dev_lm) goto cleanup;
+
+  const vk_colorin_pc_t pc = {
+    .width = width, .height = height,
+    .blue_mapping = blue_mapping ? 1 : 0,
+    .corr_x = coeffs[0], .corr_y = coeffs[1],
+    .corr_z = coeffs[2], .corr_w = coeffs[3],
+    .a_r0 = d->unbounded_coeffs[0][0],
+    .a_r1 = d->unbounded_coeffs[0][1],
+    .a_r2 = d->unbounded_coeffs[0][2],
+    .a_g0 = d->unbounded_coeffs[1][0],
+    .a_g1 = d->unbounded_coeffs[1][1],
+    .a_g2 = d->unbounded_coeffs[1][2],
+    .a_b0 = d->unbounded_coeffs[2][0],
+    .a_b1 = d->unbounded_coeffs[2][1],
+    .a_b2 = d->unbounded_coeffs[2][2],
+  };
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_r, dev_g, dev_b, dev_cm, dev_lm };
+  const dt_vk_upload_t uploads[] = {
+    { dev_r,  d->lut[0], lut_bytes },
+    { dev_g,  d->lut[1], lut_bytes },
+    { dev_b,  d->lut[2], lut_bytes },
+    { dev_cm, cmat,      mat_bytes },
+    { dev_lm, lmat,      mat_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(kernel, bufs, 7,
+                                    uploads, 5,
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(dev_r)  dt_vulkan_free_buffer(devid, dev_r);
+  if(dev_g)  dt_vulkan_free_buffer(devid, dev_g);
+  if(dev_b)  dt_vulkan_free_buffer(devid, dev_b);
+  if(dev_cm) dt_vulkan_free_buffer(devid, dev_cm);
+  if(dev_lm) dt_vulkan_free_buffer(devid, dev_lm);
+  return rc;
 }
 #endif
 
