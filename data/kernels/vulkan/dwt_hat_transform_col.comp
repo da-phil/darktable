@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer LP { vec4 data[]; } lpass;
+layout(std430, binding = 1)           buffer TB { vec4 data[]; } temp_buffer;
+layout(push_constant) uniform PC {
+  int width; int height; int sc; float lpass_mult;
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width) return;
+
+  const float hat_mult = 2.0;
+  int size = pc.height;
+
+  if(y < pc.sc) {
+    temp_buffer.data[y * pc.width + x] =
+        (hat_mult * lpass.data[y * pc.width + x]
+         + lpass.data[(pc.sc - y) * pc.width + x]
+         + lpass.data[(y + pc.sc) * pc.width + x]) * pc.lpass_mult;
+  } else if(y + pc.sc < size) {
+    temp_buffer.data[y * pc.width + x] =
+        (hat_mult * lpass.data[y * pc.width + x]
+         + lpass.data[(y - pc.sc) * pc.width + x]
+         + lpass.data[(y + pc.sc) * pc.width + x]) * pc.lpass_mult;
+  } else if(y < size) {
+    temp_buffer.data[y * pc.width + x] =
+        (hat_mult * lpass.data[y * pc.width + x]
+         + lpass.data[(y - pc.sc) * pc.width + x]
+         + lpass.data[(2 * size - 2 - (y + pc.sc)) * pc.width + x]) * pc.lpass_mult;
+  }
+}
