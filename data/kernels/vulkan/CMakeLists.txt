@@ -153,7 +153,9 @@ set(VK_KERNELS
     ll_gauss_reduce:ll_gauss_reduce
     ll_process_curve:ll_process_curve
     ll_laplacian_assemble:ll_laplacian_assemble
-    ll_write_back:ll_write_back)
+    ll_write_back:ll_write_back
+    colorin_unbound:colorin_unbound
+    colorin_clipping:colorin_clipping)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
