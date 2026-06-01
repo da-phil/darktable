@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out { float data[]; } out_buf;
+layout(push_constant) uniform PC {
+  int wd; int ht;
+  float g; float sigma; float shadows; float highlights; float clarity;
+} pc;
+
+float ll_curve(float x) {
+  float c = x - pc.g;
+  float ssigma = c > 0.0 ? pc.sigma : -pc.sigma;
+  float shadhi = c > 0.0 ? pc.shadows : pc.highlights;
+  float val;
+  if(abs(c) > 2.0 * pc.sigma) {
+    val = pc.g + ssigma + shadhi * (c - ssigma);
+  } else {
+    float t  = clamp(c / (2.0 * ssigma), 0.0, 1.0);
+    float t2 = t * t;
+    float mt = 1.0 - t;
+    val = pc.g + ssigma * 2.0 * mt * t + t2 * (ssigma + ssigma * shadhi);
+  }
+  val += pc.clarity * c * exp(-c * c / (2.0 * pc.sigma * pc.sigma / 3.0));
+  return val;
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.wd || y >= pc.ht) return;
+  out_buf.data[y * pc.wd + x] = ll_curve(in_buf.data[y * pc.wd + x]);
+}
