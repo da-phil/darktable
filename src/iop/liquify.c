@@ -258,6 +258,9 @@ typedef struct
 typedef struct
 {
   int warp_kernel;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_warp;
+#endif
 } dt_iop_liquify_global_data_t;
 
 typedef struct
@@ -1582,6 +1585,148 @@ int process_cl(dt_iop_module_t *self,
 
 #endif
 
+#ifdef HAVE_VULKAN
+// 14 ints = 56 B PC mirroring all the small structs the OpenCL
+// warp_kernel takes as separate buffer args.
+typedef struct
+{
+  int in_width;     int in_height;
+  int out_width;    int out_height;
+  int roi_in_x;     int roi_in_y;
+  int roi_out_x;    int roi_out_y;
+  int map_extent_x; int map_extent_y;
+  int map_extent_w; int map_extent_h;
+  int kdesc_size;   int kdesc_resolution;
+} vk_liquify_pc_t;
+
+static int _apply_global_distortion_map_vk(const dt_iop_module_t *self,
+                                           const dt_dev_pixelpipe_iop_t *piece,
+                                           dt_vk_mem_t *dev_in,
+                                           dt_vk_mem_t *dev_out,
+                                           const dt_iop_roi_t *roi_in,
+                                           const dt_iop_roi_t *roi_out,
+                                           const float complex *map,
+                                           const cairo_rectangle_int_t *map_extent)
+{
+  const dt_iop_liquify_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+
+  const dt_interpolation_t *interpolation
+    = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  dt_liquify_kernel_descriptor_t kdesc = { .size = 0, .resolution = 100 };
+  float *k = NULL;
+
+  switch(interpolation->id)
+  {
+    case DT_INTERPOLATION_BILINEAR:
+      kdesc.size = 1; kdesc.resolution = 1;
+      k = malloc(sizeof(float) * 2);
+      k[0] = 1.0f; k[1] = 0.0f;
+      break;
+    case DT_INTERPOLATION_BICUBIC:
+      kdesc.size = 2;
+      k = malloc(sizeof(float) * ((size_t)kdesc.size * kdesc.resolution + 1));
+      for(int i = 0; i <= kdesc.size * kdesc.resolution; i++)
+        k[i] = bicubic(0.5f, (float)i / kdesc.resolution);
+      break;
+    case DT_INTERPOLATION_LANCZOS2:
+      kdesc.size = 2;
+      k = malloc(sizeof(float) * ((size_t)kdesc.size * kdesc.resolution + 1));
+      for(int i = 0; i <= kdesc.size * kdesc.resolution; i++)
+        k[i] = lanczos(2, (float)i / kdesc.resolution);
+      break;
+    case DT_INTERPOLATION_LANCZOS3:
+      kdesc.size = 3;
+      k = malloc(sizeof(float) * ((size_t)kdesc.size * kdesc.resolution + 1));
+      for(int i = 0; i <= kdesc.size * kdesc.resolution; i++)
+        k[i] = lanczos(3, (float)i / kdesc.resolution);
+      break;
+    default:
+      return -1;
+  }
+
+  const size_t map_bytes = sizeof(float) * 2 * map_extent->width * map_extent->height;
+  const size_t k_bytes   = sizeof(float) * (kdesc.size * kdesc.resolution + 1);
+
+  dt_vk_mem_t *dev_map = dt_vulkan_alloc_buffer(devid, map_bytes);
+  dt_vk_mem_t *dev_k   = dt_vulkan_alloc_buffer(devid, k_bytes);
+  int rc = -1;
+  if(!dev_map || !dev_k) goto cleanup;
+
+  const vk_liquify_pc_t pc = {
+    .in_width = roi_in->width, .in_height = roi_in->height,
+    .out_width = roi_out->width, .out_height = roi_out->height,
+    .roi_in_x = roi_in->x, .roi_in_y = roi_in->y,
+    .roi_out_x = roi_out->x, .roi_out_y = roi_out->y,
+    .map_extent_x = map_extent->x, .map_extent_y = map_extent->y,
+    .map_extent_w = map_extent->width, .map_extent_h = map_extent->height,
+    .kdesc_size = kdesc.size, .kdesc_resolution = kdesc.resolution,
+  };
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_map, dev_k };
+  const dt_vk_upload_t uploads[] = {
+    { dev_map, (void *)map, map_bytes },
+    { dev_k,   k,           k_bytes   },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&gd->vk_warp, bufs, 4,
+                                    uploads, 2,
+                                    roi_out->width, roi_out->height,
+                                    &pc, sizeof(pc));
+
+cleanup:
+  if(dev_map) dt_vulkan_free_buffer(devid, dev_map);
+  if(dev_k)   dt_vulkan_free_buffer(devid, dev_k);
+  free(k);
+  return rc;
+}
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out)
+{
+  const int devid = piece->pipe->devid;
+  const size_t img_bytes = (size_t)roi_out->width * roi_out->height * 4 * sizeof(float);
+
+  // Build the distortion map first so we know whether there's any
+  // work to do; if it's empty we can take the pure pass-through path.
+  cairo_rectangle_int_t map_extent;
+  float complex *map = NULL;
+  _build_global_distortion_map(self, piece, roi_in->scale,
+                               roi_out, &map_extent, FALSE, &map);
+
+  if(!map || map_extent.width == 0 || map_extent.height == 0)
+  {
+    // No warps to apply — fall back to a sub-region pass-through copy.
+    // For the common case where roi_in == roi_out, this is a single
+    // device-to-device copy. Otherwise the warp kernel itself handles
+    // the per-pixel pass-through inside its image-shortcut branch, so
+    // we dispatch it with an empty (1×1, all-zero) map to force the
+    // every-pixel pass-through path.
+    if(roi_in->x == roi_out->x && roi_in->y == roi_out->y
+       && roi_in->width == roi_out->width && roi_in->height == roi_out->height)
+    {
+      dt_free_align((void *)map);
+      return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+    }
+    // Else fall through to the warp dispatch with a 1×1 zero map.
+    cairo_rectangle_int_t empty = { .x = roi_out->x, .y = roi_out->y,
+                                    .width = 1, .height = 1 };
+    float complex zero_map[1] = { 0.0f };
+    const int rc = _apply_global_distortion_map_vk(self, piece, dev_in, dev_out,
+                                                   roi_in, roi_out,
+                                                   zero_map, &empty);
+    dt_free_align((void *)map);
+    return rc;
+  }
+
+  const int rc = _apply_global_distortion_map_vk(self, piece, dev_in, dev_out,
+                                                 roi_in, roi_out,
+                                                 map, &map_extent);
+  dt_free_align((void *)map);
+  return rc;
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
   // called once at startup
@@ -1589,13 +1734,21 @@ void init_global(dt_iop_module_so_t *self)
   dt_iop_liquify_global_data_t *gd =  malloc(sizeof(dt_iop_liquify_global_data_t));
   self->data = gd;
   gd->warp_kernel = dt_opencl_create_kernel(program, "warp_kernel");
+#ifdef HAVE_VULKAN
+  // 4 storage bindings (in, out, map, k), 56 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_warp, "liquify_warp", "liquify_warp",
+                               4, sizeof(vk_liquify_pc_t), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   // called once at shutdown
-  const dt_iop_liquify_global_data_t *gd = self->data;
+  dt_iop_liquify_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->warp_kernel);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_warp);
+#endif
   free(self->data);
   self->data = NULL;
 }
