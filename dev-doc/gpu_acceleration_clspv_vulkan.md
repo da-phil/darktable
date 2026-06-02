@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 56 modules currently expose `process_vk`,
+**Per-module ports**: 57 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -248,6 +248,7 @@ in three categories.
 | `src/iop/colorin.c` | Input ICC colour profile transform — the input-side mirror of `colorout`. Two kernels picked by `d->nrgb`: `colorin_unbound` (cam → XYZ via cmat then XYZ → Lab) and `colorin_clipping` (cam → RGB via cmat, clipped to [0, 1], then RGB → XYZ via lmat, then XYZ → Lab). Both share the same 7-binding (in, out, lutr, lutg, lutb, cmat, lmat) / 64 B PC (width, height, blue_mapping, corr.xyzw, a_r/g/b\[0..2\]) shape; lmat is unused in `colorin_unbound` but kept for binding symmetry. The OpenCL `image2d_t`-shaped LUTs (256×256 = 65536 entries each) become flat float storage buffers; the LUT lookups use `vk_lerp_lookup_unbounded` to match `lerp_lookup_unbounded0`'s linear interpolation between adjacent entries byte-for-byte (the gamma-power extrapolation tail `c1·pow(x·c0, c2)` for x ≥ 1 is reproduced identically). The Bayer blue-mapping gamut clamp is folded into both kernels behind the `blue_mapping` flag, mirroring the OpenCL kernel; `process_vk` ANDs the user flag with `dt_image_is_matrix_correction_supported(&pipe->image)` just like `process_cl`. The white-balance correction `(D65 / as-shot)` is computed host-side from `self->dev->chroma` (the `late_correction` path also mutates `pipe->dsc.temperature.coeffs` and `pipe->dsc.processed_maximum`, mirroring the CL behaviour). The `DT_COLORSPACE_LAB` fast path routes through `dt_vulkan_copy_device_to_device` (same shape as `colorout`'s Lab pass-through). The lcms2 slow path (non-matrix profiles) stays on CPU as in OpenCL. Validated end-to-end on lavapipe against an independent C reference of both kernels' math: unbound + blue_mapping at 1.8e-4, clipping at 9e-5 — FP precision through the LUT lerp + matrix + XYZ→Lab chain. |
 | `src/iop/crop.c` | Hard image crop. `crop` runs ahead of distort and its `modify_roi_in` aligns roi_in to the cropped region — by the time the pipeline reaches `process_cl` / `process_vk` the input buffer is already the cropped image, and the OpenCL fast-path is just `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, …)`. The Vulkan twin is one line: `dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, roi_out->w * roi_out->h * 4 * sizeof(float))`. Practically valuable because `crop` is always in the pipeline — a missing `process_vk` here forces a CL↔VK transition for every image even though no actual kernel work happens. Same shape as `mask_manager`. |
 | `src/iop/lut3d.c` | 3-D LUT colour grading (Hald CLUT / .cube / GMIC). All four kernels port via the image-shortcut (sampler-clamp integer coords on in/out, the LUT was already a flat `global float *` storage buffer in OpenCL): `lut3d_none` (2 bindings, 8 B PC — identity copy when no LUT is configured), `lut3d_trilinear` / `lut3d_tetrahedral` / `lut3d_pyramid` (3 bindings each — in, out, clut — 12 B PC with `width, height, level`). The 8-corner cube indexing math `(color = ir + ig*level + ib*level²; i000 = color*3 …)` translates verbatim — the OpenCL packs 3 floats per LUT entry rather than a `float3` (no SoA alignment in `global float*`) and the Vulkan port keeps the same layout. The `clip4` clamp to [0, 1] is applied to the entire float4 input including alpha, matching OpenCL byte-for-byte. `process_vk` mirrors `process_cl`'s ICC-profile transform sandwich: optional `work_profile → lut_profile` via `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12), kernel dispatch with `src = transform ? dev_out : dev_in`, then `lut_profile → work_profile`. Validated end-to-end on lavapipe against a C reference of all 4 algorithms with a non-identity LUT and an alpha > 1 input (caught the clip4-clamps-alpha subtlety): trilinear bit-equal, tetrahedral and pyramid at 7e-9 (single-bit FP). |
+| `src/iop/liquify.c` | Per-pixel free-form image warp with a user-painted spline / point distortion map. The OpenCL `warp_kernel` uses `read_imagef(in, sampleri, ...)` — `sampleri` is the CLK_FILTER_NEAREST + CLK_ADDRESS_CLAMP_TO_EDGE sampler, applied with the integer-truncated source coord — so the Lanczos / bicubic / bilinear reconstruction is done in kernel code via a host-prepared discrete kernel `k[]`, not by a hardware sampler. That makes liquify image-shortcut tractable like `lut3d` / `colormapping`. The Vulkan port folds the OpenCL flow's two dispatches (sub-region image copy + warp pass) into a single `liquify_warp` kernel dispatched over `roi_out`: every output pixel pass-through-copies its image-coord input by default, and only the pixels inside `map_extent` with a non-zero warp run the 2a×2a reconstruction. 4 bindings (in, out, map `float2[]`, k `float[]`) + 14-int 56 B PC carrying all 6 small structs the OpenCL kernel took as separate buffer args (`roi_in.{x,y,w,h}`, `roi_out.{x,y,w,h}`, `map_extent.{x,y,w,h}`, `kdesc.{size, resolution}`). When the host builds an empty map (no user warps yet) the Vulkan path short-circuits to a single `dt_vulkan_copy_device_to_device` when `roi_in == roi_out`. The Lanczos kernel-table compilation in the host (bilinear / bicubic / lanczos2 / lanczos3 → up to 6-tap `k[]`) ports verbatim from `process_cl`. Validated end-to-end on lavapipe against a C reference of the same warp math: pass-through (`warp == 0` everywhere), bilinear warp inside a 16×12 map_extent, and lanczos2 warp inside an 18×14 map_extent — **all three bit-equal (max 0.0)**. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -431,7 +432,7 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `shadhi`, `retouch`, `monochrome` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
-  clipping), liquify, rasterfile. These
+  clipping), rasterfile. These
   need the sampled-image + sampler bindings (§5.2 milestone 5) and
   in some cases full distort pipelines. Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
@@ -447,7 +448,14 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   to the cropped region, so `process_vk` is one `dt_vulkan_copy_device_to_device`,
   same shape as `mask_manager`; practically valuable because crop is
   always in the pipeline and a missing `process_vk` would force a
-  CL↔VK transition per image). `overlay` was originally in this
+  CL↔VK transition per image),
+  `liquify` (free-form pixel warp — the OpenCL `warp_kernel` uses
+  `sampleri` with integer-coord reads, so the Lanczos / bicubic /
+  bilinear reconstruction is done in kernel code via a host-prepared
+  `k[]` table, not by a hardware sampler; the Vulkan port folds the
+  CL flow's image-copy + warp dispatches into one kernel that runs
+  the reconstruction inside map_extent and passes-through outside).
+  `overlay` was originally in this
   bucket but turned out to be tractable without sampler support — its
   image-bound CL signature was rewritten to storage buffers (RGBA float
   in/out) and the Cairo ARGB32 byte buffer is bound as a packed `uint`

@@ -1,0 +1,70 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly  buffer Map  { vec2  data[]; } map_buf;
+layout(std430, binding = 3) readonly  buffer Krn  { float data[]; } k_buf;
+layout(push_constant) uniform PC {
+  int in_width;     int in_height;
+  int out_width;    int out_height;
+  int roi_in_x;     int roi_in_y;
+  int roi_out_x;    int roi_out_y;
+  int map_extent_x; int map_extent_y;
+  int map_extent_w; int map_extent_h;
+  int kdesc_size;   int kdesc_resolution;
+} pc;
+
+float vk_kmix(float t) {
+  t = abs(t * float(pc.kdesc_resolution));
+  float flor = floor(t);
+  float frac = t - flor;
+  int i = int(flor);
+  return mix(k_buf.data[i], k_buf.data[i + 1], frac);
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.out_width || y >= pc.out_height) return;
+
+  int img_x = pc.roi_out_x + x;
+  int img_y = pc.roi_out_y + y;
+  int mx = img_x - pc.map_extent_x;
+  int my = img_y - pc.map_extent_y;
+
+  int src_x = clamp(img_x - pc.roi_in_x, 0, pc.in_width  - 1);
+  int src_y = clamp(img_y - pc.roi_in_y, 0, pc.in_height - 1);
+  vec4 result = in_buf.data[src_y * pc.in_width + src_x];
+
+  if(mx >= 0 && mx < pc.map_extent_w && my >= 0 && my < pc.map_extent_h) {
+    vec2 warp = map_buf.data[my * pc.map_extent_w + mx];
+    if(warp.x != 0.0 || warp.y != 0.0) {
+      vec2 in_pos = vec2(float(img_x - pc.roi_in_x) + warp.x,
+                         float(img_y - pc.roi_in_y) + warp.y);
+      int a = pc.kdesc_size;
+      float lkx[6], lky[6];
+      float norm_x = 0.0, norm_y = 0.0;
+      float fx = floor(in_pos.x);
+      float fy = floor(in_pos.y);
+      for(int i = 1 - a; i <= a; i++) {
+        float wx = vk_kmix(in_pos.x - fx - float(i));
+        float wy = vk_kmix(in_pos.y - fy - float(i));
+        lkx[i + a - 1] = wx; norm_x += wx;
+        lky[i + a - 1] = wy; norm_y += wy;
+      }
+      int base_x = int(fx);
+      int base_y = int(fy);
+      vec4 Sxy = vec4(0.0);
+      for(int sy = 1 - a; sy <= a; sy++)
+        for(int sx = 1 - a; sx <= a; sx++) {
+          int ix = clamp(base_x + sx, 0, pc.in_width  - 1);
+          int iy = clamp(base_y + sy, 0, pc.in_height - 1);
+          Sxy += in_buf.data[iy * pc.in_width + ix]
+               * lkx[sx + a - 1] * lky[sy + a - 1];
+        }
+      result = Sxy / (norm_x * norm_y);
+    }
+  }
+
+  out_buf.data[y * pc.out_width + x] = result;
+}
