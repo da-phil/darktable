@@ -34,6 +34,7 @@
 #include "common/interpolation.h"
 #include "common/fast_guided_filter.h"
 #include "common/pfm.h"
+#include "common/vulkan.h"
 #include "common/ras2vect.h"
 #include "common/utility.h"
 #include "imageio/imageio_png.h"
@@ -534,6 +535,55 @@ int process_cl(dt_iop_module_t *self,
   return err;
 }
 #endif  // OpenCL
+
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const ssize_t ch = pipe->dsc.filters ? 1 : 4;
+  const gboolean fullpipe = dt_pipe_is_full(pipe);
+  const gboolean visual = fullpipe && dt_iop_has_focus(self);
+
+  // Visual focus mode (mask preview) stays on CPU like process_cl.
+  if(visual) return -1;
+
+  // The clip_and_zoom path needs the §8.5 sampler / resampler helper
+  // (dt_iop_clip_and_zoom_vk doesn't exist yet); when scales differ
+  // we fall back to OpenCL / CPU.
+  if(roi_out->scale != roi_in->scale && ch == 4) return -1;
+
+  // Sub-region pass-through copy: the OpenCL path is
+  // enqueue_copy_image with src origin = (roi_out->x, roi_out->y).
+  // The §5.14 multi-region copy helper covers this with one
+  // vkCmdCopyBuffer call (one VkBufferCopy per row).
+  const int rc = dt_vulkan_copy_subregion(piece->pipe->devid,
+                                          dev_out, dev_in,
+                                          (size_t)roi_out->x, (size_t)roi_out->y,
+                                          0, 0,
+                                          (size_t)roi_out->width,
+                                          (size_t)roi_out->height,
+                                          (size_t)roi_in->width,
+                                          (size_t)roi_out->width,
+                                          4 * sizeof(float));
+
+  if(dt_iop_is_raster_mask_used(piece->module, BLEND_RASTER_ID) && (rc == 0))
+  {
+    float *mask = _get_rasterfile_mask(piece, roi_in, roi_out);
+    if(mask)
+      dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
+    else
+      dt_iop_piece_clear_raster(piece, NULL);
+  }
+  else
+    dt_iop_piece_clear_raster(piece, NULL);
+
+  return rc;
+}
+#endif
 
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
