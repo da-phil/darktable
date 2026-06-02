@@ -155,7 +155,11 @@ set(VK_KERNELS
     ll_laplacian_assemble:ll_laplacian_assemble
     ll_write_back:ll_write_back
     colorin_unbound:colorin_unbound
-    colorin_clipping:colorin_clipping)
+    colorin_clipping:colorin_clipping
+    lut3d_none:lut3d_none
+    lut3d_trilinear:lut3d_trilinear
+    lut3d_tetrahedral:lut3d_tetrahedral
+    lut3d_pyramid:lut3d_pyramid)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
