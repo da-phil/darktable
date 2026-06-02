@@ -614,6 +614,23 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  // crop's `modify_roi_in` aligns roi_in to the cropped region, so
+  // dev_in is already the cropped image. process_cl just enqueues a
+  // copy; the Vulkan twin does the same via dt_vulkan_copy_device_to_device.
+  // Both buffers are float4 per pixel and roi_out matches roi_in's
+  // dimensions when the pipeline reaches this point.
+  const size_t size = (size_t)roi_out->width * roi_out->height * 4 * sizeof(float);
+  return dt_vulkan_copy_device_to_device(piece->pipe->devid, dev_out, dev_in, size);
+}
+#endif
+
 void commit_params(dt_iop_module_t *self,
                    dt_iop_params_t *p1,
                    dt_dev_pixelpipe_t *pipe,
