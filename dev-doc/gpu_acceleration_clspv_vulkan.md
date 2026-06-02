@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 57 modules currently expose `process_vk`,
+**Per-module ports**: 58 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -249,6 +249,7 @@ in three categories.
 | `src/iop/crop.c` | Hard image crop. `crop` runs ahead of distort and its `modify_roi_in` aligns roi_in to the cropped region — by the time the pipeline reaches `process_cl` / `process_vk` the input buffer is already the cropped image, and the OpenCL fast-path is just `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, …)`. The Vulkan twin is one line: `dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, roi_out->w * roi_out->h * 4 * sizeof(float))`. Practically valuable because `crop` is always in the pipeline — a missing `process_vk` here forces a CL↔VK transition for every image even though no actual kernel work happens. Same shape as `mask_manager`. |
 | `src/iop/lut3d.c` | 3-D LUT colour grading (Hald CLUT / .cube / GMIC). All four kernels port via the image-shortcut (sampler-clamp integer coords on in/out, the LUT was already a flat `global float *` storage buffer in OpenCL): `lut3d_none` (2 bindings, 8 B PC — identity copy when no LUT is configured), `lut3d_trilinear` / `lut3d_tetrahedral` / `lut3d_pyramid` (3 bindings each — in, out, clut — 12 B PC with `width, height, level`). The 8-corner cube indexing math `(color = ir + ig*level + ib*level²; i000 = color*3 …)` translates verbatim — the OpenCL packs 3 floats per LUT entry rather than a `float3` (no SoA alignment in `global float*`) and the Vulkan port keeps the same layout. The `clip4` clamp to [0, 1] is applied to the entire float4 input including alpha, matching OpenCL byte-for-byte. `process_vk` mirrors `process_cl`'s ICC-profile transform sandwich: optional `work_profile → lut_profile` via `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12), kernel dispatch with `src = transform ? dev_out : dev_in`, then `lut_profile → work_profile`. Validated end-to-end on lavapipe against a C reference of all 4 algorithms with a non-identity LUT and an alpha > 1 input (caught the clip4-clamps-alpha subtlety): trilinear bit-equal, tetrahedral and pyramid at 7e-9 (single-bit FP). |
 | `src/iop/liquify.c` | Per-pixel free-form image warp with a user-painted spline / point distortion map. The OpenCL `warp_kernel` uses `read_imagef(in, sampleri, ...)` — `sampleri` is the CLK_FILTER_NEAREST + CLK_ADDRESS_CLAMP_TO_EDGE sampler, applied with the integer-truncated source coord — so the Lanczos / bicubic / bilinear reconstruction is done in kernel code via a host-prepared discrete kernel `k[]`, not by a hardware sampler. That makes liquify image-shortcut tractable like `lut3d` / `colormapping`. The Vulkan port folds the OpenCL flow's two dispatches (sub-region image copy + warp pass) into a single `liquify_warp` kernel dispatched over `roi_out`: every output pixel pass-through-copies its image-coord input by default, and only the pixels inside `map_extent` with a non-zero warp run the 2a×2a reconstruction. 4 bindings (in, out, map `float2[]`, k `float[]`) + 14-int 56 B PC carrying all 6 small structs the OpenCL kernel took as separate buffer args (`roi_in.{x,y,w,h}`, `roi_out.{x,y,w,h}`, `map_extent.{x,y,w,h}`, `kdesc.{size, resolution}`). When the host builds an empty map (no user warps yet) the Vulkan path short-circuits to a single `dt_vulkan_copy_device_to_device` when `roi_in == roi_out`. The Lanczos kernel-table compilation in the host (bilinear / bicubic / lanczos2 / lanczos3 → up to 6-tap `k[]`) ports verbatim from `process_cl`. Validated end-to-end on lavapipe against a C reference of the same warp math: pass-through (`warp == 0` everywhere), bilinear warp inside a 16×12 map_extent, and lanczos2 warp inside an 18×14 map_extent — **all three bit-equal (max 0.0)**. |
+| `src/iop/rasterfile.c` | Loads a separately-exported mask file (.pfm) and routes its data through the raster-mask infrastructure for downstream blending. The OpenCL `process_cl` has two paths: when `roi_out->scale != roi_in->scale` it delegates to `dt_iop_clip_and_zoom_cl` (real bilinear / lanczos resampling — sampler-blocked, no Vulkan twin yet), and otherwise it does a sub-region copy via `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, (roi_out->x, roi_out->y), (0, 0), (w, h))`. The Vulkan port covers the same-scale path via the new `dt_vulkan_copy_subregion` HAL helper (§5.9 entry 2) — one `vkCmdCopyBuffer` with `roi_out->height` `VkBufferCopy` row descriptors — and returns -1 for the resample path so the pipeline falls back to OpenCL / CPU. The mask-preview GUI focus mode (`visual = fullpipe && dt_iop_has_focus(self)`) also returns -1 like `process_cl`. The raster-mask plumbing (`dt_iop_piece_set_raster` / `_clear_raster`) is host-side and ports verbatim. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -432,7 +433,7 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `shadhi`, `retouch`, `monochrome` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
-  clipping), rasterfile. These
+  clipping). These
   need the sampled-image + sampler bindings (§5.2 milestone 5) and
   in some cases full distort pipelines. Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
@@ -454,7 +455,11 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   bilinear reconstruction is done in kernel code via a host-prepared
   `k[]` table, not by a hardware sampler; the Vulkan port folds the
   CL flow's image-copy + warp dispatches into one kernel that runs
-  the reconstruction inside map_extent and passes-through outside).
+  the reconstruction inside map_extent and passes-through outside),
+  `rasterfile` (same-scale sub-region pass-through via the new
+  `dt_vulkan_copy_subregion` HAL helper — §5.9 entry 2; the different-
+  scale resample path still needs the §8.5 sampler / resampler helper
+  and falls back to OpenCL / CPU).
   `overlay` was originally in this
   bucket but turned out to be tractable without sampler support — its
   image-bound CL signature was rewritten to storage buffers (RGBA float
@@ -779,20 +784,36 @@ arbitrary destination rectangle with a constant colour, and copying
 a source rectangle into an offset region of a larger destination
 buffer.
 
-Two complementary mechanisms exist:
+Three complementary mechanisms exist:
 
 1. **Device-to-device buffer copy** (`dt_vulkan_copy_device_to_device`)
    — a thin wrapper around `vkCmdCopyBuffer` for full-buffer
    `dt_vk_mem_t* → dt_vk_mem_t*` transfers, no kernel needed. Used
    by `mask_manager` (the entire OpenCL path was a single
    `enqueue_copy_image`; the Vulkan equivalent is one
-   `vkCmdCopyBuffer` of the float4 pipe buffer).
+   `vkCmdCopyBuffer` of the float4 pipe buffer), and by `crop` and
+   `liquify`'s empty-map shortcut.
 
-2. **Sub-region copy / fill kernels** (`borders.cl::borders_copy`,
+2. **Sub-region 2-D copy** (`dt_vulkan_copy_subregion`) — submits a
+   single `vkCmdCopyBuffer` with `region_h` `VkBufferCopy` entries
+   (one per row), each describing a `region_w * bytes_per_pixel`-byte
+   row copy from `src + (src_y + r) * src_stride + src_x * bpp` to
+   `dst + (dst_y + r) * dst_stride + dst_x * bpp`. Generalises the
+   OpenCL `enqueue_copy_image(src, dst, src_origin, dst_origin, region)`
+   primitive for arbitrary row strides and origin offsets in either
+   buffer. Used by `rasterfile` for its same-scale sub-region pass-
+   through (the OpenCL path is exactly `enqueue_copy_image` with
+   `(roi_out->x, roi_out->y)` as the src origin). The per-row
+   `VkBufferCopy` cost is proportional to `region_h` — fine for typical
+   image sizes (4000 rows × ~16 B per descriptor ≈ 64 KB of region
+   array, well within typical command-buffer command stream budgets).
+
+3. **Sub-region copy / fill kernels** (`borders.cl::borders_copy`,
    `borders.cl::borders_fill`) — when the source or destination is
-   a strict subrectangle of a larger buffer, kernel-based copies and
-   fills are clearer than chains of `vkCmdCopyBuffer`s with per-row
-   `VkBufferCopy` regions. The OpenCL build dispatches the fill
+   a strict subrectangle of a larger buffer *and* the copy needs to
+   thread between a constant fill and a non-trivial source, kernel-
+   based copies are clearer than splitting the work across multiple
+   `vkCmdCopyBuffer` calls. The OpenCL build dispatches the fill
    kernel over the entire canvas and returns early outside the
    target rectangle; the Vulkan port instead dispatches the kernel
    exactly over the target rectangle (since buffer storage doesn't

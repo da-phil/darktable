@@ -330,6 +330,22 @@ int dt_vulkan_copy_device_to_device(int devid,
                                     const dt_vk_mem_t *src,
                                     size_t size);
 
+/** Sub-region 2-D copy from `src` to `dst`. Maps onto a single
+ *  `vkCmdCopyBuffer` with `region_h` `VkBufferCopy` entries (one
+ *  per row). The src/dst buffers are interpreted as row-major
+ *  pixel grids with `*_row_pixels` pixels per row and
+ *  `bytes_per_pixel` bytes per pixel; `*_offset_{x,y}` are the top-
+ *  left of the rectangle in each. Used by rasterfile, and a building
+ *  block for future ports that need cropped / shifted-origin copies. */
+int dt_vulkan_copy_subregion(int devid,
+                             dt_vk_mem_t *dst,
+                             const dt_vk_mem_t *src,
+                             size_t src_offset_x, size_t src_offset_y,
+                             size_t dst_offset_x, size_t dst_offset_y,
+                             size_t region_w, size_t region_h,
+                             size_t src_row_pixels, size_t dst_row_pixels,
+                             size_t bytes_per_pixel);
+
 // ---- dispatch --------------------------------------------------------
 
 /** Bind storage buffers (count must match the kernel's registered
@@ -396,6 +412,15 @@ static inline int dt_vulkan_dispatch_n_batched(const dt_vk_module_kernel_t *k,
 static inline int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *d,
                                                   const dt_vk_mem_t *s, size_t sz)
 { (void)devid; (void)d; (void)s; (void)sz; return -1; }
+
+static inline int dt_vulkan_copy_subregion(int devid, dt_vk_mem_t *d,
+                                           const dt_vk_mem_t *s,
+                                           size_t sox, size_t soy,
+                                           size_t dox, size_t doy,
+                                           size_t rw, size_t rh,
+                                           size_t srp, size_t drp, size_t bpp)
+{ (void)devid; (void)d; (void)s; (void)sox; (void)soy; (void)dox; (void)doy;
+  (void)rw; (void)rh; (void)srp; (void)drp; (void)bpp; return -1; }
 
 static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
 static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }
