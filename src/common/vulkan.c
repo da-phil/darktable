@@ -650,6 +650,20 @@ static int _record_copy(VkCommandBuffer cmd, void *u)
   return 0;
 }
 
+typedef struct
+{
+  VkBuffer        src, dst;
+  const VkBufferCopy *regions;
+  uint32_t        n_regions;
+} _copy_multi_args_t;
+
+static int _record_copy_multi(VkCommandBuffer cmd, void *u)
+{
+  _copy_multi_args_t *a = u;
+  vkCmdCopyBuffer(cmd, a->src, a->dst, a->n_regions, a->regions);
+  return 0;
+}
+
 // Return d->staging sized at least `size`. Reallocates if the
 // cached buffer is smaller. Always host-visible + both transfer
 // directions so the same buffer serves uploads and downloads.
@@ -721,6 +735,46 @@ int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *dst,
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
   _copy_args_t a = { src->buffer, dst->buffer, (VkDeviceSize)size };
   return _submit_one_shot(d, _record_copy, &a);
+}
+
+int dt_vulkan_copy_subregion(int devid,
+                             dt_vk_mem_t *dst,
+                             const dt_vk_mem_t *src,
+                             size_t src_offset_x, size_t src_offset_y,
+                             size_t dst_offset_x, size_t dst_offset_y,
+                             size_t region_w, size_t region_h,
+                             size_t src_row_pixels, size_t dst_row_pixels,
+                             size_t bytes_per_pixel)
+{
+  if(!dt_vulkan_running() || !dst || !src) return -1;
+  if(region_w == 0 || region_h == 0) return 0;
+  (void)devid;
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+
+  // One VkBufferCopy region per row. For small region_h this is a
+  // single command; for large region_h the driver-side cost is
+  // proportional to row count but the per-row copy itself runs at
+  // device-memory bandwidth.
+  VkBufferCopy *regions = malloc(sizeof(VkBufferCopy) * region_h);
+  if(!regions) return -1;
+  const VkDeviceSize row_bytes = (VkDeviceSize)region_w * bytes_per_pixel;
+  const VkDeviceSize src_stride = (VkDeviceSize)src_row_pixels * bytes_per_pixel;
+  const VkDeviceSize dst_stride = (VkDeviceSize)dst_row_pixels * bytes_per_pixel;
+  for(size_t r = 0; r < region_h; r++)
+  {
+    regions[r].srcOffset = (VkDeviceSize)(src_offset_y + r) * src_stride
+                         + (VkDeviceSize)src_offset_x * bytes_per_pixel;
+    regions[r].dstOffset = (VkDeviceSize)(dst_offset_y + r) * dst_stride
+                         + (VkDeviceSize)dst_offset_x * bytes_per_pixel;
+    regions[r].size = row_bytes;
+  }
+  _copy_multi_args_t a = {
+    .src = src->buffer, .dst = dst->buffer,
+    .regions = regions, .n_regions = (uint32_t)region_h
+  };
+  const int rc = _submit_one_shot(d, _record_copy_multi, &a);
+  free(regions);
+  return rc;
 }
 
 // ---- dispatch --------------------------------------------------------
