@@ -113,6 +113,12 @@ typedef struct dt_iop_lut3d_global_data_t
   int kernel_lut3d_trilinear;
   int kernel_lut3d_pyramid;
   int kernel_lut3d_none;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_tetrahedral;
+  dt_vk_module_kernel_t vk_trilinear;
+  dt_vk_module_kernel_t vk_pyramid;
+  dt_vk_module_kernel_t vk_none;
+#endif
 } dt_iop_lut3d_global_data_t;
 
 #ifdef HAVE_GMIC
@@ -1080,6 +1086,91 @@ cleanup:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// 3 ints PC for the interpolation kernels (width, height, level);
+// 2 ints for lut3d_none (width, height).
+typedef struct { int width; int height; int level; } vk_lut3d_pc_t;
+typedef struct { int width; int height;            } vk_lut3d_none_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lut3d_data_t *d = piece->data;
+  const dt_iop_lut3d_global_data_t *gd = self->global_data;
+  const float *const clut = (float *)d->clut;
+  const int level = d->level;
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // No LUT configured → identity copy via the lut3d_none kernel.
+  if(!(clut && level))
+  {
+    const vk_lut3d_none_pc_t pc = { .width = width, .height = height };
+    return dt_vulkan_dispatch_inout(&gd->vk_none, dev_in, dev_out,
+                                    width, height, &pc, sizeof(pc));
+  }
+
+  const dt_vk_module_kernel_t *kernel
+    = (d->params.interpolation == DT_IOP_TETRAHEDRAL) ? &gd->vk_tetrahedral
+    : (d->params.interpolation == DT_IOP_TRILINEAR)   ? &gd->vk_trilinear
+                                                      : &gd->vk_pyramid;
+
+  const int colorspace
+    = (d->params.colorspace == DT_IOP_SRGB)           ? DT_COLORSPACE_SRGB
+    : (d->params.colorspace == DT_IOP_REC709)         ? DT_COLORSPACE_REC709
+    : (d->params.colorspace == DT_IOP_ARGB)           ? DT_COLORSPACE_ADOBERGB
+    : (d->params.colorspace == DT_IOP_LIN_PROPHOTO)   ? DT_COLORSPACE_PROPHOTO_RGB
+    : (d->params.colorspace == DT_IOP_LIN_REC709)     ? DT_COLORSPACE_LIN_REC709
+                                                      : DT_COLORSPACE_LIN_REC2020;
+  const dt_iop_order_iccprofile_info_t *const lut_profile
+    = dt_ioppr_add_profile_info_to_list(self->dev, colorspace, "", INTENT_PERCEPTUAL);
+  const dt_iop_order_iccprofile_info_t *const work_profile
+    = dt_ioppr_get_iop_work_profile_info(self, self->dev->iop);
+  gboolean transform = (work_profile && lut_profile) ? TRUE : FALSE;
+
+  const size_t clut_bytes = sizeof(float) * 3 * level * level * level;
+  dt_vk_mem_t *dev_clut = dt_vulkan_alloc_buffer(devid, clut_bytes);
+  if(!dev_clut) return -1;
+
+  int rc = -1;
+  if(transform)
+  {
+    if(!dt_ioppr_transform_image_colorspace_rgb_vk(devid, dev_in, dev_out,
+                                                   width, height,
+                                                   work_profile, lut_profile,
+                                                   "work profile to LUT profile"))
+      transform = FALSE;
+  }
+
+  const vk_lut3d_pc_t pc = { .width = width, .height = height, .level = level };
+  dt_vk_mem_t *const src = transform ? dev_out : dev_in;
+  dt_vk_mem_t *bufs[] = { src, dev_out, dev_clut };
+  const dt_vk_upload_t uploads[] = {
+    { dev_clut, (void *)clut, clut_bytes },
+  };
+  if(dt_vulkan_dispatch_n_batched(kernel, bufs, 3,
+                                  uploads, 1,
+                                  width, height, &pc, sizeof(pc)) != 0)
+    goto cleanup_v;
+
+  if(transform)
+  {
+    if(!dt_ioppr_transform_image_colorspace_rgb_vk(devid, dev_out, dev_out,
+                                                   width, height,
+                                                   lut_profile, work_profile,
+                                                   "LUT profile to work profile"))
+      goto cleanup_v;
+  }
+  rc = 0;
+
+cleanup_v:
+  dt_vulkan_free_buffer(devid, dev_clut);
+  return rc;
+}
+#endif
+
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ibuf, void *const obuf,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
@@ -1149,6 +1240,20 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_lut3d_trilinear = dt_opencl_create_kernel(program, "lut3d_trilinear");
   gd->kernel_lut3d_pyramid = dt_opencl_create_kernel(program, "lut3d_pyramid");
   gd->kernel_lut3d_none = dt_opencl_create_kernel(program, "lut3d_none");
+#ifdef HAVE_VULKAN
+  // 3 ints PC for the 3 interpolation kernels (width, height, level),
+  // 2 ints for lut3d_none. 3 bindings (in, out, clut) / 2 (in, out).
+  const uint32_t pc3  = 3 * sizeof(int);
+  const uint32_t pc2  = 2 * sizeof(int);
+  dt_vulkan_module_kernel_load(&gd->vk_tetrahedral, "lut3d_tetrahedral",
+                               "lut3d_tetrahedral", 3, pc3, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_trilinear,   "lut3d_trilinear",
+                               "lut3d_trilinear",   3, pc3, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_pyramid,     "lut3d_pyramid",
+                               "lut3d_pyramid",     3, pc3, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_none,        "lut3d_none",
+                               "lut3d_none",        2, pc2, 16, 16, 1);
+#endif
 
 #ifdef HAVE_GMIC
   // make sure the cache dir exists
@@ -1166,6 +1271,12 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_lut3d_trilinear);
   dt_opencl_free_kernel(gd->kernel_lut3d_pyramid);
   dt_opencl_free_kernel(gd->kernel_lut3d_none);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_tetrahedral);
+  dt_vulkan_module_kernel_unload(&gd->vk_trilinear);
+  dt_vulkan_module_kernel_unload(&gd->vk_pyramid);
+  dt_vulkan_module_kernel_unload(&gd->vk_none);
+#endif
   free(self->data);
   self->data = NULL;
 }

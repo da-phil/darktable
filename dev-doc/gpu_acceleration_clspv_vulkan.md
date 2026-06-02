@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 55 modules currently expose `process_vk`,
+**Per-module ports**: 56 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -247,6 +247,7 @@ in three categories.
 | `src/iop/colormapping.c` | Hertzmann-style colour-transfer mapping: equalised L histogram remap + soft-cluster-weighted Lab a/b remap from target to source statistics. Both kernels (`colormapping_histogram` and `colormapping_mapping`) port via the standard image-shortcut (the OpenCL `image2d_t` reads only use integer fixed coords, equivalent to flat `in[y*width + x]`). Histogram has 4 bindings (in, out, target_hist `int[2048]`, source_ihist `float[2048]`) with a 12 B PC (width, height, equalization); mapping has 7 bindings (in, tmp, out, target_mean `float2[5]`, source_mean `float2[5]`, var_ratio `float2[5]`, mapio `int[5]`) with a 12 B PC (width, height, clusters). `get_clusters` (chroma-distance soft membership) is inlined into the mapping kernel. The ACQUIRE preview-pipe input snapshot for host-side cluster training (`_get_cluster_mapping`) reads back via `dt_vulkan_read_from_device` — same precedent as `globaltonemap`'s lwmax cache miss and `hazeremoval`'s ambient-light snapshot. The bilateral-smoothed dL path reuses the §5.13 helper; the `equalization < 0.001` shortcut skips the bilateral and copies dev_out → dev_tmp via `dt_vulkan_copy_device_to_device`. When no source/target stats are present yet (the default-pass-through state) `process_vk` shortcuts to a single `dt_vulkan_copy_device_to_device` like `process_cl`'s `enqueue_copy_image` shortcut. Validated end-to-end on lavapipe with both kernels against an independent C reference: histogram matches at 3.8e-6, mapping at 1.5e-5 — single-bit FP precision over the cluster-weighted sum. |
 | `src/iop/colorin.c` | Input ICC colour profile transform — the input-side mirror of `colorout`. Two kernels picked by `d->nrgb`: `colorin_unbound` (cam → XYZ via cmat then XYZ → Lab) and `colorin_clipping` (cam → RGB via cmat, clipped to [0, 1], then RGB → XYZ via lmat, then XYZ → Lab). Both share the same 7-binding (in, out, lutr, lutg, lutb, cmat, lmat) / 64 B PC (width, height, blue_mapping, corr.xyzw, a_r/g/b\[0..2\]) shape; lmat is unused in `colorin_unbound` but kept for binding symmetry. The OpenCL `image2d_t`-shaped LUTs (256×256 = 65536 entries each) become flat float storage buffers; the LUT lookups use `vk_lerp_lookup_unbounded` to match `lerp_lookup_unbounded0`'s linear interpolation between adjacent entries byte-for-byte (the gamma-power extrapolation tail `c1·pow(x·c0, c2)` for x ≥ 1 is reproduced identically). The Bayer blue-mapping gamut clamp is folded into both kernels behind the `blue_mapping` flag, mirroring the OpenCL kernel; `process_vk` ANDs the user flag with `dt_image_is_matrix_correction_supported(&pipe->image)` just like `process_cl`. The white-balance correction `(D65 / as-shot)` is computed host-side from `self->dev->chroma` (the `late_correction` path also mutates `pipe->dsc.temperature.coeffs` and `pipe->dsc.processed_maximum`, mirroring the CL behaviour). The `DT_COLORSPACE_LAB` fast path routes through `dt_vulkan_copy_device_to_device` (same shape as `colorout`'s Lab pass-through). The lcms2 slow path (non-matrix profiles) stays on CPU as in OpenCL. Validated end-to-end on lavapipe against an independent C reference of both kernels' math: unbound + blue_mapping at 1.8e-4, clipping at 9e-5 — FP precision through the LUT lerp + matrix + XYZ→Lab chain. |
 | `src/iop/crop.c` | Hard image crop. `crop` runs ahead of distort and its `modify_roi_in` aligns roi_in to the cropped region — by the time the pipeline reaches `process_cl` / `process_vk` the input buffer is already the cropped image, and the OpenCL fast-path is just `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, …)`. The Vulkan twin is one line: `dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, roi_out->w * roi_out->h * 4 * sizeof(float))`. Practically valuable because `crop` is always in the pipeline — a missing `process_vk` here forces a CL↔VK transition for every image even though no actual kernel work happens. Same shape as `mask_manager`. |
+| `src/iop/lut3d.c` | 3-D LUT colour grading (Hald CLUT / .cube / GMIC). All four kernels port via the image-shortcut (sampler-clamp integer coords on in/out, the LUT was already a flat `global float *` storage buffer in OpenCL): `lut3d_none` (2 bindings, 8 B PC — identity copy when no LUT is configured), `lut3d_trilinear` / `lut3d_tetrahedral` / `lut3d_pyramid` (3 bindings each — in, out, clut — 12 B PC with `width, height, level`). The 8-corner cube indexing math `(color = ir + ig*level + ib*level²; i000 = color*3 …)` translates verbatim — the OpenCL packs 3 floats per LUT entry rather than a `float3` (no SoA alignment in `global float*`) and the Vulkan port keeps the same layout. The `clip4` clamp to [0, 1] is applied to the entire float4 input including alpha, matching OpenCL byte-for-byte. `process_vk` mirrors `process_cl`'s ICC-profile transform sandwich: optional `work_profile → lut_profile` via `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12), kernel dispatch with `src = transform ? dev_out : dev_in`, then `lut_profile → work_profile`. Validated end-to-end on lavapipe against a C reference of all 4 algorithms with a non-identity LUT and an alpha > 1 input (caught the clip4-clamps-alpha subtlety): trilinear bit-equal, tetrahedral and pyramid at 7e-9 (single-bit FP). |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -292,8 +293,7 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   profile plumbing §5.11), `lowlight` (template for the next LUT
   consumers).
 - **EASY bucket** — one or two storage buffers for matrices /
-  LUTs: `lut3d` (3D LUT — needs a 256³ float buffer or sampled
-  image, blocked on §8.5). Done in earlier passes:
+  LUTs. Done in earlier passes:
   `basecurve` (non-fusion path — the two LUT kernels off the
   curve-cohort template; the Laplacian-pyramid fusion path needs
   §8.5 and stays on OpenCL via a `process_vk_ready` gate),
@@ -317,7 +317,12 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `pack_3xSSE_to_3x3`), `agx` (first to migrate a >128 B param
   struct from PC into a storage-buffer binding — pattern available
   for future param-heavy ports), `channelmixer` (legacy 4-mode
-  mixer reusing the existing HSL helpers).
+  mixer reusing the existing HSL helpers),
+  `lut3d` (3-D LUT colour grading — turned out tractable without
+  §8.5 since the LUT was already a flat `global float *` buffer in
+  OpenCL and the cube indexing math doesn't need sampler filtering;
+  all 4 algorithms ported, ICC-profile transform sandwich reuses
+  §5.12 `dt_ioppr_transform_image_colorspace_rgb_vk`).
 - **MODERATE** — multi-pass with intermediate buffers or
   local-memory barriers: `highlights`. The Gaussian VK
   helper (§5.10) handles the separable-blur half (`blurs` uses

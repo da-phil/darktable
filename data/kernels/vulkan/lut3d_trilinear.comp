@@ -1,0 +1,50 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly  buffer CLUT { float data[]; } clut;
+layout(push_constant) uniform PC { int width; int height; int level; } pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+
+  int level2 = pc.level * pc.level;
+  vec4 input_pix = clamp(in_buf.data[idx], vec4(0.0), vec4(1.0));
+
+  vec4 rgbd = input_pix * float(pc.level - 1);
+  ivec4 rgbi = clamp(ivec4(rgbd), ivec4(0), ivec4(pc.level - 2));
+  rgbd -= vec4(rgbi);
+
+  int color = rgbi.x + rgbi.y * pc.level + rgbi.z * level2;
+  int i000 = color * 3;
+  int i100 = i000 + 3;
+  int i010 = (color + pc.level) * 3;
+  int i110 = i010 + 3;
+  int i001 = (color + level2) * 3;
+  int i101 = i001 + 3;
+  int i011 = (color + pc.level + level2) * 3;
+  int i111 = i011 + 3;
+
+  vec4 c000 = vec4(clut.data[i000], clut.data[i000+1], clut.data[i000+2], 0.0);
+  vec4 c100 = vec4(clut.data[i100], clut.data[i100+1], clut.data[i100+2], 0.0);
+  vec4 c010 = vec4(clut.data[i010], clut.data[i010+1], clut.data[i010+2], 0.0);
+  vec4 c110 = vec4(clut.data[i110], clut.data[i110+1], clut.data[i110+2], 0.0);
+  vec4 c001 = vec4(clut.data[i001], clut.data[i001+1], clut.data[i001+2], 0.0);
+  vec4 c101 = vec4(clut.data[i101], clut.data[i101+1], clut.data[i101+2], 0.0);
+  vec4 c011 = vec4(clut.data[i011], clut.data[i011+1], clut.data[i011+2], 0.0);
+  vec4 c111 = vec4(clut.data[i111], clut.data[i111+1], clut.data[i111+2], 0.0);
+
+  vec4 tmp1 = c000 * (1.0 - rgbd.x) + c100 * rgbd.x;
+  vec4 tmp2 = c010 * (1.0 - rgbd.x) + c110 * rgbd.x;
+  vec4 output_pix = tmp1 * (1.0 - rgbd.y) + tmp2 * rgbd.y;
+  tmp1 = c001 * (1.0 - rgbd.x) + c101 * rgbd.x;
+  tmp2 = c011 * (1.0 - rgbd.x) + c111 * rgbd.x;
+  tmp1 = tmp1 * (1.0 - rgbd.y) + tmp2 * rgbd.y;
+  output_pix = output_pix * (1.0 - rgbd.z) + tmp1 * rgbd.z;
+
+  output_pix.w = input_pix.w;
+  out_buf.data[idx] = output_pix;
+}
