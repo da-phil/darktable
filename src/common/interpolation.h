@@ -179,6 +179,21 @@ int dt_interpolation_resample_roi_cl(const dt_interpolation_t *itor, int devid, 
                                      const dt_iop_roi_t *const roi_in);
 #endif
 
+#include "common/vulkan.h"
+#ifdef HAVE_VULKAN
+/** Vulkan equivalent of dt_interpolation_resample_cl. Operates on
+ *  flat float4 storage buffers. Uses the same `_prepare_resampling_plan`
+ *  tables as the OpenCL path but a single-pass full-convolution gather
+ *  kernel (no workgroup-local memory). Returns 0 on success or -1 on
+ *  failure (the caller should fall back to OpenCL / CPU). See
+ *  dev-doc/gpu_acceleration_clspv_vulkan.md §5.18. */
+int dt_interpolation_resample_vk(const dt_interpolation_t *itor, int devid,
+                                 dt_vk_mem_t *dev_out,
+                                 const dt_iop_roi_t *const roi_out,
+                                 dt_vk_mem_t *dev_in,
+                                 const dt_iop_roi_t *const roi_in);
+#endif
+
 void dt_interpolation_resample_mask(const dt_interpolation_t *itor,
                                   float *out, const dt_iop_roi_t *const roi_out,
                                   const float *const in, const dt_iop_roi_t *const roi_in);

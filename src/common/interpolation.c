@@ -1395,6 +1395,143 @@ int dt_interpolation_resample_roi_cl(const dt_interpolation_t *itor,
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Kernel slots loaded lazily on first dt_interpolation_resample_vk
+// call (the interpolation module has no global-data hook of its own
+// in the Vulkan path, so we keep static slots like the device
+// helpers in bilateralvk / dwt).
+static dt_vk_module_kernel_t _vk_resample = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_rcopy    = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_resample_loaded = FALSE;
+
+typedef struct { int width, height, in_width, in_height; } _vk_resample_pc_t;
+typedef struct { int owidth, oheight, iwidth, iheight, dx, dy; } _vk_rcopy_pc_t;
+
+static void _vk_resample_ensure(void)
+{
+  if(_vk_resample_loaded) return;
+  if(!dt_vulkan_running()) return;
+  dt_vulkan_module_kernel_load(&_vk_resample, "interpolation_resample",
+                               "interpolation_resample", 10,
+                               sizeof(_vk_resample_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_rcopy, "interpolation_copy",
+                               "interpolation_copy", 2,
+                               sizeof(_vk_rcopy_pc_t), 16, 16, 1);
+  _vk_resample_loaded = TRUE;
+}
+
+int dt_interpolation_resample_vk(const dt_interpolation_t *itor,
+                                 const int devid,
+                                 dt_vk_mem_t *dev_out,
+                                 const dt_iop_roi_t *const roi_out,
+                                 dt_vk_mem_t *dev_in,
+                                 const dt_iop_roi_t *const roi_in)
+{
+  if(!dt_vulkan_running()) return -1;
+  _vk_resample_ensure();
+  if(_vk_resample.kernel < 0 || _vk_rcopy.kernel < 0) return -1;
+
+  int *hindex = NULL, *hlength = NULL, *hmeta = NULL;
+  int *vindex = NULL, *vlength = NULL, *vmeta = NULL;
+  float *hkernel = NULL, *vkernel = NULL;
+
+  const int dx = MAX(0, roi_out->x);
+  const int dy = MAX(0, roi_out->y);
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const gboolean wd_fit = roi_in->width >= (width - dx);
+  const gboolean ht_fit = roi_in->height >= (height - dy);
+  const gboolean copymode = roi_out->scale == 1.0f;
+
+  // Fast 1:1 copy / crop path.
+  if(copymode)
+  {
+    if(wd_fit && ht_fit)
+    {
+      // Pure sub-region copy from (dx, dy) into (0, 0).
+      return dt_vulkan_copy_subregion(devid, dev_out, dev_in,
+                                      (size_t)dx, (size_t)dy, 0, 0,
+                                      (size_t)width, (size_t)height,
+                                      (size_t)roi_in->width, (size_t)width,
+                                      4 * sizeof(float));
+    }
+    // Expanded crop with possible out-of-bounds (zero-fill) — kernel.
+    const _vk_rcopy_pc_t pc = { width, height, roi_in->width, roi_in->height, dx, dy };
+    return dt_vulkan_dispatch_inout(&_vk_rcopy, dev_in, dev_out,
+                                    width, height, &pc, sizeof(pc));
+  }
+
+  // Generic non-1:1 case: build the same separable plans the OpenCL
+  // path uses.
+  int rc = -1;
+  dt_vk_mem_t *d_hindex = NULL, *d_hlength = NULL, *d_hkernel = NULL, *d_hmeta = NULL;
+  dt_vk_mem_t *d_vindex = NULL, *d_vlength = NULL, *d_vkernel = NULL, *d_vmeta = NULL;
+
+  if(_prepare_resampling_plan(itor, roi_in->width, width, dx, roi_out->scale,
+                              &hlength, &hkernel, &hindex, &hmeta))
+    goto cleanup;
+  if(_prepare_resampling_plan(itor, roi_in->height, height, dy, roi_out->scale,
+                              &vlength, &vkernel, &vindex, &vmeta))
+    goto cleanup;
+
+  int hmaxtaps = -1, vmaxtaps = -1;
+  for(int k = 0; k < width; k++)  hmaxtaps = MAX(hmaxtaps, hlength[k]);
+  for(int k = 0; k < height; k++) vmaxtaps = MAX(vmaxtaps, vlength[k]);
+
+  const size_t hindex_bytes  = sizeof(int)   * (size_t)width  * (hmaxtaps + 1);
+  const size_t hkernel_bytes = sizeof(float) * (size_t)width  * (hmaxtaps + 1);
+  const size_t vindex_bytes  = sizeof(int)   * (size_t)height * (vmaxtaps + 1);
+  const size_t vkernel_bytes = sizeof(float) * (size_t)height * (vmaxtaps + 1);
+  const size_t hlength_bytes = sizeof(int)   * (size_t)width;
+  const size_t vlength_bytes = sizeof(int)   * (size_t)height;
+  const size_t hmeta_bytes   = sizeof(int)   * (size_t)width  * 3;
+  const size_t vmeta_bytes   = sizeof(int)   * (size_t)height * 3;
+
+  d_hindex  = dt_vulkan_alloc_buffer(devid, hindex_bytes);
+  d_hlength = dt_vulkan_alloc_buffer(devid, hlength_bytes);
+  d_hkernel = dt_vulkan_alloc_buffer(devid, hkernel_bytes);
+  d_hmeta   = dt_vulkan_alloc_buffer(devid, hmeta_bytes);
+  d_vindex  = dt_vulkan_alloc_buffer(devid, vindex_bytes);
+  d_vlength = dt_vulkan_alloc_buffer(devid, vlength_bytes);
+  d_vkernel = dt_vulkan_alloc_buffer(devid, vkernel_bytes);
+  d_vmeta   = dt_vulkan_alloc_buffer(devid, vmeta_bytes);
+  if(!d_hindex || !d_hlength || !d_hkernel || !d_hmeta
+     || !d_vindex || !d_vlength || !d_vkernel || !d_vmeta)
+    goto cleanup;
+
+  const _vk_resample_pc_t pc = { width, height, roi_in->width, roi_in->height };
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, d_hmeta, d_vmeta,
+                          d_hlength, d_vlength, d_hindex, d_vindex,
+                          d_hkernel, d_vkernel };
+  const dt_vk_upload_t uploads[] = {
+    { d_hmeta,   hmeta,   hmeta_bytes   },
+    { d_vmeta,   vmeta,   vmeta_bytes   },
+    { d_hlength, hlength, hlength_bytes },
+    { d_vlength, vlength, vlength_bytes },
+    { d_hindex,  hindex,  hindex_bytes  },
+    { d_vindex,  vindex,  vindex_bytes  },
+    { d_hkernel, hkernel, hkernel_bytes },
+    { d_vkernel, vkernel, vkernel_bytes },
+  };
+  rc = dt_vulkan_dispatch_n_batched(&_vk_resample, bufs, 10,
+                                    uploads, 8,
+                                    width, height, &pc, sizeof(pc));
+
+cleanup:
+  if(d_hindex)  dt_vulkan_free_buffer(devid, d_hindex);
+  if(d_hlength) dt_vulkan_free_buffer(devid, d_hlength);
+  if(d_hkernel) dt_vulkan_free_buffer(devid, d_hkernel);
+  if(d_hmeta)   dt_vulkan_free_buffer(devid, d_hmeta);
+  if(d_vindex)  dt_vulkan_free_buffer(devid, d_vindex);
+  if(d_vlength) dt_vulkan_free_buffer(devid, d_vlength);
+  if(d_vkernel) dt_vulkan_free_buffer(devid, d_vkernel);
+  if(d_vmeta)   dt_vulkan_free_buffer(devid, d_vmeta);
+  dt_free_align(hlength);
+  dt_free_align(vlength);
+  return rc;
+}
+#endif
+
 /** Applies resampling (re-scaling) on *full* input and output buffers.
  *  roi_in and roi_out define the part of the buffers that is affected.
  */

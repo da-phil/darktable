@@ -160,7 +160,9 @@ set(VK_KERNELS
     lut3d_trilinear:lut3d_trilinear
     lut3d_tetrahedral:lut3d_tetrahedral
     lut3d_pyramid:lut3d_pyramid
-    liquify_warp:liquify_warp)
+    liquify_warp:liquify_warp
+    interpolation_resample:interpolation_resample
+    interpolation_copy:interpolation_copy)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

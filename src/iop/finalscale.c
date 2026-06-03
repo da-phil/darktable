@@ -169,6 +169,30 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  // Upscaling stays on OpenCL / CPU (same gate as process_cl — the
+  // resampler's downscale path is what the Vulkan kernel implements).
+  if(roi_out->scale > 1.0f) return -1;
+
+  const int devid = piece->pipe->devid;
+  const gboolean exporting = dt_pipe_is_export(piece->pipe);
+
+  dt_print_pipe(DT_DEBUG_IMAGEIO,
+                exporting ? "clip_and_zoom_roi" : "clip_and_zoom",
+                piece->pipe, self, devid, roi_in, roi_out, "vk device=%i", devid);
+  if(exporting)
+    return dt_iop_clip_and_zoom_roi_vk(devid, dev_out, dev_in, roi_out, roi_in);
+  else
+    return dt_iop_clip_and_zoom_vk(devid, dev_out, dev_in, roi_out, roi_in);
+}
+#endif
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,
