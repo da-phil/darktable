@@ -242,6 +242,33 @@ int dt_iop_clip_and_zoom_roi_cl(int devid,
 
 #endif
 
+#ifdef HAVE_VULKAN
+int dt_iop_clip_and_zoom_vk(int devid,
+                            dt_vk_mem_t *dev_out,
+                            dt_vk_mem_t *dev_in,
+                            const dt_iop_roi_t *const roi_out,
+                            const dt_iop_roi_t *const roi_in)
+{
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return dt_interpolation_resample_vk(itor, devid, dev_out, roi_out, dev_in, roi_in);
+}
+
+int dt_iop_clip_and_zoom_roi_vk(int devid,
+                                dt_vk_mem_t *dev_out,
+                                dt_vk_mem_t *dev_in,
+                                const dt_iop_roi_t *const roi_out,
+                                const dt_iop_roi_t *const roi_in)
+{
+  // Mirror dt_interpolation_resample_roi_cl: zero the offsets and
+  // resample. The Vulkan single-pass gather kernel has no vertical-
+  // tap-vs-workgroupsize limit, so no CPU fallback is needed.
+  dt_iop_roi_t oroi = *roi_out; oroi.x = oroi.y = 0;
+  dt_iop_roi_t iroi = *roi_in;  iroi.x = iroi.y = 0;
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return dt_interpolation_resample_vk(itor, devid, dev_out, &oroi, dev_in, &iroi);
+}
+#endif
+
 void dt_iop_clip_and_zoom_mosaic_half_size(uint16_t *const out,
                                            const uint16_t *const in,
                                            const dt_iop_roi_t *const roi_out,

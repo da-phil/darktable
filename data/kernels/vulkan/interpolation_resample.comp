@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer HM   { int   data[]; } hmeta;
+layout(std430, binding = 3) readonly buffer VM   { int   data[]; } vmeta;
+layout(std430, binding = 4) readonly buffer HL   { int   data[]; } hlength;
+layout(std430, binding = 5) readonly buffer VL   { int   data[]; } vlength;
+layout(std430, binding = 6) readonly buffer HI   { int   data[]; } hindex;
+layout(std430, binding = 7) readonly buffer VI   { int   data[]; } vindex;
+layout(std430, binding = 8) readonly buffer HK   { float data[]; } hkernel;
+layout(std430, binding = 9) readonly buffer VK   { float data[]; } vkernel;
+layout(push_constant) uniform PC {
+  int width; int height; int in_width; int in_height;
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  int hlidx = hmeta.data[x * 3];
+  int hkidx = hmeta.data[x * 3 + 1];
+  int hiidx = hmeta.data[x * 3 + 2];
+  int vlidx = vmeta.data[y * 3];
+  int vkidx = vmeta.data[y * 3 + 1];
+  int viidx = vmeta.data[y * 3 + 2];
+
+  int hl = hlength.data[hlidx];
+  int vl = vlength.data[vlidx];
+
+  vec4 acc = vec4(0.0);
+  for(int iy = 0; iy < vl; iy++) {
+    int yy = vindex.data[viidx + iy];
+    vec4 hsum = vec4(0.0);
+    for(int ix = 0; ix < hl; ix++) {
+      int xx = hindex.data[hiidx + ix];
+      hsum += in_buf.data[yy * pc.in_width + xx] * hkernel.data[hkidx + ix];
+    }
+    acc += hsum * vkernel.data[vkidx + iy];
+  }
+  out_buf.data[y * pc.width + x] = acc;
+}

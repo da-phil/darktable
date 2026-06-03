@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 58 modules currently expose `process_vk`,
+**Per-module ports**: 59 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -249,7 +249,8 @@ in three categories.
 | `src/iop/crop.c` | Hard image crop. `crop` runs ahead of distort and its `modify_roi_in` aligns roi_in to the cropped region — by the time the pipeline reaches `process_cl` / `process_vk` the input buffer is already the cropped image, and the OpenCL fast-path is just `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, …)`. The Vulkan twin is one line: `dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, roi_out->w * roi_out->h * 4 * sizeof(float))`. Practically valuable because `crop` is always in the pipeline — a missing `process_vk` here forces a CL↔VK transition for every image even though no actual kernel work happens. Same shape as `mask_manager`. |
 | `src/iop/lut3d.c` | 3-D LUT colour grading (Hald CLUT / .cube / GMIC). All four kernels port via the image-shortcut (sampler-clamp integer coords on in/out, the LUT was already a flat `global float *` storage buffer in OpenCL): `lut3d_none` (2 bindings, 8 B PC — identity copy when no LUT is configured), `lut3d_trilinear` / `lut3d_tetrahedral` / `lut3d_pyramid` (3 bindings each — in, out, clut — 12 B PC with `width, height, level`). The 8-corner cube indexing math `(color = ir + ig*level + ib*level²; i000 = color*3 …)` translates verbatim — the OpenCL packs 3 floats per LUT entry rather than a `float3` (no SoA alignment in `global float*`) and the Vulkan port keeps the same layout. The `clip4` clamp to [0, 1] is applied to the entire float4 input including alpha, matching OpenCL byte-for-byte. `process_vk` mirrors `process_cl`'s ICC-profile transform sandwich: optional `work_profile → lut_profile` via `dt_ioppr_transform_image_colorspace_rgb_vk` (§5.12), kernel dispatch with `src = transform ? dev_out : dev_in`, then `lut_profile → work_profile`. Validated end-to-end on lavapipe against a C reference of all 4 algorithms with a non-identity LUT and an alpha > 1 input (caught the clip4-clamps-alpha subtlety): trilinear bit-equal, tetrahedral and pyramid at 7e-9 (single-bit FP). |
 | `src/iop/liquify.c` | Per-pixel free-form image warp with a user-painted spline / point distortion map. The OpenCL `warp_kernel` uses `read_imagef(in, sampleri, ...)` — `sampleri` is the CLK_FILTER_NEAREST + CLK_ADDRESS_CLAMP_TO_EDGE sampler, applied with the integer-truncated source coord — so the Lanczos / bicubic / bilinear reconstruction is done in kernel code via a host-prepared discrete kernel `k[]`, not by a hardware sampler. That makes liquify image-shortcut tractable like `lut3d` / `colormapping`. The Vulkan port folds the OpenCL flow's two dispatches (sub-region image copy + warp pass) into a single `liquify_warp` kernel dispatched over `roi_out`: every output pixel pass-through-copies its image-coord input by default, and only the pixels inside `map_extent` with a non-zero warp run the 2a×2a reconstruction. 4 bindings (in, out, map `float2[]`, k `float[]`) + 14-int 56 B PC carrying all 6 small structs the OpenCL kernel took as separate buffer args (`roi_in.{x,y,w,h}`, `roi_out.{x,y,w,h}`, `map_extent.{x,y,w,h}`, `kdesc.{size, resolution}`). When the host builds an empty map (no user warps yet) the Vulkan path short-circuits to a single `dt_vulkan_copy_device_to_device` when `roi_in == roi_out`. The Lanczos kernel-table compilation in the host (bilinear / bicubic / lanczos2 / lanczos3 → up to 6-tap `k[]`) ports verbatim from `process_cl`. Validated end-to-end on lavapipe against a C reference of the same warp math: pass-through (`warp == 0` everywhere), bilinear warp inside a 16×12 map_extent, and lanczos2 warp inside an 18×14 map_extent — **all three bit-equal (max 0.0)**. |
-| `src/iop/rasterfile.c` | Loads a separately-exported mask file (.pfm) and routes its data through the raster-mask infrastructure for downstream blending. The OpenCL `process_cl` has two paths: when `roi_out->scale != roi_in->scale` it delegates to `dt_iop_clip_and_zoom_cl` (real bilinear / lanczos resampling — sampler-blocked, no Vulkan twin yet), and otherwise it does a sub-region copy via `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, (roi_out->x, roi_out->y), (0, 0), (w, h))`. The Vulkan port covers the same-scale path via the new `dt_vulkan_copy_subregion` HAL helper (§5.9 entry 2) — one `vkCmdCopyBuffer` with `roi_out->height` `VkBufferCopy` row descriptors — and returns -1 for the resample path so the pipeline falls back to OpenCL / CPU. The mask-preview GUI focus mode (`visual = fullpipe && dt_iop_has_focus(self)`) also returns -1 like `process_cl`. The raster-mask plumbing (`dt_iop_piece_set_raster` / `_clear_raster`) is host-side and ports verbatim. |
+| `src/iop/rasterfile.c` | Loads a separately-exported mask file (.pfm) and routes its data through the raster-mask infrastructure for downstream blending. The OpenCL `process_cl` has two paths: when `roi_out->scale != roi_in->scale` it delegates to `dt_iop_clip_and_zoom_cl` (resample), and otherwise it does a sub-region copy via `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, (roi_out->x, roi_out->y), (0, 0), (w, h))`. The Vulkan port now covers **both**: the same-scale path via `dt_vulkan_copy_subregion` (§5.9 entry 2) and the resample path via the new `dt_iop_clip_and_zoom_vk` (§5.18). The mask-preview GUI focus mode (`visual = fullpipe && dt_iop_has_focus(self)`) returns -1 like `process_cl`. The raster-mask plumbing (`dt_iop_piece_set_raster` / `_clear_raster`) is host-side and ports verbatim. |
+| `src/iop/finalscale.c` | The final output rescale that fits the pipe's working image to the export / display dimensions. `process_cl` gates upscaling (`roi_out->scale > 1.0f`) to OpenCL / CPU and routes downscale + 1:1 through `dt_iop_clip_and_zoom_{roi_}cl`. The Vulkan port mirrors this exactly: same upscale gate (returns -1), then `dt_iop_clip_and_zoom_roi_vk` for the export pipe or `dt_iop_clip_and_zoom_vk` for the interactive pipe (§5.18). First consumer of the resampler helper — practically high-value because finalscale runs on every export and every zoomed-out darkroom view, so a missing `process_vk` would force a CL↔VK transition at the most bandwidth-heavy point in the pipe (the full-resolution → display-resolution downscale). |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -435,7 +436,13 @@ the user out-of-container on AMD RX 9060 XT (RADV).
 - **VERY HARD** — demosaicing, geometric corrections (ashift,
   clipping). These
   need the sampled-image + sampler bindings (§5.2 milestone 5) and
-  in some cases full distort pipelines. Done in earlier passes:
+  in some cases full distort pipelines — **but the resampler helper
+  (§5.18) is now in place**, so ashift / clipping become per-module
+  orchestration ports (homography + the §5.18 resample) rather than
+  blocked-on-infrastructure work; their remaining piece is the
+  perspective backtransform kernel, which (like liquify) does its
+  interpolation in kernel code rather than via a hardware sampler.
+  Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
   kernel instead), `mask_manager` (used the new
   `dt_vulkan_copy_device_to_device` HAL primitive instead of a
@@ -456,10 +463,13 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   `k[]` table, not by a hardware sampler; the Vulkan port folds the
   CL flow's image-copy + warp dispatches into one kernel that runs
   the reconstruction inside map_extent and passes-through outside),
-  `rasterfile` (same-scale sub-region pass-through via the new
-  `dt_vulkan_copy_subregion` HAL helper — §5.9 entry 2; the different-
-  scale resample path still needs the §8.5 sampler / resampler helper
-  and falls back to OpenCL / CPU).
+  `rasterfile` (same-scale sub-region pass-through via the
+  `dt_vulkan_copy_subregion` HAL helper — §5.9 entry 2 — and the
+  different-scale resample path via the new §5.18 resampler helper;
+  both paths now Vulkan-native),
+  `finalscale` (output rescale — first consumer of the §5.18
+  resampler; downscale + 1:1 ported, upscale gated to OpenCL / CPU
+  like `process_cl`).
   `overlay` was originally in this
   bucket but turned out to be tractable without sampler support — its
   image-bound CL signature was rewritten to storage buffers (RGBA float
@@ -1331,6 +1341,72 @@ independent C references: pad_input and gauss_reduce are bit-equal
 (max 0.0), process_curve and laplacian_assemble match at 6e-8
 (single-bit FP), write_back round-trips exactly (L scale + chroma
 passthrough).
+
+### 5.18 Resampler helper (`dt_interpolation_resample_vk` / `dt_iop_clip_and_zoom_vk`)
+
+Sixth device helper. The image up/down-scaler used by the geometric
+and scaling modules (`finalscale`, `rasterfile`, and the
+sampler-blocked `clipping` / `ashift` once those land). Mirrors
+`dt_interpolation_resample_cl` in `src/common/interpolation.c` and
+`dt_iop_clip_and_zoom_{,roi_}cl` in `src/develop/imageop_math.c`.
+
+The OpenCL `interpolation_resample` kernel processes the image
+column-wise with **workgroup-local memory + a recursive reduction**
+for the vertical convolution — it caches the horizontal-convolution
+intermediate in `local float4 buffer[]` and reduces across work-items.
+The Vulkan port instead does the **full separable convolution as a
+single per-output-pixel gather**:
+
+```
+out[x,y] = Σ_iy vkernel[iy] · ( Σ_ix hkernel[ix] · in[vindex[iy], hindex[ix]] )
+```
+
+This is mathematically identical (a separable kernel is the outer
+product of its 1-D factors, so the 2-D convolution equals the nested
+sum either way) but needs **no local memory, no barriers, and no
+intermediate buffer** — a much better fit for the one-shot HAL. For
+typical tap counts (lanczos3 = 6×6 = 36 multiply-adds per output
+pixel) the arithmetic is modest. It also sidesteps the OpenCL path's
+`CL_INVALID_WORK_GROUP_SIZE` fallback (where the vertical tap count
+exceeds the workgroup size and the CL helper bails to CPU) — the
+single-pass gather has no such limit, so the `_roi` variant needs no
+CPU fallback.
+
+The resampling **plan tables** are built by the *shared* static
+`_prepare_resampling_plan` (the same code the OpenCL path uses,
+verbatim) and uploaded as flat storage buffers in one batched submit:
+`hmeta`/`vmeta` (3 ints per output column/row — the (length, kernel,
+index) base offsets), `hlength`/`vlength`, `hindex`/`vindex` (pre-
+clamped input coordinates, so no border handling in the kernel), and
+`hkernel`/`vkernel` (normalised filter weights). 10 storage bindings,
+16 B PC (width, height, in_width, in_height).
+
+Two kernels:
+
+| kernel                   | bindings | PC (bytes) | role |
+|--------------------------|:--------:|:----------:|------|
+| `interpolation_resample` |       10 |         16 | generic up/down-scale gather |
+| `interpolation_copy`     |        2 |         24 | 1:1 expand crop with zero-fill |
+
+The 1:1 paths mirror `dt_interpolation_resample_cl`'s `copymode`
+branch: when `roi_out->scale == 1` and the input fully covers the
+output, the new `dt_vulkan_copy_subregion` (§5.9) handles it with a
+plain row-wise `vkCmdCopyBuffer`; when the input doesn't fully cover
+(expanded crop), `interpolation_copy` zero-fills the out-of-bounds
+border.
+
+`dt_iop_clip_and_zoom_vk` / `_roi_vk` are the thin `imageop_math.c`
+wrappers (pick the user-preference interpolator, call the resampler)
+that the modules call, exactly paralleling the `_cl` pair.
+
+Validated end-to-end on lavapipe against C references that recreate
+the gather with hand-built plan tables (the real plan math is shared
+verbatim with the already-tested OpenCL path, so the Vulkan-specific
+risk is the table indirection + accumulation): the 1:1 offset copy
+with zero-fill, a 2× box downscale, and an **asymmetric variable-tap
+plan** (2–4 taps per pixel with a packed non-uniform-stride index /
+kernel layout, exercising the per-pixel meta offsets) are **all three
+bit-equal (max 0.0)**.
 
 ## 6. Per-OS picture
 

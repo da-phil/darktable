@@ -551,24 +551,28 @@ int process_vk(dt_iop_module_t *self,
   // Visual focus mode (mask preview) stays on CPU like process_cl.
   if(visual) return -1;
 
-  // The clip_and_zoom path needs the §8.5 sampler / resampler helper
-  // (dt_iop_clip_and_zoom_vk doesn't exist yet); when scales differ
-  // we fall back to OpenCL / CPU.
-  if(roi_out->scale != roi_in->scale && ch == 4) return -1;
-
-  // Sub-region pass-through copy: the OpenCL path is
-  // enqueue_copy_image with src origin = (roi_out->x, roi_out->y).
-  // The §5.14 multi-region copy helper covers this with one
-  // vkCmdCopyBuffer call (one VkBufferCopy per row).
-  const int rc = dt_vulkan_copy_subregion(piece->pipe->devid,
-                                          dev_out, dev_in,
-                                          (size_t)roi_out->x, (size_t)roi_out->y,
-                                          0, 0,
-                                          (size_t)roi_out->width,
-                                          (size_t)roi_out->height,
-                                          (size_t)roi_in->width,
-                                          (size_t)roi_out->width,
-                                          4 * sizeof(float));
+  const int devid = piece->pipe->devid;
+  int rc;
+  if(roi_out->scale != roi_in->scale && ch == 4)
+  {
+    // Resample path — now covered by the §5.18 resampler helper.
+    rc = dt_iop_clip_and_zoom_vk(devid, dev_out, dev_in, roi_out, roi_in);
+  }
+  else
+  {
+    // Sub-region pass-through copy: the OpenCL path is
+    // enqueue_copy_image with src origin = (roi_out->x, roi_out->y).
+    // The §5.9 multi-region copy helper covers this with one
+    // vkCmdCopyBuffer call (one VkBufferCopy per row).
+    rc = dt_vulkan_copy_subregion(devid, dev_out, dev_in,
+                                  (size_t)roi_out->x, (size_t)roi_out->y,
+                                  0, 0,
+                                  (size_t)roi_out->width,
+                                  (size_t)roi_out->height,
+                                  (size_t)roi_in->width,
+                                  (size_t)roi_out->width,
+                                  4 * sizeof(float));
+  }
 
   if(dt_iop_is_raster_mask_used(piece->module, BLEND_RASTER_ID) && (rc == 0))
   {
