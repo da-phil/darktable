@@ -183,7 +183,7 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 59 modules currently expose `process_vk`,
+**Per-module ports**: 60 modules currently expose `process_vk`,
 in three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
@@ -251,6 +251,7 @@ in three categories.
 | `src/iop/liquify.c` | Per-pixel free-form image warp with a user-painted spline / point distortion map. The OpenCL `warp_kernel` uses `read_imagef(in, sampleri, ...)` — `sampleri` is the CLK_FILTER_NEAREST + CLK_ADDRESS_CLAMP_TO_EDGE sampler, applied with the integer-truncated source coord — so the Lanczos / bicubic / bilinear reconstruction is done in kernel code via a host-prepared discrete kernel `k[]`, not by a hardware sampler. That makes liquify image-shortcut tractable like `lut3d` / `colormapping`. The Vulkan port folds the OpenCL flow's two dispatches (sub-region image copy + warp pass) into a single `liquify_warp` kernel dispatched over `roi_out`: every output pixel pass-through-copies its image-coord input by default, and only the pixels inside `map_extent` with a non-zero warp run the 2a×2a reconstruction. 4 bindings (in, out, map `float2[]`, k `float[]`) + 14-int 56 B PC carrying all 6 small structs the OpenCL kernel took as separate buffer args (`roi_in.{x,y,w,h}`, `roi_out.{x,y,w,h}`, `map_extent.{x,y,w,h}`, `kdesc.{size, resolution}`). When the host builds an empty map (no user warps yet) the Vulkan path short-circuits to a single `dt_vulkan_copy_device_to_device` when `roi_in == roi_out`. The Lanczos kernel-table compilation in the host (bilinear / bicubic / lanczos2 / lanczos3 → up to 6-tap `k[]`) ports verbatim from `process_cl`. Validated end-to-end on lavapipe against a C reference of the same warp math: pass-through (`warp == 0` everywhere), bilinear warp inside a 16×12 map_extent, and lanczos2 warp inside an 18×14 map_extent — **all three bit-equal (max 0.0)**. |
 | `src/iop/rasterfile.c` | Loads a separately-exported mask file (.pfm) and routes its data through the raster-mask infrastructure for downstream blending. The OpenCL `process_cl` has two paths: when `roi_out->scale != roi_in->scale` it delegates to `dt_iop_clip_and_zoom_cl` (resample), and otherwise it does a sub-region copy via `dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, (roi_out->x, roi_out->y), (0, 0), (w, h))`. The Vulkan port now covers **both**: the same-scale path via `dt_vulkan_copy_subregion` (§5.9 entry 2) and the resample path via the new `dt_iop_clip_and_zoom_vk` (§5.18). The mask-preview GUI focus mode (`visual = fullpipe && dt_iop_has_focus(self)`) returns -1 like `process_cl`. The raster-mask plumbing (`dt_iop_piece_set_raster` / `_clear_raster`) is host-side and ports verbatim. |
 | `src/iop/finalscale.c` | The final output rescale that fits the pipe's working image to the export / display dimensions. `process_cl` gates upscaling (`roi_out->scale > 1.0f`) to OpenCL / CPU and routes downscale + 1:1 through `dt_iop_clip_and_zoom_{roi_}cl`. The Vulkan port mirrors this exactly: same upscale gate (returns -1), then `dt_iop_clip_and_zoom_roi_vk` for the export pipe or `dt_iop_clip_and_zoom_vk` for the interactive pipe (§5.18). First consumer of the resampler helper — practically high-value because finalscale runs on every export and every zoomed-out darkroom view, so a missing `process_vk` would force a CL↔VK transition at the most bandwidth-heavy point in the pipe (the full-resolution → display-resolution downscale). |
+| `src/iop/ashift.c` | Perspective correction (lens-shift / keystone correction via a user-specified rotation + shear + lens-shift + aspect homography). Four interpolation kernels (`ashift_bilinear` / `ashift_bicubic` / `ashift_lanczos2` / `ashift_lanczos3`) selected at runtime via `DT_INTERPOLATION_USERPREF_WARP`. The OpenCL `bilinear` variant uses `samplerf` for hardware bilinear filtering; the Vulkan port implements **manual 4-tap bilinear in kernel code** with CLAMP-to-zero borders (matching the OpenCL semantics byte-for-byte: out-of-bounds corner reads return `(0,0,0,0)`). The `bicubic` / `lanczos2` / `lanczos3` variants use `samplerA` (nearest + ADDRESS_NONE) at integer coords — pure image-shortcut, so the kernel does its own multi-tap reconstruction via the new `vk_interpolation_bicubic` / `vk_interpolation_lanczos` helpers + the `vk_sinf_fast` bit-pun union (clspv-safe; the `.comp` twin uses GLSL's even/odd branch in lieu of the union sign-trick). The `vk_clip_mirror` helper handles edge mirroring for the multi-tap reads. 3 storage bindings (in, out, homograph float[9]) + 48 B PC (8 ints + 4 floats: width, height, iwidth, iheight, roi_in.{x,y}, roi_out.{x,y}, in_scale, out_scale, clip.{x,y}). The preview-pipe input snapshot for parameter-fitting (`g->buf` for the `_fit_helper` line-detection passes) reads back via `dt_vulkan_read_from_device` — same precedent as `globaltonemap` / `colormapping` / `hazeremoval`. The neutral-params pass-through (`_isneutral(d)`) routes to `dt_vulkan_copy_device_to_device` like `process_cl`'s `enqueue_copy_image` shortcut. Validated end-to-end on lavapipe against C references of all 4 interpolators (small rotation around the image centre exercising sub-pixel sampling): bilinear at 6e-7, bicubic at 8e-7, lanczos2 at 9e-7, lanczos3 at 9e-7 — all single-bit FP precision. |
 
 *Partial (clspv: full; glslang fallback: one mode only):*
 
@@ -433,15 +434,13 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   kernel pipelines or per-warp reductions. `lowpass`, `censorize`,
   `shadhi`, `retouch`, `monochrome` can now build
   on the bilateral helper (§5.13) for their grid-based passes.
-- **VERY HARD** — demosaicing, geometric corrections (ashift,
-  clipping). These
-  need the sampled-image + sampler bindings (§5.2 milestone 5) and
-  in some cases full distort pipelines — **but the resampler helper
-  (§5.18) is now in place**, so ashift / clipping become per-module
-  orchestration ports (homography + the §5.18 resample) rather than
-  blocked-on-infrastructure work; their remaining piece is the
-  perspective backtransform kernel, which (like liquify) does its
-  interpolation in kernel code rather than via a hardware sampler.
+- **VERY HARD** — demosaicing, geometric corrections (clipping).
+  These need the sampled-image + sampler bindings (§5.2 milestone 5)
+  and in some cases full distort pipelines — **but the resampler
+  helper (§5.18) is now in place**. ashift has landed (the
+  bilinear/bicubic/lanczos2/lanczos3 interpolators are implemented in
+  kernel code, mirroring the OpenCL semantics byte-for-byte); clipping
+  is a near-identical port with a different homography source.
   Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
   kernel instead), `mask_manager` (used the new
@@ -469,7 +468,13 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   both paths now Vulkan-native),
   `finalscale` (output rescale — first consumer of the §5.18
   resampler; downscale + 1:1 ported, upscale gated to OpenCL / CPU
-  like `process_cl`).
+  like `process_cl`),
+  `ashift` (perspective correction — all 4 interpolators
+  bilinear/bicubic/lanczos2/lanczos3 with manual in-kernel
+  reconstruction; the new `vk_interpolation_bicubic` /
+  `vk_interpolation_lanczos` / `vk_sinf_fast` / `vk_clip_mirror`
+  helpers in `dt_vulkan_common.h` are also reusable for the future
+  clipping / lens module ports).
   `overlay` was originally in this
   bucket but turned out to be tractable without sampler support — its
   image-bound CL signature was rewritten to storage buffers (RGBA float
