@@ -1,0 +1,108 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Un   { float data[]; } _unused;
+layout(push_constant) uniform PC {
+  int width; int height; int in_width; int in_height;
+  int roi_in_x; int roi_in_y; int flip;
+  float roi_out_x; float roi_out_y;
+  float scale_in;  float scale_out;
+  float t_x; float t_y; float k_x; float k_y;
+  float m0; float m1; float m2; float m3;
+  float ks_x; float ks_y; float ks_z; float ks_w;
+  float ka_x; float ka_y;
+  float ma0; float ma1; float ma2; float ma3;
+  float mb0; float mb1;
+} pc;
+
+int vk_clip_mirror(int x, int edge) {
+  int v = x;
+  if(v < 0) v = -v;
+  if(v > edge) v = 2 * edge - v;
+  if(v < 0) v = 0;
+  if(v > edge) v = edge;
+  return v;
+}
+
+const float M_PI_F = 3.14159265358979323846;
+const float VK_LANCZOS_EPSILON = 1e-9;
+
+float vk_sinf_fast(float t) {
+  const float a = 4.0 / (M_PI_F * M_PI_F);
+  const float p = 0.225;
+  t = a * t * (M_PI_F - abs(t));
+  return p * (t * abs(t) - t) + t;
+}
+
+float vk_interpolation_lanczos(float width, float t) {
+  int an = int(t);
+  float r = t - float(an);
+  float sign = ((an & 1) != 0) ? -1.0 : 1.0;
+  return (VK_LANCZOS_EPSILON
+          + width * sign
+                  * vk_sinf_fast(M_PI_F * r)
+                  * vk_sinf_fast(M_PI_F * t / width))
+       / (VK_LANCZOS_EPSILON + M_PI_F * M_PI_F * t * t);
+}
+
+void clip_backtransform(inout float px, inout float py) {
+  float qx = px, qy = py;
+  qy /= 1.0 + qx * pc.k_x;
+  qx /= 1.0 + qy * pc.k_y;
+  px = qx * pc.m0 + qy * pc.m1;
+  py = qx * pc.m2 + qy * pc.m3;
+}
+
+void clip_keystone_backtransform(inout float px, inout float py) {
+  float xx = px - pc.ks_x;
+  float yy = py - pc.ks_y;
+  float div = (pc.ma2 * xx - pc.ma0 * yy) * pc.mb1
+            + (pc.ma1 * yy - pc.ma3 * xx) * pc.mb0
+            + pc.ma0 * pc.ma3 - pc.ma1 * pc.ma2;
+  px =  (pc.ma3 * xx - pc.ma1 * yy) / div + pc.ka_x;
+  py = -(pc.ma2 * xx - pc.ma0 * yy) / div + pc.ka_y;
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  const int kwidth = 3;
+
+  float px = pc.roi_out_x + float(x) + 0.5;
+  float py = pc.roi_out_y + float(y) + 0.5;
+  px -= (pc.flip != 0) ? pc.t_y * pc.scale_out : pc.t_x * pc.scale_out;
+  py -= (pc.flip != 0) ? pc.t_x * pc.scale_out : pc.t_y * pc.scale_out;
+  px /= pc.scale_out;
+  py /= pc.scale_out;
+  clip_backtransform(px, py);
+  px *= pc.scale_in;
+  py *= pc.scale_in;
+  px += pc.t_x * pc.scale_in;
+  py += pc.t_y * pc.scale_in;
+  if(pc.ks_z > 0.0) clip_keystone_backtransform(px, py);
+  px -= float(pc.roi_in_x) + 0.5;
+  py -= float(pc.roi_in_y) + 0.5;
+
+  int tx = int(px), ty = int(py);
+  vec4 pixel = vec4(0.0);
+  float weight = 0.0;
+  for(int jj = 1 - kwidth; jj <= kwidth; jj++)
+    for(int ii = 1 - kwidth; ii <= kwidth; ii++) {
+      int i = tx + ii; int j = ty + jj;
+      float wx = vk_interpolation_lanczos(3.0, float(i) - px);
+      float wy = vk_interpolation_lanczos(3.0, float(j) - py);
+      float w = wx * wy;
+      int mi = vk_clip_mirror(i, pc.in_width  - 1);
+      int mj = vk_clip_mirror(j, pc.in_height - 1);
+      pixel += in_buf.data[mj * pc.in_width + mi] * w;
+      weight += w;
+    }
+  if(tx < 0 || ty < 0 || tx >= pc.in_width || ty >= pc.in_height)
+    pixel = vec4(0.0);
+  else
+    pixel = pixel / weight;
+  out_buf.data[y * pc.width + x] = pixel;
+}

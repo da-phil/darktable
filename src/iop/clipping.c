@@ -316,6 +316,12 @@ typedef struct dt_iop_clipping_global_data_t
   int kernel_clip_rotate_bicubic;
   int kernel_clip_rotate_lanczos2;
   int kernel_clip_rotate_lanczos3;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_clip_rotate_bilinear;
+  dt_vk_module_kernel_t vk_clip_rotate_bicubic;
+  dt_vk_module_kernel_t vk_clip_rotate_lanczos2;
+  dt_vk_module_kernel_t vk_clip_rotate_lanczos3;
+#endif
 } dt_iop_clipping_global_data_t;
 
 static void commit_box(dt_iop_module_t *self, dt_iop_clipping_gui_data_t *g, dt_iop_clipping_params_t *p);
@@ -1144,6 +1150,92 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// PC layout: 7 ints + 24 floats = 124 B (just under the 128 B limit).
+typedef struct
+{
+  int   width;    int   height;
+  int   in_width; int   in_height;
+  int   roi_in_x; int   roi_in_y; int   flip;
+  float roi_out_x; float roi_out_y;
+  float scale_in;  float scale_out;
+  float t_x; float t_y; float k_x; float k_y;
+  float m0;  float m1;  float m2;  float m3;
+  float ks_x; float ks_y; float ks_z; float ks_w;
+  float ka_x; float ka_y;
+  float ma0;  float ma1;  float ma2;  float ma3;
+  float mb0;  float mb1;
+} vk_clip_rotate_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_clipping_data_t *d = piece->data;
+  const dt_iop_clipping_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  // Fast crop-only path (same gate as process_cl): no rotation, all
+  // gui controls off, ROI dimensions match — just copy.
+  if(!d->flags && d->angle == 0.0 && d->all_off
+     && roi_in->width == roi_out->width
+     && roi_in->height == roi_out->height)
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  const dt_vk_module_kernel_t *kernel = NULL;
+  switch(interpolation->id)
+  {
+    case DT_INTERPOLATION_BILINEAR: kernel = &gd->vk_clip_rotate_bilinear; break;
+    case DT_INTERPOLATION_BICUBIC:  kernel = &gd->vk_clip_rotate_bicubic;  break;
+    case DT_INTERPOLATION_LANCZOS2: kernel = &gd->vk_clip_rotate_lanczos2; break;
+    case DT_INTERPOLATION_LANCZOS3: kernel = &gd->vk_clip_rotate_lanczos3; break;
+    default: return -1;
+  }
+
+  // Build the keystone homography exactly like process_cl.
+  const float k_sizes[2] = { piece->buf_in.width * roi_in->scale,
+                             piece->buf_in.height * roi_in->scale };
+  const dt_boundingbox_t k_space = { d->k_space[0] * k_sizes[0],
+                                     d->k_space[1] * k_sizes[1],
+                                     d->k_apply ? d->k_space[2] * k_sizes[0] : 0.0f,
+                                     d->k_space[3] * k_sizes[1] };
+  float ma, mb, md, me, mg, mh;
+  keystone_get_matrix(k_space,
+                      d->kxa * k_sizes[0], d->kxb * k_sizes[0],
+                      d->kxc * k_sizes[0], d->kxd * k_sizes[0],
+                      d->kya * k_sizes[1], d->kyb * k_sizes[1],
+                      d->kyc * k_sizes[1], d->kyd * k_sizes[1],
+                      &ma, &mb, &md, &me, &mg, &mh);
+
+  const vk_clip_rotate_pc_t pc = {
+    .width    = width,    .height    = height,
+    .in_width = roi_in->width, .in_height = roi_in->height,
+    .roi_in_x = roi_in->x, .roi_in_y = roi_in->y, .flip = d->flip,
+    .roi_out_x = (float)roi_out->x - roi_out->scale * d->enlarge_x
+                  + roi_out->scale * d->cix,
+    .roi_out_y = (float)roi_out->y - roi_out->scale * d->enlarge_y
+                  + roi_out->scale * d->ciy,
+    .scale_in  = roi_in->scale,  .scale_out = roi_out->scale,
+    .t_x = d->tx,    .t_y = d->ty,   .k_x = d->k_h, .k_y = d->k_v,
+    .m0  = d->m[0],  .m1  = d->m[1], .m2  = d->m[2], .m3  = d->m[3],
+    .ks_x = k_space[0], .ks_y = k_space[1],
+    .ks_z = k_space[2], .ks_w = k_space[3],
+    .ka_x = d->kxa * k_sizes[0], .ka_y = d->kya * k_sizes[1],
+    .ma0 = ma, .ma1 = mb, .ma2 = md, .ma3 = me,
+    .mb0 = mg, .mb1 = mh,
+  };
+  // Third binding is unused but kept for symmetry across the cohort.
+  return dt_vulkan_dispatch_n(kernel, (dt_vk_mem_t *[]){ dev_in, dev_out, dev_out },
+                              3, width, height, &pc, sizeof(pc));
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
   const int program = 2; // basic.cl from programs.conf
@@ -1153,6 +1245,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_clip_rotate_bicubic = dt_opencl_create_kernel(program, "clip_rotate_bicubic");
   gd->kernel_clip_rotate_lanczos2 = dt_opencl_create_kernel(program, "clip_rotate_lanczos2");
   gd->kernel_clip_rotate_lanczos3 = dt_opencl_create_kernel(program, "clip_rotate_lanczos3");
+#ifdef HAVE_VULKAN
+  // 3 bindings (in, out, dummy slot for symmetry), 124 B PC.
+  const uint32_t pcsize = 7 * sizeof(int) + 24 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_clip_rotate_bilinear, "clip_rotate_bilinear",
+                               "clip_rotate_bilinear", 3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_clip_rotate_bicubic,  "clip_rotate_bicubic",
+                               "clip_rotate_bicubic",  3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_clip_rotate_lanczos2, "clip_rotate_lanczos2",
+                               "clip_rotate_lanczos2", 3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_clip_rotate_lanczos3, "clip_rotate_lanczos3",
+                               "clip_rotate_lanczos3", 3, pcsize, 16, 16, 1);
+#endif
 }
 
 
@@ -1163,6 +1267,12 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_clip_rotate_bicubic);
   dt_opencl_free_kernel(gd->kernel_clip_rotate_lanczos2);
   dt_opencl_free_kernel(gd->kernel_clip_rotate_lanczos3);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_clip_rotate_bilinear);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_clip_rotate_bicubic);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_clip_rotate_lanczos2);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_clip_rotate_lanczos3);
+#endif
   free(self->data);
   self->data = NULL;
 }
