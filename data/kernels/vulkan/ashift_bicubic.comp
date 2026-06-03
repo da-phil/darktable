@@ -1,0 +1,65 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly  buffer Hom  { float data[]; } homograph;
+layout(push_constant) uniform PC {
+  int width; int height; int iwidth; int iheight;
+  int roi_in_x; int roi_in_y; int roi_out_x; int roi_out_y;
+  float in_scale; float out_scale; float clip_x; float clip_y;
+} pc;
+
+int vk_clip_mirror(int x, int edge) {
+  int v = x;
+  if(v < 0) v = -v;
+  if(v > edge) v = 2 * edge - v;
+  if(v < 0) v = 0;
+  if(v > edge) v = edge;
+  return v;
+}
+
+float vk_interpolation_bicubic(float t) {
+  t = abs(t);
+  if(t >= 2.0) return 0.0;
+  if(t >  1.0) return 0.5 * (t * (-t * t + 5.0 * t - 8.0) + 4.0);
+  return 0.5 * (t * (3.0 * t * t - 5.0 * t) + 2.0);
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  const int kwidth = 2;
+  float pout0 = (float(pc.roi_out_x + x) + pc.clip_x) / pc.out_scale;
+  float pout1 = (float(pc.roi_out_y + y) + pc.clip_y) / pc.out_scale;
+  float pin[3];
+  for(int i = 0; i < 3; i++)
+    pin[i] = homograph.data[3*i+0] * pout0
+           + homograph.data[3*i+1] * pout1
+           + homograph.data[3*i+2];
+  pin[0] = (pin[0] / pin[2]) * pc.in_scale - float(pc.roi_in_x);
+  pin[1] = (pin[1] / pin[2]) * pc.in_scale - float(pc.roi_in_y);
+
+  float rx = pin[0], ry = pin[1];
+  int tx = int(rx), ty = int(ry);
+
+  vec4 pixel = vec4(0.0);
+  float weight = 0.0;
+  for(int jj = 1 - kwidth; jj <= kwidth; jj++)
+    for(int ii = 1 - kwidth; ii <= kwidth; ii++) {
+      int i = tx + ii; int j = ty + jj;
+      float wx = vk_interpolation_bicubic(float(i) - rx);
+      float wy = vk_interpolation_bicubic(float(j) - ry);
+      float w = wx * wy;
+      int mi = vk_clip_mirror(i, pc.iwidth  - 1);
+      int mj = vk_clip_mirror(j, pc.iheight - 1);
+      pixel += in_buf.data[mj * pc.iwidth + mi] * w;
+      weight += w;
+    }
+  if(tx < 0 || ty < 0 || tx >= pc.iwidth || ty >= pc.iheight)
+    pixel = vec4(0.0);
+  else
+    pixel = pixel / weight;
+  out_buf.data[y*pc.width + x] = pixel;
+}

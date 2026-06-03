@@ -448,6 +448,12 @@ typedef struct dt_iop_ashift_global_data_t
   int kernel_ashift_bicubic;
   int kernel_ashift_lanczos2;
   int kernel_ashift_lanczos3;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_ashift_bilinear;
+  dt_vk_module_kernel_t vk_ashift_bicubic;
+  dt_vk_module_kernel_t vk_ashift_lanczos2;
+  dt_vk_module_kernel_t vk_ashift_lanczos3;
+#endif
 } dt_iop_ashift_global_data_t;
 
 int legacy_params(dt_iop_module_t *self,
@@ -3715,6 +3721,122 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+typedef struct
+{
+  int width; int height; int iwidth; int iheight;
+  int roi_in_x; int roi_in_y; int roi_out_x; int roi_out_y;
+  float in_scale; float out_scale; float clip_x; float clip_y;
+} vk_ashift_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_ashift_data_t *d = piece->data;
+  const dt_iop_ashift_global_data_t *gd = self->global_data;
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+  const int devid = piece->pipe->devid;
+  const size_t img_bytes = (size_t)roi_out->width * roi_out->height * 4 * sizeof(float);
+
+  // Preview-pipe input snapshot for the host-side parameter-fitting
+  // code (same pattern as colormapping / globaltonemap / hazeremoval
+  // — readback via dt_vulkan_read_from_device when the GUI needs it).
+  if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
+  {
+    dt_boundingbox_t points = { 0.0f, 0.0f,
+                                (float)piece->buf_in.width,
+                                (float)piece->buf_in.height };
+    const float ivec[2] = { points[2] - points[0], points[3] - points[1] };
+    const float ivecl = dt_fast_hypotf(ivec[0], ivec[1]);
+    dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order,
+                                      DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 2);
+    const float ovec[2] = { points[2] - points[0], points[3] - points[1] };
+    const float ovecl = dt_fast_hypotf(ovec[0], ovec[1]);
+    const float alpha =
+      acosf(CLAMP((ivec[0] * ovec[0] + ivec[1] * ovec[1]) / (ivecl * ovecl), -1.0f, 1.0f));
+    const int isflipped =
+      fabsf(fmodf(alpha + M_PI_F, M_PI_F) - M_PI_2f) < M_PI_4f;
+    const dt_hash_t hash = dt_dev_hash_plus(self->dev, self->dev->preview_pipe,
+                                            self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL);
+
+    dt_iop_gui_enter_critical_section(self);
+    g->isflipped = isflipped;
+    const size_t requested_size = (size_t)roi_in->width * roi_in->height;
+    if(g->buf == NULL || (size_t)g->buf_width * g->buf_height < requested_size)
+    {
+      dt_free_align(g->buf);
+      g->buf = dt_alloc_align_float(4 * requested_size);
+    }
+    int copy_err = 0;
+    if(g->buf)
+    {
+      const size_t in_bytes = (size_t)roi_in->width * roi_in->height * 4 * sizeof(float);
+      copy_err = dt_vulkan_read_from_device(devid, g->buf, dev_in, in_bytes);
+      g->buf_width = roi_in->width;
+      g->buf_height = roi_in->height;
+      g->buf_x_off = roi_in->x;
+      g->buf_y_off = roi_in->y;
+      g->buf_scale = roi_in->scale;
+      g->buf_hash = hash;
+    }
+    dt_iop_gui_leave_critical_section(self);
+    if(copy_err != 0) return -1;
+  }
+
+  // Neutral params → pass-through copy.
+  if(_isneutral(d))
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+
+  float DT_ALIGNED_ARRAY ihomograph[3][3];
+  _homography((float *)ihomograph, d->rotation, d->lensshift_v, d->lensshift_h,
+              d->shear, d->f_length_kb,
+              d->orthocorr, d->aspect,
+              piece->buf_in.width, piece->buf_in.height, ASHIFT_HOMOGRAPH_INVERTED);
+
+  const float fullwidth = (float)piece->buf_out.width / (d->cr - d->cl);
+  const float fullheight = (float)piece->buf_out.height / (d->cb - d->ct);
+  const float cx = roi_out->scale * fullwidth * d->cl;
+  const float cy = roi_out->scale * fullheight * d->ct;
+
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  const dt_vk_module_kernel_t *kernel = NULL;
+  switch(interpolation->id)
+  {
+    case DT_INTERPOLATION_BILINEAR: kernel = &gd->vk_ashift_bilinear; break;
+    case DT_INTERPOLATION_BICUBIC:  kernel = &gd->vk_ashift_bicubic;  break;
+    case DT_INTERPOLATION_LANCZOS2: kernel = &gd->vk_ashift_lanczos2; break;
+    case DT_INTERPOLATION_LANCZOS3: kernel = &gd->vk_ashift_lanczos3; break;
+    default: return -1;
+  }
+
+  dt_vk_mem_t *dev_homo = dt_vulkan_alloc_buffer(devid, sizeof(float) * 9);
+  if(!dev_homo) return -1;
+
+  // Homograph is float[3][3], stored row-major. The OpenCL kernel reads
+  // homograph[3*i+j], so the Vulkan upload layout matches verbatim.
+  const vk_ashift_pc_t pc = {
+    .width = roi_out->width, .height = roi_out->height,
+    .iwidth = roi_in->width, .iheight = roi_in->height,
+    .roi_in_x = roi_in->x,   .roi_in_y = roi_in->y,
+    .roi_out_x = roi_out->x, .roi_out_y = roi_out->y,
+    .in_scale = roi_in->scale, .out_scale = roi_out->scale,
+    .clip_x = cx, .clip_y = cy,
+  };
+  dt_vk_mem_t *bufs[] = { dev_in, dev_out, dev_homo };
+  const dt_vk_upload_t uploads[] = {
+    { dev_homo, (float *)ihomograph, sizeof(float) * 9 },
+  };
+  const int rc = dt_vulkan_dispatch_n_batched(kernel, bufs, 3, uploads, 1,
+                                              roi_out->width, roi_out->height,
+                                              &pc, sizeof(pc));
+  dt_vulkan_free_buffer(devid, dev_homo);
+  return rc;
+}
+#endif
+
 // gather information about "near"-ness in g->points_idx
 static void _get_near(const float *points,
                       dt_iop_ashift_points_idx_t *points_idx,
@@ -5775,6 +5897,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_ashift_bicubic = dt_opencl_create_kernel(program, "ashift_bicubic");
   gd->kernel_ashift_lanczos2 = dt_opencl_create_kernel(program, "ashift_lanczos2");
   gd->kernel_ashift_lanczos3 = dt_opencl_create_kernel(program, "ashift_lanczos3");
+#ifdef HAVE_VULKAN
+  // 3 storage bindings (in, out, homograph), 8 ints + 4 floats = 48 B PC.
+  const uint32_t pcsize = 8 * sizeof(int) + 4 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_ashift_bilinear, "ashift_bilinear",
+                               "ashift_bilinear", 3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_ashift_bicubic,  "ashift_bicubic",
+                               "ashift_bicubic",  3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_ashift_lanczos2, "ashift_lanczos2",
+                               "ashift_lanczos2", 3, pcsize, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_ashift_lanczos3, "ashift_lanczos3",
+                               "ashift_lanczos3", 3, pcsize, 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -5784,6 +5918,12 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_ashift_bicubic);
   dt_opencl_free_kernel(gd->kernel_ashift_lanczos2);
   dt_opencl_free_kernel(gd->kernel_ashift_lanczos3);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_ashift_bilinear);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_ashift_bicubic);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_ashift_lanczos2);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_ashift_lanczos3);
+#endif
   free(self->data);
   self->data = NULL;
 }

@@ -162,7 +162,11 @@ set(VK_KERNELS
     lut3d_pyramid:lut3d_pyramid
     liquify_warp:liquify_warp
     interpolation_resample:interpolation_resample
-    interpolation_copy:interpolation_copy)
+    interpolation_copy:interpolation_copy
+    ashift_bilinear:ashift_bilinear
+    ashift_bicubic:ashift_bicubic
+    ashift_lanczos2:ashift_lanczos2
+    ashift_lanczos3:ashift_lanczos3)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

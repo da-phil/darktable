@@ -932,3 +932,62 @@ static inline float4 vk_LCH_2_Lab(const float4 LCH)
   const float b = sin(DT_2PI_F * LCH.z) * LCH.y;
   return (float4)(L, a, b, LCH.w);
 }
+
+// ---- Interpolation helpers for geometric ports -----------------------
+//
+// Mirror data/kernels/basic.cl's interpolation_func_bicubic /
+// interpolation_func_lanczos / sinf_fast / clip_mirror byte-for-byte.
+// Used by ashift and (future) clip_rotate / lens, where the kernel
+// does its own multi-tap reconstruction rather than using a hardware
+// sampler.
+
+// Mirror coordinate for image-edge handling: reflects negative or
+// past-edge indices back into [0, edge].
+static inline int vk_clip_mirror(const int x, const int edge)
+{
+  // Same body as common.h::clip_mirror — the standard 2-fold mirror.
+  int v = x;
+  if(v < 0) v = -v;
+  if(v > edge) v = 2 * edge - v;
+  if(v < 0) v = 0;
+  if(v > edge) v = edge;
+  return v;
+}
+
+// Fast sin approximation for t ∈ [-π, π]. Mirrors basic.cl::sinf_fast
+// (and src/common/math.h's sinf_fast — both must change together).
+static inline float vk_sinf_fast(float t)
+{
+  const float a = 4.0f / (M_PI_F * M_PI_F);
+  const float p = 0.225f;
+  t = a * t * (M_PI_F - fabs(t));
+  return p * (t * fabs(t) - t) + t;
+}
+
+// Bicubic spline weight, B = 0.5. Mirrors interpolation_func_bicubic.
+static inline float vk_interpolation_bicubic(float t)
+{
+  t = fabs(t);
+  if(t >= 2.0f) return 0.0f;
+  if(t >  1.0f) return 0.5f * (t * (-t * t + 5.0f * t - 8.0f) + 4.0f);
+  return 0.5f * (t * (3.0f * t * t - 5.0f * t) + 2.0f);
+}
+
+// Lanczos windowed sinc, width = 2 or 3. The sign-bit trick from
+// basic.cl::interpolation_func_lanczos is reproduced via a union
+// (clspv-safe; the .comp twin uses uintBitsToFloat).
+#define VK_LANCZOS_EPSILON (1e-9f)
+static inline float vk_interpolation_lanczos(const float width, const float t)
+{
+  // Reduce t into [-1, 1] for the sin approximation.
+  const int an = (int)t;
+  const float r = t - (float)an;
+  // Sign for sinf(pi * an) — even an → +1, odd an → -1.
+  union { float f; unsigned int i; } sign;
+  sign.i = (((unsigned int)an & 1u) << 31u) | 0x3f800000u;
+  return (VK_LANCZOS_EPSILON
+          + width * sign.f
+                  * vk_sinf_fast(M_PI_F * r)
+                  * vk_sinf_fast(M_PI_F * t / width))
+       / (VK_LANCZOS_EPSILON + M_PI_F * M_PI_F * t * t);
+}
