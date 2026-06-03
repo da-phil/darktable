@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)           buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly  buffer Hom  { float data[]; } homograph;
+layout(push_constant) uniform PC {
+  int width; int height; int iwidth; int iheight;
+  int roi_in_x; int roi_in_y; int roi_out_x; int roi_out_y;
+  float in_scale; float out_scale; float clip_x; float clip_y;
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  float pout0 = (float(pc.roi_out_x + x) + pc.clip_x) / pc.out_scale;
+  float pout1 = (float(pc.roi_out_y + y) + pc.clip_y) / pc.out_scale;
+  float pin[3];
+  for(int i = 0; i < 3; i++)
+    pin[i] = homograph.data[3*i+0] * pout0
+           + homograph.data[3*i+1] * pout1
+           + homograph.data[3*i+2];
+  pin[0] = (pin[0] / pin[2]) * pc.in_scale - float(pc.roi_in_x);
+  pin[1] = (pin[1] / pin[2]) * pc.in_scale - float(pc.roi_in_y);
+
+  float rx = pin[0], ry = pin[1];
+  int tx = int(rx), ty = int(ry);
+
+  vec4 pixel = vec4(0.0);
+  if(tx >= 0 && ty >= 0 && tx < pc.iwidth && ty < pc.iheight) {
+    int ix0 = int(floor(rx)); int iy0 = int(floor(ry));
+    float fx = rx - float(ix0); float fy = ry - float(iy0);
+    int ix1 = ix0 + 1; int iy1 = iy0 + 1;
+    vec4 c00 = (ix0 >= 0 && ix0 < pc.iwidth && iy0 >= 0 && iy0 < pc.iheight)
+               ? in_buf.data[iy0*pc.iwidth + ix0] : vec4(0.0);
+    vec4 c10 = (ix1 >= 0 && ix1 < pc.iwidth && iy0 >= 0 && iy0 < pc.iheight)
+               ? in_buf.data[iy0*pc.iwidth + ix1] : vec4(0.0);
+    vec4 c01 = (ix0 >= 0 && ix0 < pc.iwidth && iy1 >= 0 && iy1 < pc.iheight)
+               ? in_buf.data[iy1*pc.iwidth + ix0] : vec4(0.0);
+    vec4 c11 = (ix1 >= 0 && ix1 < pc.iwidth && iy1 >= 0 && iy1 < pc.iheight)
+               ? in_buf.data[iy1*pc.iwidth + ix1] : vec4(0.0);
+    pixel = (1.0-fx)*(1.0-fy)*c00 + fx*(1.0-fy)*c10
+          + (1.0-fx)*    fy *c01 + fx*    fy *c11;
+  }
+  out_buf.data[y*pc.width + x] = pixel;
+}
