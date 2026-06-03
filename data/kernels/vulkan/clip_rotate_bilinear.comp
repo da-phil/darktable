@@ -1,0 +1,75 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In   { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out  { vec4  data[]; } out_buf;
+layout(std430, binding = 2) readonly buffer Un   { float data[]; } _unused;
+layout(push_constant) uniform PC {
+  int width; int height; int in_width; int in_height;
+  int roi_in_x; int roi_in_y; int flip;
+  float roi_out_x; float roi_out_y;
+  float scale_in;  float scale_out;
+  float t_x; float t_y; float k_x; float k_y;
+  float m0; float m1; float m2; float m3;
+  float ks_x; float ks_y; float ks_z; float ks_w;
+  float ka_x; float ka_y;
+  float ma0; float ma1; float ma2; float ma3;
+  float mb0; float mb1;
+} pc;
+
+void clip_backtransform(inout float px, inout float py) {
+  float qx = px, qy = py;
+  qy /= 1.0 + qx * pc.k_x;
+  qx /= 1.0 + qy * pc.k_y;
+  px = qx * pc.m0 + qy * pc.m1;
+  py = qx * pc.m2 + qy * pc.m3;
+}
+
+void clip_keystone_backtransform(inout float px, inout float py) {
+  float xx = px - pc.ks_x;
+  float yy = py - pc.ks_y;
+  float div = (pc.ma2 * xx - pc.ma0 * yy) * pc.mb1
+            + (pc.ma1 * yy - pc.ma3 * xx) * pc.mb0
+            + pc.ma0 * pc.ma3 - pc.ma1 * pc.ma2;
+  px =  (pc.ma3 * xx - pc.ma1 * yy) / div + pc.ka_x;
+  py = -(pc.ma2 * xx - pc.ma0 * yy) / div + pc.ka_y;
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  float px = pc.roi_out_x + float(x) + 0.5;
+  float py = pc.roi_out_y + float(y) + 0.5;
+  px -= (pc.flip != 0) ? pc.t_y * pc.scale_out : pc.t_x * pc.scale_out;
+  py -= (pc.flip != 0) ? pc.t_x * pc.scale_out : pc.t_y * pc.scale_out;
+  px /= pc.scale_out;
+  py /= pc.scale_out;
+  clip_backtransform(px, py);
+  px *= pc.scale_in;
+  py *= pc.scale_in;
+  px += pc.t_x * pc.scale_in;
+  py += pc.t_y * pc.scale_in;
+  if(pc.ks_z > 0.0) clip_keystone_backtransform(px, py);
+  px -= float(pc.roi_in_x) + 0.5;
+  py -= float(pc.roi_in_y) + 0.5;
+
+  int ii = int(px), jj = int(py);
+  vec4 pixel = vec4(0.0);
+  if(ii >= 0 && jj >= 0 && ii < pc.in_width && jj < pc.in_height) {
+    int ix0 = int(floor(px)); int iy0 = int(floor(py));
+    float fx = px - float(ix0); float fy = py - float(iy0);
+    int ix1 = ix0 + 1; int iy1 = iy0 + 1;
+    vec4 c00 = (ix0 >= 0 && ix0 < pc.in_width && iy0 >= 0 && iy0 < pc.in_height)
+               ? in_buf.data[iy0 * pc.in_width + ix0] : vec4(0.0);
+    vec4 c10 = (ix1 >= 0 && ix1 < pc.in_width && iy0 >= 0 && iy0 < pc.in_height)
+               ? in_buf.data[iy0 * pc.in_width + ix1] : vec4(0.0);
+    vec4 c01 = (ix0 >= 0 && ix0 < pc.in_width && iy1 >= 0 && iy1 < pc.in_height)
+               ? in_buf.data[iy1 * pc.in_width + ix0] : vec4(0.0);
+    vec4 c11 = (ix1 >= 0 && ix1 < pc.in_width && iy1 >= 0 && iy1 < pc.in_height)
+               ? in_buf.data[iy1 * pc.in_width + ix1] : vec4(0.0);
+    pixel = (1.0-fx)*(1.0-fy)*c00 + fx*(1.0-fy)*c10
+          + (1.0-fx)*    fy *c01 + fx*    fy *c11;
+  }
+  out_buf.data[y * pc.width + x] = pixel;
+}
