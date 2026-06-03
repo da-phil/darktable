@@ -49,6 +49,17 @@ int dt_iop_clip_and_zoom_roi_cl(int devid, cl_mem dev_out, cl_mem dev_in,
                                 const struct dt_iop_roi_t *const roi_in);
 #endif
 
+#include "common/vulkan.h"
+#ifdef HAVE_VULKAN
+int dt_iop_clip_and_zoom_vk(int devid, dt_vk_mem_t *dev_out, dt_vk_mem_t *dev_in,
+                            const struct dt_iop_roi_t *const roi_out,
+                            const struct dt_iop_roi_t *const roi_in);
+
+int dt_iop_clip_and_zoom_roi_vk(int devid, dt_vk_mem_t *dev_out, dt_vk_mem_t *dev_in,
+                                const struct dt_iop_roi_t *const roi_out,
+                                const struct dt_iop_roi_t *const roi_in);
+#endif
+
 void dt_iop_clip_and_zoom_mosaic_half_size_f(float *const out, const float *const in,
                                              const dt_iop_roi_t *const roi_out, const dt_iop_roi_t *const roi_in,
                                              const int32_t out_stride, const int32_t in_stride,
