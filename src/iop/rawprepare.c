@@ -88,6 +88,13 @@ typedef struct dt_iop_rawprepare_global_data_t
   int kernel_rawprepare_1f_unnormalized;
   int kernel_rawprepare_1f_unnormalized_gainmap;
   int kernel_rawprepare_4f;
+#ifdef HAVE_VULKAN
+  // Only the 4f path is wired up on Vulkan; the 1f Bayer / X-Trans
+  // variants need single-channel buffer support (uint16 / float)
+  // and the FC() pattern lookup, gated to OpenCL / CPU via
+  // process_vk_ready when the pipeline is on a Bayer image.
+  dt_vk_module_kernel_t vk_4f;
+#endif
 } dt_iop_rawprepare_global_data_t;
 
 
@@ -566,6 +573,53 @@ finish:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+typedef struct
+{
+  int   width;
+  int   height;
+  int   cx;
+  int   cy;
+  int   rx;
+  int   ry;
+  int   in_width;
+  float b0, b1, b2, b3;
+  float d0, d1, d2, d3;
+} vk_rawprepare_4f_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rawprepare_data_t *d = piece->data;
+  const dt_iop_rawprepare_global_data_t *gd = self->global_data;
+
+  // commit_params gates the Bayer / gainmap paths; if we reach here
+  // the pipeline already has float4 data (HDR DNG / 16-bit TIFF / etc.).
+  // Belt-and-suspenders return -1 if the gate somehow allowed a Bayer
+  // image through.
+  if(piece->pipe->dsc.filters || d->apply_gainmaps) return -1;
+
+  const int csx = _compute_proper_crop(piece, roi_in, d->left);
+  const int csy = _compute_proper_crop(piece, roi_in, d->top);
+
+  const vk_rawprepare_4f_pc_t pc = {
+    .width = roi_out->width, .height = roi_out->height,
+    .cx = csx, .cy = csy,
+    .rx = roi_out->x, .ry = roi_out->y,
+    .in_width = roi_in->width,
+    .b0 = d->sub[0], .b1 = d->sub[1], .b2 = d->sub[2], .b3 = d->sub[3],
+    .d0 = d->div[0], .d1 = d->div[1], .d2 = d->div[2], .d3 = d->div[3],
+  };
+
+  return dt_vulkan_dispatch_inout(&gd->vk_4f, dev_in, dev_out,
+                                  roi_out->width, roi_out->height,
+                                  &pc, sizeof(pc));
+}
+#endif
+
 static int _image_is_normalized(const dt_image_t *const image)
 {
   // if raw with floating-point data, if not 1 or legacy magic whitelevel, then it needs normalization
@@ -737,6 +791,16 @@ void commit_params(dt_iop_module_t *self,
 
   if(piece->pipe->want_detail_mask)
     piece->process_tiling_ready = FALSE;
+
+#ifdef HAVE_VULKAN
+  // Only the 4-channel float path has a Vulkan twin so far. The 1f
+  // Bayer / X-Trans variants need single-channel input buffers and
+  // an FC()/FCxtrans() pattern lookup that aren't wired up on the
+  // Vulkan integration yet; gate via the §10.2 predictive pattern
+  // so the pipeline falls back to OpenCL / CPU for those cases.
+  if(piece->pipe->dsc.filters || d->apply_gainmaps)
+    piece->process_vk_ready = FALSE;
+#endif
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -787,6 +851,12 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_rawprepare_1f_unnormalized = dt_opencl_create_kernel(program, "rawprepare_1f_unnormalized");
   gd->kernel_rawprepare_1f_unnormalized_gainmap = dt_opencl_create_kernel(program, "rawprepare_1f_unnormalized_gainmap");
   gd->kernel_rawprepare_4f = dt_opencl_create_kernel(program, "rawprepare_4f");
+#ifdef HAVE_VULKAN
+  // 2 bindings (in, out), 56 B PC (7 ints + 8 floats).
+  const uint32_t pcsize = 7 * sizeof(int) + 8 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk_4f, "rawprepare_4f", "rawprepare_4f",
+                               2, pcsize, 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -797,6 +867,9 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_rawprepare_1f);
   dt_opencl_free_kernel(gd->kernel_rawprepare_1f_gainmap);
   dt_opencl_free_kernel(gd->kernel_rawprepare_1f_unnormalized_gainmap);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_4f);
+#endif
   free(self->data);
   self->data = NULL;
 }
