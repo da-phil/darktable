@@ -1,0 +1,60 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC { int width; int height; float noise; } pc;
+
+const float M_PI_F = 3.14159265358979323846;
+
+uint vk_hash32(uint x) {
+  x = (x ^ 61u) ^ (x >> 16);
+  x = x + (x << 3);
+  x = x ^ (x >> 4);
+  x = x * 0x27d4eb2du;
+  x = x ^ (x >> 15);
+  return x;
+}
+
+uint vk_rol32(uint x, int k) { return (x << k) | (x >> (32 - k)); }
+
+float vk_xoshiro128plus(inout uvec4 state) {
+  uint result = state.x + state.w;
+  uint t = state.y << 9;
+  state.z ^= state.x;
+  state.w ^= state.y;
+  state.y ^= state.z;
+  state.x ^= state.w;
+  state.z ^= t;
+  state.w = vk_rol32(state.w, 11);
+  return float(result >> 8) * (1.0 / 16777216.0);
+}
+
+void main() {
+  int j = int(gl_GlobalInvocationID.x);
+  int i = int(gl_GlobalInvocationID.y);
+  if(j >= pc.width || i >= pc.height) return;
+
+  uvec4 state = uvec4(
+    vk_hash32(uint(j + 1)),
+    vk_hash32(uint((j + 1) * (i + 3))),
+    vk_hash32(1337u),
+    vk_hash32(666u)
+  );
+  for(int k = 0; k < 4; k++) vk_xoshiro128plus(state);
+
+  int idx = i * pc.width + j;
+  vec4 pix = out_buf.data[idx];
+  float norm = pix.y;
+
+  int flip = ((i & 1) != 0 || (j & 1) != 0) ? 1 : 0;
+  float u1 = max(vk_xoshiro128plus(state), 1.1754944e-38);
+  float u2 = vk_xoshiro128plus(state);
+  float two_pi = 2.0 * M_PI_F;
+  float g = (flip != 0) ? sqrt(-2.0 * log(u1)) * cos(two_pi * u2)
+                         : sqrt(-2.0 * log(u1)) * sin(two_pi * u2);
+  float epsilon = (g * pc.noise * norm + norm) / norm;
+
+  pix.x = max(pix.x * epsilon, 0.0);
+  pix.y = max(pix.y * epsilon, 0.0);
+  pix.z = max(pix.z * epsilon, 0.0);
+  out_buf.data[idx] = pix;
+}

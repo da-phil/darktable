@@ -172,7 +172,9 @@ set(VK_KERNELS
     clip_rotate_lanczos2:clip_rotate_lanczos2
     clip_rotate_lanczos3:clip_rotate_lanczos3
     rawprepare_4f:rawprepare_4f
-    highlights_4f_clip:highlights_4f_clip)
+    highlights_4f_clip:highlights_4f_clip
+    censorize_pixelate:censorize_pixelate
+    censorize_noise:censorize_noise)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
