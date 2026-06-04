@@ -162,6 +162,13 @@ typedef struct dt_iop_highlights_global_data_t
   int kernel_filmic_wavelets_detail;
 
   int kernel_interpolate_bilinear;
+#ifdef HAVE_VULKAN
+  // Only the post-demosaic 4f_clip path is wired up on Vulkan; all
+  // RAW (Bayer / X-Trans) variants need single-channel buffer support
+  // and the FC()/FCxtrans() lookup — commit_params gates those off
+  // via piece->process_vk_ready.
+  dt_vk_module_kernel_t vk_4f_clip;
+#endif
 } dt_iop_highlights_global_data_t;
 
 
@@ -704,6 +711,32 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_highlights_data_t *d = piece->data;
+  const dt_iop_highlights_global_data_t *gd = self->global_data;
+
+  // commit_params clears process_vk_ready for Bayer / mask-preview /
+  // PASSTHRU cases; belt-and-suspenders return -1 if the gate let
+  // anything through.
+  if(piece->filters
+     || piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU)
+    return -1;
+
+  const float clipper = d->clip * highlights_clip_magics[d->mode];
+  struct { int width, height; float clip; } pc
+    = { roi_in->width, roi_in->height, clipper };
+  return dt_vulkan_dispatch_inout(&gd->vk_4f_clip, dev_in, dev_out,
+                                  roi_in->width, roi_in->height,
+                                  &pc, sizeof(pc));
+}
+#endif
+
 static void process_clip(dt_iop_module_t *self,
                          dt_dev_pixelpipe_iop_t *piece,
                          const void *const ivoid,
@@ -1044,6 +1077,16 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_highlights_gui_data_t *g = self->gui_data;
   if(g && (g->hlr_mask_mode == DT_HIGHLIGHTS_MASK_CLIPPED) && linear && fullpipe)
     piece->process_cl_ready = FALSE;
+
+#ifdef HAVE_VULKAN
+  // Only non-Bayer images run on the simple 4f_clip kernel — gate
+  // everything else (RAW Bayer / X-Trans + the false-colour mask
+  // preview path) to OpenCL / CPU via the §10.2 predictive pattern.
+  if(piece->pipe->dsc.filters
+     || (g && g->hlr_mask_mode != DT_HIGHLIGHTS_MASK_OFF && fullpipe)
+     || piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU)
+    piece->process_vk_ready = FALSE;
+#endif
 }
 
 void init_global(dt_iop_module_so_t *self)
@@ -1071,6 +1114,12 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_filmic_bspline_horizontal = dt_opencl_create_kernel(wavelets, "blur_2D_Bspline_horizontal");
   gd->kernel_filmic_bspline_vertical = dt_opencl_create_kernel(wavelets, "blur_2D_Bspline_vertical");
   gd->kernel_filmic_wavelets_detail = dt_opencl_create_kernel(wavelets, "wavelets_detail_level");
+#ifdef HAVE_VULKAN
+  // 2 bindings (in, out), 12 B PC (width, height, clip).
+  dt_vulkan_module_kernel_load(&gd->vk_4f_clip, "highlights_4f_clip",
+                               "highlights_4f_clip", 2,
+                               2 * sizeof(int) + sizeof(float), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -1096,6 +1145,9 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_filmic_bspline_horizontal);
   dt_opencl_free_kernel(gd->kernel_filmic_wavelets_detail);
 
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_4f_clip);
+#endif
   free(self->data);
   self->data = NULL;
 }
