@@ -64,6 +64,10 @@ typedef dt_iop_censorize_params_t dt_iop_censorize_data_t;
 typedef struct dt_iop_censorize_global_data_t
 {
   int kernel_lowpass_mix;
+#ifdef HAVE_VULKAN
+  dt_vk_module_kernel_t vk_pixelate;
+  dt_vk_module_kernel_t vk_noise;
+#endif
 } dt_iop_censorize_global_data_t;
 
 typedef struct point_t
@@ -391,22 +395,130 @@ void tiling_callback(dt_iop_module_t *self,
   tiling->align = 1;
 }
 
+#endif
+
+// init_global / cleanup_global live outside the `#if FALSE` because
+// the OpenCL `process_cl` above is a never-compiled stub but the
+// Vulkan `process_vk` (below) is real and needs its kernel slots
+// loaded. The lowpass_mix OpenCL kernel slot stays zero-initialised.
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 6; // gaussian.cl, from programs.conf
-  dt_iop_censorize_global_data_t *gd = malloc(sizeof(dt_iop_censorize_global_data_t));
+  dt_iop_censorize_global_data_t *gd = calloc(1, sizeof(dt_iop_censorize_global_data_t));
   self->data = gd;
-  gd->kernel_lowpass_mix = dt_opencl_create_kernel(program, "lowpass_mix");
+#ifdef HAVE_VULKAN
+  // censorize_pixelate: 2 bindings (in, out), 12 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_pixelate, "censorize_pixelate",
+                               "censorize_pixelate", 2, 3 * sizeof(int),
+                               8, 8, 1);
+  // censorize_noise: 1 binding (out, in-place), 12 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_noise, "censorize_noise",
+                               "censorize_noise", 1,
+                               2 * sizeof(int) + sizeof(float), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
   dt_iop_censorize_global_data_t *gd = self->data;
-  dt_opencl_free_kernel(gd->kernel_lowpass_mix);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_pixelate);
+  dt_vulkan_module_kernel_unload(&gd->vk_noise);
+#endif
   free(self->data);
   self->data = NULL;
 }
 
+#ifdef HAVE_VULKAN
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_censorize_data_t *data = piece->data;
+  const dt_iop_censorize_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t img_bytes = (size_t)width * height * 4 * sizeof(float);
+
+  const float sigma_1 = data->radius_1 * roi_in->scale / piece->iscale;
+  const float sigma_2 = data->radius_2 * roi_in->scale / piece->iscale;
+  const size_t pixel_radius = (size_t)(data->pixelate * roi_in->scale / piece->iscale);
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float noise = data->noise / scale;
+
+  // Allocate the scratch buffer for the pixelate intermediate (the
+  // CPU path uses `temp`). It needs both src and dst usage since
+  // pixelate writes into it, the second blur reads from it.
+  dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
+  if(!dev_tmp) return -1;
+
+  // Stage 1: optional first Gaussian blur. The CPU code blurs `in →
+  // out` only when sigma_1 != 0; otherwise input = ivoid. Mirror by
+  // always copying dev_in → dev_out first so the rest of the chain
+  // operates on dev_out (and dev_tmp) — keeps dev_in pristine.
+  int rc = dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
+  if(rc != 0) { dt_vulkan_free_buffer(devid, dev_tmp); return -1; }
+
+  if(sigma_1 != 0.f)
+  {
+    if(dt_gaussian_mean_blur_vk(devid, dev_out, width, height, 4, sigma_1) != 0)
+      goto cleanup;
+  }
+
+  // Stage 2: pixelate dev_out → dev_tmp (only if pixel_radius > 0).
+  if(pixel_radius != 0)
+  {
+    const int pr2 = 2 * (int)pixel_radius;
+    const int blocks_x = width  / pr2 + 1;
+    const int blocks_y = height / pr2 + 1;
+    struct { int width, height, pixel_radius; } pc
+      = { width, height, (int)pixel_radius };
+    dt_vk_mem_t *bufs[] = { dev_out, dev_tmp };
+    if(dt_vulkan_dispatch_n(&gd->vk_pixelate, bufs, 2,
+                            blocks_x, blocks_y, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+    // Swap roles: dev_tmp now holds the pixelated image; pipe it
+    // back into dev_out for the second blur stage.
+    if(dt_vulkan_copy_device_to_device(devid, dev_out, dev_tmp, img_bytes) != 0)
+      goto cleanup;
+  }
+
+  // Stage 3: optional noise pre-pass (only if sigma_2 != 0 to match
+  // the CPU code's `if(sigma_2 != 0.f) { if(noise) make_noise(...); }`).
+  if(sigma_2 != 0.f && noise != 0.f)
+  {
+    struct { int width, height; float noise; } pc = { width, height, noise };
+    dt_vk_mem_t *bufs[] = { dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_noise, bufs, 1,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Stage 4: optional second Gaussian blur.
+  if(sigma_2 != 0.f)
+  {
+    if(dt_gaussian_mean_blur_vk(devid, dev_out, width, height, 4, sigma_2) != 0)
+      goto cleanup;
+  }
+
+  // Stage 5: final noise pass (unconditional when noise != 0).
+  if(noise != 0.f)
+  {
+    struct { int width, height; float noise; } pc = { width, height, noise };
+    dt_vk_mem_t *bufs[] = { dev_out };
+    if(dt_vulkan_dispatch_n(&gd->vk_noise, bufs, 1,
+                            width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_tmp);
+  return rc;
+}
 #endif
 
 void gui_init(dt_iop_module_t *self)
