@@ -19,12 +19,14 @@
 #include "bauhaus/bauhaus.h"
 #include "common/bilateral.h"
 #include "common/bilateralcl.h"
+#include "common/bilateralvk.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/dwt.h"
 #include "common/gaussian.h"
 #include "common/heal.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "develop/blend.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
@@ -185,7 +187,49 @@ typedef struct dt_iop_retouch_global_data_t
   int kernel_retouch_image_rgb2lab;
   int kernel_retouch_image_lab2rgb;
   int kernel_retouch_copy_mask_to_alpha;
+#ifdef HAVE_VULKAN
+  // 8 kernel slots — copy_buffer_to_image and copy_image_to_buffer_masked
+  // collapse to copy_buffer_to_buffer and copy_buffer_to_buffer_masked in
+  // VK because the "image" path becomes a flat float4 storage buffer
+  // (image-shortcut pattern, §5.2). The retouch HEAL form is gated to
+  // OpenCL/CPU — process_vk returns -1 if any form on the param block
+  // is DT_IOP_RETOUCH_HEAL until dt_heal_*_vk lands.
+  dt_vk_module_kernel_t vk_clear_alpha;
+  dt_vk_module_kernel_t vk_copy_alpha;
+  dt_vk_module_kernel_t vk_copy_b2b;
+  dt_vk_module_kernel_t vk_copy_b2b_masked;
+  dt_vk_module_kernel_t vk_copy_mask_to_alpha;
+  dt_vk_module_kernel_t vk_fill;
+  dt_vk_module_kernel_t vk_image_rgb2lab;
+  dt_vk_module_kernel_t vk_image_lab2rgb;
+#endif
 } dt_iop_retouch_global_data_t;
+
+#ifdef HAVE_VULKAN
+// Push-constant blob shapes used by the retouch VK kernels.
+// Declared here (near global_data_t) so init_global can use sizeof().
+typedef struct vk_rt_wh_pc_t { int width, height; } vk_rt_wh_pc_t;
+typedef struct vk_rt_copy_b2b_pc_t {
+  int in_width, in_height, out_width, out_height;
+  int xoffs, yoffs;
+} vk_rt_copy_b2b_pc_t;
+typedef struct vk_rt_mask_pc_t {
+  int roi_in_x, roi_in_y, roi_in_width;
+  int roi_ms_x, roi_ms_y, roi_ms_width, roi_ms_height;
+  float opacity;
+} vk_rt_mask_pc_t;
+typedef struct vk_rt_fill_pc_t {
+  int roi_in_x, roi_in_y, roi_in_width;
+  int roi_ms_x, roi_ms_y, roi_ms_width, roi_ms_height;
+  float opacity;
+  float color_x, color_y, color_z;
+} vk_rt_fill_pc_t;
+typedef struct vk_rt_dest_pc_t {
+  int roi_dest_x, roi_dest_y, roi_dest_width;
+  int roi_ms_x, roi_ms_y, roi_ms_width, roi_ms_height;
+  float opacity;
+} vk_rt_dest_pc_t;
+#endif
 
 
 // this returns a translatable name
@@ -2165,6 +2209,44 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(program, "retouch_image_lab2rgb");
   gd->kernel_retouch_copy_mask_to_alpha =
     dt_opencl_create_kernel(program, "retouch_copy_mask_to_alpha");
+#ifdef HAVE_VULKAN
+  // 1 binding, 8 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_clear_alpha,
+                               "retouch_clear_alpha", "retouch_clear_alpha", 1,
+                               sizeof(vk_rt_wh_pc_t), 16, 16, 1);
+  // 2 bindings, 8 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_copy_alpha,
+                               "retouch_copy_alpha", "retouch_copy_alpha", 2,
+                               sizeof(vk_rt_wh_pc_t), 16, 16, 1);
+  // 2 bindings, 24 B PC (covers both copy_b2b and copy_b2i in VK)
+  dt_vulkan_module_kernel_load(&gd->vk_copy_b2b,
+                               "retouch_copy_buffer_to_buffer",
+                               "retouch_copy_buffer_to_buffer", 2,
+                               sizeof(vk_rt_copy_b2b_pc_t), 16, 16, 1);
+  // 3 bindings, 28 B PC (covers both b2b_masked and i2b_masked in VK)
+  dt_vulkan_module_kernel_load(&gd->vk_copy_b2b_masked,
+                               "retouch_copy_buffer_to_buffer_masked",
+                               "retouch_copy_buffer_to_buffer_masked", 3,
+                               sizeof(vk_rt_dest_pc_t), 16, 16, 1);
+  // 2 bindings, 28 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_copy_mask_to_alpha,
+                               "retouch_copy_mask_to_alpha",
+                               "retouch_copy_mask_to_alpha", 2,
+                               sizeof(vk_rt_mask_pc_t), 16, 16, 1);
+  // 2 bindings, 44 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_fill,
+                               "retouch_fill", "retouch_fill", 2,
+                               sizeof(vk_rt_fill_pc_t), 16, 16, 1);
+  // 1 binding, 8 B PC each
+  dt_vulkan_module_kernel_load(&gd->vk_image_rgb2lab,
+                               "retouch_image_rgb2lab",
+                               "retouch_image_rgb2lab", 1,
+                               sizeof(vk_rt_wh_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_image_lab2rgb,
+                               "retouch_image_lab2rgb",
+                               "retouch_image_lab2rgb", 1,
+                               sizeof(vk_rt_wh_pc_t), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -2181,7 +2263,16 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_retouch_image_rgb2lab);
   dt_opencl_free_kernel(gd->kernel_retouch_image_lab2rgb);
   dt_opencl_free_kernel(gd->kernel_retouch_copy_mask_to_alpha);
-
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_clear_alpha);
+  dt_vulkan_module_kernel_unload(&gd->vk_copy_alpha);
+  dt_vulkan_module_kernel_unload(&gd->vk_copy_b2b);
+  dt_vulkan_module_kernel_unload(&gd->vk_copy_b2b_masked);
+  dt_vulkan_module_kernel_unload(&gd->vk_copy_mask_to_alpha);
+  dt_vulkan_module_kernel_unload(&gd->vk_fill);
+  dt_vulkan_module_kernel_unload(&gd->vk_image_rgb2lab);
+  dt_vulkan_module_kernel_unload(&gd->vk_image_lab2rgb);
+#endif
   free(self->data);
   self->data = NULL;
 }
@@ -4721,6 +4812,539 @@ cleanup:
 
   return err;
 }
+#endif
+
+#ifdef HAVE_VULKAN
+
+// Mirrors rt_copy_in_to_out_cl. Both copy_buffer_to_buffer and
+// copy_buffer_to_image collapse to the same kernel in VK.
+static int rt_copy_in_to_out_vk(const int devid,
+                                dt_vk_mem_t *dev_in,
+                                const dt_iop_roi_t *const roi_in,
+                                dt_vk_mem_t *dev_out,
+                                const dt_iop_roi_t *const roi_out,
+                                const int dx, const int dy,
+                                const dt_vk_module_kernel_t *kernel)
+{
+  const int xoffs = roi_out->x - roi_in->x - dx;
+  const int yoffs = roi_out->y - roi_in->y - dy;
+  const vk_rt_copy_b2b_pc_t pc = {
+    .in_width = roi_in->width, .in_height = roi_in->height,
+    .out_width = roi_out->width, .out_height = roi_out->height,
+    .xoffs = xoffs, .yoffs = yoffs,
+  };
+  return dt_vulkan_dispatch_inout(kernel, dev_in, dev_out,
+                                  MIN(roi_out->width, roi_in->width),
+                                  MIN(roi_out->height, roi_in->height),
+                                  &pc, sizeof(pc));
+}
+
+// Builds the scaled mask via the CPU path (same as the OpenCL helper:
+// rt_build_scaled_mask is unchanged) and uploads it to a fresh device buffer.
+static int rt_build_scaled_mask_vk(const int devid,
+                                   float *const mask,
+                                   dt_iop_roi_t *const roi_mask,
+                                   float **mask_scaled,
+                                   dt_vk_mem_t **p_dev_mask_scaled,
+                                   dt_iop_roi_t *roi_mask_scaled,
+                                   dt_iop_roi_t *const roi_in,
+                                   const int dx, const int dy,
+                                   const int algo)
+{
+  if(rt_build_scaled_mask(mask, roi_mask, mask_scaled, roi_mask_scaled,
+                          roi_in, dx, dy, algo))
+    return -1;
+  if(*mask_scaled == NULL) return -1;
+  const size_t bytes = sizeof(float) * roi_mask_scaled->width * roi_mask_scaled->height;
+  dt_vk_mem_t *dev_mask = dt_vulkan_alloc_buffer(devid, bytes);
+  if(!dev_mask) return -1;
+  if(dt_vulkan_write_to_device(devid, dev_mask, *mask_scaled, bytes) != 0)
+  {
+    dt_vulkan_free_buffer(devid, dev_mask);
+    return -1;
+  }
+  *p_dev_mask_scaled = dev_mask;
+  return 0;
+}
+
+static int rt_copy_image_masked_vk(const int devid,
+                                   dt_vk_mem_t *dev_src,
+                                   dt_vk_mem_t *dev_dest,
+                                   dt_iop_roi_t *const roi_dest,
+                                   dt_vk_mem_t *dev_mask_scaled,
+                                   dt_iop_roi_t *const roi_mask_scaled,
+                                   const float opacity,
+                                   const dt_vk_module_kernel_t *kernel)
+{
+  const vk_rt_dest_pc_t pc = {
+    .roi_dest_x = roi_dest->x, .roi_dest_y = roi_dest->y,
+    .roi_dest_width = roi_dest->width,
+    .roi_ms_x = roi_mask_scaled->x, .roi_ms_y = roi_mask_scaled->y,
+    .roi_ms_width = roi_mask_scaled->width, .roi_ms_height = roi_mask_scaled->height,
+    .opacity = opacity,
+  };
+  dt_vk_mem_t *bufs[3] = { dev_src, dev_dest, dev_mask_scaled };
+  return dt_vulkan_dispatch_n(kernel, bufs, 3,
+                              roi_mask_scaled->width, roi_mask_scaled->height,
+                              &pc, sizeof(pc));
+}
+
+static int rt_copy_mask_to_alpha_vk(const int devid,
+                                    dt_vk_mem_t *dev_layer,
+                                    dt_iop_roi_t *const roi_layer,
+                                    dt_vk_mem_t *dev_mask_scaled,
+                                    dt_iop_roi_t *const roi_mask_scaled,
+                                    const float opacity,
+                                    dt_iop_retouch_global_data_t *gd)
+{
+  const vk_rt_mask_pc_t pc = {
+    .roi_in_x = roi_layer->x, .roi_in_y = roi_layer->y,
+    .roi_in_width = roi_layer->width,
+    .roi_ms_x = roi_mask_scaled->x, .roi_ms_y = roi_mask_scaled->y,
+    .roi_ms_width = roi_mask_scaled->width, .roi_ms_height = roi_mask_scaled->height,
+    .opacity = opacity,
+  };
+  dt_vk_mem_t *bufs[2] = { dev_layer, dev_mask_scaled };
+  return dt_vulkan_dispatch_n(&gd->vk_copy_mask_to_alpha, bufs, 2,
+                              roi_mask_scaled->width, roi_mask_scaled->height,
+                              &pc, sizeof(pc));
+}
+
+static int _retouch_clone_vk(const int devid,
+                             dt_vk_mem_t *dev_layer,
+                             dt_iop_roi_t *const roi_layer,
+                             dt_vk_mem_t *dev_mask_scaled,
+                             dt_iop_roi_t *const roi_mask_scaled,
+                             const int dx, const int dy,
+                             const float opacity,
+                             dt_iop_retouch_global_data_t *gd)
+{
+  int rc = -1;
+  dt_vk_mem_t *dev_src = dt_vulkan_alloc_buffer(devid,
+       sizeof(float) * 4 * roi_mask_scaled->width * roi_mask_scaled->height);
+  if(!dev_src) return -1;
+
+  if(rt_copy_in_to_out_vk(devid, dev_layer, roi_layer, dev_src, roi_mask_scaled,
+                          dx, dy, &gd->vk_copy_b2b) != 0)
+    goto cleanup;
+
+  rc = rt_copy_image_masked_vk(devid, dev_src, dev_layer, roi_layer,
+                               dev_mask_scaled, roi_mask_scaled, opacity,
+                               &gd->vk_copy_b2b_masked);
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_src);
+  return rc;
+}
+
+static int _retouch_fill_vk(const int devid,
+                            dt_vk_mem_t *dev_layer,
+                            dt_iop_roi_t *const roi_layer,
+                            dt_vk_mem_t *dev_mask_scaled,
+                            dt_iop_roi_t *const roi_mask_scaled,
+                            const float opacity,
+                            float *color,
+                            dt_iop_retouch_global_data_t *gd)
+{
+  const vk_rt_fill_pc_t pc = {
+    .roi_in_x = roi_layer->x, .roi_in_y = roi_layer->y,
+    .roi_in_width = roi_layer->width,
+    .roi_ms_x = roi_mask_scaled->x, .roi_ms_y = roi_mask_scaled->y,
+    .roi_ms_width = roi_mask_scaled->width, .roi_ms_height = roi_mask_scaled->height,
+    .opacity = opacity,
+    .color_x = color[0], .color_y = color[1], .color_z = color[2],
+  };
+  dt_vk_mem_t *bufs[2] = { dev_layer, dev_mask_scaled };
+  return dt_vulkan_dispatch_n(&gd->vk_fill, bufs, 2,
+                              roi_mask_scaled->width, roi_mask_scaled->height,
+                              &pc, sizeof(pc));
+}
+
+static int _retouch_blur_vk(const int devid,
+                            dt_vk_mem_t *dev_layer,
+                            dt_iop_roi_t *const roi_layer,
+                            dt_vk_mem_t *dev_mask_scaled,
+                            dt_iop_roi_t *const roi_mask_scaled,
+                            const float opacity,
+                            const int blur_type,
+                            const float blur_radius,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_iop_retouch_global_data_t *gd)
+{
+  if(fabsf(blur_radius) <= 0.1f) return 0;
+
+  const float sigma = blur_radius * roi_layer->scale / piece->iscale;
+  int rc = -1;
+
+  dt_vk_mem_t *dev_dest = dt_vulkan_alloc_buffer(devid,
+      sizeof(float) * 4 * roi_mask_scaled->width * roi_mask_scaled->height);
+  if(!dev_dest) return -1;
+
+  if(blur_type == DT_IOP_RETOUCH_BLUR_BILATERAL)
+  {
+    const vk_rt_wh_pc_t pc = { roi_layer->width, roi_layer->height };
+    dt_vk_mem_t *bufs[1] = { dev_layer };
+    if(dt_vulkan_dispatch_n(&gd->vk_image_rgb2lab, bufs, 1,
+                            roi_layer->width, roi_layer->height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  if(rt_copy_in_to_out_vk(devid, dev_layer, roi_layer, dev_dest,
+                          roi_mask_scaled, 0, 0, &gd->vk_copy_b2b) != 0)
+    goto cleanup;
+
+  if(blur_type == DT_IOP_RETOUCH_BLUR_GAUSSIAN && fabsf(blur_radius) > 0.1f)
+  {
+    static const float Labmax[] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+    static const float Labmin[] = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    dt_gaussian_vk_t *gg = dt_gaussian_init_vk(roi_mask_scaled->width,
+                                               roi_mask_scaled->height, 4,
+                                               Labmax, Labmin, sigma,
+                                               DT_IOP_GAUSSIAN_ZERO);
+    if(gg)
+    {
+      const int br = dt_gaussian_blur_vk(gg, dev_dest, dev_dest);
+      dt_gaussian_free_vk(gg);
+      if(br != 0) goto cleanup;
+    }
+    else goto cleanup;
+  }
+  else if(blur_type == DT_IOP_RETOUCH_BLUR_BILATERAL && fabsf(blur_radius) > 0.1f)
+  {
+    const float sigma_r = 100.0f;
+    const float sigma_s = sigma;
+    const float detail = -1.0f;
+    dt_bilateral_vk_t *b = dt_bilateral_init_vk(roi_mask_scaled->width,
+                                                roi_mask_scaled->height,
+                                                sigma_s, sigma_r);
+    if(b)
+    {
+      int br = dt_bilateral_splat_vk(b, dev_dest);
+      if(br == 0) br = dt_bilateral_blur_vk(b);
+      if(br == 0) br = dt_bilateral_slice_vk(b, dev_dest, dev_dest, detail);
+      dt_bilateral_free_vk(b);
+      if(br != 0) goto cleanup;
+    }
+    else goto cleanup;
+  }
+
+  if(rt_copy_image_masked_vk(devid, dev_dest, dev_layer, roi_layer,
+                             dev_mask_scaled, roi_mask_scaled, opacity,
+                             &gd->vk_copy_b2b_masked) != 0)
+    goto cleanup;
+
+  if(blur_type == DT_IOP_RETOUCH_BLUR_BILATERAL)
+  {
+    const vk_rt_wh_pc_t pc = { roi_layer->width, roi_layer->height };
+    dt_vk_mem_t *bufs[1] = { dev_layer };
+    if(dt_vulkan_dispatch_n(&gd->vk_image_lab2rgb, bufs, 1,
+                            roi_layer->width, roi_layer->height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  rc = 0;
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_dest);
+  return rc;
+}
+
+// Stats / level autorange — same approach as the OpenCL helpers:
+// read back to CPU, run the existing CPU helper, write back. Cheap
+// because these only fire when auto-levels is requested or a single
+// detail scale is previewed.
+static int rt_process_stats_vk(dt_iop_module_t *self,
+                               dt_dev_pixelpipe_iop_t *piece,
+                               const int devid,
+                               dt_vk_mem_t *dev_img,
+                               const int width, const int height,
+                               float levels[3])
+{
+  const int ch = 4;
+  float *src = dt_alloc_align_float((size_t)ch * width * height);
+  if(!src) return -1;
+  if(dt_vulkan_read_from_device(devid, src, dev_img,
+                                (size_t)width * height * ch * sizeof(float)) != 0)
+  { dt_free_align(src); return -1; }
+  rt_process_stats(self, piece, src, width, height, ch, levels);
+  const int rc = dt_vulkan_write_to_device(devid, dev_img, src,
+                                           sizeof(float) * ch * width * height);
+  dt_free_align(src);
+  return rc;
+}
+
+static int rt_adjust_levels_vk(dt_iop_module_t *self,
+                               dt_dev_pixelpipe_iop_t *piece,
+                               const int devid,
+                               dt_vk_mem_t *dev_img,
+                               const int width, const int height,
+                               const float levels[3])
+{
+  const int ch = 4;
+  float *src = dt_alloc_align_float((size_t)ch * width * height);
+  if(!src) return -1;
+  if(dt_vulkan_read_from_device(devid, src, dev_img,
+                                (size_t)width * height * ch * sizeof(float)) != 0)
+  { dt_free_align(src); return -1; }
+  rt_adjust_levels(self, piece, src, width, height, ch, levels);
+  const int rc = dt_vulkan_write_to_device(devid, dev_img, src,
+                                           sizeof(float) * ch * width * height);
+  dt_free_align(src);
+  return rc;
+}
+
+static int rt_process_forms_vk(dt_vk_mem_t *dev_layer,
+                               dwt_params_vk_t *const wt_p,
+                               const int scale1)
+{
+  int rc = 0;
+  int scale = scale1;
+  retouch_user_data_t *usr_d = wt_p->user_data;
+  dt_iop_module_t *self = usr_d->self;
+  dt_dev_pixelpipe_iop_t *piece = usr_d->piece;
+
+  if(wt_p->merge_from_scale == 0
+     && wt_p->return_layer > 0
+     && scale != wt_p->return_layer
+     && scale != 0)
+    return 0;
+  if(scale > wt_p->scales + 1) return 0;
+
+  dt_develop_blend_params_t *bp = piece->blendop_data;
+  dt_iop_retouch_params_t *p = piece->data;
+  dt_iop_retouch_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  dt_iop_roi_t *roi_layer = &usr_d->roi;
+  const gboolean mask_display = usr_d->mask_display && (scale == usr_d->display_scale);
+
+  if(wt_p->scales < p->num_scales
+     && wt_p->return_layer == 0
+     && scale == wt_p->scales + 1)
+    scale = p->num_scales + 1;
+
+  if(usr_d->suppress_mask) return 0;
+
+  dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, bp->mask_id);
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return 0;
+
+  for(const GList *forms = grp->points; forms && rc == 0; forms = g_list_next(forms))
+  {
+    dt_masks_point_group_t *grpt = forms->data;
+    if(!grpt) continue;
+    const dt_mask_id_t formid = grpt->formid;
+    const float form_opacity = grpt->opacity;
+    if(!dt_is_valid_maskid(formid)) continue;
+    const int index = rt_get_index_from_formid(p, formid);
+    if(index == -1) continue;
+    if(p->rt_forms[index].scale != scale) continue;
+
+    dt_masks_form_t *form = dt_masks_get_from_id_ext(piece->pipe->forms, formid);
+    if(!form) continue;
+    if(!rt_masks_form_is_in_roi(self, piece, form, roi_layer, roi_layer)) continue;
+
+    float *mask = NULL;
+    dt_iop_roi_t roi_mask = { 0 };
+    dt_masks_get_mask(self, piece, form, &mask, &roi_mask.width, &roi_mask.height,
+                      &roi_mask.x, &roi_mask.y);
+    if(!mask) continue;
+
+    float dx = 0.f, dy = 0.f;
+    const dt_iop_retouch_algo_type_t algo = p->rt_forms[index].algorithm;
+    if(algo != DT_IOP_RETOUCH_BLUR && algo != DT_IOP_RETOUCH_FILL)
+    {
+      if(!rt_masks_get_delta_to_destination(self, piece, roi_layer, form, &dx, &dy,
+                                            p->rt_forms[index].distort_mode))
+      { dt_free_align(mask); continue; }
+    }
+
+    dt_vk_mem_t *dev_mask_scaled = NULL;
+    float *mask_scaled = NULL;
+    dt_iop_roi_t roi_mask_scaled = { 0 };
+    rc = rt_build_scaled_mask_vk(devid, mask, &roi_mask, &mask_scaled,
+                                 &dev_mask_scaled, &roi_mask_scaled,
+                                 roi_layer, dx, dy, algo);
+    dt_free_align(mask_scaled); // heal is gated out; other algos don't need it
+    mask_scaled = NULL;
+    dt_free_align(mask);
+
+    if(rc == 0
+       && (dx != 0 || dy != 0
+           || algo == DT_IOP_RETOUCH_BLUR
+           || algo == DT_IOP_RETOUCH_FILL)
+       && roi_mask_scaled.width > 2 && roi_mask_scaled.height > 2)
+    {
+      if(algo == DT_IOP_RETOUCH_CLONE)
+      {
+        rc = _retouch_clone_vk(devid, dev_layer, roi_layer,
+                               dev_mask_scaled, &roi_mask_scaled,
+                               (int)dx, (int)dy, form_opacity, gd);
+      }
+      else if(algo == DT_IOP_RETOUCH_BLUR)
+      {
+        rc = _retouch_blur_vk(devid, dev_layer, roi_layer,
+                              dev_mask_scaled, &roi_mask_scaled, form_opacity,
+                              p->rt_forms[index].blur_type,
+                              p->rt_forms[index].blur_radius, piece, gd);
+      }
+      else if(algo == DT_IOP_RETOUCH_FILL)
+      {
+        dt_aligned_pixel_t fill_color;
+        if(p->rt_forms[index].fill_mode == DT_IOP_RETOUCH_FILL_ERASE)
+          fill_color[0] = fill_color[1] = fill_color[2] =
+              p->rt_forms[index].fill_brightness;
+        else
+        {
+          fill_color[0] = p->rt_forms[index].fill_color[0] + p->rt_forms[index].fill_brightness;
+          fill_color[1] = p->rt_forms[index].fill_color[1] + p->rt_forms[index].fill_brightness;
+          fill_color[2] = p->rt_forms[index].fill_color[2] + p->rt_forms[index].fill_brightness;
+        }
+        rc = _retouch_fill_vk(devid, dev_layer, roi_layer,
+                              dev_mask_scaled, &roi_mask_scaled, form_opacity,
+                              fill_color, gd);
+      }
+      // HEAL is gated out at process_vk entry; this branch can't be reached.
+
+      if(mask_display && rc == 0)
+        rc = rt_copy_mask_to_alpha_vk(devid, dev_layer, roi_layer,
+                                       dev_mask_scaled, &roi_mask_scaled,
+                                       form_opacity, gd);
+    }
+
+    dt_vulkan_free_buffer(devid, dev_mask_scaled);
+  }
+
+  return rc;
+}
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_retouch_params_t *p = piece->data;
+  dt_iop_retouch_global_data_t *gd = self->global_data;
+  dt_iop_retouch_gui_data_t *g = self->gui_data;
+
+  // Gate: any HEAL form on the param block falls back to OpenCL/CPU
+  // until dt_heal_*_vk lands. Done at runtime rather than via
+  // commit_params so the user can iteratively add/remove HEAL forms
+  // without re-triggering pipeline state changes. (Uses sizeof to
+  // avoid depending on RETOUCH_NO_FORMS, which is #undef-ed earlier.)
+  const int n_forms = (int)(sizeof(p->rt_forms) / sizeof(p->rt_forms[0]));
+  for(int i = 0; i < n_forms; i++)
+    if(dt_is_valid_maskid(p->rt_forms[i].formid)
+       && p->rt_forms[i].algorithm == DT_IOP_RETOUCH_HEAL)
+      return -1;
+
+  const int devid = piece->pipe->devid;
+  dt_iop_roi_t roi_retouch = *roi_in;
+  dt_iop_roi_t *roi_rt = &roi_retouch;
+  retouch_user_data_t usr_data = { 0 };
+  dwt_params_vk_t *dwt_p = NULL;
+  int rc = -1;
+
+  const gboolean display_wavelet_scale = g && dt_iop_has_focus(self) ? g->display_wavelet_scale : FALSE;
+
+  dt_vk_mem_t *in_retouch = dt_vulkan_alloc_buffer(devid,
+       sizeof(float) * 4 * roi_rt->width * roi_rt->height);
+  if(!in_retouch) return -1;
+
+  if(dt_vulkan_copy_device_to_device(devid, in_retouch, dev_in,
+                                     (size_t)roi_rt->width * roi_rt->height * 4 * sizeof(float)) != 0)
+    goto cleanup;
+
+  usr_data.self = self;
+  usr_data.piece = piece;
+  usr_data.roi = *roi_rt;
+  usr_data.mask_display = FALSE;
+  usr_data.suppress_mask = (g && g->suppress_mask && dt_iop_has_focus(self)
+                            && (piece->pipe == self->dev->full.pipe));
+  usr_data.display_scale = p->curr_scale;
+
+  dwt_p = dt_dwt_init_vk(devid, in_retouch, roi_rt->width, roi_rt->height,
+                         p->num_scales,
+                         (!display_wavelet_scale || !dt_pipe_is_full(piece->pipe))
+                         ? 0 : p->curr_scale,
+                         p->merge_from_scale, &usr_data,
+                         roi_in->scale / piece->iscale);
+  if(!dwt_p) goto cleanup;
+
+  if(dt_pipe_is_full(piece->pipe)
+     && g && g->mask_display && dt_iop_has_focus(self)
+     && (piece->pipe == self->dev->full.pipe))
+  {
+    const vk_rt_wh_pc_t pc = { roi_rt->width, roi_rt->height };
+    dt_vk_mem_t *bufs[1] = { in_retouch };
+    if(dt_vulkan_dispatch_n(&gd->vk_clear_alpha, bufs, 1,
+                            roi_rt->width, roi_rt->height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+    piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+    piece->pipe->bypass_blendif = TRUE;
+    usr_data.mask_display = TRUE;
+  }
+
+  if(dt_pipe_is_full(piece->pipe))
+  {
+    if(dt_iop_has_focus(self))
+    {
+      const int max_scales = dwt_get_max_scale_vk(dwt_p);
+      if(dwt_p->scales > max_scales)
+        dt_control_log(_("max scale is %i for this image size"), max_scales);
+    }
+    if(g) g->first_scale_visible = dt_dwt_first_scale_visible_vk(dwt_p);
+  }
+
+  if(dwt_decompose_vk(dwt_p, rt_process_forms_vk) != 0)
+    goto cleanup;
+
+  dt_aligned_pixel_t levels = { p->preview_levels[0],
+                                p->preview_levels[1],
+                                p->preview_levels[2] };
+
+  if(g && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    if(g->preview_auto_levels == 1 && !DT_IN_GUI_UPDATE())
+    {
+      g->preview_auto_levels = -1;
+      dt_iop_gui_leave_critical_section(self);
+      levels[0] = levels[1] = levels[2] = 0;
+      if(rt_process_stats_vk(self, piece, devid, in_retouch,
+                             roi_rt->width, roi_rt->height, levels) != 0)
+        goto cleanup;
+      rt_clamp_minmax(levels, levels);
+      for(int i = 0; i < 3; i++) g->preview_levels[i] = levels[i];
+      dt_iop_gui_enter_critical_section(self);
+      g->preview_auto_levels = 2;
+    }
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  if(dwt_p->return_layer > 0 && dwt_p->return_layer < dwt_p->scales + 1)
+  {
+    if(rt_adjust_levels_vk(self, piece, devid, in_retouch,
+                           roi_rt->width, roi_rt->height, levels) != 0)
+      goto cleanup;
+  }
+
+  if((piece->pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
+     && g && !g->mask_display)
+  {
+    const vk_rt_wh_pc_t pc = { roi_rt->width, roi_rt->height };
+    if(dt_vulkan_dispatch_inout(&gd->vk_copy_alpha, dev_in, in_retouch,
+                                roi_rt->width, roi_rt->height,
+                                &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = rt_copy_in_to_out_vk(devid, in_retouch, roi_in, dev_out, roi_out, 0, 0,
+                            &gd->vk_copy_b2b);
+
+cleanup:
+  if(dwt_p) dt_dwt_free_vk(dwt_p);
+  dt_vulkan_free_buffer(devid, in_retouch);
+  return rc;
+}
+
 #endif
 
 // clang-format off
