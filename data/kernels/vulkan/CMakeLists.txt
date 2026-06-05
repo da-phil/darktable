@@ -191,7 +191,15 @@ set(VK_KERNELS
     ce_bilinear4:ce_bilinear4
     rawoverexposed_mark_cfa:rawoverexposed_mark_cfa
     rawoverexposed_mark_solid:rawoverexposed_mark_solid
-    rawoverexposed_falsecolor:rawoverexposed_falsecolor)
+    rawoverexposed_falsecolor:rawoverexposed_falsecolor
+    retouch_clear_alpha:retouch_clear_alpha
+    retouch_copy_alpha:retouch_copy_alpha
+    retouch_copy_buffer_to_buffer:retouch_copy_buffer_to_buffer
+    retouch_copy_buffer_to_buffer_masked:retouch_copy_buffer_to_buffer_masked
+    retouch_copy_mask_to_alpha:retouch_copy_mask_to_alpha
+    retouch_fill:retouch_fill
+    retouch_image_rgb2lab:retouch_image_rgb2lab
+    retouch_image_lab2rgb:retouch_image_lab2rgb)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer In { vec4 data[]; } in_buf;
+layout(push_constant) uniform PC { int width; int height; } pc;
+
+vec4 lab_f(vec4 x) {
+  vec4 eps = vec4(216.0 / 24389.0);
+  vec4 k   = vec4(24389.0 / 27.0);
+  bvec4 m = greaterThan(x, eps);
+  vec4 a = vec4(pow(x.x, 1.0/3.0), pow(x.y, 1.0/3.0),
+                pow(x.z, 1.0/3.0), pow(x.w, 1.0/3.0));
+  vec4 b = (k * x + vec4(16.0)) / vec4(116.0);
+  return mix(b, a, m);
+}
+vec4 XYZ_to_Lab(vec4 xyz) {
+  vec4 d50i = vec4(1.0/0.9642, 1.0, 1.0/0.8249, 1.0);
+  vec4 f = lab_f(xyz * d50i);
+  vec4 lab;
+  lab.x = 116.0 * f.y - 16.0;
+  lab.y = 500.0 * (f.x - f.y);
+  lab.z = 200.0 * (f.y - f.z);
+  lab.w = xyz.w;
+  return lab;
+}
+vec4 sRGB_to_XYZ(vec4 sRGB) {
+  vec4 XYZ;
+  XYZ.x = 0.4360747 * sRGB.x + 0.3850649 * sRGB.y + 0.1430804 * sRGB.z;
+  XYZ.y = 0.2225045 * sRGB.x + 0.7168786 * sRGB.y + 0.0606169 * sRGB.z;
+  XYZ.z = 0.0139322 * sRGB.x + 0.0971045 * sRGB.y + 0.7141733 * sRGB.z;
+  XYZ.w = sRGB.w;
+  return XYZ;
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+  in_buf.data[idx] = XYZ_to_Lab(sRGB_to_XYZ(in_buf.data[idx]));
+}
