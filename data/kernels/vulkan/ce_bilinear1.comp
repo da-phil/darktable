@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { float data[]; } in_buf;
+layout(std430, binding = 1) buffer Out { float data[]; } out_buf;
+layout(push_constant) uniform PC { int width_in; int height_in; int width_out; int height_out; } pc;
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width_out || y >= pc.height_out) return;
+  float x_in = (float(x) / float(pc.width_out))  * float(pc.width_in);
+  float y_in = (float(y) / float(pc.height_out)) * float(pc.height_in);
+  int xp = int(floor(x_in)); int xn = xp + 1;
+  int yp = int(floor(y_in)); int yn = yp + 1;
+  xp = min(xp, pc.width_in - 1); xn = min(xn, pc.width_in - 1);
+  yp = min(yp, pc.height_in - 1); yn = min(yn, pc.height_in - 1);
+  float NW = in_buf.data[yp * pc.width_in + xp];
+  float NE = in_buf.data[yp * pc.width_in + xn];
+  float SE = in_buf.data[yn * pc.width_in + xn];
+  float SW = in_buf.data[yn * pc.width_in + xp];
+  float dyn = float(yn) - y_in; float dyp = 1.0 - dyn;
+  float dxn = float(xn) - x_in; float dxp = 1.0 - dxn;
+  out_buf.data[y * pc.width_out + x] = dyp * (SW * dxn + SE * dxp) + dyn * (NW * dxn + NE * dxp);
+}

@@ -177,7 +177,18 @@ set(VK_KERNELS
     censorize_noise:censorize_noise
     ce_sample_input:ce_sample_input
     ce_process_data:ce_process_data
-    ce_write_output:ce_write_output)
+    ce_write_output:ce_write_output
+    ce_init_covariance:ce_init_covariance
+    ce_finish_covariance:ce_finish_covariance
+    ce_prepare_prefilter:ce_prepare_prefilter
+    ce_apply_prefilter:ce_apply_prefilter
+    ce_prepare_correlations:ce_prepare_correlations
+    ce_finish_correlations:ce_finish_correlations
+    ce_final_guide:ce_final_guide
+    ce_apply_guided:ce_apply_guided
+    ce_bilinear1:ce_bilinear1
+    ce_bilinear2:ce_bilinear2
+    ce_bilinear4:ce_bilinear4)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
