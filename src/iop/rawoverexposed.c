@@ -21,6 +21,7 @@
 #include "common/imagebuf.h"     // for dt_iop_image_copy_by_size
 #include "common/mipmap_cache.h" // for dt_mipmap_buffer_t, dt_mipmap_cach...
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"      // for dt_control_log
 #include "develop/develop.h"      // for dt_develop_t, dt_develop_t::(anony...
 #include "develop/imageop.h"      // for dt_iop_module_t, dt_iop_roi_t, dt_...
@@ -58,6 +59,16 @@ typedef struct dt_iop_rawoverexposed_global_data_t
   int kernel_rawoverexposed_mark_cfa;
   int kernel_rawoverexposed_mark_solid;
   int kernel_rawoverexposed_falsecolor;
+#ifdef HAVE_VULKAN
+  // 3 visualisation kernels; each takes the float4 in/out plus a
+  // float coord buffer (post-distort raw-coord lookup), the raw
+  // uint16 buffer promoted to uint32 (one per pixel — wastes 2 B
+  // per pixel but keeps the shader trivial), and the 36-byte X-Trans
+  // pattern as 36 uints.
+  dt_vk_module_kernel_t vk_mark_cfa;
+  dt_vk_module_kernel_t vk_mark_solid;
+  dt_vk_module_kernel_t vk_falsecolor;
+#endif
 } dt_iop_rawoverexposed_global_data_t;
 
 const char *name()
@@ -352,6 +363,168 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+// Mirrors process_cl, with raw uint16 promoted to uint32 on host
+// before upload. Three push-constant shapes (one per mode) keep the
+// kernel signatures small enough to fit inside the 128 B Vulkan PC
+// floor. All three modes share the same 5-binding layout
+// (in, out, coord, raw, xtrans).
+typedef struct vk_roe_base_pc_t
+{
+  int width, height;
+  int raw_width, raw_height;
+  unsigned int filters;
+  unsigned int thr0, thr1, thr2, thr3;
+} vk_roe_base_pc_t;
+
+typedef struct vk_roe_cfa_pc_t
+{
+  vk_roe_base_pc_t base;
+  float c0x, c0y, c0z, c0w;
+  float c1x, c1y, c1z, c1w;
+  float c2x, c2y, c2z, c2w;
+  float c3x, c3y, c3z, c3w;
+} vk_roe_cfa_pc_t;
+
+typedef struct vk_roe_solid_pc_t
+{
+  vk_roe_base_pc_t base;
+  float scx, scy, scz, scw;
+} vk_roe_solid_pc_t;
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rawoverexposed_data_t *const d = piece->data;
+  dt_develop_t *dev = self->dev;
+  dt_iop_rawoverexposed_global_data_t *gd = self->global_data;
+
+  int rc = -1;
+  const int devid = piece->pipe->devid;
+  const int width  = roi_out->width;
+  const int height = roi_out->height;
+  const dt_image_t *const image = &dev->image_storage;
+
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, image->id, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  if(!buf.buf)
+  {
+    dt_control_log(_("failed to get raw buffer from image `%s'"), image->filename);
+    dt_mipmap_cache_release(&buf);
+    return -1;
+  }
+
+  process_common_setup(self, piece);
+
+  // First seed dev_out with dev_in (the kernel writes every output pixel,
+  // but for OOB raw-coord rows we still rely on having a sane base).
+  if(dt_vulkan_copy_device_to_device(devid, dev_out, dev_in,
+                                     (size_t)width * height * sizeof(float) * 4) != 0)
+  {
+    dt_mipmap_cache_release(&buf);
+    return -1;
+  }
+
+  const int raw_width = buf.width;
+  const int raw_height = buf.height;
+  const uint16_t *const raw_src = (const uint16_t *)buf.buf;
+
+  // Promote uint16 -> uint32 so the shader can index a plain uint[].
+  const size_t raw_count = (size_t)raw_width * raw_height;
+  uint32_t *raw_u32 = dt_alloc_aligned(raw_count * sizeof(uint32_t));
+  if(!raw_u32) { dt_mipmap_cache_release(&buf); return -1; }
+  DT_OMP_FOR()
+  for(size_t i = 0; i < raw_count; i++) raw_u32[i] = (uint32_t)raw_src[i];
+
+  const size_t coordbufsize = (size_t)height * width * 2 * sizeof(float);
+  float *coordbuf = dt_alloc_aligned(coordbufsize);
+  if(!coordbuf) { dt_free_align(raw_u32); dt_mipmap_cache_release(&buf); return -1; }
+
+  DT_OMP_FOR()
+  for(int j = 0; j < height; j++)
+  {
+    float *bufptr = coordbuf + (size_t)2 * j * width;
+    for(int i = 0; i < width; i++)
+    {
+      bufptr[2 * i] = (float)(roi_out->x + i) / roi_in->scale;
+      bufptr[2 * i + 1] = (float)(roi_out->y + j) / roi_in->scale;
+    }
+    dt_dev_distort_backtransform_plus(self->dev, self->dev->full.pipe,
+                                      self->iop_order,
+                                      DT_DEV_TRANSFORM_DIR_BACK_INCL,
+                                      bufptr, width);
+  }
+
+  // 36 uints for the X-Trans pattern (one byte per uint slot).
+  uint32_t xtrans_flat[36];
+  const uint8_t (*const xt)[6] = image->buf_dsc.xtrans;
+  for(int r = 0; r < 6; r++)
+    for(int c = 0; c < 6; c++)
+      xtrans_flat[r * 6 + c] = (uint32_t)xt[r][c];
+
+  dt_vk_mem_t *dev_coord = dt_vulkan_alloc_buffer(devid, coordbufsize);
+  dt_vk_mem_t *dev_raw   = dt_vulkan_alloc_buffer(devid, raw_count * sizeof(uint32_t));
+  dt_vk_mem_t *dev_xtr   = dt_vulkan_alloc_buffer(devid, sizeof(xtrans_flat));
+  if(!dev_coord || !dev_raw || !dev_xtr) goto cleanup;
+
+  const vk_roe_base_pc_t base = {
+    .width = width, .height = height,
+    .raw_width = raw_width, .raw_height = raw_height,
+    .filters = image->buf_dsc.filters,
+    .thr0 = d->threshold[0], .thr1 = d->threshold[1],
+    .thr2 = d->threshold[2], .thr3 = d->threshold[3],
+  };
+
+  dt_vk_mem_t *bufs[5] = { dev_in, dev_out, dev_coord, dev_raw, dev_xtr };
+  const dt_vk_upload_t uploads[] = {
+    { dev_coord, coordbuf,    coordbufsize },
+    { dev_raw,   raw_u32,     raw_count * sizeof(uint32_t) },
+    { dev_xtr,   xtrans_flat, sizeof(xtrans_flat) },
+  };
+
+  switch(dev->rawoverexposed.mode)
+  {
+    case DT_DEV_RAWOVEREXPOSED_MODE_MARK_CFA:
+    {
+      vk_roe_cfa_pc_t pc = { .base = base };
+      memcpy(&pc.c0x, dt_iop_rawoverexposed_colors, 16 * sizeof(float));
+      rc = dt_vulkan_dispatch_n_batched(&gd->vk_mark_cfa, bufs, 5,
+                                        uploads, 3, width, height,
+                                        &pc, sizeof(pc));
+      break;
+    }
+    case DT_DEV_RAWOVEREXPOSED_MODE_MARK_SOLID:
+    {
+      const int colorscheme = dev->rawoverexposed.colorscheme;
+      const float *const color = dt_iop_rawoverexposed_colors[colorscheme];
+      vk_roe_solid_pc_t pc = { .base = base,
+                               .scx = color[0], .scy = color[1],
+                               .scz = color[2], .scw = color[3] };
+      rc = dt_vulkan_dispatch_n_batched(&gd->vk_mark_solid, bufs, 5,
+                                        uploads, 3, width, height,
+                                        &pc, sizeof(pc));
+      break;
+    }
+    case DT_DEV_RAWOVEREXPOSED_MODE_FALSECOLOR:
+    default:
+      rc = dt_vulkan_dispatch_n_batched(&gd->vk_falsecolor, bufs, 5,
+                                        uploads, 3, width, height,
+                                        &base, sizeof(base));
+      break;
+  }
+
+cleanup:
+  dt_vulkan_free_buffer(devid, dev_coord);
+  dt_vulkan_free_buffer(devid, dev_raw);
+  dt_vulkan_free_buffer(devid, dev_xtr);
+  dt_free_align(coordbuf);
+  dt_free_align(raw_u32);
+  dt_mipmap_cache_release(&buf);
+  return rc;
+}
+#endif
+
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
                      dt_develop_tiling_t *tiling)
@@ -405,6 +578,19 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_rawoverexposed_mark_cfa = dt_opencl_create_kernel(program, "rawoverexposed_mark_cfa");
   gd->kernel_rawoverexposed_mark_solid = dt_opencl_create_kernel(program, "rawoverexposed_mark_solid");
   gd->kernel_rawoverexposed_falsecolor = dt_opencl_create_kernel(program, "rawoverexposed_falsecolor");
+#ifdef HAVE_VULKAN
+  // 5 bindings each: in, out, coord, raw, xtrans.
+  // PC: 36 B base + 64 B CFA colors (mark_cfa) / 16 B solid (mark_solid) / 0 (falsecolor).
+  dt_vulkan_module_kernel_load(&gd->vk_mark_cfa, "rawoverexposed_mark_cfa",
+                               "rawoverexposed_mark_cfa", 5,
+                               sizeof(vk_roe_cfa_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_mark_solid, "rawoverexposed_mark_solid",
+                               "rawoverexposed_mark_solid", 5,
+                               sizeof(vk_roe_solid_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_falsecolor, "rawoverexposed_falsecolor",
+                               "rawoverexposed_falsecolor", 5,
+                               sizeof(vk_roe_base_pc_t), 16, 16, 1);
+#endif
 }
 
 
@@ -414,6 +600,11 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_rawoverexposed_falsecolor);
   dt_opencl_free_kernel(gd->kernel_rawoverexposed_mark_solid);
   dt_opencl_free_kernel(gd->kernel_rawoverexposed_mark_cfa);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_mark_cfa);
+  dt_vulkan_module_kernel_unload(&gd->vk_mark_solid);
+  dt_vulkan_module_kernel_unload(&gd->vk_falsecolor);
+#endif
   free(self->data);
   self->data = NULL;
 }
