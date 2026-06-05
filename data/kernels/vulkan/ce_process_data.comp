@@ -1,0 +1,89 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer UV  { vec2 data[]; } uv_buf;
+layout(std430, binding = 1)          buffer Lsc { float data[]; } lscharr;
+layout(std430, binding = 2) readonly buffer Sat { float data[]; } sat_buf;
+layout(std430, binding = 3)          buffer Cor { vec2 data[]; } corr;
+layout(std430, binding = 4)          buffer BCo { float data[]; } bcorr;
+layout(std430, binding = 5)          buffer Po  { vec4 data[]; } pixout;
+layout(std430, binding = 6) readonly buffer LS  { float data[]; } LUT_sat;
+layout(std430, binding = 7) readonly buffer LH  { float data[]; } LUT_hue;
+layout(std430, binding = 8) readonly buffer LB  { float data[]; } LUT_bri;
+layout(push_constant) uniform PC {
+  float white; float gradient_amp; int guiding; int width; int height;
+} pc;
+
+const float M_PI_F = 3.14159265358979323846;
+const float DT_2PI_F = 6.28318530717958647692;
+const int LUT_ELEM = 512;
+const float NORM_MIN = 1.52587890625e-05;
+
+vec4 dt_UCS_LUV_to_JCH(float L_star, float L_white, vec2 UVp) {
+  float M2 = UVp.x * UVp.x + UVp.y * UVp.y;
+  return vec4(
+    L_star / L_white,
+    15.932993652962535 * pow(L_star, 0.6523997524738018)
+                       * pow(M2,     0.6007557017508491) / L_white,
+    atan(UVp.y, UVp.x),
+    0.0);
+}
+
+vec4 dt_UCS_JCH_to_HSB(vec4 JCH) {
+  vec4 HSB;
+  HSB.z = JCH.x * (pow(JCH.y, 1.33654221029386) + 1.0);
+  HSB.y = (HSB.z > 0.0) ? JCH.y / HSB.z : 0.0;
+  HSB.x = JCH.z;
+  HSB.w = 0.0;
+  return HSB;
+}
+
+float lookup_gamut(uint which, float x) {
+  float x_test = float(LUT_ELEM) * (x + M_PI_F) / DT_2PI_F;
+  float x_prev = floor(x_test);
+  float x_next = ceil(x_test);
+  int xi  = int(x_prev) & (LUT_ELEM - 1);
+  int xii = int(x_next) & (LUT_ELEM - 1);
+  float y_prev = (which == 0u) ? LUT_hue.data[xi] : (which == 1u) ? LUT_sat.data[xi] : LUT_bri.data[xi];
+  float y_next = (which == 0u) ? LUT_hue.data[xii] : (which == 1u) ? LUT_sat.data[xii] : LUT_bri.data[xii];
+  return y_prev + ((xi != xii) ? (x_test - x_prev) * (y_next - y_prev) : 0.0);
+}
+
+float scharr_gradient(int k, int w) {
+  float gx = 47.0 / 255.0 * (sat_buf.data[k-w-1] - sat_buf.data[k-w+1] + sat_buf.data[k+w-1] - sat_buf.data[k+w+1])
+          + 162.0 / 255.0 * (sat_buf.data[k-1]   - sat_buf.data[k+1]);
+  float gy = 47.0 / 255.0 * (sat_buf.data[k-w-1] - sat_buf.data[k+w-1] + sat_buf.data[k-w+1] - sat_buf.data[k+w+1])
+          + 162.0 / 255.0 * (sat_buf.data[k-w]   - sat_buf.data[k+w]);
+  return sqrt(gx * gx + gy * gy);
+}
+
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+
+  vec4 JCH = dt_UCS_LUV_to_JCH(lscharr.data[k], pc.white, uv_buf.data[k]);
+  vec4 HSB = dt_UCS_JCH_to_HSB(JCH);
+
+  float hue = HSB.x;
+  float sat = HSB.y;
+  pixout.data[k].x = hue;
+  pixout.data[k].y = sat;
+  pixout.data[k].z = HSB.z;
+
+  if(pc.guiding != 0) {
+    int kk = clamp(row, 1, pc.height - 2) * pc.width + clamp(col, 1, pc.width - 2);
+    float kscharr = max(0.0, scharr_gradient(kk, pc.width) - 0.02);
+    lscharr.data[k] = pc.gradient_amp * kscharr * kscharr;
+  }
+
+  if(JCH.y > NORM_MIN) {
+    corr.data[k].x = lookup_gamut(0u, hue);
+    corr.data[k].y = lookup_gamut(1u, hue);
+    bcorr.data[k]  = sat * (lookup_gamut(2u, hue) - 1.0);
+  } else {
+    corr.data[k].x = 0.0;
+    corr.data[k].y = 1.0;
+    bcorr.data[k]  = 0.0;
+  }
+}
