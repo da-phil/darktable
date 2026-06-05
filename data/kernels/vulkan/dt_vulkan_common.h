@@ -991,3 +991,148 @@ static inline float vk_interpolation_lanczos(const float width, const float t)
                   * vk_sinf_fast(M_PI_F * t / width))
        / (VK_LANCZOS_EPSILON + M_PI_F * M_PI_F * t * t);
 }
+
+// ---- colour-science helpers for colorequal -------------------------
+//
+// Mirror colorspace.h::matrix_dot / dt_D65_XYZ_to_xyY / dt_xyY_to_XYZ /
+// dt_UCS_LUV_to_JCH / dt_UCS_HSB_to_JCH / dt_UCS_L_star_to_Y /
+// dt_UCS_JCH_to_xyY / dt_UCS_HSB_to_XYZ / gamut_map_HSB byte-for-byte.
+// Used by sample_input / process_data / write_output kernels.
+
+#define VK_DT_UCS_L_STAR_RANGE 1.31202137f
+#define VK_DT_UCS_L_STAR_UPPER_LIMIT 2.0987842f
+
+// 3-row matrix-vector multiply. The OpenCL `matrix` is a float4[3]
+// where each row's .xyz is the matrix row, .w is unused. The Vulkan
+// port stores the matrix as a 12-float storage buffer; rows accessed
+// via base+0, base+4, base+8 (4 floats apart for alignment with the
+// OpenCL `cl_mem_t copy_host_to_device_constant` 16-byte stride).
+static inline float4 vk_matrix_dot(const float4 v, global const float *m)
+{
+  // m is laid out [m0r, m0g, m0b, m0w,  m1r, m1g, m1b, m1w,  m2r, m2g, m2b, m2w].
+  const float4 vc = (float4)(v.x, v.y, v.z, 0.0f);
+  const float4 r0 = (float4)(m[0], m[1], m[2],  m[3]);
+  const float4 r1 = (float4)(m[4], m[5], m[6],  m[7]);
+  const float4 r2 = (float4)(m[8], m[9], m[10], m[11]);
+  return (float4)(dot(vc, r0), dot(vc, r1), dot(vc, r2), v.w);
+}
+
+static inline float4 vk_dt_D65_XYZ_to_xyY(const float4 sXYZ)
+{
+  float4 XYZ = fmax(sXYZ, (float4)(0.0f));
+  float4 xyY;
+  const float sum = XYZ.x + XYZ.y + XYZ.z;
+  if(sum > 0.0f)
+  {
+    xyY.x = XYZ.x / sum;
+    xyY.y = XYZ.y / sum;
+  }
+  else
+  {
+    xyY.x = 0.31271f;  // D65 white-point x
+    xyY.y = 0.32902f;  // D65 white-point y
+  }
+  xyY.z = XYZ.y;
+  xyY.w = XYZ.w;
+  return xyY;
+}
+
+static inline float4 vk_dt_xyY_to_XYZ(const float4 xyY)
+{
+  float4 XYZ = (float4)(0.0f);
+  if(xyY.y != 0.0f)
+  {
+    XYZ.x = xyY.z * xyY.x / xyY.y;
+    XYZ.y = xyY.z;
+    XYZ.z = xyY.z * (1.0f - xyY.x - xyY.y) / xyY.y;
+  }
+  XYZ.w = xyY.w;
+  return XYZ;
+}
+
+static inline float4 vk_dt_UCS_LUV_to_JCH(const float L_star,
+                                          const float L_white,
+                                          const float2 UV_star_prime)
+{
+  const float M2 = UV_star_prime.x * UV_star_prime.x
+                 + UV_star_prime.y * UV_star_prime.y;
+  return (float4)(
+    L_star / L_white,
+    15.932993652962535f * pow(L_star, 0.6523997524738018f)
+                        * pow(M2,     0.6007557017508491f) / L_white,
+    atan2(UV_star_prime.y, UV_star_prime.x),
+    0.0f);
+}
+
+static inline float vk_dt_UCS_L_star_to_Y(const float L_star)
+{
+  return pow((1.12426773749357f * L_star / (VK_DT_UCS_L_STAR_RANGE - L_star)),
+             1.5831518565279648f);
+}
+
+static inline float4 vk_dt_UCS_HSB_to_JCH(const float4 HSB)
+{
+  float4 JCH;
+  JCH.z = HSB.x;                                       // H
+  JCH.y = HSB.y * HSB.z;                               // C
+  JCH.x = HSB.z / (pow(JCH.y, 1.33654221029386f) + 1.0f); // J
+  JCH.w = HSB.w;
+  return JCH;
+}
+
+static inline float4 vk_dt_UCS_JCH_to_xyY(const float4 JCH, const float L_white)
+{
+  // Mirrors colorspace.h::dt_UCS_JCH_to_xyY byte-for-byte.
+  const float L_star = clamp(JCH.x * L_white, 0.0f, VK_DT_UCS_L_STAR_UPPER_LIMIT);
+  const float M = L_star != 0.0f
+    ? pow(JCH.y * L_white
+          / (15.932993652962535f * pow(L_star, 0.6523997524738018f)),
+          0.8322850678616855f)
+    : 0.0f;
+  const float U_sp = M * cos(JCH.z);
+  const float V_sp = M * sin(JCH.z);
+
+  // Inverse linear part (from colorspace.h).
+  const float2 UV_star = {
+    -5.037522385190711f * U_sp - 2.504856328185843f * V_sp,
+     4.760029407436461f * U_sp + 2.874012963239247f * V_sp
+  };
+  const float2 factors     = { 1.39656225667f, 1.4513954287f };
+  const float2 half_values = { 1.49217352929f, 1.52488637914f };
+  const float2 UV = {
+    -half_values.x * UV_star.x / (fabs(UV_star.x) - factors.x),
+    -half_values.y * UV_star.y / (fabs(UV_star.y) - factors.y)
+  };
+  const float4 U_factors = {  0.167171472114775f,   -0.150959086409163f,    0.940254742367256f,  0.0f };
+  const float4 V_factors = {  0.141299802443708f,   -0.155185060382272f,    1.000000000000000f,  0.0f };
+  const float4 offsets   = { -0.00801531300850582f, -0.00843312433578007f, -0.0256325967652889f, 0.0f };
+  const float4 xyD = U_factors * UV.x + V_factors * UV.y + offsets;
+  const float div = (xyD.z >= 0.0f) ? fmax(1.17549435e-38f, xyD.z)
+                                    : fmin(-1.17549435e-38f, xyD.z);
+  const float x = xyD.x / div;
+  const float y = xyD.y / div;
+  const float Y = vk_dt_UCS_L_star_to_Y(L_star);
+  return (float4)(x, y, Y, JCH.w);
+}
+
+static inline float4 vk_dt_UCS_HSB_to_XYZ(const float4 HSB, const float L_w)
+{
+  const float4 JCH = vk_dt_UCS_HSB_to_JCH(HSB);
+  const float4 xyY = vk_dt_UCS_JCH_to_xyY(JCH, L_w);
+  return vk_dt_xyY_to_XYZ(xyY);
+}
+
+static inline float vk_gamut_map_HSB(const float4 HSB,
+                                     global const float *gamut_LUT,
+                                     const float L_white)
+{
+  const float4 JCH = vk_dt_UCS_HSB_to_JCH(HSB);
+  const float max_colorfulness = vk_lookup_gamut(gamut_LUT, JCH.z);
+  const float max_chroma =
+      15.932993652962535f
+    * pow(JCH.x * L_white, 0.6523997524738018f)
+    * pow(max_colorfulness, 0.6007557017508491f) / L_white;
+  const float4 JCH_gb = (float4)(JCH.x, max_chroma, JCH.z, 0.0f);
+  const float4 HSB_gb = vk_dt_UCS_JCH_to_HSB(JCH_gb);
+  return vk_soft_clip(HSB.y, 0.8f * HSB_gb.y, HSB_gb.y);
+}
