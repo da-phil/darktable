@@ -388,17 +388,22 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   same pattern as `globaltonemap`'s lwmax cache miss and
   `hazeremoval`'s ambient-light snapshot).
 - **HARD** — denoiseprofile,
-  retouch, basecurve (full variants).
+  basecurve (full variants).
   `colorequal` is now **fully ported** (§4.2 — both the non-guiding
   fast path and the 14-kernel guided-filter path with the two-stage
-  prefilter / guide orchestration + bilinear up/downsamples). `retouch`
-  is now **helper-unblocked** by the
-  `dt_dwt_*_vk` à-trous helper (§5.16) — its OpenCL path drives the
-  a-trous decomposition through a per-form callback (clone / fill /
-  blur / heal); the same callback shape ports to Vulkan with
-  `_dwt_layer_func_vk`. The remaining work for retouch is the per-
-  form kernels themselves (the largest is `heal` with its Poisson
-  iteration). Done
+  prefilter / guide orchestration + bilinear up/downsamples).
+  `retouch` is now **partially ported** in this pass — 8 of the 10
+  OpenCL kernels translate (the `*_image*` variants collapse onto the
+  `*_buffer*` ones in VK because the image-shortcut pattern §5.2 makes
+  them buffer-equivalent); the `dt_dwt_*_vk` à-trous helper (§5.16)
+  drives the per-form callback (`rt_process_forms_vk`); the existing
+  `dt_gaussian_*_vk` (§5.10) and `dt_bilateral_*_vk` (§5.13) helpers
+  run the gaussian / bilateral blur arms of the BLUR form. The HEAL
+  form remains gated to OpenCL/CPU — process_vk scans the param
+  block at entry and returns -1 if any HEAL form is present, so the
+  pipeline routes the whole module through `process_cl` / `process`
+  in that case. Porting `dt_heal_*_vk` (Poisson iteration with
+  multigrid relaxation) is the remaining work to lift the gate. Done
   in earlier passes: `agx` (params struct migrated from PC into a
   storage-buffer binding so the 124 B struct fits — the pattern is
   now available for any future port whose param block exceeds the

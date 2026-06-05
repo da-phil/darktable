@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0)          buffer In   { vec4 data[]; }  in_buf;
+layout(std430, binding = 1) readonly buffer Mask { float data[]; } mask_buf;
+layout(push_constant) uniform PC {
+  int roi_in_x; int roi_in_y; int roi_in_width;
+  int roi_ms_x; int roi_ms_y; int roi_ms_width; int roi_ms_height;
+  float opacity;
+} pc;
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.roi_ms_width || y >= pc.roi_ms_height) return;
+  int mi = y * pc.roi_ms_width + x;
+  int di = (y + pc.roi_ms_y - pc.roi_in_y) * pc.roi_in_width + (x + pc.roi_ms_x - pc.roi_in_x);
+  float f = clamp(mask_buf.data[mi] * pc.opacity, 0.0, 1.0);
+  if(f > in_buf.data[di].w) in_buf.data[di].w = f;
+}
