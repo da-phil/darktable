@@ -294,9 +294,17 @@ the user out-of-container on AMD RX 9060 XT (RADV).
   lifted off the colisa template (§5.8) + the §5.11 ICC profile
   plumbing for their norm-preserving modes. `monochrome` is
   already ported as the first bilateral consumer (§5.13).
-  `rawoverexposed` is RAW-only and likely stays on OpenCL.
-  `rawoverexposed` is RAW-only and likely stays on OpenCL. Done in
-  earlier passes: `colisa`, `levels`, `profile_gamma`,
+  `rawoverexposed` ported in this pass — the post-demosaic float4
+  in/out lets us keep the standard 2-binding pipe shape; the raw
+  uint16 sensor buffer is uploaded as a flat `uint[]` (promoted on
+  host so the shader can index it without bit-unpacking), the
+  X-Trans 6×6 pattern goes in a 36-entry `uint[]` binding via the
+  existing `vk_FCxtrans` helper, and the per-pixel post-distort raw
+  coords ride a third float buffer. Three kernel variants
+  (`mark_cfa`, `mark_solid`, `falsecolor`) share the same 5-binding
+  layout; PCs carry the four uint thresholds plus the mode-specific
+  colors. Done in earlier passes: `colisa`, `levels`,
+  `profile_gamma`,
   `zonesystem`, `splittoning` (added RGB↔HSL helpers to
   `dt_vulkan_common.h`), `overexposed` (first consumer of ICC
   profile plumbing §5.11), `lowlight` (template for the next LUT
