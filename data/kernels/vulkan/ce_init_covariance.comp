@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer Cov { vec4 data[]; } cov;
+layout(std430, binding = 1) readonly buffer UV { vec2 data[]; } uv;
+layout(push_constant) uniform PC { int width; int height; } pc;
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+  cov.data[k] = vec4(uv.data[k].x * uv.data[k].x, uv.data[k].x * uv.data[k].y,
+                     uv.data[k].x * uv.data[k].y, uv.data[k].y * uv.data[k].y);
+}
