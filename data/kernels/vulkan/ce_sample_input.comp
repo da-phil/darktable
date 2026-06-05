@@ -1,0 +1,77 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly  buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Sa  { float data[]; } sat_buf;
+layout(std430, binding = 2)           buffer Lu  { float data[]; } lum_buf;
+layout(std430, binding = 3)           buffer UV  { vec2 data[]; } uv_buf;
+layout(std430, binding = 4)           buffer Po  { vec4 data[]; } pix_out;
+layout(std430, binding = 5) readonly  buffer Mat { float data[]; } mat;
+layout(push_constant) uniform PC { int width; int height; } pc;
+
+const float NORM_MIN = 1.52587890625e-05;
+const float DT_UCS_L_STAR_RANGE = 1.31202137;
+
+vec4 matrix_dot(vec4 v) {
+  vec4 vc = vec4(v.xyz, 0.0);
+  vec4 r0 = vec4(mat.data[0],  mat.data[1],  mat.data[2],  mat.data[3]);
+  vec4 r1 = vec4(mat.data[4],  mat.data[5],  mat.data[6],  mat.data[7]);
+  vec4 r2 = vec4(mat.data[8],  mat.data[9],  mat.data[10], mat.data[11]);
+  return vec4(dot(vc, r0), dot(vc, r1), dot(vc, r2), v.w);
+}
+
+vec4 dt_D65_XYZ_to_xyY(vec4 sXYZ) {
+  vec4 XYZ = max(sXYZ, vec4(0.0));
+  vec4 xyY;
+  float sum = XYZ.x + XYZ.y + XYZ.z;
+  if(sum > 0.0) {
+    xyY.x = XYZ.x / sum;
+    xyY.y = XYZ.y / sum;
+  } else {
+    xyY.x = 0.31271; xyY.y = 0.32902;
+  }
+  xyY.z = XYZ.y; xyY.w = XYZ.w;
+  return xyY;
+}
+
+float Y_to_UCS_L_star(float Y) {
+  float Y_hat = pow(Y, 0.631651345306265);
+  return DT_UCS_L_STAR_RANGE * Y_hat / (Y_hat + 1.12426773749357);
+}
+
+vec2 xyY_to_dt_UCS_UV(vec4 xyY) {
+  vec4 x_factors = vec4(-0.783941002840055,  0.745273540913283, 0.318707282433486, 0.0);
+  vec4 y_factors = vec4( 0.277512987809202, -0.205375866083878, 2.16743692732158,  0.0);
+  vec4 offsets   = vec4( 0.153836578598858, -0.165478376301988, 0.291320554395942, 0.0);
+  vec4 UVD = x_factors * xyY.x + y_factors * xyY.y + offsets;
+  float div = (UVD.z >= 0.0) ? max(1.17549435e-38, UVD.z) : min(-1.17549435e-38, UVD.z);
+  UVD.xy /= div;
+  vec2 factors     = vec2(1.39656225667, 1.4513954287);
+  vec2 half_values = vec2(1.49217352929, 1.52488637914);
+  vec2 UV_star;
+  UV_star.x = factors.x * UVD.x / (abs(UVD.x) + half_values.x);
+  UV_star.y = factors.y * UVD.y / (abs(UVD.y) + half_values.y);
+  // Final 2×2 mix matching colorspace.h::xyY_to_dt_UCS_UV exactly.
+  return vec2(
+    -1.124983854323892 * UV_star.x - 0.980483721769325 * UV_star.y,
+     1.86323315098672  * UV_star.x + 1.971853092390862 * UV_star.y
+  );
+}
+
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+
+  vec4 pix_in = in_buf.data[k];
+  float dmin = min(pix_in.x, min(pix_in.y, pix_in.z));
+  float dmax = max(pix_in.x, max(pix_in.y, pix_in.z));
+  float delta = dmax - dmin;
+  sat_buf.data[k] = (dmax > NORM_MIN && delta > NORM_MIN) ? delta / dmax : 0.0;
+
+  vec4 XYZ_D65 = matrix_dot(pix_in);
+  vec4 xyY = dt_D65_XYZ_to_xyY(XYZ_D65);
+  lum_buf.data[k] = Y_to_UCS_L_star(xyY.z);
+  uv_buf.data[k]  = xyY_to_dt_UCS_UV(xyY);
+  pix_out.data[k].w = pix_in.w;
+}
