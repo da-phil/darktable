@@ -175,7 +175,9 @@ set(VK_KERNELS
     highlights_4f_clip:highlights_4f_clip
     censorize_pixelate:censorize_pixelate
     censorize_noise:censorize_noise
-    ce_sample_input:ce_sample_input)
+    ce_sample_input:ce_sample_input
+    ce_process_data:ce_process_data
+    ce_write_output:ce_write_output)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

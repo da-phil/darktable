@@ -1,0 +1,125 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0)          buffer Out { vec4 data[]; } out_buf;
+layout(std430, binding = 1)          buffer Po  { vec4 data[]; } pixout;
+layout(std430, binding = 2) readonly buffer Cor { vec2 data[]; } corr;
+layout(std430, binding = 3) readonly buffer BCo { float data[]; } bcorr;
+layout(std430, binding = 4) readonly buffer Mat { float data[]; } mat;
+layout(std430, binding = 5) readonly buffer GL  { float data[]; } gamut;
+layout(push_constant) uniform PC { float white; int width; int height; } pc;
+
+const float M_PI_F = 3.14159265358979323846;
+const float DT_2PI_F = 6.28318530717958647692;
+const int LUT_ELEM = 512;
+const float SAT_EFFECT = 2.0;
+const float BRIGHT_EFFECT = 8.0;
+const float L_STAR_UPPER = 2.0987842;
+const float L_STAR_RANGE = 1.31202137;
+
+float lookup_gamut(float x) {
+  float x_test = float(LUT_ELEM) * (x + M_PI_F) / DT_2PI_F;
+  float x_prev = floor(x_test);
+  float x_next = ceil(x_test);
+  int xi  = int(x_prev) & (LUT_ELEM - 1);
+  int xii = int(x_next) & (LUT_ELEM - 1);
+  float y_prev = gamut.data[xi];
+  return y_prev + ((xi != xii) ? (x_test - x_prev) * (gamut.data[xii] - y_prev) : 0.0);
+}
+
+float soft_clip(float x, float soft, float hard) {
+  float norm = hard - soft;
+  return (x > soft) ? soft + (1.0 - exp(-(x - soft) / norm)) * norm : x;
+}
+
+vec4 dt_UCS_HSB_to_JCH(vec4 HSB) {
+  vec4 JCH;
+  JCH.z = HSB.x;
+  JCH.y = HSB.y * HSB.z;
+  JCH.x = HSB.z / (pow(JCH.y, 1.33654221029386) + 1.0);
+  JCH.w = HSB.w;
+  return JCH;
+}
+
+vec4 dt_UCS_JCH_to_HSB(vec4 JCH) {
+  vec4 HSB;
+  HSB.z = JCH.x * (pow(JCH.y, 1.33654221029386) + 1.0);
+  HSB.y = (HSB.z > 0.0) ? JCH.y / HSB.z : 0.0;
+  HSB.x = JCH.z;
+  HSB.w = 0.0;
+  return HSB;
+}
+
+float L_star_to_Y(float L_star) {
+  return pow((1.12426773749357 * L_star / (L_STAR_RANGE - L_star)), 1.5831518565279648);
+}
+
+vec4 dt_UCS_JCH_to_xyY(vec4 JCH, float L_white) {
+  float L_star = clamp(JCH.x * L_white, 0.0, L_STAR_UPPER);
+  float M = (L_star != 0.0)
+    ? pow(JCH.y * L_white / (15.932993652962535 * pow(L_star, 0.6523997524738018)), 0.8322850678616855)
+    : 0.0;
+  float U_sp = M * cos(JCH.z);
+  float V_sp = M * sin(JCH.z);
+  vec2 UV_star = vec2(
+    -5.037522385190711 * U_sp - 2.504856328185843 * V_sp,
+     4.760029407436461 * U_sp + 2.874012963239247 * V_sp);
+  vec2 factors     = vec2(1.39656225667, 1.4513954287);
+  vec2 half_values = vec2(1.49217352929, 1.52488637914);
+  vec2 UV = vec2(
+    -half_values.x * UV_star.x / (abs(UV_star.x) - factors.x),
+    -half_values.y * UV_star.y / (abs(UV_star.y) - factors.y));
+  vec4 U_factors = vec4( 0.167171472114775,   -0.150959086409163,    0.940254742367256,  0.0);
+  vec4 V_factors = vec4( 0.141299802443708,   -0.155185060382272,    1.000000000000000,  0.0);
+  vec4 offsets   = vec4(-0.00801531300850582, -0.00843312433578007, -0.0256325967652889, 0.0);
+  vec4 xyD = U_factors * UV.x + V_factors * UV.y + offsets;
+  float div = (xyD.z >= 0.0) ? max(1.17549435e-38, xyD.z) : min(-1.17549435e-38, xyD.z);
+  float x = xyD.x / div;
+  float y = xyD.y / div;
+  float Y = L_star_to_Y(L_star);
+  return vec4(x, y, Y, JCH.w);
+}
+
+vec4 dt_xyY_to_XYZ(vec4 xyY) {
+  vec4 XYZ = vec4(0.0);
+  if(xyY.y != 0.0) {
+    XYZ.x = xyY.z * xyY.x / xyY.y;
+    XYZ.y = xyY.z;
+    XYZ.z = xyY.z * (1.0 - xyY.x - xyY.y) / xyY.y;
+  }
+  XYZ.w = xyY.w;
+  return XYZ;
+}
+
+float gamut_map_HSB(vec4 HSB, float L_white) {
+  vec4 JCH = dt_UCS_HSB_to_JCH(HSB);
+  float max_colorfulness = lookup_gamut(JCH.z);
+  float max_chroma = 15.932993652962535 * pow(JCH.x * L_white, 0.6523997524738018)
+                   * pow(max_colorfulness, 0.6007557017508491) / L_white;
+  vec4 JCH_gb = vec4(JCH.x, max_chroma, JCH.z, 0.0);
+  vec4 HSB_gb = dt_UCS_JCH_to_HSB(JCH_gb);
+  return soft_clip(HSB.y, 0.8 * HSB_gb.y, HSB_gb.y);
+}
+
+vec4 matrix_dot(vec4 v) {
+  vec4 vc = vec4(v.xyz, 0.0);
+  vec4 r0 = vec4(mat.data[0],  mat.data[1],  mat.data[2],  mat.data[3]);
+  vec4 r1 = vec4(mat.data[4],  mat.data[5],  mat.data[6],  mat.data[7]);
+  vec4 r2 = vec4(mat.data[8],  mat.data[9],  mat.data[10], mat.data[11]);
+  return vec4(dot(vc, r0), dot(vc, r1), dot(vc, r2), v.w);
+}
+
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+
+  vec4 hsb = pixout.data[k];
+  hsb.x += corr.data[k].x;
+  hsb.y = max(0.0, hsb.y * (1.0 + SAT_EFFECT * (corr.data[k].y - 1.0)));
+  hsb.z = max(0.0, hsb.z * (1.0 + BRIGHT_EFFECT * bcorr.data[k]));
+
+  hsb.y = gamut_map_HSB(hsb, pc.white);
+  vec4 XYZ_D65 = dt_xyY_to_XYZ(dt_UCS_JCH_to_xyY(dt_UCS_HSB_to_JCH(hsb), pc.white));
+  out_buf.data[k] = matrix_dot(XYZ_D65);
+}
