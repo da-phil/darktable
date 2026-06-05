@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer UV  { vec2 data[]; } uv;
+layout(std430, binding = 1) readonly buffer Cov { vec4 data[]; } cov;
+layout(std430, binding = 2) buffer A { vec4 data[]; } a;
+layout(std430, binding = 3) buffer B { vec2 data[]; } b;
+layout(push_constant) uniform PC { float eps; int width; int height; } pc;
+const float FLT_EPS = 1.1920929e-07;
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+
+  vec4 c = cov.data[k];
+  vec4 sigma = vec4(c.x + pc.eps, c.y, c.z, c.w + pc.eps);
+  float det = sigma.x * sigma.w - sigma.y * sigma.z;
+  vec4 ak;
+  if(abs(det) > 4.0 * FLT_EPS) {
+    vec4 si = vec4(sigma.w / det, -sigma.y / det, -sigma.z / det, sigma.x / det);
+    ak.x = c.x * si.x + c.y * si.y;
+    ak.y = c.x * si.z + c.y * si.w;
+    ak.z = c.z * si.x + c.w * si.y;
+    ak.w = c.z * si.z + c.w * si.w;
+  } else ak = vec4(0.0);
+  a.data[k] = ak;
+  b.data[k].x = uv.data[k].x - ak.x * uv.data[k].x - ak.y * uv.data[k].y;
+  b.data[k].y = uv.data[k].y - ak.z * uv.data[k].x - ak.w * uv.data[k].y;
+}

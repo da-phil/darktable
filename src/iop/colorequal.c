@@ -195,12 +195,21 @@ typedef struct dt_iop_colorequal_global_data_t
   int ce_bilinear2;
   int ce_bilinear4;
 #ifdef HAVE_VULKAN
-  // Non-guiding fast path only (use_filter off). The 13-kernel
-  // guided-filter path + the gui mask-display kernels stay on
-  // OpenCL / CPU, gated via commit_params.
   dt_vk_module_kernel_t vk_sample_input;
   dt_vk_module_kernel_t vk_process_data;
   dt_vk_module_kernel_t vk_write_output;
+  // Guided-filter path (use_filter on).
+  dt_vk_module_kernel_t vk_init_covariance;
+  dt_vk_module_kernel_t vk_finish_covariance;
+  dt_vk_module_kernel_t vk_prepare_prefilter;
+  dt_vk_module_kernel_t vk_apply_prefilter;
+  dt_vk_module_kernel_t vk_prepare_correlations;
+  dt_vk_module_kernel_t vk_finish_correlations;
+  dt_vk_module_kernel_t vk_final_guide;
+  dt_vk_module_kernel_t vk_apply_guided;
+  dt_vk_module_kernel_t vk_bilinear1;
+  dt_vk_module_kernel_t vk_bilinear2;
+  dt_vk_module_kernel_t vk_bilinear4;
 #endif
 } dt_iop_colorequal_global_data_t;
 
@@ -327,6 +336,33 @@ void init_global(dt_iop_module_so_t *self)
   dt_vulkan_module_kernel_load(&gd->vk_write_output, "ce_write_output",
                                "ce_write_output", 6,
                                sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+  // Guided-filter path.
+  dt_vulkan_module_kernel_load(&gd->vk_init_covariance, "ce_init_covariance",
+                               "ce_init_covariance", 2, 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_finish_covariance, "ce_finish_covariance",
+                               "ce_finish_covariance", 2, 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_prepare_prefilter, "ce_prepare_prefilter",
+                               "ce_prepare_prefilter", 4,
+                               sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_apply_prefilter, "ce_apply_prefilter",
+                               "ce_apply_prefilter", 5,
+                               sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_prepare_correlations, "ce_prepare_correlations",
+                               "ce_prepare_correlations", 4, 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_finish_correlations, "ce_finish_correlations",
+                               "ce_finish_correlations", 5, 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_final_guide, "ce_final_guide",
+                               "ce_final_guide", 7,
+                               sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_apply_guided, "ce_apply_guided",
+                               "ce_apply_guided", 8,
+                               2 * sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_bilinear1, "ce_bilinear1",
+                               "ce_bilinear1", 2, 4 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_bilinear2, "ce_bilinear2",
+                               "ce_bilinear2", 2, 4 * sizeof(int), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_bilinear4, "ce_bilinear4",
+                               "ce_bilinear4", 2, 4 * sizeof(int), 16, 16, 1);
 #endif
 }
 
@@ -353,6 +389,17 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_sample_input);
   dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_process_data);
   dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_write_output);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_init_covariance);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_finish_covariance);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_prepare_prefilter);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_apply_prefilter);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_prepare_correlations);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_finish_correlations);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_final_guide);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_apply_guided);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_bilinear1);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_bilinear2);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_bilinear4);
 #endif
 
   free(self->data);
@@ -1670,6 +1717,245 @@ error:
 typedef struct { int width, height; } vk_ce_sample_pc_t;
 typedef struct { float white, gradient_amp; int guiding, width, height; } vk_ce_process_pc_t;
 typedef struct { float white; int width, height; } vk_ce_write_pc_t;
+typedef struct { int width, height; } vk_ce_wh_pc_t;
+typedef struct { float eps; int width, height; } vk_ce_eps_pc_t;
+typedef struct { float sat_shift; int width, height; } vk_ce_sat_pc_t;
+typedef struct { float sat_shift, bright_shift; int width, height; } vk_ce_sb_pc_t;
+typedef struct { int wi, hi, wo, ho; } vk_ce_bilin_pc_t;
+
+// Mirror _init_covariance_cl: alloc + init the covariance buffer.
+static dt_vk_mem_t *_init_covariance_vk(const int devid,
+                                        const dt_iop_colorequal_global_data_t *gd,
+                                        dt_vk_mem_t *uv, const int w, const int h)
+{
+  dt_vk_mem_t *cov = dt_vulkan_alloc_buffer(devid, 4 * sizeof(float) * w * h);
+  if(!cov) return NULL;
+  const vk_ce_wh_pc_t pc = { w, h };
+  dt_vk_mem_t *bufs[] = { cov, uv };
+  if(dt_vulkan_dispatch_n(&gd->vk_init_covariance, bufs, 2, w, h, &pc, sizeof(pc)) != 0)
+  {
+    dt_vulkan_free_buffer(devid, cov);
+    return NULL;
+  }
+  return cov;
+}
+
+// Vulkan twin of _prefilter_chromaticity_cl.
+static int _prefilter_chromaticity_vk(const int devid,
+                                      const dt_iop_colorequal_global_data_t *gd,
+                                      dt_vk_mem_t *UV, dt_vk_mem_t *saturation,
+                                      dt_vk_mem_t *weight,
+                                      const int width, const int height,
+                                      const float sigma, const float eps,
+                                      const float sat_shift)
+{
+  const float scaling = _get_scaling(sigma);
+  const float gsigma = MAX(0.2f, sigma / scaling);
+  const int ds_height = height / scaling;
+  const int ds_width = width / scaling;
+  const gboolean resized = width != ds_width || height != ds_height;
+  const size_t ds_bsize = (size_t)ds_width * ds_height * sizeof(float);
+  const size_t bsize = (size_t)width * height * sizeof(float);
+
+  int rc = -1;
+  dt_vk_mem_t *ds_UV = UV, *covariance = NULL, *ds_a = NULL, *ds_b = NULL, *a = NULL, *b = NULL;
+
+  if(resized)
+  {
+    ds_UV = dt_vulkan_alloc_buffer(devid, 2 * ds_bsize);
+    if(!ds_UV) goto cleanup;
+    const vk_ce_bilin_pc_t pc = { width, height, ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { UV, ds_UV };
+    if(dt_vulkan_dispatch_n(&gd->vk_bilinear2, bufs, 2, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  covariance = _init_covariance_vk(devid, gd, ds_UV, ds_width, ds_height);
+  if(!covariance) goto cleanup;
+
+  if(dt_gaussian_mean_blur_vk(devid, ds_UV, ds_width, ds_height, 2, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, covariance, ds_width, ds_height, 4, gsigma) != 0) goto cleanup;
+
+  {
+    const vk_ce_wh_pc_t pc = { ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { covariance, ds_UV };
+    if(dt_vulkan_dispatch_n(&gd->vk_finish_covariance, bufs, 2, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  ds_a = dt_vulkan_alloc_buffer(devid, 4 * ds_bsize);
+  ds_b = dt_vulkan_alloc_buffer(devid, 2 * ds_bsize);
+  if(!ds_a || !ds_b) goto cleanup;
+
+  {
+    const vk_ce_eps_pc_t pc = { eps, ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { ds_UV, covariance, ds_a, ds_b };
+    if(dt_vulkan_dispatch_n(&gd->vk_prepare_prefilter, bufs, 4, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  dt_vulkan_free_buffer(devid, covariance); covariance = NULL;
+  if(resized) { dt_vulkan_free_buffer(devid, ds_UV); ds_UV = NULL; }
+
+  if(dt_gaussian_mean_blur_vk(devid, ds_a, ds_width, ds_height, 4, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, ds_b, ds_width, ds_height, 2, gsigma) != 0) goto cleanup;
+
+  a = ds_a; b = ds_b;
+  if(resized)
+  {
+    a = dt_vulkan_alloc_buffer(devid, 4 * bsize);
+    b = dt_vulkan_alloc_buffer(devid, 2 * bsize);
+    if(!a || !b) goto cleanup;
+    const vk_ce_bilin_pc_t pc = { ds_width, ds_height, width, height };
+    { dt_vk_mem_t *bufs[] = { ds_a, a };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear4, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup; }
+    { dt_vk_mem_t *bufs[] = { ds_b, b };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear2, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup; }
+    dt_vulkan_free_buffer(devid, ds_a); ds_a = NULL;
+    dt_vulkan_free_buffer(devid, ds_b); ds_b = NULL;
+  }
+
+  {
+    const vk_ce_sat_pc_t pc = { sat_shift, width, height };
+    dt_vk_mem_t *bufs[] = { UV, saturation, a, b, weight };
+    if(dt_vulkan_dispatch_n(&gd->vk_apply_prefilter, bufs, 5, width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  rc = 0;
+
+cleanup:
+  if(resized)
+  {
+    if(a && a != ds_a) dt_vulkan_free_buffer(devid, a);
+    if(b && b != ds_b) dt_vulkan_free_buffer(devid, b);
+    if(ds_UV && ds_UV != UV) dt_vulkan_free_buffer(devid, ds_UV);
+  }
+  if(covariance) dt_vulkan_free_buffer(devid, covariance);
+  if(ds_a) dt_vulkan_free_buffer(devid, ds_a);
+  if(ds_b) dt_vulkan_free_buffer(devid, ds_b);
+  return rc;
+}
+
+// Vulkan twin of _guide_with_chromaticity_cl.
+static int _guide_with_chromaticity_vk(const int devid,
+                                       const dt_iop_colorequal_global_data_t *gd,
+                                       dt_vk_mem_t *UV, dt_vk_mem_t *corrections,
+                                       dt_vk_mem_t *saturation, dt_vk_mem_t *b_corrections,
+                                       dt_vk_mem_t *scharr, dt_vk_mem_t *weight,
+                                       const int width, const int height,
+                                       const float sigma, const float eps,
+                                       const float bright_shift, const float sat_shift)
+{
+  const float scaling = _get_scaling(sigma);
+  const float gsigma = MAX(0.2f, sigma / scaling);
+  const int ds_height = height / scaling;
+  const int ds_width = width / scaling;
+  const gboolean resized = width != ds_width || height != ds_height;
+  const size_t ds_bsize = (size_t)ds_width * ds_height * sizeof(float);
+  const size_t bsize = (size_t)width * height * sizeof(float);
+
+  int rc = -1;
+  dt_vk_mem_t *ds_UV = UV, *ds_corr = corrections, *ds_bcorr = b_corrections;
+  dt_vk_mem_t *covariance = NULL, *correlations = NULL, *ds_a = NULL, *ds_b = NULL, *a = NULL, *b = NULL;
+
+  if(resized)
+  {
+    ds_UV = dt_vulkan_alloc_buffer(devid, 2 * ds_bsize);
+    ds_corr = dt_vulkan_alloc_buffer(devid, 2 * ds_bsize);
+    ds_bcorr = dt_vulkan_alloc_buffer(devid, ds_bsize);
+    if(!ds_UV || !ds_corr || !ds_bcorr) goto cleanup;
+    const vk_ce_bilin_pc_t pc = { width, height, ds_width, ds_height };
+    { dt_vk_mem_t *bufs[] = { UV, ds_UV };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear2, bufs, 2, ds_width, ds_height, &pc, sizeof(pc)) != 0) goto cleanup; }
+    { dt_vk_mem_t *bufs[] = { corrections, ds_corr };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear2, bufs, 2, ds_width, ds_height, &pc, sizeof(pc)) != 0) goto cleanup; }
+    { dt_vk_mem_t *bufs[] = { b_corrections, ds_bcorr };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear1, bufs, 2, ds_width, ds_height, &pc, sizeof(pc)) != 0) goto cleanup; }
+  }
+
+  covariance = _init_covariance_vk(devid, gd, ds_UV, ds_width, ds_height);
+  correlations = dt_vulkan_alloc_buffer(devid, 4 * ds_bsize);
+  if(!covariance || !correlations) goto cleanup;
+
+  {
+    const vk_ce_wh_pc_t pc = { ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { ds_corr, ds_bcorr, ds_UV, correlations };
+    if(dt_vulkan_dispatch_n(&gd->vk_prepare_correlations, bufs, 4, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  if(dt_gaussian_mean_blur_vk(devid, ds_UV, ds_width, ds_height, 2, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, covariance, ds_width, ds_height, 4, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, ds_corr, ds_width, ds_height, 2, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, ds_bcorr, ds_width, ds_height, 1, 0.1f * gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, correlations, ds_width, ds_height, 4, gsigma) != 0) goto cleanup;
+
+  ds_a = dt_vulkan_alloc_buffer(devid, 4 * ds_bsize);
+  ds_b = dt_vulkan_alloc_buffer(devid, 2 * ds_bsize);
+  if(!ds_a || !ds_b) goto cleanup;
+
+  {
+    const vk_ce_wh_pc_t pc = { ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { ds_corr, ds_bcorr, ds_UV, correlations, covariance };
+    if(dt_vulkan_dispatch_n(&gd->vk_finish_correlations, bufs, 5, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  {
+    const vk_ce_eps_pc_t pc = { eps, ds_width, ds_height };
+    dt_vk_mem_t *bufs[] = { covariance, correlations, ds_corr, ds_bcorr, ds_UV, ds_a, ds_b };
+    if(dt_vulkan_dispatch_n(&gd->vk_final_guide, bufs, 7, ds_width, ds_height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  if(resized)
+  {
+    dt_vulkan_free_buffer(devid, ds_UV); ds_UV = NULL;
+    dt_vulkan_free_buffer(devid, ds_corr); ds_corr = NULL;
+    dt_vulkan_free_buffer(devid, ds_bcorr); ds_bcorr = NULL;
+  }
+  dt_vulkan_free_buffer(devid, correlations); correlations = NULL;
+  dt_vulkan_free_buffer(devid, covariance); covariance = NULL;
+
+  if(dt_gaussian_mean_blur_vk(devid, ds_a, ds_width, ds_height, 4, gsigma) != 0) goto cleanup;
+  if(dt_gaussian_mean_blur_vk(devid, ds_b, ds_width, ds_height, 2, gsigma) != 0) goto cleanup;
+
+  a = ds_a; b = ds_b;
+  if(resized)
+  {
+    a = dt_vulkan_alloc_buffer(devid, 4 * bsize);
+    b = dt_vulkan_alloc_buffer(devid, 2 * bsize);
+    if(!a || !b) goto cleanup;
+    const vk_ce_bilin_pc_t pc = { ds_width, ds_height, width, height };
+    { dt_vk_mem_t *bufs[] = { ds_a, a };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear4, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup; }
+    { dt_vk_mem_t *bufs[] = { ds_b, b };
+      if(dt_vulkan_dispatch_n(&gd->vk_bilinear2, bufs, 2, width, height, &pc, sizeof(pc)) != 0) goto cleanup; }
+  }
+
+  {
+    const vk_ce_sb_pc_t pc = { sat_shift, bright_shift, width, height };
+    dt_vk_mem_t *bufs[] = { UV, saturation, scharr, a, b, corrections, b_corrections, weight };
+    if(dt_vulkan_dispatch_n(&gd->vk_apply_guided, bufs, 8, width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  rc = 0;
+
+cleanup:
+  if(resized)
+  {
+    if(ds_UV && ds_UV != UV) dt_vulkan_free_buffer(devid, ds_UV);
+    if(ds_corr && ds_corr != corrections) dt_vulkan_free_buffer(devid, ds_corr);
+    if(ds_bcorr && ds_bcorr != b_corrections) dt_vulkan_free_buffer(devid, ds_bcorr);
+    if(a && a != ds_a) dt_vulkan_free_buffer(devid, a);
+    if(b && b != ds_b) dt_vulkan_free_buffer(devid, b);
+  }
+  if(correlations) dt_vulkan_free_buffer(devid, correlations);
+  if(covariance) dt_vulkan_free_buffer(devid, covariance);
+  if(ds_a) dt_vulkan_free_buffer(devid, ds_a);
+  if(ds_b) dt_vulkan_free_buffer(devid, ds_b);
+  return rc;
+}
 
 int process_vk(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
@@ -1689,12 +1975,11 @@ int process_vk(dt_iop_module_t *self,
       = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
   if(piece->colors != 4 || work_profile == NULL) return -1;
 
-  // commit_params gates use_filter on; belt-and-suspenders.
-  if(d->use_filter) return -1;
-
   const dt_iop_colorequal_gui_data_t *g = self->gui_data;
   const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
   if(g && fullpipe && g->mask_mode != 0) return -1;  // mask preview → CPU/CL
+  const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
+  const gboolean guiding = d->use_filter;
 
   float white, sat_shift, max_brightness_shift, corr_max_brightness_shift,
         bright_shift, gradient_amp, hue_sigma, par_sigma, sat_sigma, scharr_sigma;
@@ -1712,6 +1997,7 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *dev_lsat = NULL, *dev_lhue = NULL, *dev_lbright = NULL;
   dt_vk_mem_t *dev_pixout = NULL, *dev_uv = NULL, *dev_corr = NULL;
   dt_vk_mem_t *dev_bcorr = NULL, *dev_lscharr = NULL, *dev_sat = NULL;
+  dt_vk_mem_t *dev_weight = NULL;
 
   dev_inmat   = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
   dev_outmat  = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
@@ -1725,10 +2011,28 @@ int process_vk(dt_iop_module_t *self,
   dev_bcorr   = dt_vulkan_alloc_buffer(devid, bsize);
   dev_lscharr = dt_vulkan_alloc_buffer(devid, bsize);
   dev_sat     = dt_vulkan_alloc_buffer(devid, bsize);
+  if(guiding && !run_fast)
+    dev_weight = dt_vulkan_alloc_buffer(devid, (2 * SATSIZE + 1) * sizeof(float));
   if(!dev_inmat || !dev_outmat || !dev_gamut || !dev_lsat || !dev_lhue
      || !dev_lbright || !dev_pixout || !dev_uv || !dev_corr || !dev_bcorr
-     || !dev_lscharr || !dev_sat)
+     || !dev_lscharr || !dev_sat
+     || (guiding && !run_fast && !dev_weight))
     goto cleanup;
+
+  // Upload the satweight LUT once for the guided path.
+  if(guiding && !run_fast)
+  {
+    const dt_vk_upload_t up[] = { { dev_weight, satweights, (2 * SATSIZE + 1) * sizeof(float) } };
+    // Use a no-op dispatch path: piggyback the upload onto the first
+    // guided kernel instead. Simpler: do an explicit staged upload via
+    // a 1-binding identity copy is overkill — instead upload through
+    // the prefilter's batched dispatch. We pre-stage it here via a
+    // dedicated helper-less write using dt_vulkan_write_to_device.
+    if(dt_vulkan_write_to_device(devid, dev_weight, satweights,
+                                 (2 * SATSIZE + 1) * sizeof(float)) != 0)
+      goto cleanup;
+    (void)up;
+  }
 
   // sample_input: in, saturation, lum(Lscharr), uv, pixout, mat.
   {
@@ -1744,10 +2048,19 @@ int process_vk(dt_iop_module_t *self,
   if(dt_gaussian_mean_blur_vk(devid, dev_sat, width, height, 1, sat_sigma) != 0)
     goto cleanup;
 
+  // STEP 2: prefilter chromaticity (guided) to smooth UV hue.
+  if(guiding && !run_fast)
+  {
+    if(_prefilter_chromaticity_vk(devid, gd, dev_uv, dev_sat, dev_weight,
+                                  width, height, hue_sigma, d->chroma_feathering,
+                                  sat_shift) != 0)
+      goto cleanup;
+  }
+
   // process_data: uv, Lscharr, saturation, corrections, b_corrections,
   // pixout, LUT_sat, LUT_hue, LUT_brightness.
   {
-    const vk_ce_process_pc_t pc = { white, gradient_amp, 0 /*guiding*/, width, height };
+    const vk_ce_process_pc_t pc = { white, gradient_amp, guiding ? 1 : 0, width, height };
     dt_vk_mem_t *bufs[] = { dev_uv, dev_lscharr, dev_sat, dev_corr, dev_bcorr,
                             dev_pixout, dev_lsat, dev_lhue, dev_lbright };
     const dt_vk_upload_t uploads[] = {
@@ -1757,6 +2070,20 @@ int process_vk(dt_iop_module_t *self,
     };
     if(dt_vulkan_dispatch_n_batched(&gd->vk_process_data, bufs, 9, uploads, 3,
                                     width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // STEP 3: guide the corrections with chromaticity (guided path).
+  if(guiding && !run_fast)
+  {
+    // process_data wrote the Scharr gradient amplitude into Lscharr;
+    // the CL path blurs it before the guided step.
+    if(dt_gaussian_mean_blur_vk(devid, dev_lscharr, width, height, 1, scharr_sigma) != 0)
+      goto cleanup;
+    if(_guide_with_chromaticity_vk(devid, gd, dev_uv, dev_corr, dev_sat, dev_bcorr,
+                                   dev_lscharr, dev_weight, width, height,
+                                   par_sigma, d->param_feathering,
+                                   bright_shift, sat_shift) != 0)
       goto cleanup;
   }
 
@@ -1788,6 +2115,7 @@ cleanup:
   if(dev_bcorr)   dt_vulkan_free_buffer(devid, dev_bcorr);
   if(dev_lscharr) dt_vulkan_free_buffer(devid, dev_lscharr);
   if(dev_sat)     dt_vulkan_free_buffer(devid, dev_sat);
+  if(dev_weight)  dt_vulkan_free_buffer(devid, dev_weight);
   return rc;
 }
 #endif
@@ -1998,16 +2326,10 @@ void commit_params(dt_iop_module_t *self,
     d->lut_inited = TRUE;
   }
 
-#ifdef HAVE_VULKAN
-  // The Vulkan path implements only the non-guiding fast path
-  // (sample_input → blur → process_data → write_output). The guided-
-  // filter chain (13 kernels with the covariance / prefilter /
-  // correlation passes + bilinear up/downsamples) and the gui mask-
-  // display preview stay on OpenCL / CPU. Gate via §10.2 predictive
-  // pattern.
-  if(d->use_filter)
-    piece->process_vk_ready = FALSE;
-#endif
+  // Note: both the non-guiding fast path and the guided-filter path
+  // now run on Vulkan. Only the GUI mask-display preview falls back
+  // to OpenCL / CPU (handled with a runtime check in process_vk, not
+  // a commit_params gate, since mask_mode is gui state).
 }
 
 

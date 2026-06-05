@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer UV { vec2 data[]; } uv;
+layout(std430, binding = 1) readonly buffer Sat { float data[]; } sat;
+layout(std430, binding = 2) readonly buffer A { vec4 data[]; } a;
+layout(std430, binding = 3) readonly buffer B { vec2 data[]; } b;
+layout(std430, binding = 4) readonly buffer W { float data[]; } weights;
+layout(push_constant) uniform PC { float sat_shift; int width; int height; } pc;
+const float SATSIZE = 4096.0;
+float get_satweight(float s) {
+  float isat = SATSIZE * (1.0 + clamp(s, -1.0, 1.0 - (1.0 / SATSIZE)));
+  float base = floor(isat);
+  int i = int(base);
+  return weights.data[i] + (isat - base) * (weights.data[i+1] - weights.data[i]);
+}
+void main() {
+  int col = int(gl_GlobalInvocationID.x);
+  int row = int(gl_GlobalInvocationID.y);
+  if(col >= pc.width || row >= pc.height) return;
+  int k = row * pc.width + col;
+  vec2 UV = uv.data[k];
+  vec2 cv = vec2(a.data[k].x * UV.x + a.data[k].y * UV.y + b.data[k].x,
+                 a.data[k].z * UV.x + a.data[k].w * UV.y + b.data[k].y);
+  float sw = get_satweight(sat.data[k] - pc.sat_shift);
+  uv.data[k].x = mix(UV.x, cv.x, sw);
+  uv.data[k].y = mix(UV.y, cv.y, sw);
+}
