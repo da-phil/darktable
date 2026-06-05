@@ -279,13 +279,17 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 41 module files and the new
-backend compile clean against all four `(HAVE_VULKAN × HAVE_OPENCL)`
-combinations (the full darktable build target succeeds, including
-`libfilmic.so`, `libcolorout.so` and the other plugin shared
-libraries). All GLSL twins build to valid SPIR-V via glslang +
-`spirv-val`. End-to-end runs against a real RAW are exercised by
-the user out-of-container on AMD RX 9060 XT (RADV).
+**Verified in this container:** all 71 module files (of 73
+surveyed `process_cl` modules) and the new backend compile clean
+against all four `(HAVE_VULKAN × HAVE_OPENCL)` combinations (the
+full darktable build target succeeds, including `libfilmic.so`,
+`libcolorout.so` and the other plugin shared libraries). All
+GLSL twins build to valid SPIR-V via glslang + `spirv-val`.
+End-to-end runs against a real RAW are exercised by the user
+out-of-container on AMD RX 9060 XT (RADV). Two modules remain:
+`demosaic` (multi-algorithm RAW path; VERY HARD bucket) and
+`denoiseprofile` (nlmeans / wavelet dual mode with workgroup
+reductions; multi-session HARD bucket).
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
