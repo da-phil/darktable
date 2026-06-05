@@ -188,7 +188,10 @@ set(VK_KERNELS
     ce_apply_guided:ce_apply_guided
     ce_bilinear1:ce_bilinear1
     ce_bilinear2:ce_bilinear2
-    ce_bilinear4:ce_bilinear4)
+    ce_bilinear4:ce_bilinear4
+    rawoverexposed_mark_cfa:rawoverexposed_mark_cfa
+    rawoverexposed_mark_solid:rawoverexposed_mark_solid
+    rawoverexposed_falsecolor:rawoverexposed_falsecolor)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
