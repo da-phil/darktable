@@ -194,6 +194,14 @@ typedef struct dt_iop_colorequal_global_data_t
   int ce_bilinear1;
   int ce_bilinear2;
   int ce_bilinear4;
+#ifdef HAVE_VULKAN
+  // Non-guiding fast path only (use_filter off). The 13-kernel
+  // guided-filter path + the gui mask-display kernels stay on
+  // OpenCL / CPU, gated via commit_params.
+  dt_vk_module_kernel_t vk_sample_input;
+  dt_vk_module_kernel_t vk_process_data;
+  dt_vk_module_kernel_t vk_write_output;
+#endif
 } dt_iop_colorequal_global_data_t;
 
 
@@ -307,6 +315,19 @@ void init_global(dt_iop_module_so_t *self)
   gd->ce_bilinear1 = dt_opencl_create_kernel(program, "bilinear1");
   gd->ce_bilinear2 = dt_opencl_create_kernel(program, "bilinear2");
   gd->ce_bilinear4 = dt_opencl_create_kernel(program, "bilinear4");
+#ifdef HAVE_VULKAN
+  // sample_input: 6 bindings, 8 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_sample_input, "ce_sample_input",
+                               "ce_sample_input", 6, 2 * sizeof(int), 16, 16, 1);
+  // process_data: 9 bindings, 20 B PC (2 floats + 3 ints).
+  dt_vulkan_module_kernel_load(&gd->vk_process_data, "ce_process_data",
+                               "ce_process_data", 9,
+                               2 * sizeof(float) + 3 * sizeof(int), 16, 16, 1);
+  // write_output: 6 bindings, 12 B PC (1 float + 2 ints).
+  dt_vulkan_module_kernel_load(&gd->vk_write_output, "ce_write_output",
+                               "ce_write_output", 6,
+                               sizeof(float) + 2 * sizeof(int), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -328,6 +349,11 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->ce_bilinear1);
   dt_opencl_free_kernel(gd->ce_bilinear2);
   dt_opencl_free_kernel(gd->ce_bilinear4);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_sample_input);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_process_data);
+  dt_vulkan_module_kernel_unload((dt_vk_module_kernel_t *)&gd->vk_write_output);
+#endif
 
   free(self->data);
   self->data = NULL;
@@ -1639,6 +1665,133 @@ error:
 
 #endif // OpenCL
 
+#ifdef HAVE_VULKAN
+// Push-constant structs — match the ce_*.cl/.comp twins byte-for-byte.
+typedef struct { int width, height; } vk_ce_sample_pc_t;
+typedef struct { float white, gradient_amp; int guiding, width, height; } vk_ce_process_pc_t;
+typedef struct { float white; int width, height; } vk_ce_write_pc_t;
+
+int process_vk(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorequal_data_t *d = piece->data;
+  const dt_iop_colorequal_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const size_t npix = (size_t)width * height;
+  const size_t bsize = npix * sizeof(float);
+
+  const struct dt_iop_order_iccprofile_info_t *const work_profile
+      = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(piece->colors != 4 || work_profile == NULL) return -1;
+
+  // commit_params gates use_filter on; belt-and-suspenders.
+  if(d->use_filter) return -1;
+
+  const dt_iop_colorequal_gui_data_t *g = self->gui_data;
+  const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
+  if(g && fullpipe && g->mask_mode != 0) return -1;  // mask preview → CPU/CL
+
+  float white, sat_shift, max_brightness_shift, corr_max_brightness_shift,
+        bright_shift, gradient_amp, hue_sigma, par_sigma, sat_sigma, scharr_sigma;
+  _prepare_process(roi_in->scale / piece->iscale, d,
+    &white, &sat_shift, &max_brightness_shift, &corr_max_brightness_shift,
+    &bright_shift, &gradient_amp, &hue_sigma, &par_sigma, &sat_sigma, &scharr_sigma);
+
+  // Build the 12-float input/output matrices (padded 3x4 layout).
+  dt_colormatrix_t input_matrix, output_matrix;
+  dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  int rc = -1;
+  dt_vk_mem_t *dev_inmat = NULL, *dev_outmat = NULL, *dev_gamut = NULL;
+  dt_vk_mem_t *dev_lsat = NULL, *dev_lhue = NULL, *dev_lbright = NULL;
+  dt_vk_mem_t *dev_pixout = NULL, *dev_uv = NULL, *dev_corr = NULL;
+  dt_vk_mem_t *dev_bcorr = NULL, *dev_lscharr = NULL, *dev_sat = NULL;
+
+  dev_inmat   = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
+  dev_outmat  = dt_vulkan_alloc_buffer(devid, 12 * sizeof(float));
+  dev_gamut   = dt_vulkan_alloc_buffer(devid, LUT_ELEM * sizeof(float));
+  dev_lsat    = dt_vulkan_alloc_buffer(devid, LUT_ELEM * sizeof(float));
+  dev_lhue    = dt_vulkan_alloc_buffer(devid, LUT_ELEM * sizeof(float));
+  dev_lbright = dt_vulkan_alloc_buffer(devid, LUT_ELEM * sizeof(float));
+  dev_pixout  = dt_vulkan_alloc_buffer(devid, 4 * bsize);
+  dev_uv      = dt_vulkan_alloc_buffer(devid, 2 * bsize);
+  dev_corr    = dt_vulkan_alloc_buffer(devid, 2 * bsize);
+  dev_bcorr   = dt_vulkan_alloc_buffer(devid, bsize);
+  dev_lscharr = dt_vulkan_alloc_buffer(devid, bsize);
+  dev_sat     = dt_vulkan_alloc_buffer(devid, bsize);
+  if(!dev_inmat || !dev_outmat || !dev_gamut || !dev_lsat || !dev_lhue
+     || !dev_lbright || !dev_pixout || !dev_uv || !dev_corr || !dev_bcorr
+     || !dev_lscharr || !dev_sat)
+    goto cleanup;
+
+  // sample_input: in, saturation, lum(Lscharr), uv, pixout, mat.
+  {
+    const vk_ce_sample_pc_t pc = { width, height };
+    dt_vk_mem_t *bufs[] = { dev_in, dev_sat, dev_lscharr, dev_uv, dev_pixout, dev_inmat };
+    const dt_vk_upload_t uploads[] = { { dev_inmat, input_matrix, 12 * sizeof(float) } };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_sample_input, bufs, 6, uploads, 1,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // Smoothen saturation (mean blur, 1 channel).
+  if(dt_gaussian_mean_blur_vk(devid, dev_sat, width, height, 1, sat_sigma) != 0)
+    goto cleanup;
+
+  // process_data: uv, Lscharr, saturation, corrections, b_corrections,
+  // pixout, LUT_sat, LUT_hue, LUT_brightness.
+  {
+    const vk_ce_process_pc_t pc = { white, gradient_amp, 0 /*guiding*/, width, height };
+    dt_vk_mem_t *bufs[] = { dev_uv, dev_lscharr, dev_sat, dev_corr, dev_bcorr,
+                            dev_pixout, dev_lsat, dev_lhue, dev_lbright };
+    const dt_vk_upload_t uploads[] = {
+      { dev_lsat,    d->LUT_saturation, LUT_ELEM * sizeof(float) },
+      { dev_lhue,    d->LUT_hue,        LUT_ELEM * sizeof(float) },
+      { dev_lbright, d->LUT_brightness, LUT_ELEM * sizeof(float) },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_process_data, bufs, 9, uploads, 3,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  // write_output: out, pixout, corrections, b_corrections, mat, gamut_LUT.
+  {
+    const vk_ce_write_pc_t pc = { white, width, height };
+    dt_vk_mem_t *bufs[] = { dev_out, dev_pixout, dev_corr, dev_bcorr, dev_outmat, dev_gamut };
+    const dt_vk_upload_t uploads[] = {
+      { dev_outmat, output_matrix, 12 * sizeof(float) },
+      { dev_gamut,  d->gamut_LUT,  LUT_ELEM * sizeof(float) },
+    };
+    if(dt_vulkan_dispatch_n_batched(&gd->vk_write_output, bufs, 6, uploads, 2,
+                                    width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  rc = 0;
+
+cleanup:
+  if(dev_inmat)   dt_vulkan_free_buffer(devid, dev_inmat);
+  if(dev_outmat)  dt_vulkan_free_buffer(devid, dev_outmat);
+  if(dev_gamut)   dt_vulkan_free_buffer(devid, dev_gamut);
+  if(dev_lsat)    dt_vulkan_free_buffer(devid, dev_lsat);
+  if(dev_lhue)    dt_vulkan_free_buffer(devid, dev_lhue);
+  if(dev_lbright) dt_vulkan_free_buffer(devid, dev_lbright);
+  if(dev_pixout)  dt_vulkan_free_buffer(devid, dev_pixout);
+  if(dev_uv)      dt_vulkan_free_buffer(devid, dev_uv);
+  if(dev_corr)    dt_vulkan_free_buffer(devid, dev_corr);
+  if(dev_bcorr)   dt_vulkan_free_buffer(devid, dev_bcorr);
+  if(dev_lscharr) dt_vulkan_free_buffer(devid, dev_lscharr);
+  if(dev_sat)     dt_vulkan_free_buffer(devid, dev_sat);
+  return rc;
+}
+#endif
+
 static inline float _get_hue_node(const int k, const float hue_shift)
 {
   // Get the angular coordinate of the k-th hue node, including hue shift
@@ -1844,6 +1997,17 @@ void commit_params(dt_iop_module_t *self,
     dt_UCS_22_build_gamut_LUT(input_matrix, d->gamut_LUT);
     d->lut_inited = TRUE;
   }
+
+#ifdef HAVE_VULKAN
+  // The Vulkan path implements only the non-guiding fast path
+  // (sample_input → blur → process_data → write_output). The guided-
+  // filter chain (13 kernels with the covariance / prefilter /
+  // correlation passes + bilinear up/downsamples) and the gui mask-
+  // display preview stay on OpenCL / CPU. Gate via §10.2 predictive
+  // pattern.
+  if(d->use_filter)
+    piece->process_vk_ready = FALSE;
+#endif
 }
 
 
