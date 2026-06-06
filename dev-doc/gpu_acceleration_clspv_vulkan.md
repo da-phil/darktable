@@ -279,17 +279,18 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 71 module files (of 73
+**Verified in this container:** all 72 module files (of 73
 surveyed `process_cl` modules) and the new backend compile clean
 against all four `(HAVE_VULKAN × HAVE_OPENCL)` combinations (the
 full darktable build target succeeds, including `libfilmic.so`,
 `libcolorout.so` and the other plugin shared libraries). All
 GLSL twins build to valid SPIR-V via glslang + `spirv-val`.
 End-to-end runs against a real RAW are exercised by the user
-out-of-container on AMD RX 9060 XT (RADV). Two modules remain:
-`demosaic` (multi-algorithm RAW path; VERY HARD bucket) and
-`denoiseprofile` (nlmeans / wavelet dual mode with workgroup
-reductions; multi-session HARD bucket).
+out-of-container on AMD RX 9060 XT (RADV). One module remains:
+`demosaic` (multi-algorithm RAW path; VERY HARD bucket).
+`denoiseprofile` is **partially ported** — the wavelets-mode RGB
+v2 path runs on Vulkan, with NLM / Y0U0V0 / legacy-VST variants
+gated to OpenCL/CPU via a runtime check at process_vk entry.
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
@@ -391,8 +392,13 @@ reductions; multi-session HARD bucket).
   `dt_vulkan_read_from_device` for host-side cluster training —
   same pattern as `globaltonemap`'s lwmax cache miss and
   `hazeremoval`'s ambient-light snapshot).
-- **HARD** — denoiseprofile,
-  basecurve (full variants).
+- **HARD** — denoiseprofile (NLM + Y0U0V0 modes still on OpenCL;
+  wavelet RGB v2 path landed this pass — precondition_v2,
+  decompose, synthesize, backtransform_v2 plus a single
+  `denoiseprofile_reduce_tile` kernel that folds the OpenCL
+  `reduce_first` + `reduce_second` pair into one tile-sum dispatch
+  followed by a tiny CPU sum-up — sidesteps the workgroup-shared-
+  memory limit), basecurve (full variants).
   `colorequal` is now **fully ported** (§4.2 — both the non-guiding
   fast path and the 14-kernel guided-filter path with the two-stage
   prefilter / guide orchestration + bilinear up/downsamples).

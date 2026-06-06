@@ -23,6 +23,7 @@
 #include "common/nlmeans_core.h"
 #include "common/noiseprofiles.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "control/control.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
@@ -212,7 +213,49 @@ typedef struct dt_iop_denoiseprofile_global_data_t
   int kernel_denoiseprofile_synthesize;
   int kernel_denoiseprofile_reduce_first;
   int kernel_denoiseprofile_reduce_second;
+#ifdef HAVE_VULKAN
+  // Vulkan only carries the wavelet RGB-mode (v2) path right now. The
+  // NLM / Y0U0V0 / legacy-VST variants stay on OpenCL via the gate at
+  // the head of process_vk. The reduce kernels collapse into a single
+  // tile-sum kernel (no workgroup-shared memory in our HAL).
+  dt_vk_module_kernel_t vk_precondition_v2;
+  dt_vk_module_kernel_t vk_decompose;
+  dt_vk_module_kernel_t vk_synthesize;
+  dt_vk_module_kernel_t vk_backtransform_v2;
+  dt_vk_module_kernel_t vk_reduce_tile;
+#endif
 } dt_iop_denoiseprofile_global_data_t;
+
+#ifdef HAVE_VULKAN
+typedef struct vk_dp_pc4_t {
+  int width; int height;
+  float a0, a1, a2, a3;
+  float p0, p1, p2, p3;
+  float b0, b1, b2, b3;
+  float wb0, wb1, wb2, wb3;
+} vk_dp_pc4_t;
+typedef struct vk_dp_back_pc_t {
+  int width; int height;
+  float a0, a1, a2, a3;
+  float p0, p1, p2, p3;
+  float b0, b1, b2, b3;
+  float bias;
+  float wb0, wb1, wb2, wb3;
+} vk_dp_back_pc_t;
+typedef struct vk_dp_dec_pc_t {
+  int width; int height;
+  int scale;
+  float inv_sigma2;
+} vk_dp_dec_pc_t;
+typedef struct vk_dp_syn_pc_t {
+  int width; int height;
+  float t0, t1, t2, t3;
+  float b0, b1, b2, b3;
+} vk_dp_syn_pc_t;
+typedef struct vk_dp_red_pc_t {
+  int width; int height; int tile_size;
+} vk_dp_red_pc_t;
+#endif
 
 static dt_noiseprofile_t dt_iop_denoiseprofile_get_auto_profile(dt_iop_module_t *self,
                                                                 GList *profiles,
@@ -2597,6 +2640,263 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif // HAVE_OPENCL
 
+#ifdef HAVE_VULKAN
+// Mirrors process_wavelets_cl for the RGB + use_new_vst path. All
+// other paths (NLM, Y0U0V0, legacy VST) are gated to OpenCL/CPU at
+// the head of process_vk by returning -1. The BayesShrink variance
+// estimation per scale uses a single tile-sum kernel + CPU readback
+// in place of the OpenCL workgroup-shared reduce_first/second pair.
+static int _denoiseprofile_process_wavelets_vk(
+    dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+    dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+    const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_denoiseprofile_data_t *d = piece->data;
+  const dt_iop_denoiseprofile_global_data_t *gd = self->global_data;
+
+  const int max_max_scale = DT_IOP_DENOISE_PROFILE_BANDS;
+  int max_scale = 0;
+  const float scale = fminf(roi_in->scale / piece->iscale, 1.0f);
+  const float supp0
+      = MIN(2 * (2u << (max_max_scale - 1)) + 1,
+            MAX(piece->buf_in.height * piece->iscale,
+                piece->buf_in.width * piece->iscale) * 0.2f);
+  const float i0 = dt_log2f((supp0 - 1.0f) * .5f);
+  for(; max_scale < max_max_scale; max_scale++)
+  {
+    const float supp = 2 * (2u << max_scale) + 1;
+    const float supp_in = supp * (1.0f / scale);
+    const float i_in = dt_log2f((supp_in - 1) * .5f) - 1.0f;
+    const float t = 1.0f - (i_in + .5f) / i0;
+    if(t < 0.0f) break;
+  }
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t npixels = (size_t)width * height;
+  const size_t buf_bytes = (size_t)4 * sizeof(float) * width * height;
+
+  int rc = -1;
+  dt_vk_mem_t *dev_tmp = NULL;
+  dt_vk_mem_t *dev_filter = NULL;
+  dt_vk_mem_t *dev_m = NULL;
+  dt_vk_mem_t **dev_detail = calloc(max_max_scale, sizeof(dt_vk_mem_t *));
+  float *sumsum_host = NULL;
+  if(!dev_detail) return -1;
+
+  if(npixels < 2)
+  {
+    rc = dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, buf_bytes);
+    goto cleanup;
+  }
+
+  dev_tmp = dt_vulkan_alloc_buffer(devid, buf_bytes);
+  if(!dev_tmp) goto cleanup;
+
+  for(int k = 0; k < max_scale; k++)
+  {
+    dev_detail[k] = dt_vulkan_alloc_buffer(devid, buf_bytes);
+    if(!dev_detail[k]) goto cleanup;
+  }
+
+  // 5x5 separable atrous filter (1,4,6,4,1)/16 outer-product.
+  const float m[] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+  float mm[25];
+  for(int j = 0; j < 5; j++)
+    for(int i = 0; i < 5; i++) mm[j * 5 + i] = m[i] * m[j];
+  dev_filter = dt_vulkan_alloc_buffer(devid, sizeof(mm));
+  if(!dev_filter) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_filter, mm, sizeof(mm)) != 0)
+    goto cleanup;
+
+  dt_aligned_pixel_t wb;
+  const dt_aligned_pixel_t wb_weights = { 2.0f, 1.0f, 2.0f, 0.0f };
+  compute_wb_factors(wb, d, piece, wb_weights);
+  wb[3] = 0.0f;
+
+  const dt_aligned_pixel_t p = { MAX(d->shadows + 0.1 * logf(scale / wb[0]), 0.0f),
+                                 MAX(d->shadows + 0.1 * logf(scale / wb[1]), 0.0f),
+                                 MAX(d->shadows + 0.1 * logf(scale / wb[2]), 0.0f),
+                                 1.0f};
+
+  const float compensate_strength = 1.0f;
+  for_each_channel(i) wb[i] *= d->strength * compensate_strength * scale;
+
+  dt_aligned_pixel_t aa = { d->a[1] * wb[0], d->a[1] * wb[1], d->a[1] * wb[2], 1.0f };
+  dt_aligned_pixel_t bb = { d->b[1] * wb[0], d->b[1] * wb[1], d->b[1] * wb[2], 1.0f };
+
+  const float compensate_p =
+    DT_IOP_DENOISE_PROFILE_P_FULCRUM / powf(DT_IOP_DENOISE_PROFILE_P_FULCRUM, d->shadows);
+  for_each_channel(c)
+  {
+    aa[c] = d->a[1] * compensate_p;
+    bb[c] = d->b[1];
+  }
+
+  // precondition: dev_in -> dev_out
+  {
+    const vk_dp_pc4_t pc = {
+      .width = width, .height = height,
+      .a0 = aa[0], .a1 = aa[1], .a2 = aa[2], .a3 = aa[3],
+      .p0 = p[0],  .p1 = p[1],  .p2 = p[2],  .p3 = p[3],
+      .b0 = bb[0], .b1 = bb[1], .b2 = bb[2], .b3 = bb[3],
+      .wb0 = wb[0], .wb1 = wb[1], .wb2 = wb[2], .wb3 = wb[3],
+    };
+    if(dt_vulkan_dispatch_inout(&gd->vk_precondition_v2, dev_in, dev_out,
+                                width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+
+  dt_vk_mem_t *dev_buf1 = dev_out;
+  dt_vk_mem_t *dev_buf2 = dev_tmp;
+
+  for(int s = 0; s < max_scale; s++)
+  {
+    const float sigma = 1.0f;
+    const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f;
+    const float sigma_band = powf(varf, s) * sigma;
+    const float inv_sigma2 = 1.0f / (sigma_band * sigma_band);
+
+    const vk_dp_dec_pc_t pc = {
+      .width = width, .height = height, .scale = s, .inv_sigma2 = inv_sigma2,
+    };
+    dt_vk_mem_t *bufs[4] = { dev_buf1, dev_buf2, dev_detail[s], dev_filter };
+    if(dt_vulkan_dispatch_n(&gd->vk_decompose, bufs, 4, width, height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+
+    dt_vk_mem_t *t3 = dev_buf2;
+    dev_buf2 = dev_buf1;
+    dev_buf1 = t3;
+  }
+
+  // BayesShrink threshold + synthesize loop.
+  const int TILE = 16;
+  const int ntiles_x = (width  + TILE - 1) / TILE;
+  const int ntiles_y = (height + TILE - 1) / TILE;
+  const size_t ntiles = (size_t)ntiles_x * ntiles_y;
+  dev_m = dt_vulkan_alloc_buffer(devid, sizeof(float) * 4 * ntiles);
+  if(!dev_m) goto cleanup;
+  sumsum_host = dt_alloc_align_float((size_t)4 * ntiles);
+  if(!sumsum_host) goto cleanup;
+
+  for(int s = max_scale - 1; s >= 0; s--)
+  {
+    const float sigma = 1.0f;
+    const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f;
+    const float sigma_band = powf(varf, s) * sigma;
+
+    // reduce dev_detail[s] -> per-tile squared sums -> CPU sum.
+    {
+      const vk_dp_red_pc_t pc = { .width = width, .height = height, .tile_size = TILE };
+      dt_vk_mem_t *bufs[2] = { dev_detail[s], dev_m };
+      if(dt_vulkan_dispatch_n(&gd->vk_reduce_tile, bufs, 2, ntiles_x, ntiles_y,
+                              &pc, sizeof(pc)) != 0)
+        goto cleanup;
+    }
+    if(dt_vulkan_read_from_device(devid, sumsum_host, dev_m,
+                                  sizeof(float) * 4 * ntiles) != 0)
+      goto cleanup;
+
+    dt_aligned_pixel_t sum_y2 = { 0.0f };
+    for(size_t k = 0; k < ntiles; k++)
+      for_each_channel(c) sum_y2[c] += sumsum_host[4 * k + c];
+
+    const float sb2 = sigma_band * sigma_band;
+    const dt_aligned_pixel_t var_y = { sum_y2[0] / (npixels - 1.0f),
+                                       sum_y2[1] / (npixels - 1.0f),
+                                       sum_y2[2] / (npixels - 1.0f),
+                                       0.0f };
+    const dt_aligned_pixel_t std_x = { sqrtf(MAX(1e-6f, var_y[0] - sb2)),
+                                       sqrtf(MAX(1e-6f, var_y[1] - sb2)),
+                                       sqrtf(MAX(1e-6f, var_y[2] - sb2)),
+                                       1.0f };
+    dt_aligned_pixel_t adjt = { 8.0f, 8.0f, 8.0f, 0.0f };
+    const int offset_scale = DT_IOP_DENOISE_PROFILE_BANDS - max_scale;
+    const int band_index = DT_IOP_DENOISE_PROFILE_BANDS - (s + offset_scale + 1);
+
+    float bfe = d->force[DT_DENOISE_PROFILE_ALL][band_index];
+    bfe *= bfe; bfe *= 4;
+    for_each_channel(ch) adjt[ch] *= bfe;
+    bfe = d->force[DT_DENOISE_PROFILE_R][band_index];
+    bfe *= bfe; bfe *= 4; adjt[0] *= bfe;
+    bfe = d->force[DT_DENOISE_PROFILE_G][band_index];
+    bfe *= bfe; bfe *= 4; adjt[1] *= bfe;
+    bfe = d->force[DT_DENOISE_PROFILE_B][band_index];
+    bfe *= bfe; bfe *= 4; adjt[2] *= bfe;
+
+    const dt_aligned_pixel_t thrs = { adjt[0] * sb2 / std_x[0],
+                                      adjt[1] * sb2 / std_x[1],
+                                      adjt[2] * sb2 / std_x[2],
+                                      0.0f };
+    const dt_aligned_pixel_t boost = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    const vk_dp_syn_pc_t pc = {
+      .width = width, .height = height,
+      .t0 = thrs[0], .t1 = thrs[1], .t2 = thrs[2], .t3 = thrs[3],
+      .b0 = boost[0], .b1 = boost[1], .b2 = boost[2], .b3 = boost[3],
+    };
+    dt_vk_mem_t *bufs[3] = { dev_buf1, dev_detail[s], dev_buf2 };
+    if(dt_vulkan_dispatch_n(&gd->vk_synthesize, bufs, 3, width, height,
+                            &pc, sizeof(pc)) != 0)
+      goto cleanup;
+
+    dt_vk_mem_t *t3 = dev_buf2;
+    dev_buf2 = dev_buf1;
+    dev_buf1 = t3;
+  }
+
+  // dev_buf1 holds the final synthesized result. Move to dev_tmp for backtransform input.
+  if(dev_buf1 != dev_tmp)
+  {
+    if(dt_vulkan_copy_device_to_device(devid, dev_tmp, dev_buf1, buf_bytes) != 0)
+      goto cleanup;
+  }
+
+  // backtransform: dev_tmp -> dev_out
+  {
+    const float bias = d->bias - 0.5f * logf(scale);
+    const vk_dp_back_pc_t pc = {
+      .width = width, .height = height,
+      .a0 = aa[0], .a1 = aa[1], .a2 = aa[2], .a3 = aa[3],
+      .p0 = p[0],  .p1 = p[1],  .p2 = p[2],  .p3 = p[3],
+      .b0 = bb[0], .b1 = bb[1], .b2 = bb[2], .b3 = bb[3],
+      .bias = bias,
+      .wb0 = wb[0], .wb1 = wb[1], .wb2 = wb[2], .wb3 = wb[3],
+    };
+    if(dt_vulkan_dispatch_inout(&gd->vk_backtransform_v2, dev_tmp, dev_out,
+                                width, height, &pc, sizeof(pc)) != 0)
+      goto cleanup;
+  }
+  rc = 0;
+
+cleanup:
+  dt_free_align(sumsum_host);
+  dt_vulkan_free_buffer(devid, dev_m);
+  dt_vulkan_free_buffer(devid, dev_filter);
+  dt_vulkan_free_buffer(devid, dev_tmp);
+  for(int k = 0; k < max_max_scale; k++)
+    if(dev_detail[k]) dt_vulkan_free_buffer(devid, dev_detail[k]);
+  free(dev_detail);
+  return rc;
+}
+
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_denoiseprofile_data_t *d = piece->data;
+  // Gate: only the wavelets-mode RGB + use_new_vst path is supported
+  // on Vulkan. NLM, Y0U0V0, and the legacy VST stay on OpenCL/CPU.
+  if(d->mode != MODE_WAVELETS && d->mode != MODE_WAVELETS_AUTO) return -1;
+  if(d->wavelet_color_mode != MODE_RGB) return -1;
+  if(!d->use_new_vst) return -1;
+  return _denoiseprofile_process_wavelets_vk(self, piece, dev_in, dev_out,
+                                             roi_in, roi_out);
+}
+#endif // HAVE_VULKAN
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,
@@ -2776,6 +3076,33 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(program, "denoiseprofile_reduce_first");
   gd->kernel_denoiseprofile_reduce_second =
     dt_opencl_create_kernel(program, "denoiseprofile_reduce_second");
+#ifdef HAVE_VULKAN
+  // 2 bindings, 68 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_precondition_v2,
+                               "denoiseprofile_precondition_v2",
+                               "denoiseprofile_precondition_v2", 2,
+                               sizeof(vk_dp_pc4_t), 16, 16, 1);
+  // 4 bindings, 16 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_decompose,
+                               "denoiseprofile_decompose",
+                               "denoiseprofile_decompose", 4,
+                               sizeof(vk_dp_dec_pc_t), 16, 16, 1);
+  // 3 bindings, 40 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_synthesize,
+                               "denoiseprofile_synthesize",
+                               "denoiseprofile_synthesize", 3,
+                               sizeof(vk_dp_syn_pc_t), 16, 16, 1);
+  // 2 bindings, 72 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_backtransform_v2,
+                               "denoiseprofile_backtransform_v2",
+                               "denoiseprofile_backtransform_v2", 2,
+                               sizeof(vk_dp_back_pc_t), 16, 16, 1);
+  // 2 bindings, 12 B PC
+  dt_vulkan_module_kernel_load(&gd->vk_reduce_tile,
+                               "denoiseprofile_reduce_tile",
+                               "denoiseprofile_reduce_tile", 2,
+                               sizeof(vk_dp_red_pc_t), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -2796,6 +3123,13 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_synthesize);
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_reduce_first);
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_reduce_second);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_precondition_v2);
+  dt_vulkan_module_kernel_unload(&gd->vk_decompose);
+  dt_vulkan_module_kernel_unload(&gd->vk_synthesize);
+  dt_vulkan_module_kernel_unload(&gd->vk_backtransform_v2);
+  dt_vulkan_module_kernel_unload(&gd->vk_reduce_tile);
+#endif
   free(self->data);
   self->data = NULL;
 }

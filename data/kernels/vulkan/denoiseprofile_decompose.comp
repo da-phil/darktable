@@ -1,0 +1,61 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer C   { vec4 data[]; } coarse_buf;
+layout(std430, binding = 2)          buffer D   { vec4 data[]; } detail_buf;
+layout(std430, binding = 3) readonly buffer F   { float data[]; } filter_buf;
+layout(push_constant) uniform PC {
+  int width; int height;
+  int scale;
+  float inv_sigma2;
+} pc;
+
+float fast_mexp2f(float x) {
+  float i1 = uintBitsToFloat(0x3f800000u);
+  float i2 = uintBitsToFloat(0x3f000000u);
+  float k0 = i1 + x * (i2 - i1);
+  uint ki = (k0 >= uintBitsToFloat(0x00800000u)) ? uint(k0) : 0u;
+  return uintBitsToFloat(ki);
+}
+
+vec4 dp_weight(vec4 c1, vec4 c2, float inv_sigma2) {
+  vec4 sqr = (c1 - c2) * (c1 - c2);
+  float dt = (sqr.x + sqr.y + sqr.z) * inv_sigma2;
+  float varc = 0.02;
+  float off2 = 9.0;
+  float r = fast_mexp2f(max(0.0, dt * varc - off2));
+  return vec4(r, r, r, r);
+}
+
+vec4 read_clamped(int x, int y) {
+  int cx = clamp(x, 0, pc.width - 1);
+  int cy = clamp(y, 0, pc.height - 1);
+  return in_buf.data[cy * pc.width + cx];
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  int mult = 1 << pc.scale;
+  vec4 pixel = read_clamped(x, y);
+  vec4 sum = vec4(0.0);
+  vec4 wgt = vec4(0.0);
+
+  for(int j = 0; j < 5; j++)
+    for(int i = 0; i < 5; i++) {
+      int xx = x + mult * (i - 2);
+      int yy = y + mult * (j - 2);
+      int k  = j * 5 + i;
+      vec4 px = read_clamped(xx, yy);
+      vec4 w  = filter_buf.data[k] * dp_weight(pixel, px, pc.inv_sigma2);
+      sum += w * px;
+      wgt += w;
+    }
+
+  sum = sum / wgt;
+  sum.w = pixel.w;
+  detail_buf.data[y * pc.width + x] = pixel - sum;
+  coarse_buf.data[y * pc.width + x] = sum;
+}
