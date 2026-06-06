@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+  int width; int height; int tile_size;
+} pc;
+
+void main() {
+  int tx = int(gl_GlobalInvocationID.x);
+  int ty = int(gl_GlobalInvocationID.y);
+  int ntiles_x = (pc.width  + pc.tile_size - 1) / pc.tile_size;
+  int ntiles_y = (pc.height + pc.tile_size - 1) / pc.tile_size;
+  if(tx >= ntiles_x || ty >= ntiles_y) return;
+
+  vec4 sum = vec4(0.0);
+  for(int j = 0; j < pc.tile_size; j++)
+    for(int i = 0; i < pc.tile_size; i++) {
+      int x = tx * pc.tile_size + i;
+      int y = ty * pc.tile_size + j;
+      if(x < pc.width && y < pc.height) {
+        vec4 px = in_buf.data[y * pc.width + x];
+        sum += px * px;
+      }
+    }
+  out_buf.data[ty * ntiles_x + tx] = sum;
+}

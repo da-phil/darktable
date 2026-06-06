@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+  int width; int height;
+  float a0, a1, a2, a3;
+  float p0, p1, p2, p3;
+  float b0, b1, b2, b3;
+  float bias;
+  float wb0, wb1, wb2, wb3;
+} pc;
+
+vec4 pow4(vec4 v, vec4 e) {
+  return vec4(pow(v.x, e.x), pow(v.y, e.y), pow(v.z, e.z), pow(v.w, e.w));
+}
+vec4 sqrt4(vec4 v) {
+  return vec4(sqrt(v.x), sqrt(v.y), sqrt(v.z), sqrt(v.w));
+}
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+
+  vec4 a  = vec4(pc.a0, pc.a1, pc.a2, pc.a3);
+  vec4 p  = vec4(pc.p0, pc.p1, pc.p2, pc.p3);
+  vec4 b  = vec4(pc.b0, pc.b1, pc.b2, pc.b3);
+  vec4 wb = vec4(pc.wb0, pc.wb1, pc.wb2, pc.wb3);
+
+  vec4 px = in_buf.data[idx];
+  float alpha = px.w;
+
+  px = max(vec4(0.0), px);
+  vec4 delta = px * px + vec4(pc.bias);
+  vec4 denominator = vec4(4.0) / (sqrt4(a) * (vec4(2.0) - p));
+  vec4 z1 = (px + sqrt4(max(vec4(0.0), delta))) / denominator;
+  px = max(pow4(z1, vec4(1.0) / (vec4(1.0) - p / 2.0)) - b, vec4(0.0));
+  px = px * wb;
+  px.w = alpha;
+  out_buf.data[idx] = px;
+}

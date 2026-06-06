@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer C   { vec4 data[]; } coarse_buf;
+layout(std430, binding = 1) readonly buffer D   { vec4 data[]; } detail_buf;
+layout(std430, binding = 2)          buffer Out { vec4 data[]; } out_buf;
+layout(push_constant) uniform PC {
+  int width; int height;
+  float t0, t1, t2, t3;
+  float b0, b1, b2, b3;
+} pc;
+
+void main() {
+  int x = int(gl_GlobalInvocationID.x);
+  int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+  int idx = y * pc.width + x;
+
+  vec4 thrs  = vec4(pc.t0, pc.t1, pc.t2, pc.t3);
+  vec4 boost = vec4(pc.b0, pc.b1, pc.b2, pc.b3);
+  vec4 c = coarse_buf.data[idx];
+  vec4 d = detail_buf.data[idx];
+  vec4 absd = abs(d);
+  vec4 abs_amt = max(vec4(0.0), absd - thrs);
+  vec4 signs = vec4(d.x < 0.0 ? -1.0 : 1.0,
+                    d.y < 0.0 ? -1.0 : 1.0,
+                    d.z < 0.0 ? -1.0 : 1.0,
+                    d.w < 0.0 ? -1.0 : 1.0);
+  vec4 amount = signs * abs_amt;
+  vec4 sum = c + boost * amount;
+  sum.w = c.w;
+  out_buf.data[idx] = sum;
+}
