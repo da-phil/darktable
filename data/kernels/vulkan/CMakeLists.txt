@@ -199,7 +199,12 @@ set(VK_KERNELS
     retouch_copy_mask_to_alpha:retouch_copy_mask_to_alpha
     retouch_fill:retouch_fill
     retouch_image_rgb2lab:retouch_image_rgb2lab
-    retouch_image_lab2rgb:retouch_image_lab2rgb)
+    retouch_image_lab2rgb:retouch_image_lab2rgb
+    denoiseprofile_precondition_v2:denoiseprofile_precondition_v2
+    denoiseprofile_backtransform_v2:denoiseprofile_backtransform_v2
+    denoiseprofile_decompose:denoiseprofile_decompose
+    denoiseprofile_synthesize:denoiseprofile_synthesize
+    denoiseprofile_reduce_tile:denoiseprofile_reduce_tile)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
