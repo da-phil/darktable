@@ -204,7 +204,9 @@ set(VK_KERNELS
     denoiseprofile_backtransform_v2:denoiseprofile_backtransform_v2
     denoiseprofile_decompose:denoiseprofile_decompose
     denoiseprofile_synthesize:denoiseprofile_synthesize
-    denoiseprofile_reduce_tile:denoiseprofile_reduce_tile)
+    denoiseprofile_reduce_tile:denoiseprofile_reduce_tile
+    demosaic_passthrough_monochrome:demosaic_passthrough_monochrome
+    demosaic_passthrough_color:demosaic_passthrough_color)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

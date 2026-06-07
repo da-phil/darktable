@@ -279,18 +279,19 @@ its GLSL `void main()` entry renamed via `--source-entrypoint main
 `dt_vulkan_create_kernel` host-side call passes the entry name and
 both toolchains' `.spv` work without further dispatch.
 
-**Verified in this container:** all 72 module files (of 73
+**Verified in this container:** all 73 module files (of 73
 surveyed `process_cl` modules) and the new backend compile clean
 against all four `(HAVE_VULKAN × HAVE_OPENCL)` combinations (the
 full darktable build target succeeds, including `libfilmic.so`,
 `libcolorout.so` and the other plugin shared libraries). All
 GLSL twins build to valid SPIR-V via glslang + `spirv-val`.
 End-to-end runs against a real RAW are exercised by the user
-out-of-container on AMD RX 9060 XT (RADV). One module remains:
-`demosaic` (multi-algorithm RAW path; VERY HARD bucket).
-`denoiseprofile` is **partially ported** — the wavelets-mode RGB
-v2 path runs on Vulkan, with NLM / Y0U0V0 / legacy-VST variants
-gated to OpenCL/CPU via a runtime check at process_vk entry.
+out-of-container on AMD RX 9060 XT (RADV). Two modules are
+**partially ported**: `denoiseprofile` (wavelets RGB v2 path on
+Vulkan; NLM / Y0U0V0 / legacy-VST gated to OpenCL) and `demosaic`
+(MONO + the two PASSTHROUGH modes on Vulkan; PPG / RCD / VNG /
+AMaZE / Markesteijn / LMMSE / FDC + their dual variants gated to
+OpenCL via runtime checks at process_vk entry).
 
 **What's left** (from the 70 surveyed `process_cl` modules):
 
@@ -464,9 +465,20 @@ gated to OpenCL/CPU via a runtime check at process_vk entry.
   are the reusable infrastructure that took the bilinear (manual
   4-tap) and the multi-tap (bicubic / lanczos2 / lanczos3, via
   image-shortcut) cases off the still-pending list without needing
-  hardware sampler bindings. Demosaicing remains the most complex
-  outstanding category (Bayer + X-Trans pattern handling, multiple
-  algorithms with different per-pattern code paths).
+  hardware sampler bindings. Demosaicing is now **partially ported**
+  this pass: the three simplest modes (`MONO` for true-monochrome
+  sensors, `PASSTHROUGH_MONOCHROME`, `PASSTHROUGH_COLOR`) run on
+  Vulkan via two single-pass kernels (`demosaic_passthrough_monochrome`
+  reads `float[]` and broadcasts to `float4[]`; `demosaic_passthrough_color`
+  routes the single channel via the Bayer/X-Trans CFA lookup) plus a
+  `dt_vulkan_copy_device_to_device` for the no-CFA MONO path. The
+  full interpolating algorithms (PPG, RCD, VNG4 / VNG, AMaZE,
+  Markesteijn 1/3-pass, LMMSE, FDC + their dual variants) need
+  multi-pass orchestration with workgroup-shared memory and stay
+  on OpenCL/CPU; process_vk gates them along with green-equilibrium
+  correction, capture sharpening, the non-fullscale zoom kernels,
+  color smoothing, and detail-mask post-passes — all via early
+  -1 returns at entry.
   Done in earlier passes:
   `borders` (without sampled images — used a sub-region copy
   kernel instead), `mask_manager` (used the new
