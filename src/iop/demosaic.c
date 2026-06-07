@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
+#include "common/vulkan.h"
 #include "common/image_cache.h"
 #include "common/math.h"
 #include "common/imagebuf.h"
@@ -240,7 +241,25 @@ typedef struct dt_iop_demosaic_global_data_t
   int capture_result;
   int final_blend;
   float *gauss_coeffs;
+#ifdef HAVE_VULKAN
+  // Vulkan carries only the simplest demosaic paths: the two
+  // passthrough modes and the no-CFA MONO copy. The full PPG / RCD /
+  // VNG / AMaZE / Markesteijn / LMMSE / FDC algorithms stay on
+  // OpenCL/CPU — they all need workgroup-shared memory, multi-pass
+  // orchestration with intermediate scratch buffers, or the full RAW
+  // pipeline integration (rawprepare 1f variants etc.) that isn't yet
+  // wired into the VK arm. process_vk gates them by returning -1.
+  dt_vk_module_kernel_t vk_passthrough_monochrome;
+  dt_vk_module_kernel_t vk_passthrough_color;
+#endif
 } dt_iop_demosaic_global_data_t;
+
+#ifdef HAVE_VULKAN
+typedef struct vk_demosaic_pc_t { int width; int height; } vk_demosaic_pc_t;
+typedef struct vk_demosaic_color_pc_t {
+  int width; int height; unsigned int filters;
+} vk_demosaic_color_pc_t;
+#endif
 
 typedef struct dt_iop_demosaic_data_t
 {
@@ -1216,6 +1235,129 @@ finish:
 #endif
 #undef MIN_TILE_ROWS
 
+#ifdef HAVE_VULKAN
+// Vulkan demosaic carries only the simplest three modes:
+//   - MONO (true-mono sensor): the input is already float4, just a
+//     device-to-device copy.
+//   - PASSTHROUGH_MONOCHROME / PASSTHR_MONOX: single-channel float
+//     input replicated to all 3 output channels.
+//   - PASSTHROUGH_COLOR / PASSTHR_COLORX: single-channel float input
+//     routed to the per-pixel CFA channel.
+//
+// All other methods (PPG, RCD, VNG, AMaZE, Markesteijn, LMMSE, FDC,
+// dual variants) need either multi-pass orchestration with workgroup-
+// shared memory or the full RAW pipeline integration (rawprepare 1f
+// path) that isn't yet wired into the Vulkan arm. process_vk gates
+// them via early return.
+//
+// Also gated:
+//   - tiling / !fullscale paths (multiple kernel variants)
+//   - green-equilibrium correction
+//   - dual mode, capture sharpening, debug masks
+//   - any non-direct ROI (zoom/crop happens in upstream modules)
+int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+               dt_vk_mem_t *dev_in, dt_vk_mem_t *dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_image_t *img = &self->dev->image_storage;
+  dt_dev_pixelpipe_t *const pipe = piece->pipe;
+  const gboolean true_monochrome = dt_image_is_mono_sraw(img);
+  const dt_iop_demosaic_data_t *d = piece->data;
+  const dt_iop_demosaic_global_data_t *gd = self->global_data;
+  const uint32_t filters = piece->filters;
+  const gboolean fullscale = _demosaic_full(piece, img, roi_out);
+
+  // Strip the dual bit; we don't run dual on VK.
+  int method = d->demosaicing_method & ~DT_DEMOSAIC_DUAL;
+  if(d->demosaicing_method & DT_DEMOSAIC_DUAL) return -1;
+
+  // Bail on any non-trivial method.
+  const gboolean is_mono = method == DT_IOP_DEMOSAIC_MONO;
+  const gboolean is_pmono = method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME
+                         || method == DT_IOP_DEMOSAIC_PASSTHR_MONOX;
+  const gboolean is_pcolor = method == DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR
+                          || method == DT_IOP_DEMOSAIC_PASSTHR_COLORX;
+  if(!(is_mono || is_pmono || is_pcolor)) return -1;
+
+  // Bail on zoom passes — the OpenCL zoom kernels (half-size /
+  // third-size / passthrough_monochrome zoom) all do their own
+  // bilinear-ish downscaling and aren't ported yet.
+  if(!fullscale) return -1;
+
+  // Bail when ROI isn't 1:1 with the input.
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
+                       && feqf(roi_in->scale, roi_out->scale, 1e-8f);
+  if(!direct) return -1;
+
+  // Bail on debug-mask / capture-sharpening / show-blend paths.
+  if(pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU) return -1;
+  const dt_iop_demosaic_gui_data_t *g = self->gui_data;
+  const gboolean fullpipe = dt_pipe_is_full(pipe);
+  if(self->dev->gui_attached && fullpipe && g
+     && (g->dual_mask || (g->cs_mask && d->cs_enabled)
+         || (g->cs_boost_mask && d->cs_enabled)))
+    return -1;
+  // Capture sharpening uses its own multi-kernel pipeline.
+  const gboolean run_fast = dt_pipe_is_fast(pipe) || dt_pipe_is_preview(pipe);
+  if(!is_pmono && !is_pcolor && !run_fast && d->cs_enabled) return -1;
+
+  // Detail mask + color smoothing run as a post-pass in process_cl
+  // but aren't wired into the VK arm yet.
+  if(pipe->want_detail_mask) return -1;
+  const gboolean no_masking = dt_pipe_no_mask_display(pipe);
+  if(d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && no_masking && !run_fast)
+    return -1;
+  // Green equilibrium correction (Bayer green_eq != NONE) needs its
+  // own kernel chain.
+  const gboolean is_bayer = filters != 9u && filters != 0 && !true_monochrome;
+  if(is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && no_masking && !run_fast)
+    return -1;
+
+  const int devid = piece->pipe->devid;
+  const size_t out_bytes = (size_t)4 * sizeof(float) * iwidth * iheight;
+
+  if(is_mono)
+  {
+    // true_monochrome path: input is already float4, just copy through.
+    if(!true_monochrome) return -1;
+    return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, out_bytes);
+  }
+
+  if(is_pmono)
+  {
+    // Single-channel float -> float4 broadcast.
+    const vk_demosaic_pc_t pc = { .width = iwidth, .height = iheight };
+    return dt_vulkan_dispatch_inout(&gd->vk_passthrough_monochrome,
+                                    dev_in, dev_out, iwidth, iheight,
+                                    &pc, sizeof(pc));
+  }
+
+  // is_pcolor: needs the X-Trans pattern as a 36-uint storage buffer.
+  uint32_t xtrans_flat[36];
+  const uint8_t (*const xt)[6] = piece->xtrans;
+  for(int r = 0; r < 6; r++)
+    for(int c = 0; c < 6; c++) xtrans_flat[r * 6 + c] = (uint32_t)xt[r][c];
+
+  dt_vk_mem_t *dev_xtr = dt_vulkan_alloc_buffer(devid, sizeof(xtrans_flat));
+  if(!dev_xtr) return -1;
+
+  const vk_demosaic_color_pc_t pc = {
+    .width = iwidth, .height = iheight, .filters = filters,
+  };
+  dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_xtr };
+  const dt_vk_upload_t uploads[] = {
+    { dev_xtr, xtrans_flat, sizeof(xtrans_flat) },
+  };
+  const int rc = dt_vulkan_dispatch_n_batched(&gd->vk_passthrough_color,
+                                              bufs, 3, uploads, 1,
+                                              iwidth, iheight, &pc, sizeof(pc));
+  dt_vulkan_free_buffer(devid, dev_xtr);
+  return rc;
+}
+#endif // HAVE_VULKAN
+
 
 void init_global(dt_iop_module_so_t *self)
 {
@@ -1290,6 +1432,18 @@ void init_global(dt_iop_module_so_t *self)
   gd->gauss_coeffs = dt_alloc_align_float(CAPTURE_KERNEL_ALIGN * (UCHAR_MAX+1));
   for(int i = 0; i <= UCHAR_MAX; i++)
     _calc_9x9_gauss_coeffs(&gd->gauss_coeffs[i * CAPTURE_KERNEL_ALIGN], MAX(1e-7f, (float)i * CAPTURE_GAUSS_FRACTION));
+#ifdef HAVE_VULKAN
+  // 2 bindings (in float, out float4), 8 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_passthrough_monochrome,
+                               "demosaic_passthrough_monochrome",
+                               "demosaic_passthrough_monochrome", 2,
+                               sizeof(vk_demosaic_pc_t), 16, 16, 1);
+  // 3 bindings (in float, out float4, xtrans uint[36]), 12 B PC.
+  dt_vulkan_module_kernel_load(&gd->vk_passthrough_color,
+                               "demosaic_passthrough_color",
+                               "demosaic_passthrough_color", 3,
+                               sizeof(vk_demosaic_color_pc_t), 16, 16, 1);
+#endif
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -1349,6 +1503,10 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->capture_result);
   dt_opencl_free_kernel(gd->final_blend);
   dt_free_align(gd->gauss_coeffs);
+#ifdef HAVE_VULKAN
+  dt_vulkan_module_kernel_unload(&gd->vk_passthrough_monochrome);
+  dt_vulkan_module_kernel_unload(&gd->vk_passthrough_color);
+#endif
   free(self->data);
   self->data = NULL;
   _cleanup_lmmse_gamma();
