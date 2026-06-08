@@ -1545,39 +1545,92 @@ entry under glslang, because a `.comp` file carries one `main`.
 
 `clspv` is **not** in the Ubuntu 24.04 / 26.04 archive (nor Debian's),
 so the production path is a from-source build. clspv vendors its own
-pinned LLVM — `fetch_sources.py` checks it out — so you do **not** need
-a system LLVM/clang; only a host C++ toolchain, CMake, Ninja, Python 3
-and Git:
+pinned LLVM — `utils/fetch_sources.py` checks out the exact LLVM,
+SPIRV-Tools, and SPIRV-Headers revisions clspv was tested against
+(into `third_party/`) — so you do **not** need a system LLVM/clang;
+only a host C++ toolchain, CMake, Ninja, Python 3 and Git.
+
+**Resource budget** (this is the part the upstream README is quiet
+about):
+
+| Resource | Need | Why |
+|---|---|---|
+| Disk | **~18 GB** free | bundled LLVM + SPIRV-Tools sources (~3 GB), build tree (~12 GB), installed binaries (~200 MB) |
+| RAM | **8 GB minimum**, 16 GB comfortable | `clang/lib/Sema/SemaExpr.cpp.o` and a couple of LLVM TUs peak at ~2 GB resident per compile job; with `-j` ≥ 4 you can OOM a 4 GB box |
+| CPU | any modern x86_64 / aarch64 | scales linearly with `-j`; the build is heavily parallel |
+| Time | **30 min** on 8 cores, **60-75 min** on 4 cores, **~2 h** on 2 cores | clean release build from scratch; the LLVM tree dominates |
+| Network | **~600 MB** pulled | full LLVM history without `--shallow`, ~200 MB with |
+
+**Step-by-step:**
 
 ```sh
-# 1. build deps
+# 1. build deps (same set for 24.04 and 26.04)
 sudo apt-get install -y cmake ninja-build python3 git build-essential
 
-# 2. clone + fetch the pinned LLVM / SPIRV-Tools / SPIRV-Headers /
-#    SPIRV-LLVM-Translator sources (this is the big download)
+# 2. clone clspv itself (small, ~50 MB)
 git clone https://github.com/google/clspv.git
 cd clspv
-python3 utils/fetch_sources.py
 
-# 3. configure + build (Release; ~30-60 min, needs ~15-20 GB of disk
-#    because of the bundled LLVM tree)
+# 3. fetch the pinned LLVM / SPIRV-Tools / SPIRV-Headers /
+#    SPIRV-LLVM-Translator sources. Use --shallow on first build to
+#    skip the LLVM history (saves ~400 MB download + ~2 GB on disk):
+python3 utils/fetch_sources.py --shallow
+
+# 4. configure. Release is mandatory in practice — a debug build of
+#    LLVM is ~6x bigger and ~3x slower at runtime.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
 
-# 4. install clspv (and clspv-reflection) to /usr/local/bin
+# 5. build. Use `-jN` to match your core count; the build is
+#    embarrassingly parallel and will use all of it. If you OOM on
+#    a low-RAM box, drop `-j` to limit parallelism (do NOT pass
+#    -DLLVM_PARALLEL_LINK_JOBS — clspv and the bundled LLVM both
+#    declare a `link_job_pool`, and combining the two trips a
+#    "duplicate pool" ninja error on regeneration).
+cmake --build build -j$(nproc)
+
+# 6. install clspv (and clspv-reflection) to /usr/local/bin
 sudo cmake --install build
 
-# 5. verify
-clspv --version
+# 7. verify
+clspv --version            # expect: "clspv version <hash>, ..."
+clspv --help | head -5
 ```
 
-Identical steps work on Ubuntu 24.04 and 26.04 — clspv has no
-distro-version-specific dependencies once the bundled LLVM is fetched.
-If you'd rather not install system-wide, skip step 4 and point the
-darktable build at the binary directly:
+**Common build failures and fixes:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `c++: fatal error: Killed signal terminated` mid-build | Linker OOM | drop `-j` (e.g. `-j2`); the linker only OOMs the largest LLVM TUs |
+| `ninja: error: CMakeFiles/rules.ninja:N: duplicate pool 'link_job_pool'` | `-DLLVM_PARALLEL_LINK_JOBS` was passed and ninja regenerated build files | reconfigure without the flag; clspv and LLVM both declare the pool and ninja refuses to merge them |
+| `ninja: error: 'third_party/llvm/...' missing` | Skipped `fetch_sources.py` or hit a partial clone | rerun `python3 utils/fetch_sources.py` (drop `--shallow` if you already had a deep clone) |
+| `ImportError: No module named distutils` | Python 3.12 removed `distutils` from the stdlib; some bundled LLVM build steps still import it. Ubuntu 24.04 ships Python 3.12, 26.04 will ship 3.13+, so both hit this. | `pip install setuptools` (provides a vendored `distutils`), or `python3 -m ensurepip && python3 -m pip install setuptools` if pip isn't on the box |
+| `error: 'LLVMInitializeAArch64...' not declared` on aarch64 hosts | LLVM target build disabled | `cmake -B build ... -DLLVM_TARGETS_TO_BUILD="X86;AArch64"` |
+| Build succeeds but `clspv` binary is missing | Out-of-source install dir overridden | look in `build/bin/clspv` and use that path directly via `-DCLSPV_BIN=...` |
+
+**Pinning the clspv revision:** clspv lives at HEAD and `fetch_sources.py`
+follows; production reproducible builds should pin both. Check the
+revision you used into your build environment notes:
 
 ```sh
-cmake -S . -B build -DUSE_VULKAN=ON -DCLSPV_BIN=/path/to/clspv/build/bin/clspv
+( cd clspv && git rev-parse HEAD )
+( cd clspv/third_party/llvm && git rev-parse HEAD )
+( cd clspv/third_party/SPIRV-Tools && git rev-parse HEAD )
+```
+
+The kernels under `data/kernels/vulkan/` have been validated against
+clspv ≥ commit `ac4bea6` (mid-2024) and the LLVM tree clspv pulled in
+at that point. Older clspv builds may reject newer OpenCL C
+constructs we added (e.g. some uses of `vload4`); newer builds emit
+SPIR-V that an old `spirv-val` may flag — the fix in that case is
+upgrading `spirv-tools` rather than downgrading clspv.
+
+**Without sudo / system-wide install:** skip step 6 and either set
+`$PATH` to include `build/bin`, or point the darktable build at the
+binary directly:
+
+```sh
+cmake -S . -B build -DUSE_VULKAN=ON \
+      -DCLSPV_BIN=/path/to/clspv/build/bin/clspv
 ```
 
 To make the darktable build *fail* rather than silently fall back to
@@ -1589,6 +1642,43 @@ kernel CMake prints which toolchain it selected at configure time:
 -- Vulkan kernels: compiling .cl -> .spv with clspv (/usr/local/bin/clspv)
 -- Vulkan kernels: validating .spv with spirv-val (/usr/bin/spirv-val)
 ```
+
+**Updating an existing build** (clspv moves quickly):
+
+```sh
+cd clspv
+git pull
+python3 utils/fetch_sources.py     # picks up new pinned LLVM hash
+cmake --build build -j$(nproc)     # incremental
+sudo cmake --install build
+```
+
+#### Claude Code on the web sessions
+
+Web sessions run in an ephemeral container that is reclaimed after
+inactivity, so clspv has to be reinstalled per session. The repo
+ships a `SessionStart` hook
+(`.claude/hooks/session-start.sh`, registered in `.claude/settings.json`)
+that automates the build:
+
+- runs only when `$CLAUDE_CODE_REMOTE=true` (won't trigger on local
+  installs)
+- skips the build if `clspv` is already on `PATH` or cached in
+  `~/.cache/clspv-build/`
+- otherwise runs the from-source build above asynchronously while
+  the session starts — first-session cost matches the resource
+  budget table above (~30 min on 8 cores, ~60-75 min on 4 cores);
+  re-runs in the same container are instant
+- exports `CLSPV_BIN` (and prepends `build/bin` to `PATH`) via
+  `$CLAUDE_ENV_FILE` so subsequent `cmake -DUSE_VULKAN=ON` runs in
+  the session pick clspv automatically
+
+Race-condition caveat: with async mode the session can start before
+clspv finishes building. Commands that need clspv early in the
+session may hit the glslang fallback or fail outright (with
+`-DVK_REQUIRE_CLSPV=ON`); just retry once the build completes.
+Switch the hook to synchronous (`echo '{}'` instead of the async
+preamble) if you'd rather wait for clspv up front.
 
 ### Fedora 40+ / RHEL-likes
 
