@@ -183,8 +183,11 @@ at each Vulkan boundary make this slower per-module than a unified
 GPU chain — that optimisation (skip staging when both ends are
 Vulkan) is the next-but-one milestone (§8.6).
 
-**Per-module ports**: 65 modules currently expose `process_vk`,
-in three categories.
+**Per-module ports**: all 73 of the 73 surveyed `process_cl`
+modules now expose `process_vk` (two — `demosaic` and
+`denoiseprofile` — are partial, carrying their tractable modes on
+Vulkan and gating the rest to OpenCL at runtime). They fall in
+three categories.
 
 *Faithful (bit-equal to the OpenCL output for the same params):*
 
@@ -1518,9 +1521,9 @@ combination:
 | `glslang-tools` | `glslangValidator` | fallback shader compiler when `clspv` isn't installed |
 | `spirv-tools` | `spirv-val`, `spirv-dis` | optional, the CMake target uses them if present |
 | `spirv-cross` | `spirv-cross` CLI | optional, handy for inspecting what MoltenVK will see |
-| `clang-18` (or newer) | clspv build-from-source dep | only needed if you build clspv yourself |
+| `cmake` `ninja-build` `python3` `git` `build-essential` | clspv build-from-source deps | only needed if you build clspv yourself (see below) |
 
-One-liner:
+One-liner for the runtime + fallback toolchain (everything except clspv):
 
 ```sh
 sudo apt-get install -y \
@@ -1528,19 +1531,64 @@ sudo apt-get install -y \
     glslang-tools spirv-tools spirv-cross
 ```
 
-`clspv` is **not** packaged in Ubuntu 24.04 or 26.04. Until that
-changes, contributors who want the production-path build either:
+This is enough to **build and run** the Vulkan path: without `clspv`,
+the kernel CMake (`data/kernels/vulkan/CMakeLists.txt`) automatically
+compiles the GLSL twin (`<kernel>.comp`) with `glslangValidator`
+instead of the OpenCL source (`<kernel>.cl`) — same `.spv` entry-point
+name, same dispatch, kept behaviour-equivalent by hand. Use this when
+installing clspv is impractical (CI, fresh dev containers). The one
+limitation: multi-entry-point modules (currently only
+`channelmixerrgb`'s 5 adaptation kernels) expose just their primary
+entry under glslang, because a `.comp` file carries one `main`.
 
-- pull a prebuilt binary from the project's CI artefacts
-  (`https://github.com/google/clspv`), or
-- build it in-tree against system LLVM. A pinned build script will
-  live in `tools/vulkan_compute_poc/scripts/` once the PoC graduates.
+#### Installing clspv
 
-Without `clspv`, the PoC CMake falls back to compiling the GLSL twin
-(`kernels/basicadj_min.comp`) with `glslangValidator` — same SPIR-V
-output shape, same dispatch, kept behaviour-equivalent by hand. Useful
-for getting the host-side runtime working in environments where
-installing clspv is impractical (CI, fresh dev containers).
+`clspv` is **not** in the Ubuntu 24.04 / 26.04 archive (nor Debian's),
+so the production path is a from-source build. clspv vendors its own
+pinned LLVM — `fetch_sources.py` checks it out — so you do **not** need
+a system LLVM/clang; only a host C++ toolchain, CMake, Ninja, Python 3
+and Git:
+
+```sh
+# 1. build deps
+sudo apt-get install -y cmake ninja-build python3 git build-essential
+
+# 2. clone + fetch the pinned LLVM / SPIRV-Tools / SPIRV-Headers /
+#    SPIRV-LLVM-Translator sources (this is the big download)
+git clone https://github.com/google/clspv.git
+cd clspv
+python3 utils/fetch_sources.py
+
+# 3. configure + build (Release; ~30-60 min, needs ~15-20 GB of disk
+#    because of the bundled LLVM tree)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 4. install clspv (and clspv-reflection) to /usr/local/bin
+sudo cmake --install build
+
+# 5. verify
+clspv --version
+```
+
+Identical steps work on Ubuntu 24.04 and 26.04 — clspv has no
+distro-version-specific dependencies once the bundled LLVM is fetched.
+If you'd rather not install system-wide, skip step 4 and point the
+darktable build at the binary directly:
+
+```sh
+cmake -S . -B build -DUSE_VULKAN=ON -DCLSPV_BIN=/path/to/clspv/build/bin/clspv
+```
+
+To make the darktable build *fail* rather than silently fall back to
+glslang when clspv is absent (recommended for anyone shipping the
+production kernels), configure with `-DVK_REQUIRE_CLSPV=ON`. The
+kernel CMake prints which toolchain it selected at configure time:
+
+```
+-- Vulkan kernels: compiling .cl -> .spv with clspv (/usr/local/bin/clspv)
+-- Vulkan kernels: validating .spv with spirv-val (/usr/bin/spirv-val)
+```
 
 ### Fedora 40+ / RHEL-likes
 
@@ -1591,6 +1639,66 @@ Vulkan device on this runner, skipping the dispatch test" and is
 treated as success (the build-clean signal is still the main thing
 we care about at this stage). Non-zero, non-77 exit codes fail the
 matrix entry.
+
+### Compiling the kernels to SPIR-V
+
+Every per-module kernel under `data/kernels/vulkan/` ships as a paired
+`.cl` (OpenCL C, for clspv) and `.comp` (GLSL, for glslang). Both
+toolchains emit a `<kernel>.spv` whose entry point is named after the
+OpenCL kernel function, so the runtime loads them identically.
+
+**Automatic (the normal path).** When darktable is configured with
+`-DUSE_VULKAN=ON`, `data/kernels/vulkan/CMakeLists.txt` builds every
+kernel as part of the default `all` target via the
+`build_vulkan_kernels` target. You don't normally invoke anything by
+hand:
+
+```sh
+cmake -S . -B build -DUSE_VULKAN=ON
+cmake --build build                         # builds kernels + darktable
+# or just the kernels:
+cmake --build build --target build_vulkan_kernels
+```
+
+The CMake picks the toolchain at configure time: **clspv if it's on
+`PATH`** (or `-DCLSPV_BIN=...`), otherwise glslang. The produced `.spv`
+files are validated with `spirv-val` when it's present, then copied
+into `${DARKTABLE_DATADIR}/kernels/vulkan/` so a dev build finds them
+without `make install`. Adding a new kernel is a one-line edit to the
+`VK_KERNELS` list in that CMake file (`filename:entry_point`).
+
+**Manual, with clspv** (what the CMake runs per `.cl`):
+
+```sh
+clspv -cl-std=CL1.2 --inline-entry-points --cl-kernel-arg-info \
+      -I data/kernels/vulkan \
+      -o /tmp/velvia.spv \
+      data/kernels/vulkan/velvia.cl
+```
+
+`-I` lets the kernel `#include "dt_vulkan_common.h"`;
+`--inline-entry-points` is what lets one `.cl` carry several
+`kernel void` entries in a single module (the reason clspv is the
+production path — glslang's GLSL has a single `main`).
+
+**Manual, with glslang** (the fallback, per `.comp`):
+
+```sh
+glslangValidator -V --source-entrypoint main -e velvia \
+      data/kernels/vulkan/velvia.comp \
+      -o /tmp/velvia.spv
+```
+
+`--source-entrypoint main -e velvia` renames the GLSL `main` to the
+clspv-style entry name so the runtime addresses both identically.
+
+**Inspecting the result:**
+
+```sh
+spirv-val /tmp/velvia.spv                       # structural validation
+spirv-dis /tmp/velvia.spv | grep OpEntryPoint   # confirm entry name
+spirv-dis /tmp/velvia.spv | grep OpMemberDecorate  # push-constant offsets
+```
 
 ### Testing a Vulkan kernel port
 
@@ -1675,8 +1783,10 @@ a `USE_*` option; see the inline `case` in `build.sh`).
    `src/develop/pixelpipe_hb.c` that prefers Vulkan over CPU when a
    module has a port.
 4. ✅ **Module ports** (landed; see the §4.2 tables for the full list).
-   40 modules now expose `process_vk`, covering the simple per-pixel
-   bucket (exposure, velvia, invert, vibrance, colorcorrection,
+   All 73 surveyed `process_cl` modules now expose `process_vk`
+   (`demosaic` and `denoiseprofile` partially — tractable modes on
+   Vulkan, the rest gated to OpenCL at runtime), covering the simple
+   per-pixel bucket (exposure, velvia, invert, vibrance, colorcorrection,
    colorcontrast, colorize, flip, negadoctor, primaries, temperature
    ×3, profile_gamma ×2, splittoning, zonesystem, levels,
    whitebalance_1f / 1f_xtrans, channelmixerrgb ×5, graduatednd,
