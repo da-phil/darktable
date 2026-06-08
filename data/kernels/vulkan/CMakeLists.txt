@@ -13,11 +13,41 @@ find_program(CLSPV_BIN clspv)
 find_program(GLSLANG_BIN glslangValidator)
 find_program(SPIRV_VAL_BIN spirv-val)
 
+# When VK_REQUIRE_CLSPV=ON the build errors out if clspv is missing
+# instead of silently falling back to glslang. Use this for the
+# production-path build where you want the clspv-compiled .spv (the
+# only path that exposes multi-entry-point modules — see the note on
+# VK_KERNELS below). Defaults OFF so a stock glslang-only toolchain
+# still builds.
+option(VK_REQUIRE_CLSPV
+       "Fail the build if clspv is not found (don't fall back to glslang)" OFF)
+
 if(NOT CLSPV_BIN AND NOT GLSLANG_BIN)
   message(FATAL_ERROR
           "USE_VULKAN=ON but neither clspv nor glslangValidator was found in PATH. "
           "Install one (or set CLSPV_BIN / GLSLANG_BIN explicitly) to build the "
           "Vulkan kernels under data/kernels/vulkan/.")
+endif()
+
+if(VK_REQUIRE_CLSPV AND NOT CLSPV_BIN)
+  message(FATAL_ERROR
+          "VK_REQUIRE_CLSPV=ON but clspv was not found in PATH. Install clspv "
+          "(see dev-doc/gpu_acceleration_clspv_vulkan.md, 'Installing clspv') "
+          "or set -DCLSPV_BIN=/path/to/clspv.")
+endif()
+
+# Report the selected shader toolchain at configure time so it's
+# obvious which path produced the .spv modules. clspv is preferred
+# when present; glslang is the fallback (single entry point per .spv).
+if(CLSPV_BIN)
+  message(STATUS "Vulkan kernels: compiling .cl -> .spv with clspv (${CLSPV_BIN})")
+else()
+  message(STATUS "Vulkan kernels: clspv not found, compiling .comp -> .spv "
+                 "with glslang (${GLSLANG_BIN}) -- multi-entry-point modules "
+                 "(e.g. channelmixerrgb) will expose only their primary entry")
+endif()
+if(SPIRV_VAL_BIN)
+  message(STATUS "Vulkan kernels: validating .spv with spirv-val (${SPIRV_VAL_BIN})")
 endif()
 
 # Each entry is "kernel_filename:entry_point". For most kernels the
