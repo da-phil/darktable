@@ -238,6 +238,19 @@ set(VK_KERNELS
     demosaic_passthrough_monochrome:demosaic_passthrough_monochrome
     demosaic_passthrough_color:demosaic_passthrough_color)
 
+# Kernels that must use the glslang .comp twin even when clspv is
+# available. These use the portable float-atomic-add idiom (a
+# float* reinterpreted as uint* feeding atomic_cmpxchg); clspv keeps
+# the pointer at the buffer's float element type, so the uint atomics
+# emit SPIR-V that spirv-val rejects with a pointer/result type
+# mismatch. Their .comp twins express the same accumulation with
+# GLSL atomicCompSwap over a uint buffer view and validate cleanly.
+# Both are single-entry-point kernels, so glslang covers them fully.
+# See dt_vulkan_common.h::vk_atomic_add_f for the detailed note.
+set(VK_FORCE_GLSLANG
+    bilateral_splat
+    colorreconstruction_splat)
+
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)
   string(REPLACE ":" ";" SPEC_LIST "${SPEC}")
@@ -248,7 +261,15 @@ foreach(SPEC IN LISTS VK_KERNELS)
   set(COMP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/${K}.comp")
   set(SPV_OUT  "${CMAKE_CURRENT_BINARY_DIR}/${K}.spv")
 
-  if(CLSPV_BIN)
+  # Prefer clspv, except for kernels clspv can't lower (VK_FORCE_GLSLANG)
+  # when a glslang twin is available to take over.
+  set(USE_CLSPV ${CLSPV_BIN})
+  list(FIND VK_FORCE_GLSLANG "${K}" _force_glsl_idx)
+  if(NOT _force_glsl_idx EQUAL -1 AND GLSLANG_BIN)
+    set(USE_CLSPV FALSE)
+  endif()
+
+  if(USE_CLSPV)
     add_custom_command(
       OUTPUT  "${SPV_OUT}"
       COMMAND "${CLSPV_BIN}"

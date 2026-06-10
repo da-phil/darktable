@@ -433,19 +433,32 @@ static inline float vk_dt_rgb_norm(const float4 in, const int norm, const int wo
 //
 // `val` must point at storage-buffer (global) memory.
 
+// NOTE on clspv: the float->uint pointer reinterpret below is the
+// portable OpenCL idiom for a float atomic-add (OpenCL C 1.2 has no
+// native float atomics), and is exactly what common.h::atomic_add_f
+// does. clspv (at least the LLVM-23-era build we tested) cannot fully
+// lower it: it keeps `ival` pointing at the buffer's float element
+// type, so the uint atomics emit SPIR-V that spirv-val rejects with a
+// pointer/result type mismatch. The two kernels that use this
+// (bilateral_splat, colorreconstruction_splat) therefore ship via
+// their glslang .comp twins, which express the same accumulation with
+// GLSL's atomicCompSwap over a uint-typed buffer view. Fully fixing
+// the clspv path would mean binding those splat buffers as uint* at
+// the kernel signature and bitcasting values (not the pointer) — a
+// host-side change tracked separately. The body below still matches
+// common.h byte-for-byte so the CPU/OpenCL semantics are identical.
 static inline void vk_atomic_add_f(global float *val, const float delta)
 {
   global volatile uint *ival = (global volatile uint *)val;
-  uint old_i = *ival;
-  union { float f; uint i; } u;
-  while(1)
+  union { float f; uint i; } old_val, new_val;
+  do
   {
-    u.i = old_i;
-    u.f += delta;
-    const uint witness = atomic_cmpxchg(ival, old_i, u.i);
-    if(witness == old_i) break;
-    old_i = witness;
+    // atomic read (atomic_add of 0) rather than a plain load: OpenCL's
+    // relaxed global-memory consistency means `*ival` may be stale.
+    old_val.i = atomic_add(ival, 0u);
+    new_val.f = old_val.f + delta;
   }
+  while(atomic_cmpxchg(ival, old_val.i, new_val.i) != old_val.i);
 }
 
 // Fast 2^-x approximation. Matches data/kernels/common.h::fast_mexp2f
@@ -995,12 +1008,17 @@ static inline float vk_interpolation_lanczos(const float width, const float t)
 // ---- colour-science helpers for colorequal -------------------------
 //
 // Mirror colorspace.h::matrix_dot / dt_D65_XYZ_to_xyY / dt_xyY_to_XYZ /
-// dt_UCS_LUV_to_JCH / dt_UCS_HSB_to_JCH / dt_UCS_L_star_to_Y /
-// dt_UCS_JCH_to_xyY / dt_UCS_HSB_to_XYZ / gamut_map_HSB byte-for-byte.
+// dt_UCS_LUV_to_JCH / dt_UCS_HSB_to_XYZ / gamut_map_HSB byte-for-byte.
 // Used by sample_input / process_data / write_output kernels.
-
-#define VK_DT_UCS_L_STAR_RANGE 1.31202137f
-#define VK_DT_UCS_L_STAR_UPPER_LIMIT 2.0987842f
+//
+// NOTE: dt_UCS_L_star_to_Y / dt_UCS_HSB_to_JCH / dt_UCS_JCH_to_xyY are
+// defined once, earlier in this header (the dt-UCS block near
+// DT_UCS_L_STAR_RANGE); the functions below reuse those canonical
+// definitions. They are NOT re-declared here — doing so was a latent
+// redefinition bug that broke every clspv compile (clspv is the only
+// path that #includes this header; the glslang .comp twins are
+// self-contained, so the duplication was invisible to glslang-only
+// builds).
 
 // 3-row matrix-vector multiply. The OpenCL `matrix` is a float4[3]
 // where each row's .xyz is the matrix row, .w is unused. The Vulkan
@@ -1062,57 +1080,6 @@ static inline float4 vk_dt_UCS_LUV_to_JCH(const float L_star,
                         * pow(M2,     0.6007557017508491f) / L_white,
     atan2(UV_star_prime.y, UV_star_prime.x),
     0.0f);
-}
-
-static inline float vk_dt_UCS_L_star_to_Y(const float L_star)
-{
-  return pow((1.12426773749357f * L_star / (VK_DT_UCS_L_STAR_RANGE - L_star)),
-             1.5831518565279648f);
-}
-
-static inline float4 vk_dt_UCS_HSB_to_JCH(const float4 HSB)
-{
-  float4 JCH;
-  JCH.z = HSB.x;                                       // H
-  JCH.y = HSB.y * HSB.z;                               // C
-  JCH.x = HSB.z / (pow(JCH.y, 1.33654221029386f) + 1.0f); // J
-  JCH.w = HSB.w;
-  return JCH;
-}
-
-static inline float4 vk_dt_UCS_JCH_to_xyY(const float4 JCH, const float L_white)
-{
-  // Mirrors colorspace.h::dt_UCS_JCH_to_xyY byte-for-byte.
-  const float L_star = clamp(JCH.x * L_white, 0.0f, VK_DT_UCS_L_STAR_UPPER_LIMIT);
-  const float M = L_star != 0.0f
-    ? pow(JCH.y * L_white
-          / (15.932993652962535f * pow(L_star, 0.6523997524738018f)),
-          0.8322850678616855f)
-    : 0.0f;
-  const float U_sp = M * cos(JCH.z);
-  const float V_sp = M * sin(JCH.z);
-
-  // Inverse linear part (from colorspace.h).
-  const float2 UV_star = {
-    -5.037522385190711f * U_sp - 2.504856328185843f * V_sp,
-     4.760029407436461f * U_sp + 2.874012963239247f * V_sp
-  };
-  const float2 factors     = { 1.39656225667f, 1.4513954287f };
-  const float2 half_values = { 1.49217352929f, 1.52488637914f };
-  const float2 UV = {
-    -half_values.x * UV_star.x / (fabs(UV_star.x) - factors.x),
-    -half_values.y * UV_star.y / (fabs(UV_star.y) - factors.y)
-  };
-  const float4 U_factors = {  0.167171472114775f,   -0.150959086409163f,    0.940254742367256f,  0.0f };
-  const float4 V_factors = {  0.141299802443708f,   -0.155185060382272f,    1.000000000000000f,  0.0f };
-  const float4 offsets   = { -0.00801531300850582f, -0.00843312433578007f, -0.0256325967652889f, 0.0f };
-  const float4 xyD = U_factors * UV.x + V_factors * UV.y + offsets;
-  const float div = (xyD.z >= 0.0f) ? fmax(1.17549435e-38f, xyD.z)
-                                    : fmin(-1.17549435e-38f, xyD.z);
-  const float x = xyD.x / div;
-  const float y = xyD.y / div;
-  const float Y = vk_dt_UCS_L_star_to_Y(L_star);
-  return (float4)(x, y, Y, JCH.w);
 }
 
 static inline float4 vk_dt_UCS_HSB_to_XYZ(const float4 HSB, const float L_w)
