@@ -167,17 +167,10 @@ static inline float4 vk_uvY_to_xyY(const float4 uvY)
   return (float4)(9.f * uvY.x / den, 4.f * uvY.y / den, uvY.z, uvY.w);
 }
 
-static inline float4 vk_xyY_to_XYZ(const float4 xyY)
-{
-  float4 XYZ = (float4)(0.0f, 0.0f, 0.0f, xyY.w);
-  if(xyY.y != 0.0f)
-  {
-    XYZ.x = xyY.z * xyY.x / xyY.y;
-    XYZ.y = xyY.z;
-    XYZ.z = xyY.z * (1.f - xyY.x - xyY.y) / xyY.y;
-  }
-  return XYZ;
-}
+// vk_xyY_to_XYZ is provided by dt_vulkan_common.h (identical body);
+// don't redefine it here — a local copy is a redefinition error under
+// clspv, which #includes the header (the glslang .comp twin is
+// self-contained and never saw the clash).
 
 // Gamut mapping in xyY space: compresses chroma proportionally to
 // distance-from-D50². Used by all 5 kernels. Translation of

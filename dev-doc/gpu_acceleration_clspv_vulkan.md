@@ -287,9 +287,17 @@ surveyed `process_cl` modules) and the new backend compile clean
 against all four `(HAVE_VULKAN × HAVE_OPENCL)` combinations (the
 full darktable build target succeeds, including `libfilmic.so`,
 `libcolorout.so` and the other plugin shared libraries). All
-GLSL twins build to valid SPIR-V via glslang + `spirv-val`.
-End-to-end runs against a real RAW are exercised by the user
-out-of-container on AMD RX 9060 XT (RADV). Two modules are
+GLSL twins build to valid SPIR-V via glslang + `spirv-val`. The
+**clspv production path is now also verified**: clspv was built
+from source in-container (LLVM-23-era) and run over all 177 `.cl`
+kernels — 177/177 compile, 175/177 also pass `spirv-val` (the 2
+float-atomic kernels use the glslang override, see §7 "Compiling
+the kernels to SPIR-V"). That sweep surfaced — and this branch
+fixes — two header-level redefinition bugs that had silently broken
+*every* clspv compile (invisible to glslang, which doesn't include
+the shared header). End-to-end runs against a real RAW are
+exercised by the user out-of-container on AMD RX 9060 XT (RADV).
+Two modules are
 **partially ported**: `denoiseprofile` (wavelets RGB v2 path on
 Vulkan; NLM / Y0U0V0 / legacy-VST gated to OpenCL) and `demosaic`
 (MONO + the two PASSTHROUGH modes on Vulkan; PPG / RCD / VNG /
@@ -1928,6 +1936,29 @@ files are validated with `spirv-val` when it's present, then copied
 into `${DARKTABLE_DATADIR}/kernels/vulkan/` so a dev build finds them
 without `make install`. Adding a new kernel is a one-line edit to the
 `VK_KERNELS` list in that CMake file (`filename:entry_point`).
+
+**Per-kernel glslang override.** A short `VK_FORCE_GLSLANG` list in the
+CMake names kernels that must use the glslang `.comp` twin even when
+clspv is present. Currently that's `bilateral_splat` and
+`colorreconstruction_splat`: both use the portable float-atomic-add
+idiom (a `float*` reinterpreted as `uint*` feeding `atomic_cmpxchg`),
+which clspv can't lower to valid SPIR-V — it keeps the pointer at the
+buffer's float element type, so the uint atomics fail `spirv-val` with
+a pointer/result-type mismatch. Their `.comp` twins express the same
+accumulation with GLSL `atomicCompSwap` over a uint buffer view and
+validate cleanly; both are single-entry kernels, so glslang covers
+them fully. See `dt_vulkan_common.h::vk_atomic_add_f` for the detail.
+
+**clspv coverage, measured.** A full sweep of all 177 `.cl` kernels
+through clspv (LLVM-23-era build) on this branch: **177/177 compile,
+175/177 also pass `spirv-val`**; the 2 exceptions are the
+float-atomic kernels above, which is why they're on the glslang
+override list. So a clspv build with the override in place is
+fully green. (Surfacing this required actually building clspv —
+the glslang-only path never `#include`s `dt_vulkan_common.h`, so two
+header-level redefinition bugs that broke *every* clspv compile were
+invisible until a clspv sweep was run. Both are now fixed; the moral
+is that CI should run a clspv build, not just glslang — see §7 "CI".)
 
 **Manual, with clspv** (what the CMake runs per `.cl`):
 
