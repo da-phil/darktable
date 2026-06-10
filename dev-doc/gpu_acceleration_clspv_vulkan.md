@@ -1543,6 +1543,29 @@ entry under glslang, because a `.comp` file carries one `main`.
 
 #### Installing clspv
 
+> **clspv is a build-time dependency, not a runtime one.** The kernel
+> CMake compiles every `.cl`/`.comp` to a `.spv` at build time and
+> installs the `.spv` modules into the darktable data dir — they are
+> *not* committed to the source tree (`git ls-files data/kernels/vulkan/`
+> shows zero `.spv`), they are build artifacts. So only the person
+> *building a darktable package* needs clspv; **end users on every OS
+> just receive the precompiled SPIR-V** in the app bundle / installer
+> and run it through their Vulkan driver (MoltenVK on macOS, the
+> vendor ICD on Linux/Windows). This is what makes the clspv path a
+> drop-in replacement for OpenCL on macOS — the user-facing
+> dependency surface is *smaller*, not larger, than today's
+> per-vendor OpenCL ICDs. The build-from-source cost below is a
+> packager / CI concern, paid once per build machine.
+
+clspv is officially built and CI-tested by upstream on **Linux
+(gcc + clang), macOS (clang), and Windows (Visual Studio 2022,
+x64)** — each in debug and release — so all three of darktable's
+target platforms are covered. The build is the same three steps
+everywhere (CMake + `fetch_sources.py` + a C++ compiler); the
+per-OS specifics are below.
+
+##### Linux (Ubuntu 24.04 / 26.04, Debian, Fedora, …)
+
 `clspv` is **not** in the Ubuntu 24.04 / 26.04 archive (nor Debian's),
 so the production path is a from-source build. clspv vendors its own
 pinned LLVM — `utils/fetch_sources.py` checks out the exact LLVM,
@@ -1653,6 +1676,138 @@ cmake --build build -j$(nproc)     # incremental
 sudo cmake --install build
 ```
 
+##### macOS (Intel and Apple Silicon)
+
+This is the platform the whole effort exists for — Apple deprecated
+OpenCL (and OpenGL) at WWDC 2018 in favour of Metal, which exposes no
+OpenCL-compatible API. Rather than rewrite every `.cl` kernel in Metal
+Shading Language, clspv + SPIR-V + MoltenVK lets darktable keep its
+OpenCL-C source of truth and still reach the GPU on macOS. clspv's
+upstream CI builds the `macos-clang` configuration on every commit, so
+the toolchain is known-good on macOS; the recipe below is lifted from
+that CI script (`kokoro/scripts/macos/build.sh`).
+
+clspv builds as a **native host tool** (an arm64 binary on Apple
+Silicon, x86_64 on Intel) — it does not need Vulkan or Metal to *run*;
+it only emits SPIR-V. Build deps come from Homebrew (the Xcode
+Command Line Tools supply `clang++`):
+
+```sh
+# 1. build deps (Xcode CLT for the compiler, brew for the rest)
+xcode-select --install 2>/dev/null || true
+brew install cmake ninja python git
+
+# 2. clone + fetch pinned sources
+git clone https://github.com/google/clspv.git
+cd clspv
+python3 utils/fetch_sources.py --shallow
+
+# 3. configure. The -DLLVM_ENABLE_LIBXML2=0 is the one macOS-specific
+#    flag (matches clspv's own CI): it stops the bundled LLVM from
+#    picking up a libxml2 in /usr/local or /opt/homebrew that then
+#    fails to link. Explicit clang++/clang avoids a stray gcc shim.
+cmake -S . -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_LIBXML2=0 \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+# 4. build + (optional) self-test
+cmake --build build -j$(sysctl -n hw.ncpu)
+cmake --build build --target check-spirv      # upstream unit tests
+
+# 5. install (Homebrew prefix is on PATH already)
+sudo cmake --install build
+clspv --version
+```
+
+Resource budget is the same order as Linux (~18 GB disk, 8 GB RAM
+comfortable, 30-75 min depending on core count). Apple Silicon builds
+are noticeably faster per-core. There is **no `clspv` Homebrew
+formula** as of this writing — don't `brew install clspv`, it doesn't
+exist; the from-source build is the only route. Once built, point
+darktable at it the same way:
+
+```sh
+cmake -S . -B build -DUSE_VULKAN=ON \
+      -DCLSPV_BIN=/path/to/clspv/build/bin/clspv
+```
+
+The produced `.spv` are consumed at darktable runtime by MoltenVK
+(SPIR-V → MSL via SPIRV-Cross); see §6 "macOS". Nothing in the kernel
+set uses features outside MoltenVK's SPIR-V support — the same
+buffer-only, no-sampler kernels that run on RADV run on MoltenVK.
+
+##### Windows (Visual Studio 2022, x64)
+
+clspv's upstream CI builds `windows-vs2022-amd64` on every commit, so
+Windows x64 is a supported, tested target. The recipe mirrors that CI
+script (`kokoro/scripts/windows/build.bat`). The build needs the
+**MSVC toolchain environment** (from Visual Studio 2022 or the
+standalone Build Tools) plus LLVM/clang as the actual compiler — the
+CI uses clang inside the VS environment because LLVM builds itself
+fastest and most predictably with clang:
+
+```bat
+:: from an "x64 Native Tools Command Prompt for VS 2022"
+:: (this is what runs vcvarsall x64 and sets up the MSVC headers/libs;
+::  clspv's CI calls vcvarsall x64 explicitly for the same effect)
+
+:: deps: choco install -y cmake ninja python llvm
+::   (or install each from its own installer)
+where cmake ninja python clang   :: sanity-check they're on PATH
+
+:: Match the CI: use the LLVM clang/clang++ drivers via CC/CXX rather
+:: than MSVC cl.exe. LLVM builds itself fastest and most predictably
+:: with clang.
+set "CC=clang.exe"
+set "CXX=clang++.exe"
+
+git clone https://github.com/google/clspv.git
+cd clspv
+python utils\fetch_sources.py --shallow
+
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --build build --target check-spirv
+
+:: clspv.exe lands at build\bin\clspv.exe
+build\bin\clspv.exe --version
+```
+
+Notes:
+- The Ninja generator is recommended (clspv's CI uses it); a plain
+  Visual Studio generator (`-G "Visual Studio 17 2022"`) also works
+  but is slower and produces a multi-config tree, in which case pass
+  `--config Release` to the build/`check-spirv` commands.
+- The CI installs LLVM via `choco install llvm` and points `CC`/`CXX`
+  at `clang.exe`/`clang++.exe`. Stock MSVC `cl.exe` also compiles
+  clspv (drop the `CC`/`CXX` lines) but is slower on the LLVM tree;
+  `clang-cl` is a third option if you need the MSVC-style driver.
+- Disk/RAM budget is the same ~18 GB / 8 GB as Linux; the build is a
+  little slower than an equivalent-core Linux box because of NTFS and
+  the larger PDBs (use `-DCMAKE_BUILD_TYPE=Release`, not
+  `RelWithDebInfo`, to keep PDBs small).
+- Point darktable at the binary with
+  `-DCLSPV_BIN=C:/path/to/clspv/build/bin/clspv.exe`.
+
+For the MSYS2/UCRT64 toolchain darktable itself uses on Windows, the
+runtime Vulkan deps are listed under "Windows (MSYS2 UCRT64)" below;
+clspv is best built with the native MSVC+clang toolchain above rather
+than under MSYS2 (the bundled LLVM's CMake assumes a native Windows
+compiler).
+
+> **Caveat on verification.** The macOS and Windows recipes above are
+> transcribed from clspv's own continuous-integration scripts and
+> match its supported-platform matrix, so the toolchain is proven on
+> those OSes upstream. They have **not** been re-run on macOS/Windows
+> hosts as part of *this* darktable work — the dev container is Linux
+> only, where the full build was exercised end-to-end. Treat the
+> cross-platform steps as "upstream-verified, darktable-unverified"
+> until someone runs them on a Mac / Windows packaging host and the
+> resulting `.spv` are diffed against the glslang/clspv-on-Linux
+> output (they should be byte-identical for single-entry kernels and
+> differ only by entry-point count for the multi-entry ones).
+
 #### Claude Code on the web sessions
 
 Web sessions run in an ephemeral container that is reclaimed after
@@ -1684,31 +1839,40 @@ preamble) if you'd rather wait for clspv up front.
 
 Equivalent packages: `vulkan-loader-devel`, `vulkan-tools`,
 `mesa-vulkan-drivers`, `glslang`, `spirv-tools`, `spirv-cross-devel`.
-`clspv` is not packaged; the same in-tree-build story applies.
+`clspv` is not packaged; build it from source as in "Installing
+clspv → Linux" above (the steps are distro-agnostic).
 
 ### Arch / Manjaro
 
 `vulkan-devel` (meta), `vulkan-tools`, `vulkan-mesa-layers` (or
 the vendor driver of choice), `glslang`, `spirv-tools`,
-`spirv-cross`. `clspv` is in AUR.
+`spirv-cross`. `clspv` is in the AUR (`clspv-git`); building that
+package runs the same from-source steps as "Installing clspv → Linux".
 
 ### macOS (Homebrew)
 
-The PoC build hasn't been exercised on macOS in this PR (no CI hosts
-yet), but the dependency surface is small:
+Runtime + build dependency surface is small:
 
 ```sh
 brew install vulkan-headers molten-vk glslang spirv-tools spirv-cross
+brew install cmake ninja python git   # for building clspv from source
 ```
 
 `molten-vk` provides both the Vulkan loader shim (`libvulkan.dylib`)
 and the Metal-backed ICD; `vulkan-headers` is what `find_package(Vulkan)`
 picks up. The LunarG SDK is an alternative one-shot install that
-bundles all of these plus `vulkaninfo`.
+bundles all of these plus `vulkaninfo`. There is no `clspv` formula —
+build it from source per "Installing clspv → macOS" above (upstream
+CI-tested; the Apple-Silicon/Intel split and the `LLVM_ENABLE_LIBXML2=0`
+gotcha are covered there). Because the `.spv` are precompiled build
+artifacts, the shipped macOS app bundle carries them and **end users
+need only MoltenVK, not clspv** — the point of the whole exercise now
+that Apple has dropped OpenCL.
 
 ### Windows (MSYS2 UCRT64)
 
-The CI's MSYS2 environment can install everything needed via:
+The CI's MSYS2 environment can install the runtime + fallback shader
+toolchain via:
 
 ```
 pacboy -S vulkan-headers:p vulkan-validation-layers:p \
@@ -1718,6 +1882,14 @@ pacboy -S vulkan-headers:p vulkan-validation-layers:p \
 `molten-vk` does not apply on Windows; the Vulkan loader is installed
 with the GPU driver. For developer machines the LunarG SDK installer
 is the simplest option.
+
+For **clspv** on Windows, build from source with the native MSVC+clang
+toolchain per "Installing clspv → Windows" above — *not* under MSYS2,
+because the bundled LLVM's CMake assumes a native Windows compiler.
+clspv's upstream CI tests exactly this configuration
+(`windows-vs2022-amd64`), so it's a supported target. As on macOS, the
+shipped Windows installer carries the precompiled `.spv`, so end users
+need only their GPU vendor's Vulkan driver, never clspv.
 
 ### CI
 
