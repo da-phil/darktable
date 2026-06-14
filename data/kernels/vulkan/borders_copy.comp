@@ -1,0 +1,32 @@
+// GLSL twin for borders_copy.cl. Ships separately from borders.comp
+// so glslang-only builds get the borders_copy entry — GLSL's one-
+// entry-per-module limit prevents bundling it alongside borders_fill.
+// The host loads this program as a fallback when the primary borders
+// program is missing the borders_copy entry (see borders.c
+// init_global).
+//
+// Push-constant layout matches the clspv path byte-for-byte at
+// 24 bytes (6 ints).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1) buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int in_width;
+    int out_width;
+    int dst_x;
+    int dst_y;
+    int region_w;
+    int region_h;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.region_w || y >= pc.region_h) return;
+    int oi = (pc.dst_y + y) * pc.out_width + (pc.dst_x + x);
+    int ii = y * pc.in_width + x;
+    out_buf.data[oi] = in_buf.data[ii];
+}
