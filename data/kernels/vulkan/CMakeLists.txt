@@ -75,6 +75,7 @@ set(VK_KERNELS
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
     borders:borders_fill
+    borders_copy:borders_copy
     colisa:colisa
     graduatednd:graduatednd
     relight:relight

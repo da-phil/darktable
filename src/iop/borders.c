@@ -800,6 +800,18 @@ void init_global(dt_iop_module_so_t *self)
       dt_vulkan_module_kernel_create_from(&gd->vk_copy, gd->vk_program,
                                           "borders_copy", 2, copy_pcs, 16, 16, 1);
     }
+    // glslang-only builds can only embed one entry per .spv, so the
+    // borders_copy entry is missing from the primary borders program
+    // there. Probe the standalone borders_copy program as a fallback
+    // — clspv builds find borders_copy in the primary above and skip
+    // this branch.
+    if(gd->vk_copy.kernel < 0)
+    {
+      const int prog = dt_vulkan_load_program_by_name("borders_copy");
+      if(prog >= 0)
+        dt_vulkan_module_kernel_create_from(&gd->vk_copy, prog,
+                                            "borders_copy", 2, copy_pcs, 16, 16, 1);
+    }
   }
 }
 

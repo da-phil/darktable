@@ -2225,6 +2225,64 @@ a `USE_*` option; see the inline `case` in `build.sh`).
     `USE_OPENCL=OFF` and announce a deprecation window of one
     release.
 
+### 8a. Active task list (current session)
+
+Surfaced by a real-world perf trace on AMD RX 9060 XT (RADV) with
+`opencl_force_vulkan_routing=true` — the coverage-test mode that
+forces every VK-ready module through Vulkan so missing-port and
+silent-fallback bugs become visible. The trace exposed four concrete
+items, ordered by impact:
+
+1. ✅ **Profile-gate completeness audit (colorin / colorout sRGB-
+   fallback paths).** Three sites in `src/iop/colorin.c` (lines 1611,
+   1637, 1680) and one in `src/iop/colorout.c` (line 829) marked
+   `cmatrix` invalid and cleared `process_cl_ready` but left
+   `process_vk_ready = TRUE`. Two distinct failure modes resulted:
+   - `colorin::process_vk` dispatched the kernel anyway with a NaN
+     matrix buffer → silent all-NaN output (worse than a crash).
+   - `colorout::process_vk` caught the bad matrix with its
+     `dt_is_valid_colormatrix` guard and returned -1 → "vulkan -> CPU
+     fallback" log noise on every export with an unusual output
+     profile. Fixed: cleared `process_vk_ready` at all four sites;
+     added a defensive `dt_is_valid_colormatrix` / `_nmatrix` /
+     `_lmatrix` check at the head of `colorin::process_vk` mirroring
+     `colorout`'s guard so a stale-pipe state or future refactor
+     can't reintroduce the silent-NaN path. (`colorin.c:781`,
+     `colorin.c:1611/1637/1680`, `colorout.c:829`.)
+2. ✅ **`borders_copy.comp` GLSL twin.** Startup trace warned
+   `[vulkan] entry 'borders_copy' not in program 48 (likely glslang
+   fallback build…)`. The `.cl` exports both `borders_fill` and
+   `borders_copy`; the `.comp` only carried `borders_fill` (GLSL's
+   one-entry-per-module limit). Shipped a standalone `borders_copy.cl`
+   + `.comp` pair as a second program and wired
+   `init_global` in `src/iop/borders.c` to fall back to the
+   dedicated `borders_copy` program when the primary borders
+   program doesn't expose the entry. clspv builds keep finding
+   `borders_copy` inside `borders.spv` (the primary) and skip the
+   fallback; glslang-only builds now get full VK coverage of the
+   borders module instead of the OpenCL/CPU fallback path. Compiled
+   + spirv-val'd clean.
+3. ⏳ **VK→CPU fallback log diagnostics.** Today the
+   `vulkan -> CPU fallback` message in `pixelpipe_hb.c:1574` is
+   printed for both designed-fallbacks (e.g., `hazeremoval` with no
+   cached A0 → CPU `_ambient_light` is the documented path) and
+   real failures (e.g., the colorout sRGB-fallback bug above —
+   now fixed but illustrative). Either tag the reason at the
+   return -1 site, or split the log level so designed fallbacks
+   go to a finer-grained channel. Without this distinction the
+   trace stays hard to triage on the next bug.
+4. ⏳ **OpenCL profiling timestamp underflow on `Read Image (from
+   device to host)`.** Trace shows `start > end` by ~3-4 µs on
+   nearly every read-back event (already handled gracefully —
+   `timelapsed = 0` — by the §4.2 validation we added). RADV-
+   specific quirk worth confirming with the driver team or working
+   around at the queue-fence boundary. Cosmetic; no correctness
+   impact.
+
+Path B / D / E from §10.2 stay open as the larger ongoing tracks;
+the items above are the small concrete fixes the latest trace
+surfaced.
+
 ## 9. clspv subset risks
 
 `clspv` supports the subset of OpenCL C 1.2 that maps cleanly to

@@ -778,6 +778,19 @@ int process_vk(dt_iop_module_t *self,
   if(d->type == DT_COLORSPACE_LAB)
     return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes);
 
+  // Belt-and-suspenders: the sRGB-fallback paths in commit_params
+  // clear process_vk_ready alongside process_cl_ready, but a stale
+  // pipe state or a future refactor could still surface here with
+  // cmatrix invalidated. Dispatching with NaN matrix data would
+  // produce all-NaN output silently; the OpenCL twin would refuse
+  // for the same reason, so mirror that decision and fall back.
+  const gboolean nrgb_branch = d->nrgb != NULL;
+  if((nrgb_branch
+      && (!dt_is_valid_colormatrix(d->nmatrix[0][0])
+          || !dt_is_valid_colormatrix(d->lmatrix[0][0])))
+     || (!nrgb_branch && !dt_is_valid_colormatrix(d->cmatrix[0][0])))
+    return -1;
+
   // Chroma-correction coeffs, byte-for-byte process_cl.
   const dt_dev_chroma_t *chr = &self->dev->chroma;
   const gboolean corrected = chr->late_correction;
@@ -1606,6 +1619,9 @@ void commit_params(dt_iop_module_t *self,
         d->lut[0], d->lut[1], d->lut[2], LUT_SAMPLES))
     {
       piece->process_cl_ready = FALSE;
+#ifdef HAVE_VULKAN
+      piece->process_vk_ready = FALSE;
+#endif
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
       d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
                                             TYPE_LabA_FLT, p->intent, 0);
@@ -1632,6 +1648,9 @@ void commit_params(dt_iop_module_t *self,
                                                     LUT_SAMPLES))
     {
       piece->process_cl_ready = FALSE;
+#ifdef HAVE_VULKAN
+      piece->process_vk_ready = FALSE;
+#endif
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
       d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
                                             TYPE_LabA_FLT, p->intent, 0);
@@ -1675,6 +1694,9 @@ void commit_params(dt_iop_module_t *self,
                                                     LUT_SAMPLES))
     {
       piece->process_cl_ready = FALSE;
+#ifdef HAVE_VULKAN
+      piece->process_vk_ready = FALSE;
+#endif
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
       d->xform_cam_Lab = cmsCreateTransform(d->input, TYPE_RGBA_FLT, Lab,
                                             TYPE_LabA_FLT, p->intent, 0);
