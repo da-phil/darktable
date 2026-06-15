@@ -262,7 +262,11 @@ int process_vk(dt_iop_module_t *self,
 
     dt_bilateral_vk_t *b = dt_bilateral_init_vk(roi_in->width, roi_in->height,
                                                 sigma_s, sigma_r);
-    if(!b) return -1;
+    if(!b)
+    {
+      dt_pipe_vk_fallback(piece, "bilat: bilateral helper init failed");
+      return -1;
+    }
 
     int rc = -1;
     if(dt_bilateral_splat_vk(b, dev_in)              != 0) goto cleanup_b;
@@ -279,7 +283,11 @@ cleanup_b:
     dt_local_laplacian_vk_t *l = dt_local_laplacian_init_vk(
         piece->pipe->devid, roi_in->width, roi_in->height,
         d->midtone, d->sigma_s, d->sigma_r, d->detail);
-    if(!l) return -1;
+    if(!l)
+    {
+      dt_pipe_vk_fallback(piece, "bilat: local-laplacian helper init failed");
+      return -1;
+    }
     const int rc = dt_local_laplacian_vk(l, dev_in, dev_out);
     dt_local_laplacian_free_vk(l);
     return rc;

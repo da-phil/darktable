@@ -3783,7 +3783,11 @@ int process_vk(dt_iop_module_t *self,
       g->buf_hash = hash;
     }
     dt_iop_gui_leave_critical_section(self);
-    if(copy_err != 0) return -1;
+    if(copy_err != 0)
+    {
+      dt_pipe_vk_fallback(piece, "ashift: gui buffer snapshot readback failed");
+      return -1;
+    }
   }
 
   // Neutral params → pass-through copy.
@@ -3809,11 +3813,17 @@ int process_vk(dt_iop_module_t *self,
     case DT_INTERPOLATION_BICUBIC:  kernel = &gd->vk_ashift_bicubic;  break;
     case DT_INTERPOLATION_LANCZOS2: kernel = &gd->vk_ashift_lanczos2; break;
     case DT_INTERPOLATION_LANCZOS3: kernel = &gd->vk_ashift_lanczos3; break;
-    default: return -1;
+    default:
+      dt_pipe_vk_fallback(piece, "ashift: interpolation kind not ported");
+      return -1;
   }
 
   dt_vk_mem_t *dev_homo = dt_vulkan_alloc_buffer(devid, sizeof(float) * 9);
-  if(!dev_homo) return -1;
+  if(!dev_homo)
+  {
+    dt_pipe_vk_fallback(piece, "ashift: homograph alloc failed");
+    return -1;
+  }
 
   // Homograph is float[3][3], stored row-major. The OpenCL kernel reads
   // homograph[3*i+j], so the Vulkan upload layout matches verbatim.
