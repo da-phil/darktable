@@ -600,7 +600,11 @@ int process_vk(dt_iop_module_t *self,
   // the pipeline already has float4 data (HDR DNG / 16-bit TIFF / etc.).
   // Belt-and-suspenders return -1 if the gate somehow allowed a Bayer
   // image through.
-  if(piece->pipe->dsc.filters || d->apply_gainmaps) return -1;
+  if(piece->pipe->dsc.filters || d->apply_gainmaps)
+  {
+    dt_pipe_vk_fallback(piece, "rawprepare: 1f Bayer / gainmap not ported");
+    return -1;
+  }
 
   const int csx = _compute_proper_crop(piece, roi_in, d->left);
   const int csy = _compute_proper_crop(piece, roi_in, d->top);

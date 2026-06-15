@@ -2262,26 +2262,55 @@ items, ordered by impact:
    fallback; glslang-only builds now get full VK coverage of the
    borders module instead of the OpenCL/CPU fallback path. Compiled
    + spirv-val'd clean.
-3. ⏳ **VK→CPU fallback log diagnostics.** Today the
-   `vulkan -> CPU fallback` message in `pixelpipe_hb.c:1574` is
-   printed for both designed-fallbacks (e.g., `hazeremoval` with no
-   cached A0 → CPU `_ambient_light` is the documented path) and
-   real failures (e.g., the colorout sRGB-fallback bug above —
-   now fixed but illustrative). Either tag the reason at the
-   return -1 site, or split the log level so designed fallbacks
-   go to a finer-grained channel. Without this distinction the
-   trace stays hard to triage on the next bug.
-4. ⏳ **OpenCL profiling timestamp underflow on `Read Image (from
-   device to host)`.** Trace shows `start > end` by ~3-4 µs on
-   nearly every read-back event (already handled gracefully —
-   `timelapsed = 0` — by the §4.2 validation we added). RADV-
-   specific quirk worth confirming with the driver team or working
-   around at the queue-fence boundary. Cosmetic; no correctness
-   impact.
+3. ✅ **VK→CPU fallback log diagnostics.** The
+   `vulkan -> CPU fallback` message in `pixelpipe_hb.c` used to
+   print a single context-free line for both designed-fallbacks
+   (e.g., `demosaic` Bayer mode not ported → expected) and real
+   failures (e.g., a regression invalidating cmatrix). Triaging
+   a trace meant guessing per module.
+
+   Landed: a per-pipe `vk_fallback_reason` field plus a
+   `dt_pipe_vk_fallback(piece, "string literal")` helper exposed
+   in `develop/pixelpipe_hb.h`. Modules call it on the line above
+   `return -1` to annotate the gate; the pixelpipe clears the
+   field before each dispatch, then synthesizes a phase tag for
+   HAL-side failures (`alloc-in-failed`, `alloc-out-failed`,
+   `host-upload-failed`, `host-readback-failed`,
+   `device-lock-failed`, `process_vk`). The log line is now:
+   `vulkan -> CPU fallback ... [reason=<tag>]` — module reasons
+   take precedence, phase tags fall back when the module didn't
+   annotate.
+
+   Instrumented the high-frequency sites surfaced by the trace:
+   `demosaic` (10 gates), `denoiseprofile` (3), `highlights`,
+   `rawprepare`, `channelmixerrgb` (4), `colorin`, `colorout`,
+   `bilat` (2), `colorequal` (2), `retouch`, `hazeremoval` (3),
+   `sigmoid`, `ashift` (3), `atrous`, `agx`, `colorbalancergb` (2).
+   Future fallback log lines tagged `[reason=unannotated]` flag
+   sites we haven't labelled yet — gradient breadcrumb for the
+   next pass.
+
+4. ✅ **OpenCL profiling timestamp underflow on `Read Image (from
+   device to host)`.** Trace showed `start > end` by ~3-4 µs on
+   nearly every read-back event. The existing validation logged
+   `[opencl_events_flush] invalid profiling data` for each one,
+   flooding `-d perf` runs and inflating the `(N events missing)`
+   counter at the end of the profile.
+
+   Landed: in `src/common/opencl.c` `_opencl_events_consolidate`,
+   when both reads succeed and `(start - end) < 100 µs`, treat as
+   a zero-duration event silently — that's RADV's timer-rounding
+   on essentially-instant events (already-coherent buffers,
+   no-op queue advances). Anything beyond 100 µs of inversion
+   still logs as before and counts as a lost event, so genuine
+   driver oddities stay visible.
 
 Path B / D / E from §10.2 stay open as the larger ongoing tracks;
-the items above are the small concrete fixes the latest trace
-surfaced.
+the §8a items above are now complete. Next session's likely
+candidates: extend Path B by porting the float4 path of
+`cacorrectrgb` (still CPU-only in the trace) and add reason
+annotations to the long tail of return-(-1) sites in lensblur /
+shadhi / etc.
 
 ## 9. clspv subset risks
 

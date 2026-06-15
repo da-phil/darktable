@@ -1125,7 +1125,11 @@ int process_vk(dt_iop_module_t *self,
   const dt_iop_colorbalancergb_global_data_t *const gd = self->global_data;
   const dt_iop_colorbalancergb_gui_data_t *g = self->gui_data;
 
-  if(piece->colors != 4) return -1;
+  if(piece->colors != 4)
+  {
+    dt_pipe_vk_fallback(piece, "colorbalancergb: single-channel input");
+    return -1;
+  }
 
   const int devid  = piece->pipe->devid;
   const int width  = roi_in->width;
@@ -1133,7 +1137,11 @@ int process_vk(dt_iop_module_t *self,
 
   const dt_iop_order_iccprofile_info_t *const work_profile
       = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
-  if(work_profile == NULL) return -1;
+  if(work_profile == NULL)
+  {
+    dt_pipe_vk_fallback(piece, "colorbalancergb: missing work profile");
+    return -1;
+  }
 
   // Premultiply the conversion matrices host-side (work profile baked
   // in), exactly like process_cl, so the kernel does one matmul per
