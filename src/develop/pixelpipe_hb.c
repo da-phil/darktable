@@ -1589,34 +1589,63 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             vin = dt_vulkan_alloc_buffer(devid, in_size);
           }
           dt_vk_mem_t *vout = dt_vulkan_alloc_buffer(devid, out_size);
+          // §8a.3: clear the per-pipe annotation so a stale reason
+          // from a previous module can't leak into this dispatch's
+          // fallback log line.
+          pipe->vk_fallback_reason = NULL;
           const gboolean upload_ok = vin_from_cache
               ? TRUE
               : (vin && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0);
-          if(vin && vout && upload_ok
-             && module->process_vk(module, piece, vin, vout, roi_in, roi_out) == 0
-             && dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
+          const char *failure_phase = NULL;
+          if(!vin)            failure_phase = "alloc-in-failed";
+          else if(!vout)      failure_phase = "alloc-out-failed";
+          else if(!upload_ok) failure_phase = "host-upload-failed";
+          if(vin && vout && upload_ok)
           {
-            processed = TRUE;
-            *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
-            *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
-            dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
-                          pipe, module, DT_DEVICE_VK, roi_in, roi_out,
-                          "%dx%d%s", roi_in->width, roi_in->height,
-                          vin_from_cache ? " [vk handoff]" : "");
-            // Hand off vout to the next module instead of freeing
-            // it. If the next module is non-VK or has a mismatched
-            // size, it'll get dropped on that branch.
-            pipe->vk_handoff_buf  = vout;
-            pipe->vk_handoff_size = out_size;
-            vout = NULL;
+            const int rc = module->process_vk(module, piece, vin, vout, roi_in, roi_out);
+            if(rc == 0)
+            {
+              if(dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
+              {
+                processed = TRUE;
+                *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
+                *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
+                dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
+                              pipe, module, DT_DEVICE_VK, roi_in, roi_out,
+                              "%dx%d%s", roi_in->width, roi_in->height,
+                              vin_from_cache ? " [vk handoff]" : "");
+                // Hand off vout to the next module instead of freeing
+                // it. If the next module is non-VK or has a mismatched
+                // size, it'll get dropped on that branch.
+                pipe->vk_handoff_buf  = vout;
+                pipe->vk_handoff_size = out_size;
+                vout = NULL;
+              }
+              else failure_phase = "host-readback-failed";
+            }
+            else failure_phase = "process_vk";
           }
           dt_vulkan_free_buffer(devid, vin);
           if(vout) dt_vulkan_free_buffer(devid, vout);
           dt_vulkan_unlock_device(devid);
+          // §8a.3: the per-pipe vk_fallback_reason is owned by
+          // process_vk; for the other phases we synthesize a tag
+          // from the local failure_phase. Module-set reasons take
+          // precedence so designed gates stay descriptive.
+          if(!processed)
+          {
+            const char *reason = pipe->vk_fallback_reason
+                                 ? pipe->vk_fallback_reason
+                                 : (failure_phase ? failure_phase : "unannotated");
+            dt_print_pipe(DT_DEBUG_OPENCL, "vulkan -> CPU fallback",
+                          pipe, module, DT_DEVICE_CPU, roi_in, roi_out,
+                          "[reason=%s]", reason);
+          }
         }
-        if(!processed)
+        else if(!processed)
           dt_print_pipe(DT_DEBUG_OPENCL, "vulkan -> CPU fallback",
-                        pipe, module, DT_DEVICE_CPU, roi_in, roi_out, "");
+                        pipe, module, DT_DEVICE_CPU, roi_in, roi_out,
+                        "[reason=device-lock-failed]");
       }
 #endif
       if(!processed)

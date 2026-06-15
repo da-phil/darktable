@@ -618,7 +618,11 @@ int process_vk(dt_iop_module_t *self,
   const dt_iop_atrous_data_t *d = piece->data;
   const dt_iop_atrous_global_data_t *gd = self->global_data;
 
-  if(piece->colors != 4) return -1;
+  if(piece->colors != 4)
+  {
+    dt_pipe_vk_fallback(piece, "atrous: single-channel input");
+    return -1;
+  }
 
   const int devid  = piece->pipe->devid;
   const int width  = roi_out->width;

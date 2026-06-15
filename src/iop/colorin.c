@@ -789,7 +789,10 @@ int process_vk(dt_iop_module_t *self,
       && (!dt_is_valid_colormatrix(d->nmatrix[0][0])
           || !dt_is_valid_colormatrix(d->lmatrix[0][0])))
      || (!nrgb_branch && !dt_is_valid_colormatrix(d->cmatrix[0][0])))
+  {
+    dt_pipe_vk_fallback(piece, "colorin: invalid camera matrix (lcms2 path)");
     return -1;
+  }
 
   // Chroma-correction coeffs, byte-for-byte process_cl.
   const dt_dev_chroma_t *chr = &self->dev->chroma;

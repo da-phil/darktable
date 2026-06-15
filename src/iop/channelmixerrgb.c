@@ -2519,7 +2519,11 @@ int process_vk(dt_iop_module_t *self,
 {
   dt_iop_channelmixer_rbg_data_t *const d = piece->data;
   const dt_iop_channelmixer_rgb_global_data_t *const gd = self->global_data;
-  if(piece->colors != 4) return -1;
+  if(piece->colors != 4)
+  {
+    dt_pipe_vk_fallback(piece, "channelmixerrgb: single-channel input");
+    return -1;
+  }
 
   // Pick the kernel slot for the requested adaptation mode. If the
   // slot didn't load (glslang-only build without that entry point),
@@ -2535,14 +2539,22 @@ int process_vk(dt_iop_module_t *self,
     case DT_ADAPTATION_LAST:
     default:                            k = &gd->vk_rgb;             break;
   }
-  if(!k || k->kernel < 0) return -1;
+  if(!k || k->kernel < 0)
+  {
+    dt_pipe_vk_fallback(piece, "channelmixerrgb: adaptation entry missing (glslang build?)");
+    return -1;
+  }
 
   // Upload the 3 matrices (RGB_to_XYZ, XYZ_to_RGB, MIX) into one
   // 36-float storage buffer.  d->MIX is already 12 floats; the two
   // profile matrices come from work_profile.
   const dt_iop_order_iccprofile_info_t *const work_profile =
     dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
-  if(!work_profile) return -1;
+  if(!work_profile)
+  {
+    dt_pipe_vk_fallback(piece, "channelmixerrgb: missing work profile");
+    return -1;
+  }
 
   float matrices[36] = { 0 };
   for(int i = 0; i < 12; i++) matrices[i]      = ((float*)work_profile->matrix_in)[i];
@@ -2552,7 +2564,11 @@ int process_vk(dt_iop_module_t *self,
       matrices[24 + r * 4 + c] = d->MIX[r][c];
 
   dt_vk_mem_t *dev_mat = dt_vulkan_alloc_buffer(0, sizeof(matrices));
-  if(!dev_mat) return -1;
+  if(!dev_mat)
+  {
+    dt_pipe_vk_fallback(piece, "channelmixerrgb: matrix alloc failed");
+    return -1;
+  }
   vk_chmix_pc_t pc = { 0 };
   pc.width      = roi_in->width;
   pc.height     = roi_in->height;

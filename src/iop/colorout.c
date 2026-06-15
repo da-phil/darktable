@@ -404,7 +404,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   // No valid matrix means we can't take the GPU shaper-LUT path; fall
   // through to the CPU lcms2 transform (same decision as process_cl).
-  if(!dt_is_valid_colormatrix(d->cmatrix[0][0])) return -1;
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  {
+    dt_pipe_vk_fallback(piece, "colorout: invalid output matrix (lcms2 path)");
+    return -1;
+  }
 
   const size_t lut_bytes = sizeof(float) * LUT_SAMPLES;
   dt_vk_mem_t *dev_r = NULL, *dev_g = NULL, *dev_b = NULL;

@@ -914,7 +914,11 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *dev_m_pb = dt_vulkan_alloc_buffer(devid, sizeof(m_pb));
   dt_vk_mem_t *dev_m_br = dt_vulkan_alloc_buffer(devid, sizeof(m_br));
   dt_vk_mem_t *dev_m_rp = dt_vulkan_alloc_buffer(devid, sizeof(m_rp));
-  if(!dev_m_pb || !dev_m_br || !dev_m_rp) goto cleanup;
+  if(!dev_m_pb || !dev_m_br || !dev_m_rp)
+  {
+    dt_pipe_vk_fallback(piece, "sigmoid: per-channel matrix alloc failed");
+    goto cleanup;
+  }
 
   const vk_sigmoid_pc_per_channel_t pc = {
     .width            = width,

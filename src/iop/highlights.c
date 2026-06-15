@@ -726,7 +726,10 @@ int process_vk(dt_iop_module_t *self,
   // anything through.
   if(piece->filters
      || piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU)
+  {
+    dt_pipe_vk_fallback(piece, "highlights: bayer/xtrans modes not ported");
     return -1;
+  }
 
   const float clipper = d->clip * highlights_clip_magics[d->mode];
   struct { int width, height; float clip; } pc

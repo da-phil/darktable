@@ -5232,7 +5232,10 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   for(int i = 0; i < n_forms; i++)
     if(dt_is_valid_maskid(p->rt_forms[i].formid)
        && p->rt_forms[i].algorithm == DT_IOP_RETOUCH_HEAL)
+    {
+      dt_pipe_vk_fallback(piece, "retouch: HEAL form not ported");
       return -1;
+    }
 
   const int devid = piece->pipe->devid;
   dt_iop_roi_t roi_retouch = *roi_in;

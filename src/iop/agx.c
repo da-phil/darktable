@@ -2873,7 +2873,11 @@ int process_vk(dt_iop_module_t *self,
     dt_ioppr_get_pipe_work_profile_info(piece->pipe);
   const dt_iop_order_iccprofile_info_t *const base_profile =
     _agx_get_base_profile(self->dev, pipe_work_profile, d->primaries_params.base_primaries);
-  if(!base_profile) return -1;
+  if(!base_profile)
+  {
+    dt_pipe_vk_fallback(piece, "agx: missing base primaries profile");
+    return -1;
+  }
 
   dt_colormatrix_t pipe_to_base, base_to_rendering, rendering_to_pipe, rendering_to_xyz;
   dt_colormatrix_t pipe_to_base_t, base_to_rendering_t, rendering_to_pipe_t, rendering_to_xyz_t;

@@ -1973,11 +1973,19 @@ int process_vk(dt_iop_module_t *self,
 
   const struct dt_iop_order_iccprofile_info_t *const work_profile
       = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
-  if(piece->colors != 4 || work_profile == NULL) return -1;
+  if(piece->colors != 4 || work_profile == NULL)
+  {
+    dt_pipe_vk_fallback(piece, "colorequal: single-channel input or missing profile");
+    return -1;
+  }
 
   const dt_iop_colorequal_gui_data_t *g = self->gui_data;
   const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
-  if(g && fullpipe && g->mask_mode != 0) return -1;  // mask preview → CPU/CL
+  if(g && fullpipe && g->mask_mode != 0)
+  {
+    dt_pipe_vk_fallback(piece, "colorequal: gui mask preview not ported");
+    return -1;
+  }
   const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
   const gboolean guiding = d->use_filter;
 

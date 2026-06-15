@@ -2889,9 +2889,21 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const dt_iop_denoiseprofile_data_t *d = piece->data;
   // Gate: only the wavelets-mode RGB + use_new_vst path is supported
   // on Vulkan. NLM, Y0U0V0, and the legacy VST stay on OpenCL/CPU.
-  if(d->mode != MODE_WAVELETS && d->mode != MODE_WAVELETS_AUTO) return -1;
-  if(d->wavelet_color_mode != MODE_RGB) return -1;
-  if(!d->use_new_vst) return -1;
+  if(d->mode != MODE_WAVELETS && d->mode != MODE_WAVELETS_AUTO)
+  {
+    dt_pipe_vk_fallback(piece, "denoiseprofile: NLM mode not ported");
+    return -1;
+  }
+  if(d->wavelet_color_mode != MODE_RGB)
+  {
+    dt_pipe_vk_fallback(piece, "denoiseprofile: Y0U0V0 color mode not ported");
+    return -1;
+  }
+  if(!d->use_new_vst)
+  {
+    dt_pipe_vk_fallback(piece, "denoiseprofile: legacy VST not ported");
+    return -1;
+  }
   return _denoiseprofile_process_wavelets_vk(self, piece, dev_in, dev_out,
                                              roi_in, roi_out);
 }

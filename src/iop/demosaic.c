@@ -1269,7 +1269,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   // Strip the dual bit; we don't run dual on VK.
   int method = d->demosaicing_method & ~DT_DEMOSAIC_DUAL;
-  if(d->demosaicing_method & DT_DEMOSAIC_DUAL) return -1;
+  if(d->demosaicing_method & DT_DEMOSAIC_DUAL)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: dual-method not ported");
+    return -1;
+  }
 
   // Bail on any non-trivial method.
   const gboolean is_mono = method == DT_IOP_DEMOSAIC_MONO;
@@ -1277,43 +1281,76 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                          || method == DT_IOP_DEMOSAIC_PASSTHR_MONOX;
   const gboolean is_pcolor = method == DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR
                           || method == DT_IOP_DEMOSAIC_PASSTHR_COLORX;
-  if(!(is_mono || is_pmono || is_pcolor)) return -1;
+  if(!(is_mono || is_pmono || is_pcolor))
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: bayer/xtrans method not ported");
+    return -1;
+  }
 
   // Bail on zoom passes — the OpenCL zoom kernels (half-size /
   // third-size / passthrough_monochrome zoom) all do their own
   // bilinear-ish downscaling and aren't ported yet.
-  if(!fullscale) return -1;
+  if(!fullscale)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: zoom path not ported");
+    return -1;
+  }
 
   // Bail when ROI isn't 1:1 with the input.
   const int iwidth = roi_in->width;
   const int iheight = roi_in->height;
   const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
                        && feqf(roi_in->scale, roi_out->scale, 1e-8f);
-  if(!direct) return -1;
+  if(!direct)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: roi scaling not 1:1");
+    return -1;
+  }
 
   // Bail on debug-mask / capture-sharpening / show-blend paths.
-  if(pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU) return -1;
+  if(pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: gui mask passthru");
+    return -1;
+  }
   const dt_iop_demosaic_gui_data_t *g = self->gui_data;
   const gboolean fullpipe = dt_pipe_is_full(pipe);
   if(self->dev->gui_attached && fullpipe && g
      && (g->dual_mask || (g->cs_mask && d->cs_enabled)
          || (g->cs_boost_mask && d->cs_enabled)))
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: gui dual/cs mask preview");
     return -1;
+  }
   // Capture sharpening uses its own multi-kernel pipeline.
   const gboolean run_fast = dt_pipe_is_fast(pipe) || dt_pipe_is_preview(pipe);
-  if(!is_pmono && !is_pcolor && !run_fast && d->cs_enabled) return -1;
+  if(!is_pmono && !is_pcolor && !run_fast && d->cs_enabled)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: capture sharpening not ported");
+    return -1;
+  }
 
   // Detail mask + color smoothing run as a post-pass in process_cl
   // but aren't wired into the VK arm yet.
-  if(pipe->want_detail_mask) return -1;
+  if(pipe->want_detail_mask)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: detail mask post-pass not ported");
+    return -1;
+  }
   const gboolean no_masking = dt_pipe_no_mask_display(pipe);
   if(d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && no_masking && !run_fast)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: color smoothing not ported");
     return -1;
+  }
   // Green equilibrium correction (Bayer green_eq != NONE) needs its
   // own kernel chain.
   const gboolean is_bayer = filters != 9u && filters != 0 && !true_monochrome;
   if(is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && no_masking && !run_fast)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: green-eq correction not ported");
     return -1;
+  }
 
   const int devid = piece->pipe->devid;
   const size_t out_bytes = (size_t)4 * sizeof(float) * iwidth * iheight;
@@ -1321,7 +1358,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   if(is_mono)
   {
     // true_monochrome path: input is already float4, just copy through.
-    if(!true_monochrome) return -1;
+    if(!true_monochrome)
+    {
+      dt_pipe_vk_fallback(piece, "demosaic: synth-monochrome path not ported");
+      return -1;
+    }
     return dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, out_bytes);
   }
 
@@ -1341,7 +1382,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
     for(int c = 0; c < 6; c++) xtrans_flat[r * 6 + c] = (uint32_t)xt[r][c];
 
   dt_vk_mem_t *dev_xtr = dt_vulkan_alloc_buffer(devid, sizeof(xtrans_flat));
-  if(!dev_xtr) return -1;
+  if(!dev_xtr)
+  {
+    dt_pipe_vk_fallback(piece, "demosaic: xtrans pattern alloc failed");
+    return -1;
+  }
 
   const vk_demosaic_color_pc_t pc = {
     .width = iwidth, .height = iheight, .filters = filters,

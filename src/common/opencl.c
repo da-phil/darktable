@@ -4159,6 +4159,19 @@ cl_int dt_opencl_events_flush(const int devid,
       {
         (*eventtags)[k].timelapsed = end - start;
       }
+      else if(errs == CL_SUCCESS && erre == CL_SUCCESS
+              && end < start && (start - end) < 100000ULL)
+      {
+        // §8a.4 in dev-doc/gpu_acceleration_clspv_vulkan.md:
+        // RADV (and other drivers' fast paths for trivial events
+        // like [Read Image (from device to host)] on a buffer that's
+        // already device-coherent) reports end ≈ start with timer
+        // rounding that produces a few µs of negative delta. The
+        // event was a real zero-duration operation; treat it as
+        // such silently. Anything beyond 100 µs of inversion is a
+        // genuine driver oddity worth surfacing.
+        (*eventtags)[k].timelapsed = 0;
+      }
       else
       {
         // Driver returned success but timestamps are missing/inverted, or the

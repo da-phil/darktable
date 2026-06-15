@@ -273,6 +273,18 @@ typedef struct dt_dev_pixelpipe_t
   // pipeline teardown.
   dt_vk_mem_t *vk_handoff_buf;
   size_t       vk_handoff_size;
+
+  // §8a.3 in gpu_acceleration_clspv_vulkan.md — diagnostic tag set
+  // by a module's process_vk just before it returns -1 so the
+  // pixelpipe "vulkan -> CPU fallback" log can tell designed
+  // fallbacks (e.g. demosaic mode not ported) apart from real
+  // failures (e.g. dispatch errored). Borrowed string literal
+  // owned by the module's translation unit — never freed by the
+  // pipeline. Cleared by pixelpipe before each process_vk call and
+  // included in the fallback log line afterwards. NULL means the
+  // module didn't annotate, which itself is a signal worth
+  // surfacing (potential bug, not a designed gate).
+  const char *vk_fallback_reason;
 } dt_dev_pixelpipe_t;
 
 struct dt_develop_t;
@@ -433,6 +445,19 @@ gboolean dt_dev_pixelpipe_process_no_gamma(dt_dev_pixelpipe_t *pipe,
 void dt_dev_pixelpipe_disable_after(dt_dev_pixelpipe_t *pipe, const char *op);
 // disable given op and all that comes before it in the pipe:
 void dt_dev_pixelpipe_disable_before(dt_dev_pixelpipe_t *pipe, const char *op);
+
+#ifdef HAVE_VULKAN
+// §8a.3: call from process_vk just before `return -1` to label the
+// fallback reason in the pipeline's "vulkan -> CPU fallback" log.
+// `reason` must be a static string literal — the pipeline borrows
+// the pointer without copying. Cheap to call repeatedly (just a
+// pointer write); pixelpipe clears the field before every dispatch.
+static inline void dt_pipe_vk_fallback(dt_dev_pixelpipe_iop_t *piece,
+                                       const char *reason)
+{
+  if(piece && piece->pipe) piece->pipe->vk_fallback_reason = reason;
+}
+#endif
 
 // helper function to pass a raster mask through a (so far) processed pipe
 float *dt_dev_get_raster_mask(dt_dev_pixelpipe_iop_t *piece,

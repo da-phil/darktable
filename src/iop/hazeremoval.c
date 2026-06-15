@@ -1048,7 +1048,11 @@ int process_vk(dt_iop_module_t *self,
   dt_iop_hazeremoval_params_t *d = piece->data;
   const dt_iop_hazeremoval_global_data_t *gd = self->global_data;
 
-  if(piece->colors != 4) return -1;
+  if(piece->colors != 4)
+  {
+    dt_pipe_vk_fallback(piece, "hazeremoval: single-channel input");
+    return -1;
+  }
 
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
@@ -1101,10 +1105,15 @@ int process_vk(dt_iop_module_t *self,
   if(dt_isnan(distance_max))
   {
     float *host = dt_alloc_aligned(f4_bytes);
-    if(!host) return -1;
+    if(!host)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: host buffer alloc for ambient-light failed");
+      return -1;
+    }
     if(dt_vulkan_read_from_device(devid, host, img_in, f4_bytes) != 0)
     {
       dt_free_align(host);
+      dt_pipe_vk_fallback(piece, "hazeremoval: device->host readback failed");
       return -1;
     }
     const const_rgb_image img_in_cpu = (const_rgb_image){ host, width, height, 4 };
@@ -1131,7 +1140,11 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *trans_map = dt_vulkan_alloc_buffer(devid, f_bytes);
   dt_vk_mem_t *trans_map_filtered = dt_vulkan_alloc_buffer(devid, f_bytes);
   dt_vk_mem_t *temp = dt_vulkan_alloc_buffer(devid, f_bytes);
-  if(!trans_map || !trans_map_filtered || !temp) goto cleanup;
+  if(!trans_map || !trans_map_filtered || !temp)
+  {
+    dt_pipe_vk_fallback(piece, "hazeremoval: transition-map scratch alloc failed");
+    goto cleanup;
+  }
 
   // Step 1: transition map from the dark-channel prior.
   {
