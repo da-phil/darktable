@@ -403,8 +403,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   struct { int w, h, ow, oh, orient; } pc
     = { roi_in->width, roi_in->height,
         roi_out->width, roi_out->height, data->orientation };
-  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
-                                  pc.w, pc.h, &pc, sizeof(pc));
+  const int rc = dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                          pc.w, pc.h, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "flip: dispatch returned non-zero");
+  return rc;
 }
 #endif
 

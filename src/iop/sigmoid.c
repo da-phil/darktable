@@ -890,8 +890,11 @@ int process_vk(dt_iop_module_t *self,
       .contrast_power = d->film_power,
       .skew_power     = d->paper_power,
     };
-    return dt_vulkan_dispatch_inout(&gd->vk_rgb_ratio, dev_in, dev_out,
-                                    width, height, &pc, sizeof(pc));
+    const int rc = dt_vulkan_dispatch_inout(&gd->vk_rgb_ratio, dev_in, dev_out,
+                                            width, height, &pc, sizeof(pc));
+    if(rc != 0)
+      dt_pipe_vk_fallback(piece, "sigmoid: rgb_ratio dispatch returned non-zero");
+    return rc;
   }
 
   // DT_SIGMOID_METHOD_PER_CHANNEL: 3 matrices + scalars.
@@ -939,6 +942,8 @@ int process_vk(dt_iop_module_t *self,
   rc = dt_vulkan_dispatch_n_batched(&gd->vk_per_channel, bufs, 5,
                                     uploads, sizeof(uploads) / sizeof(uploads[0]),
                                     width, height, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "sigmoid: per_channel dispatch returned non-zero");
 
 cleanup:
   dt_vulkan_free_buffer(devid, dev_m_pb);

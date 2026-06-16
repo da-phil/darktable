@@ -269,9 +269,21 @@ int process_vk(dt_iop_module_t *self,
     }
 
     int rc = -1;
-    if(dt_bilateral_splat_vk(b, dev_in)              != 0) goto cleanup_b;
-    if(dt_bilateral_blur_vk(b)                       != 0) goto cleanup_b;
-    if(dt_bilateral_slice_vk(b, dev_in, dev_out, d->detail) != 0) goto cleanup_b;
+    if(dt_bilateral_splat_vk(b, dev_in) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "bilat: bilateral splat failed");
+      goto cleanup_b;
+    }
+    if(dt_bilateral_blur_vk(b) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "bilat: bilateral blur failed");
+      goto cleanup_b;
+    }
+    if(dt_bilateral_slice_vk(b, dev_in, dev_out, d->detail) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "bilat: bilateral slice failed");
+      goto cleanup_b;
+    }
     rc = 0;
 
 cleanup_b:
@@ -289,6 +301,8 @@ cleanup_b:
       return -1;
     }
     const int rc = dt_local_laplacian_vk(l, dev_in, dev_out);
+    if(rc != 0)
+      dt_pipe_vk_fallback(piece, "bilat: local-laplacian dispatch failed");
     dt_local_laplacian_free_vk(l);
     return rc;
   }

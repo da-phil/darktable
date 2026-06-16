@@ -74,9 +74,23 @@ dt_local_laplacian_vk_t *dt_local_laplacian_init_vk(int devid,
                                                     float highlights,
                                                     float clarity)
 {
-  if(!dt_vulkan_running()) return NULL;
+  if(!dt_vulkan_running())
+  {
+    dt_print(DT_DEBUG_OPENCL, "[local_laplacian_vk] init refused: vulkan not running");
+    return NULL;
+  }
   _vk_ll_ensure_kernels();
-  if(!_vk_ll_ready()) return NULL;
+  if(!_vk_ll_ready())
+  {
+    // Surface which slot is missing so a glslang-only / partial build
+    // is obvious instead of looking like a generic init failure.
+    dt_print(DT_DEBUG_OPENCL,
+             "[local_laplacian_vk] init refused: kernels not ready "
+             "(pad=%d reduce=%d curve=%d asm=%d back=%d)",
+             _vk_ll_pad.kernel, _vk_ll_reduce.kernel, _vk_ll_curve.kernel,
+             _vk_ll_asm.kernel, _vk_ll_back.kernel);
+    return NULL;
+  }
 
   dt_local_laplacian_vk_t *g = calloc(1, sizeof(*g));
   if(!g) return NULL;
@@ -104,11 +118,23 @@ dt_local_laplacian_vk_t *dt_local_laplacian_init_vk(int devid,
     const size_t bytes = (size_t)g->lwidth[l] * g->lheight[l] * sizeof(float);
     g->dev_padded[l] = dt_vulkan_alloc_buffer(devid, bytes);
     g->dev_output[l] = dt_vulkan_alloc_buffer(devid, bytes);
-    if(!g->dev_padded[l] || !g->dev_output[l]) goto fail;
+    if(!g->dev_padded[l] || !g->dev_output[l])
+    {
+      dt_print(DT_DEBUG_OPENCL,
+               "[local_laplacian_vk] buffer alloc failed at level %d (size=%zu)",
+               l, bytes);
+      goto fail;
+    }
     for(int k = 0; k < DT_LL_VK_NUM_GAMMA; k++)
     {
       g->dev_processed[k][l] = dt_vulkan_alloc_buffer(devid, bytes);
-      if(!g->dev_processed[k][l]) goto fail;
+      if(!g->dev_processed[k][l])
+      {
+        dt_print(DT_DEBUG_OPENCL,
+                 "[local_laplacian_vk] processed[%d] alloc failed at level %d (size=%zu)",
+                 k, l, bytes);
+        goto fail;
+      }
     }
   }
   return g;
