@@ -3842,6 +3842,8 @@ int process_vk(dt_iop_module_t *self,
   const int rc = dt_vulkan_dispatch_n_batched(kernel, bufs, 3, uploads, 1,
                                               roi_out->width, roi_out->height,
                                               &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "ashift: interpolation dispatch failed");
   dt_vulkan_free_buffer(devid, dev_homo);
   return rc;
 }

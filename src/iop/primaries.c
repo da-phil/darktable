@@ -213,8 +213,11 @@ int process_vk(dt_iop_module_t *self,
     for(int c = 0; c < 4; c++)
       pc.m[r * 4 + c] = matrix[r][c];
 
-  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
-                                  pc.w, pc.h, &pc, sizeof(pc));
+  const int rc = dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                          pc.w, pc.h, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "primaries: dispatch returned non-zero");
+  return rc;
 }
 #endif
 

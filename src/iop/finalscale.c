@@ -178,7 +178,11 @@ int process_vk(dt_iop_module_t *self,
 {
   // Upscaling stays on OpenCL / CPU (same gate as process_cl — the
   // resampler's downscale path is what the Vulkan kernel implements).
-  if(roi_out->scale > 1.0f) return -1;
+  if(roi_out->scale > 1.0f)
+  {
+    dt_pipe_vk_fallback(piece, "finalscale: upscale path not ported");
+    return -1;
+  }
 
   const int devid = piece->pipe->devid;
   const gboolean exporting = dt_pipe_is_export(piece->pipe);
@@ -186,10 +190,12 @@ int process_vk(dt_iop_module_t *self,
   dt_print_pipe(DT_DEBUG_IMAGEIO,
                 exporting ? "clip_and_zoom_roi" : "clip_and_zoom",
                 piece->pipe, self, devid, roi_in, roi_out, "vk device=%i", devid);
-  if(exporting)
-    return dt_iop_clip_and_zoom_roi_vk(devid, dev_out, dev_in, roi_out, roi_in);
-  else
-    return dt_iop_clip_and_zoom_vk(devid, dev_out, dev_in, roi_out, roi_in);
+  const int rc = exporting
+    ? dt_iop_clip_and_zoom_roi_vk(devid, dev_out, dev_in, roi_out, roi_in)
+    : dt_iop_clip_and_zoom_vk(devid, dev_out, dev_in, roi_out, roi_in);
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "finalscale: resampler helper failed");
+  return rc;
 }
 #endif
 

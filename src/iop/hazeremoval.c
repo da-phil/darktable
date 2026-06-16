@@ -1155,30 +1155,53 @@ int process_vk(dt_iop_module_t *self,
     };
     dt_vk_mem_t *bufs[] = { img_in, trans_map };
     if(dt_vulkan_dispatch_n(&gd->vk_transision_map, bufs, 2,
-                            width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+                            width, height, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: transition_map dispatch failed");
+      goto cleanup;
+    }
   }
   // Step 1b: refine with box-max (separable) — exactly the OpenCL
   // _transition_map_cl tail.
   {
     const vk_hazeremoval_box_pc_t pc = { .width = width, .height = height, .w = w1 };
     dt_vk_mem_t *bx[] = { trans_map, temp };
-    if(dt_vulkan_dispatch_n(&gd->vk_box_max_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    if(dt_vulkan_dispatch_n(&gd->vk_box_max_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: box_max_x dispatch failed");
+      goto cleanup;
+    }
     dt_vk_mem_t *by[] = { temp, trans_map };
-    if(dt_vulkan_dispatch_n(&gd->vk_box_max_y, by, 2, width, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    if(dt_vulkan_dispatch_n(&gd->vk_box_max_y, by, 2, width, 1, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: box_max_y dispatch failed");
+      goto cleanup;
+    }
   }
   // Step 2: refine the transition map with box-min (separable).
   {
     const vk_hazeremoval_box_pc_t pc = { .width = width, .height = height, .w = w1 };
     dt_vk_mem_t *bx[] = { trans_map, temp };
-    if(dt_vulkan_dispatch_n(&gd->vk_box_min_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    if(dt_vulkan_dispatch_n(&gd->vk_box_min_x, bx, 2, height, 1, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: box_min_x dispatch failed");
+      goto cleanup;
+    }
     dt_vk_mem_t *by[] = { temp, trans_map };
-    if(dt_vulkan_dispatch_n(&gd->vk_box_min_y, by, 2, width, 1, &pc, sizeof(pc)) != 0) goto cleanup;
+    if(dt_vulkan_dispatch_n(&gd->vk_box_min_y, by, 2, width, 1, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: box_min_y dispatch failed");
+      goto cleanup;
+    }
   }
 
   // Step 3: guided filter using the input image as the colour guide.
   if(dt_guided_filter_vk(devid, img_in, trans_map, trans_map_filtered,
                          width, height, w2, eps, 1.f, -FLT_MAX, FLT_MAX) != 0)
+  {
+    dt_pipe_vk_fallback(piece, "hazeremoval: guided filter helper failed");
     goto cleanup;
+  }
 
   // Step 4: dehaze.
   const float t_min = CLAMP(expf(-distance * distance_max), 1.0f / 1024.0f, 1.0f);
@@ -1190,7 +1213,11 @@ int process_vk(dt_iop_module_t *self,
     };
     dt_vk_mem_t *bufs[] = { img_in, trans_map_filtered, img_out };
     if(dt_vulkan_dispatch_n(&gd->vk_dehaze, bufs, 3,
-                            width, height, &pc, sizeof(pc)) != 0) goto cleanup;
+                            width, height, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "hazeremoval: dehaze dispatch failed");
+      goto cleanup;
+    }
   }
 
   rc = 0;
