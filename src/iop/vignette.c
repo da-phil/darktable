@@ -1045,8 +1045,11 @@ int process_vk(dt_iop_module_t *self,
     .dither       = dither,
     .unbound      = data->unbound,
   };
-  return dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
-                                  width, height, &pc, sizeof(pc));
+  const int rc = dt_vulkan_dispatch_inout(&gd->vk, dev_in, dev_out,
+                                          width, height, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "vignette: dispatch returned non-zero");
+  return rc;
 }
 #endif
 

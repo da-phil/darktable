@@ -2305,12 +2305,54 @@ items, ordered by impact:
    still logs as before and counts as a lost event, so genuine
    driver oddities stay visible.
 
-Path B / D / E from §10.2 stay open as the larger ongoing tracks;
-the §8a items above are now complete. Next session's likely
-candidates: extend Path B by porting the float4 path of
-`cacorrectrgb` (still CPU-only in the trace) and add reason
-annotations to the long tail of return-(-1) sites in lensblur /
-shadhi / etc.
+### 8a (continued). Fallback-reason expansion + bug surfaced
+
+The next trace from the same user (RX 9060 XT / RADV / forced VK
+routing, full zoom + pan + export of an ORF) confirmed the
+reason-tagged log lands and surfaced two more concrete items:
+
+5. ✅ **Expanded reason coverage to dispatch-failure paths.** The
+   first instrumentation pass labelled only entry gates ("colors
+   != 4", "Bayer mode not ported"). The new trace showed many
+   `[reason=process_vk]` lines for modules that already had a
+   designed-fallback annotation — meaning the entry gate passed,
+   the kernel dispatched, and *the dispatch itself returned
+   non-zero*. Each line was indistinguishable from any other
+   dispatch failure.
+
+   Added reason tags to every dispatch + cleanup site for the
+   modules the trace flagged: `colorout` (LUT alloc, dispatch),
+   `flip`, `primaries`, `vignette`, `rgbcurve` (LUT alloc, ICC
+   profile prep, dispatch), `atrous` (scratch alloc, detail alloc,
+   filter upload, seed copy, decompose, synthesize), `hazeremoval`
+   (every kernel in the 6-stage chain + guided filter), `ashift`
+   (interpolation dispatch), `bilat` (bilateral splat/blur/slice,
+   local-laplacian dispatch), `sigmoid` (rgb_ratio dispatch,
+   per_channel dispatch), `channelmixer` (matrix alloc, dispatch),
+   `colorequal` (sentinel reason on entry — every cleanup branch
+   shares one tag rather than annotating ~25 individual dispatch
+   sites; specific tags can supersede when warranted),
+   `finalscale` (upscale gate, resampler helper failure).
+
+   Next trace should show `[reason=colorout: dispatch returned
+   non-zero]` instead of bare `[reason=process_vk]` — that
+   distinguishes "dispatch happened and the driver rejected it"
+   from "module gated cleanly".
+
+6. ⏳ **Real bug: `bilat: local-laplacian helper init failed`** —
+   the user trace showed this fallback at a 674×449 thumbnail.
+   The Vulkan local-laplacian path has not been re-validated on
+   RADV since `colorequal`'s helper landed. Added internal
+   diagnostics inside `dt_local_laplacian_init_vk` that print
+   *which* check failed — kernel slots (with each slot's value),
+   buffer-alloc level/size, or `vulkan not running`. The next
+   trace should pinpoint the root cause without another
+   investigation pass.
+
+Path B / D / E from §10.2 stay open as the larger ongoing tracks.
+Next session: port `cacorrectrgb` float4 path (still CPU-only in
+the trace), and root-cause whichever specific local-laplacian
+init step the diagnostics print in the next trace.
 
 ## 9. clspv subset risks
 

@@ -1914,7 +1914,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dev_r = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_g = dt_vulkan_alloc_buffer(devid, lut_bytes);
   dev_b = dt_vulkan_alloc_buffer(devid, lut_bytes);
-  if(!dev_r || !dev_g || !dev_b) goto cleanup;
+  if(!dev_r || !dev_g || !dev_b)
+  {
+    dt_pipe_vk_fallback(piece, "rgbcurve: curve LUT alloc failed");
+    goto cleanup;
+  }
 
   dt_vk_upload_t uploads[5] = {
     { dev_r, d->table[DT_IOP_RGBCURVE_R], lut_bytes },
@@ -1926,7 +1930,10 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
        work_profile, devid, &profile_info_vk, &profile_lut_vk,
        &dev_profile_info, &dev_profile_lut,
        uploads, sizeof(uploads) / sizeof(uploads[0]), &upload_count) != 0)
+  {
+    dt_pipe_vk_fallback(piece, "rgbcurve: ICC profile upload prep failed");
     goto cleanup;
+  }
 
   const vk_rgbcurve_pc_t pc = {
     .width = width, .height = height,
@@ -1943,6 +1950,8 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 7,
                                     uploads, upload_count,
                                     width, height, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "rgbcurve: dispatch returned non-zero");
 
 cleanup:
   dt_ioppr_free_iccprofile_params_vk(&profile_info_vk, &profile_lut_vk,

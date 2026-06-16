@@ -645,16 +645,32 @@ int process_vk(dt_iop_module_t *self,
   dt_vk_mem_t *dev_tmp = dt_vulkan_alloc_buffer(devid, img_bytes);
   dt_vk_mem_t *dev_filter = dt_vulkan_alloc_buffer(devid, 25 * sizeof(float));
   dt_vk_mem_t **dev_detail = calloc(max_scale, sizeof(*dev_detail));
-  if(!dev_tmp || !dev_filter || !dev_detail) goto cleanup;
+  if(!dev_tmp || !dev_filter || !dev_detail)
+  {
+    dt_pipe_vk_fallback(piece, "atrous: scratch buffer alloc failed");
+    goto cleanup;
+  }
   for(int k = 0; k < max_scale; k++)
   {
     dev_detail[k] = dt_vulkan_alloc_buffer(devid, img_bytes);
-    if(!dev_detail[k]) goto cleanup;
+    if(!dev_detail[k])
+    {
+      dt_pipe_vk_fallback(piece, "atrous: per-scale detail alloc failed");
+      goto cleanup;
+    }
   }
-  if(dt_vulkan_write_to_device(devid, dev_filter, mm, sizeof(mm)) != 0) goto cleanup;
+  if(dt_vulkan_write_to_device(devid, dev_filter, mm, sizeof(mm)) != 0)
+  {
+    dt_pipe_vk_fallback(piece, "atrous: filter upload failed");
+    goto cleanup;
+  }
 
   // Seed dev_out with the input — the ping-pong starts here.
-  if(dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes) != 0) goto cleanup;
+  if(dt_vulkan_copy_device_to_device(devid, dev_out, dev_in, img_bytes) != 0)
+  {
+    dt_pipe_vk_fallback(piece, "atrous: seed copy failed");
+    goto cleanup;
+  }
 
   // Decompose sweep: alternates dev_out / dev_tmp as in/out to match
   // process_cl's even/odd parity exactly.
@@ -668,7 +684,10 @@ int process_vk(dt_iop_module_t *self,
     dt_vk_mem_t *bufs[] = { src, dst, dev_detail[s], dev_filter };
     if(dt_vulkan_dispatch_n(&gd->vk_decompose, bufs, 4,
                             width, height, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "atrous: decompose dispatch failed");
       goto cleanup;
+    }
   }
 
   // Synthesize sweep (reverse): src and dst swap parity to match.
@@ -684,7 +703,10 @@ int process_vk(dt_iop_module_t *self,
     dt_vk_mem_t *bufs[] = { dst, src, dev_detail[s] };
     if(dt_vulkan_dispatch_n(&gd->vk_synthesize, bufs, 3,
                             width, height, &pc, sizeof(pc)) != 0)
+    {
+      dt_pipe_vk_fallback(piece, "atrous: synthesize dispatch failed");
       goto cleanup;
+    }
   }
 
   rc = 0;

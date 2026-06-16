@@ -442,7 +442,11 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   int rc = -1;
   dt_vk_mem_t *dev_hsl = dt_vulkan_alloc_buffer(devid, sizeof(data->hsl_matrix));
   dt_vk_mem_t *dev_rgb = dt_vulkan_alloc_buffer(devid, sizeof(data->rgb_matrix));
-  if(!dev_hsl || !dev_rgb) goto cleanup;
+  if(!dev_hsl || !dev_rgb)
+  {
+    dt_pipe_vk_fallback(piece, "channelmixer: matrix alloc failed");
+    goto cleanup;
+  }
 
   const vk_channelmixer_pc_t pc = {
     .width          = width,
@@ -457,6 +461,8 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   rc = dt_vulkan_dispatch_n_batched(&gd->vk, bufs, 4,
                                     uploads, sizeof(uploads) / sizeof(uploads[0]),
                                     width, height, &pc, sizeof(pc));
+  if(rc != 0)
+    dt_pipe_vk_fallback(piece, "channelmixer: dispatch returned non-zero");
 
 cleanup:
   dt_vulkan_free_buffer(devid, dev_hsl);

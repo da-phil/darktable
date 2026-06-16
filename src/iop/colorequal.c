@@ -1989,6 +1989,12 @@ int process_vk(dt_iop_module_t *self,
   const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
   const gboolean guiding = d->use_filter;
 
+  // §8a.3 default reason: any cleanup branch below ends here unless
+  // a more specific tag has overwritten the pointer. The pipeline
+  // only reads it if rc != 0, so a successful dispatch leaves the
+  // sentinel harmless.
+  dt_pipe_vk_fallback(piece, "colorequal: helper or dispatch chain failed");
+
   float white, sat_shift, max_brightness_shift, corr_max_brightness_shift,
         bright_shift, gradient_amp, hue_sigma, par_sigma, sat_sigma, scharr_sigma;
   _prepare_process(roi_in->scale / piece->iscale, d,
