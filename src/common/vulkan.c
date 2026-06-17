@@ -339,7 +339,17 @@ int dt_vulkan_load_program(const char *name, const char *path)
   int slot = -1;
   for(int i = 0; i < DT_VULKAN_MAX_PROGRAMS; ++i)
     if(!d->programs[i].used) { slot = i; break; }
-  if(slot < 0) return -1;
+  if(slot < 0)
+  {
+    // Slot starvation: every subsequent module/helper will silently
+    // lose its Vulkan path and fall back to CPU. This must never
+    // happen in a release build — raise DT_VULKAN_MAX_PROGRAMS.
+    dt_print(DT_DEBUG_ALWAYS,
+             "[vulkan] FATAL: out of program slots (max %d) loading '%s' — "
+             "raise DT_VULKAN_MAX_PROGRAMS; all later modules will fall back to CPU",
+             DT_VULKAN_MAX_PROGRAMS, name ? name : "<?>");
+    return -1;
+  }
 
   size_t words = 0;
   uint32_t *spv = _load_spv(path, &words);
@@ -395,7 +405,14 @@ int dt_vulkan_create_kernel(int program,
   int slot = -1;
   for(int i = 0; i < DT_VULKAN_MAX_KERNELS; ++i)
     if(!d->kernels[i].used) { slot = i; break; }
-  if(slot < 0) return -1;
+  if(slot < 0)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[vulkan] FATAL: out of kernel slots (max %d) creating '%s' — "
+             "raise DT_VULKAN_MAX_KERNELS; this module will fall back to CPU",
+             DT_VULKAN_MAX_KERNELS, entry ? entry : "<?>");
+    return -1;
+  }
   dt_vk_kernel_t *k = &d->kernels[slot];
   memset(k, 0, sizeof(*k));
 
