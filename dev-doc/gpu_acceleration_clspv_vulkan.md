@@ -2349,10 +2349,63 @@ reason-tagged log lands and surfaced two more concrete items:
    trace should pinpoint the root cause without another
    investigation pass.
 
-Path B / D / E from §10.2 stay open as the larger ongoing tracks.
-Next session: port `cacorrectrgb` float4 path (still CPU-only in
-the trace), and root-cause whichever specific local-laplacian
-init step the diagnostics print in the next trace.
+### 8a (continued). Root cause: program-slot starvation
+
+The third user trace (RX 9060 XT / RADV, same scenario) finally
+nailed the systemic failure that the §8a items 5-6 diagnostics
+were probing around. The breadcrumb that broke it open:
+
+```
+[local_laplacian_vk] init refused: kernels not ready (pad=-1 reduce=-1 curve=-1 asm=-1 back=-1)
+```
+
+All five local-laplacian kernel slots were `-1` — the programs
+themselves had never loaded. Pattern check across the trace:
+modules whose `init_global` ran early (`colorin`, `agx`,
+`colorbalancergb`, `exposure`, `temperature`, `crop`, `sharpen`,
+`mask_manager`, `channelmixerrgb`) **all succeeded** on Vulkan;
+modules whose `init_global` ran later (`colorout`, `flip`,
+`sigmoid`, `hazeremoval`, `ashift`, `atrous`, `vignette`,
+`primaries`, `rgbcurve`, `colorequal`) **all failed every
+dispatch**.
+
+7. ✅ **`DT_VULKAN_MAX_PROGRAMS` exhaustion.** The ceiling was 64.
+   The in-tree build has **161 distinct `.spv` programs** with
+   ~185 `dt_vulkan_load_program_by_name` /
+   `dt_vulkan_module_kernel_load` call sites; `load_program` has
+   no dedup, so each call consumes a slot. Module init order is
+   filesystem-dependent (`g_dir_read_name` in
+   `dt_module_load_modules`), so which modules won the slot race
+   was effectively random and shifted between sessions. The
+   sentinel was visible all along: the startup line `borders_copy
+   not in program 48` — borders alone had already taken slot 48,
+   leaving 16 slots for everything else.
+
+   Bumped `DT_VULKAN_MAX_PROGRAMS` to 384 and `DT_VULKAN_MAX_KERNELS`
+   to 512 (comfortable headroom over current 161 / ~193). Added
+   `DT_DEBUG_ALWAYS`-level "FATAL: out of program slots" /
+   "out of kernel slots" messages at both allocators so future
+   exhaustion can never be silent again. The structs are tiny
+   (~150 B program, ~120 B kernel embedded in the device struct);
+   the growth costs ~60 KB total.
+
+   Local cltest confirms the fix: previously the `borders_copy`
+   entry-not-found warning capped at "program 48"; with the bump
+   it now reports "program 71" — past the old ceiling, proving
+   that programs 49-71 are now actually being allocated rather
+   than silently rejected.
+
+   This single fix retroactively explains every
+   `[reason=process_vk]` and `[reason=...: dispatch returned
+   non-zero]` line in the previous two traces. All the §8a items
+   1-6 diagnostic work remains valuable — without those reason
+   tags the failure pattern would have been impossible to spot —
+   but the underlying bug was one starved allocator, not 17
+   independent per-module issues.
+
+Next session: confirm with the user's RX 9060 XT trace that the
+17 previously-failing modules now succeed on the chain, then move
+back to Path B / D / E.
 
 ## 9. clspv subset risks
 

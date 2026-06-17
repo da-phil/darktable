@@ -45,8 +45,20 @@
 #include <stdbool.h>
 #include <vulkan/vulkan.h>
 
-#define DT_VULKAN_MAX_PROGRAMS 64
-#define DT_VULKAN_MAX_KERNELS  256
+// One program slot is consumed per distinct .spv loaded; one kernel
+// slot per entry-point dispatched. With all 73 ported modules plus
+// the shared helpers (bilateral, guided-filter, local-laplacian,
+// gaussian, à-trous) the in-tree build loads ~185 programs and ~200
+// kernels — and dt_vulkan_load_program does NOT dedup, so every
+// init_global call takes its own slot. The previous ceilings (64 /
+// 256) silently starved every module whose init_global lost the
+// (filesystem-order) race for the first 64 program slots: its
+// load_program returned -1, its kernel slot stayed -1, and every
+// process_vk dispatch fell back to CPU with "dispatch returned
+// non-zero". Sized here with generous headroom over the current
+// counts so new ports don't reintroduce the starvation.
+#define DT_VULKAN_MAX_PROGRAMS 384
+#define DT_VULKAN_MAX_KERNELS  512
 // 20 lets the guided-filter `solve` kernel bind its 13 inputs + 4
 // outputs (17) in a single dispatch. Real targets (RADV, lavapipe,
 // MoltenVK→Metal ~30 buffers/stage) all allow well over this; the
