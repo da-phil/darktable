@@ -81,6 +81,7 @@ set(VK_KERNELS
     relight:relight
     vignette:vignette
     gaussian:gaussian_column_4c
+    gaussian_row_4c:gaussian_row_4c
     gaussian_row_1c:gaussian_row_1c
     gaussian_column_1c:gaussian_column_1c
     gaussian_row_2c:gaussian_row_2c
