@@ -1,0 +1,69 @@
+// GLSL twin for gaussian_row_4c.cl. Ships as a separate program so
+// glslang-only builds get the row blur — gaussian.comp can only
+// embed gaussian_column_4c (GLSL's one-entry-per-module limit), so
+// without this fallback the 4-channel Gaussian helper has no row
+// pass and colorequal / blurs / censorize all break.
+//
+// Push-constant layout matches the clspv path byte-for-byte at 72
+// bytes (2 ints + 16 floats, no vec4 alignment holes).
+
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float a0;
+    float a1;
+    float a2;
+    float a3;
+    float b1;
+    float b2;
+    float coefp;
+    float coefn;
+    float Labmax_r;
+    float Labmax_g;
+    float Labmax_b;
+    float Labmax_a;
+    float Labmin_r;
+    float Labmin_g;
+    float Labmin_b;
+    float Labmin_a;
+} pc;
+
+void main() {
+    int y = int(gl_GlobalInvocationID.x);
+    if (y >= pc.height) return;
+
+    vec4 Labmax = vec4(pc.Labmax_r, pc.Labmax_g, pc.Labmax_b, pc.Labmax_a);
+    vec4 Labmin = vec4(pc.Labmin_r, pc.Labmin_g, pc.Labmin_b, pc.Labmin_a);
+    int row = y * pc.width;
+
+    vec4 xp = clamp(in_buf.data[row + 0], Labmin, Labmax);
+    vec4 yb = xp * pc.coefp;
+    vec4 yp = yb;
+
+    for (int x = 0; x < pc.width; x++) {
+        int idx = row + x;
+        vec4 xc = clamp(in_buf.data[idx], Labmin, Labmax);
+        vec4 yc = (pc.a0 * xc) + (pc.a1 * xp) - (pc.b1 * yp) - (pc.b2 * yb);
+        xp = xc; yb = yp; yp = yc;
+        out_buf.data[idx] = yc;
+    }
+
+    vec4 xn = clamp(in_buf.data[row + (pc.width - 1)], Labmin, Labmax);
+    vec4 xa = xn;
+    vec4 yn = xn * pc.coefn;
+    vec4 ya = yn;
+
+    for (int x = pc.width - 1; x >= 0; x--) {
+        int idx = row + x;
+        vec4 xc = clamp(in_buf.data[idx], Labmin, Labmax);
+        vec4 yc = (pc.a2 * xn) + (pc.a3 * xa) - (pc.b1 * yn) - (pc.b2 * ya);
+        xa = xn; xn = xc;
+        ya = yn; yn = yc;
+        out_buf.data[idx] += yc;
+    }
+}

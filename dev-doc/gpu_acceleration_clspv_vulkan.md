@@ -2403,9 +2403,53 @@ dispatch**.
    but the underlying bug was one starved allocator, not 17
    independent per-module issues.
 
-Next session: confirm with the user's RX 9060 XT trace that the
-17 previously-failing modules now succeed on the chain, then move
-back to Path B / D / E.
+**Confirmed:** the next user trace (same RX 9060 XT scenario, on
+RADV GFX1200 this time) shows the fix landed cleanly. The
+previously-failing modules now succeed on Vulkan:
+
+| Module | Pipeline | Status |
+|---|---|---|
+| `hazeremoval` | thumb, full | ✅ `process_vk` |
+| `flip` | thumb, full | ✅ `process_vk` |
+| `ashift` | thumb | ✅ `process_vk` |
+| `colorout` | thumb, full, export | ✅ `process_vk` |
+| `sigmoid` | thumb, full, export | ✅ `process_vk` |
+| `primaries` | thumb | ✅ `process_vk` |
+| `rgbcurve` | thumb | ✅ `process_vk` |
+| `atrous` | thumb | ✅ `process_vk` |
+| `bilat` (local-laplacian) | thumb | ✅ `process_vk` |
+| `finalscale` | export | ✅ `process_vk` |
+
+The trace shows program slots climbing past 154 — well past the old
+64-slot ceiling — exactly the headroom the bump unlocked. The
+remaining `[reason=...]` lines are all designed gates (demosaic
+Bayer, denoiseprofile Y0U0V0, retouch HEAL, colorequal helper).
+
+8. ✅ **`gaussian_row_4c` GLSL coverage.** New trace surfaced
+   one last glslang-multi-entry victim: the 4-channel Gaussian
+   helper. `gaussian.cl` exports both `gaussian_row_4c` and
+   `gaussian_column_4c`; clspv emits both into `gaussian.spv` but
+   glslang only embeds the column variant. Without the row pass
+   the helper is broken → `colorequal` (and `blurs` / `censorize`
+   on the same helper) all log `[reason=colorequal: helper or
+   dispatch chain failed]`.
+
+   Same fix pattern as borders_copy: shipped
+   `gaussian_row_4c.cl` + `.comp` as a separate program, registered
+   in `data/kernels/vulkan/CMakeLists.txt`, and wired
+   `_vk_gauss_ensure_kernels` in `src/common/gaussian.c` to fall
+   back to the dedicated program when the primary `gaussian`
+   program doesn't expose the row entry. clspv builds keep finding
+   it in `gaussian.spv` and skip the fallback; glslang-only builds
+   now get full 4c Gaussian coverage instead of breaking every
+   consumer.
+
+Next session: Path B / D / E from §10.2. The export pipeline now
+runs end-to-end on Vulkan (`hazeremoval → flip → exposure → crop
+→ colorin → channelmixerrgb → diffuse → colorbalancergb.1 →
+colorbalancergb → sigmoid → colorout → finalscale`), which makes
+Path A (porting `blendop.cl`) the highest-leverage next target —
+several modules in that chain still force CPU blending.
 
 ## 9. clspv subset risks
 

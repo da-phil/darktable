@@ -1198,6 +1198,19 @@ static void _vk_gauss_ensure_kernels(void)
     dt_vulkan_module_kernel_create_from(&_vk_gauss_col_4c, prog4,
                                         "gaussian_column_4c", 2, pcs, 64, 1, 1);
   }
+  // Same fallback pattern as borders_copy: glslang's
+  // one-entry-per-module limit means gaussian.spv built with glslang
+  // has only the column variant. Probe gaussian_row_4c as a separate
+  // program so the 4-channel helper (and colorequal / blurs /
+  // censorize on top of it) still work under glslang-only builds.
+  if(_vk_gauss_row_4c.kernel < 0)
+  {
+    const int prog_row = dt_vulkan_load_program_by_name("gaussian_row_4c");
+    if(prog_row >= 0)
+      dt_vulkan_module_kernel_create_from(&_vk_gauss_row_4c, prog_row,
+                                          "gaussian_row_4c", 2,
+                                          sizeof(vk_gauss_pc_4c_t), 64, 1, 1);
+  }
   dt_vulkan_module_kernel_load(&_vk_gauss_row_1c, "gaussian_row_1c",
                                "gaussian_row_1c", 2, sizeof(vk_gauss_pc_1c_t), 64, 1, 1);
   dt_vulkan_module_kernel_load(&_vk_gauss_col_1c, "gaussian_column_1c",
