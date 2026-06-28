@@ -35,3 +35,14 @@ add_cmocka_test(test_hdr_alignment_internal
 if(WIN32)
     _copy_required_library(test_hdr_alignment_internal lib_darktable)
 endif(WIN32)
+
+# HDR exposure-bracket merge. Drives the public dt_hdrmerge_process_cpu() from
+# lib_darktable on synthetic brackets to lock in the multi-scale blend's energy
+# preservation, highlight neutralization and the clipped-channel (anti-magenta) pin.
+add_cmocka_test(test_hdrmerge
+                SOURCES test_hdrmerge.c
+                LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_hdrmerge lib_darktable)
+endif(WIN32)
