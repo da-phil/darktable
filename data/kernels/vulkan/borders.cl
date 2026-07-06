@@ -2,9 +2,9 @@
     This file is part of darktable,
     Copyright (C) 2026 darktable developers.
 
-    Vulkan port of basic.cl::borders_fill plus a sub-region
-    buffer-to-buffer copy used by the borders module to slot the
-    original input image into the framed canvas.
+    Vulkan port of basic.cl::borders_fill. The companion sub-region
+    copy kernel lives in borders_copy.cl (its own .spv) so the
+    glslang fallback — one entry point per .spv — ships it too.
 
     The OpenCL build uses image2d_t and dispatches the fill kernel
     over the full canvas, returning early for pixels outside the
@@ -18,12 +18,6 @@
       0 = output float4 buffer
     Push constants: out_width, out_height, dst_x, dst_y, region_w,
                     region_h, color[4] = 6 ints + 4 floats = 40 bytes.
-
-    Bindings (borders_copy):
-      0 = input  float4 buffer (sized in_width * in_height)
-      1 = output float4 buffer (sized out_width * out_height)
-    Push constants: in_width, out_width, dst_x, dst_y, region_w,
-                    region_h = 6 ints = 24 bytes.
 */
 
 #include "dt_vulkan_common.h"
@@ -47,19 +41,4 @@ kernel void borders_fill(global float4 *out,
   const int oy = dst_y + y;
   if(ox >= out_width || oy >= out_height) return;
   out[oy * out_width + ox] = (float4)(color_r, color_g, color_b, color_a);
-}
-
-kernel void borders_copy(global const float4 *in,
-                         global float4 *out,
-                         const int in_width,
-                         const int out_width,
-                         const int dst_x,
-                         const int dst_y,
-                         const int region_w,
-                         const int region_h)
-{
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-  if(x >= region_w || y >= region_h) return;
-  out[(dst_y + y) * out_width + (dst_x + x)] = in[y * in_width + x];
 }

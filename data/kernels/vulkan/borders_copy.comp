@@ -1,0 +1,25 @@
+// GLSL fallback for borders_copy.cl — sub-region buffer-to-buffer
+// copy slotting the input image into the framed canvas. Push-constant
+// layout matches the clspv path byte-for-byte at 24 bytes (6 ints).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    int in_width;
+    int out_width;
+    int dst_x;
+    int dst_y;
+    int region_w;
+    int region_h;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.region_w || y >= pc.region_h) return;
+    out_buf.data[(pc.dst_y + y) * pc.out_width + (pc.dst_x + x)] =
+        in_buf.data[y * pc.in_width + x];
+}

@@ -1,13 +1,10 @@
-// GLSL fallback for channelmixerrgb.cl::channelmixerrgb_bradford_linear.
+// GLSL fallback for channelmixerrgb.cl::channelmixerrgb.
 //
-// The other 4 adaptation entry points are clspv-only; their kernel
-// slots will fail to create on glslang-only builds and the module
-// falls back to OpenCL for those modes. See channelmixerrgb.cl
-// header for the full design rationale.
-//
-// This kernel implements ONLY the linear-Bradford path. It mirrors
-// the full Vulkan kernel push-constant layout so the host-side code
-// is uniform across the two compilation paths.
+// Like the clspv kernel, one entry point switches on pc.adaptation at
+// runtime, so glslang builds cover all five adaptation modes (linear
+// Bradford, CAT16, full Bradford, XYZ, RGB bypass). The switch is
+// uniform across the dispatch — every invocation reads the same push
+// constant — so there is no divergence cost.
 
 #version 450
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -15,10 +12,17 @@ layout(std430, binding = 0) readonly buffer In  { vec4 data[];  } in_buf;
 layout(std430, binding = 1)          buffer Out { vec4 data[];  } out_buf;
 layout(std430, binding = 2) readonly buffer Mat { float data[]; } mat_buf;
 
+// Adaptation enum — values match dt_adaptation_t / VK_ADAPT_*.
+const int ADAPT_LINEAR_BRADFORD = 0;
+const int ADAPT_CAT16           = 1;
+const int ADAPT_FULL_BRADFORD   = 2;
+const int ADAPT_XYZ             = 3;
+const int ADAPT_RGB             = 4;
+
 // Scalar layout (no vec4 padding) so this matches the C-side
-// vk_chmix_pc_t byte-for-byte: 5 ints + 2 floats + 4 float[4] arrays =
-// 92 bytes. Using vec4 here forces std430 16-byte alignment and
-// silently shifts illuminant from offset 28 to offset 32, corrupting
+// vk_chmix_pc_t byte-for-byte: 6 ints + 2 floats + 4 float[4] arrays =
+// 96 bytes. Using vec4 here forces std430 16-byte alignment and
+// silently shifts illuminant from offset 32 to offset 48, corrupting
 // every read from this PC block under the glslang fallback path.
 layout(push_constant) uniform PC {
     int   width;
@@ -26,6 +30,7 @@ layout(push_constant) uniform PC {
     int   version;
     int   clip;
     int   apply_grey;
+    int   adaptation;
     float p;
     float gamut;
     float illuminant[4];
@@ -68,6 +73,18 @@ vec4 bradford_LMS_to_XYZ(vec4 v) {
                 -0.0085 * v.x + 0.0400 * v.y + 0.9685 * v.z,
                  v.w);
 }
+vec4 XYZ_to_CAT16_LMS(vec4 v) {
+    return vec4( 0.401288 * v.x + 0.650173 * v.y - 0.051461 * v.z,
+                -0.250268 * v.x + 1.204414 * v.y + 0.045854 * v.z,
+                -0.002079 * v.x + 0.048952 * v.y + 0.953127 * v.z,
+                 v.w);
+}
+vec4 CAT16_LMS_to_XYZ(vec4 v) {
+    return vec4( 1.862068 * v.x - 1.011255 * v.y + 0.149187 * v.z,
+                 0.38752  * v.x + 0.621447 * v.y - 0.008974 * v.z,
+                -0.015841 * v.x - 0.034123 * v.y + 1.049964 * v.z,
+                 v.w);
+}
 
 vec4 bradford_adapt_D50(vec4 lms, vec4 origin, float p, bool full) {
     vec4 D50 = vec4(0.996078, 1.020646, 0.818155, 0.0);
@@ -77,6 +94,17 @@ vec4 bradford_adapt_D50(vec4 lms, vec4 origin, float p, bool full) {
         return D50 * t;
     }
     return lms * (D50 / origin);
+}
+
+vec4 CAT16_adapt_D50(vec4 lms, vec4 origin, float D, bool full) {
+    vec4 D50 = vec4(0.994535, 1.000997, 0.833036, 0.0);
+    if (full) return lms * (D50 / origin);
+    return lms * (D * D50 / origin + vec4(1.0 - D));
+}
+
+vec4 XYZ_adapt_D50(vec4 v, vec4 origin) {
+    vec4 D50 = vec4(0.9642119944211994, 1.0, 0.8251882845188288, 0.0);
+    return v * (D50 / origin);
 }
 
 vec4 chroma_adapt_bradford(vec4 RGB, vec4 illuminant, float p, bool full) {
@@ -89,6 +117,33 @@ vec4 chroma_adapt_bradford(vec4 RGB, vec4 illuminant, float p, bool full) {
     LMS *= s;
     vec4 LMS_mixed = matmul_padded(LMS, 24);
     return bradford_LMS_to_XYZ(LMS_mixed);
+}
+
+vec4 chroma_adapt_CAT16(vec4 RGB, vec4 illuminant, float D, bool full) {
+    vec4 XYZ = matmul_padded(RGB, 0);
+    float Y = XYZ.y;
+    vec4 LMS = XYZ_to_CAT16_LMS(XYZ);
+    float s = (Y > NORM_MIN && !isnan(Y)) ? (Y + NORM_MIN) : NORM_MIN;
+    LMS /= s;
+    LMS = CAT16_adapt_D50(LMS, illuminant, D, full);
+    LMS *= s;
+    vec4 LMS_mixed = matmul_padded(LMS, 24);
+    return CAT16_LMS_to_XYZ(LMS_mixed);
+}
+
+vec4 chroma_adapt_XYZ(vec4 RGB, vec4 illuminant) {
+    vec4 XYZ = matmul_padded(RGB, 0);
+    float Y = XYZ.y;
+    float s = (Y > NORM_MIN && !isnan(Y)) ? (Y + NORM_MIN) : NORM_MIN;
+    XYZ /= s;
+    XYZ = XYZ_adapt_D50(XYZ, illuminant);
+    XYZ *= s;
+    return matmul_padded(XYZ, 24);
+}
+
+vec4 chroma_adapt_RGB(vec4 RGB) {
+    vec4 RGB_mixed = matmul_padded(RGB, 24);
+    return matmul_padded(RGB_mixed, 0);
 }
 
 vec4 xyY_to_uvY(vec4 xyY) {
@@ -150,6 +205,27 @@ vec4 luma_chroma(vec4 input_v, vec4 saturation, vec4 lightness, int version) {
     return output_v * vec4(norm);
 }
 
+// XYZ → working space (adaptation's LMS / XYZ / pipe RGB) and back;
+// mirrors the switches inside channelmixerrgb.cl::vk_chmix_finalize.
+vec4 XYZ_to_working(vec4 XYZ, int adaptation) {
+    switch (adaptation) {
+        case ADAPT_FULL_BRADFORD:
+        case ADAPT_LINEAR_BRADFORD: return XYZ_to_bradford_LMS(XYZ);
+        case ADAPT_CAT16:           return XYZ_to_CAT16_LMS(XYZ);
+        case ADAPT_XYZ:             return XYZ;
+        default:                    return matmul_padded(XYZ, 12);  // XYZ_to_RGB
+    }
+}
+vec4 working_to_XYZ(vec4 LMS, int adaptation) {
+    switch (adaptation) {
+        case ADAPT_FULL_BRADFORD:
+        case ADAPT_LINEAR_BRADFORD: return bradford_LMS_to_XYZ(LMS);
+        case ADAPT_CAT16:           return CAT16_LMS_to_XYZ(LMS);
+        case ADAPT_XYZ:             return LMS;
+        default:                    return matmul_padded(LMS, 0);   // RGB_to_XYZ
+    }
+}
+
 void main() {
     int x = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
@@ -161,11 +237,28 @@ void main() {
     RGB.w = 0.0;
     if (pc.clip != 0) RGB = max(RGB, vec4(0.0));
 
-    vec4 XYZ = chroma_adapt_bradford(RGB, pc_illuminant(), pc.p, false);
+    vec4 XYZ;
+    switch (pc.adaptation) {
+        case ADAPT_FULL_BRADFORD:
+            XYZ = chroma_adapt_bradford(RGB, pc_illuminant(), pc.p, true);
+            break;
+        case ADAPT_LINEAR_BRADFORD:
+            XYZ = chroma_adapt_bradford(RGB, pc_illuminant(), pc.p, false);
+            break;
+        case ADAPT_CAT16:
+            XYZ = chroma_adapt_CAT16(RGB, pc_illuminant(), 1.0, false);
+            break;
+        case ADAPT_XYZ:
+            XYZ = chroma_adapt_XYZ(RGB, pc_illuminant());
+            break;
+        default:
+            XYZ = chroma_adapt_RGB(RGB);
+            break;
+    }
     if (pc.clip != 0) XYZ = max(XYZ, vec4(0.0));
     XYZ = gamut_mapping(XYZ, pc.gamut, pc.clip != 0);
 
-    vec4 LMS = XYZ_to_bradford_LMS(XYZ);
+    vec4 LMS = XYZ_to_working(XYZ, pc.adaptation);
     if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
     LMS = luma_chroma(LMS, pc_saturation(), pc_lightness(), pc.version);
     if (pc.clip != 0) LMS = max(LMS, vec4(0.0));
@@ -175,7 +268,7 @@ void main() {
         float grey_mix = max(dot(LMS, pc_grey()), 0.0);
         RGB_out = vec4(grey_mix, grey_mix, grey_mix, pix_in.w);
     } else {
-        XYZ = bradford_LMS_to_XYZ(LMS);
+        XYZ = working_to_XYZ(LMS, pc.adaptation);
         if (pc.clip != 0) XYZ = max(XYZ, vec4(0.0));
         RGB_out = matmul_padded(XYZ, 12);  // XYZ_to_RGB
         if (pc.clip != 0) RGB_out = max(RGB_out, vec4(0.0));

@@ -22,16 +22,16 @@ endif()
 
 # Each entry is "kernel_filename:entry_point". For most kernels the
 # .cl filename matches the kernel function name and the .spv has a
-# single entry point. A few .cl sources have multiple `kernel void`
-# entries (currently: channelmixerrgb's 5 adaptation kernels); clspv
-# emits all entry points into one .spv automatically, while the
-# glslang fallback can only expose the single entry named in the
-# spec. Host code probes each entry by name and falls back when it
-# isn't present — modules that need extra entry points just won't
-# have them available in glslang-only builds.
+# single entry point. When a .cl source has multiple `kernel void`
+# entries, clspv emits all of them into one .spv automatically while
+# the glslang fallback can only expose the single entry named in the
+# spec — so multi-entry modules either switch on a push constant at
+# runtime (channelmixerrgb) or get a per-entry row whose .cl is a
+# one-line #include shim of the shared source (borders_copy), keeping
+# both toolchains at full entry coverage.
 set(VK_KERNELS
     exposure:exposure
-    channelmixerrgb:channelmixerrgb_bradford_linear
+    channelmixerrgb:channelmixerrgb
     velvia:velvia
     invert:invert_4f
     vibrance:vibrance
@@ -45,6 +45,7 @@ set(VK_KERNELS
     profile_gamma_log:profilegamma_log
     profile_gamma:profilegamma
     borders:borders_fill
+    borders_copy:borders_copy
     colisa:colisa
     graduatednd:graduatednd
     relight:relight

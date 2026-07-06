@@ -215,17 +215,11 @@ typedef struct dt_iop_channelmixer_rgb_global_data_t
   int kernel_channelmixer_rgb_bradford_full;
   int kernel_channelmixer_rgb_bradford_linear;
   int kernel_channelmixer_rgb_rgb;
-  // One Vulkan kernel slot per adaptation mode. They share the same
-  // .spv (loaded once into vk_program); each create_from picks the
-  // matching entry point. On the glslang-fallback build only the
-  // linear-Bradford entry exists, so the other four slots will stay
-  // at -1 and the module falls back to OpenCL for those modes.
-  int vk_program;
-  dt_vk_module_kernel_t vk_bradford_linear;
-  dt_vk_module_kernel_t vk_bradford_full;
-  dt_vk_module_kernel_t vk_cat16;
-  dt_vk_module_kernel_t vk_xyz;
-  dt_vk_module_kernel_t vk_rgb;
+  // One Vulkan kernel for all adaptation modes — the kernel switches
+  // on pc.adaptation at runtime (uniform branch, no divergence cost).
+  // A single entry point keeps the glslang fallback (one entry per
+  // .spv) at full coverage; no per-mode OpenCL fallback needed.
+  dt_vk_module_kernel_t vk;
 } dt_iop_channelmixer_rgb_global_data_t;
 
 
@@ -2441,35 +2435,12 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(program, "channelmixerrgb_RGB");
 #endif
 
-  // Load the shared .spv once; the 5 kernel slots come from its
-  // 5 entry points (clspv path) or are -1 if the entry isn't present
-  // (glslang fallback only exposes channelmixerrgb_bradford_linear).
+  // Single runtime-switched kernel covering all 5 adaptation modes.
   // The push-constant blob is vk_chmix_pc_t — see process_vk above
   // and the matching definition in channelmixerrgb.cl.
-  const uint32_t pcsize = 5 * sizeof(int) + 2 * sizeof(float) + 4 * 4 * sizeof(float);
-  gd->vk_program = -1;
-  gd->vk_bradford_linear = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  gd->vk_bradford_full   = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  gd->vk_cat16           = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  gd->vk_xyz             = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  gd->vk_rgb             = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  if(dt_vulkan_running())
-  {
-    gd->vk_program = dt_vulkan_load_program_by_name("channelmixerrgb");
-    if(gd->vk_program >= 0)
-    {
-      dt_vulkan_module_kernel_create_from(&gd->vk_bradford_linear, gd->vk_program,
-          "channelmixerrgb_bradford_linear", 3, pcsize, 16, 16, 1);
-      dt_vulkan_module_kernel_create_from(&gd->vk_bradford_full, gd->vk_program,
-          "channelmixerrgb_bradford_full",   3, pcsize, 16, 16, 1);
-      dt_vulkan_module_kernel_create_from(&gd->vk_cat16, gd->vk_program,
-          "channelmixerrgb_CAT16",           3, pcsize, 16, 16, 1);
-      dt_vulkan_module_kernel_create_from(&gd->vk_xyz, gd->vk_program,
-          "channelmixerrgb_XYZ",             3, pcsize, 16, 16, 1);
-      dt_vulkan_module_kernel_create_from(&gd->vk_rgb, gd->vk_program,
-          "channelmixerrgb_RGB",             3, pcsize, 16, 16, 1);
-    }
-  }
+  const uint32_t pcsize = 6 * sizeof(int) + 2 * sizeof(float) + 4 * 4 * sizeof(float);
+  dt_vulkan_module_kernel_load(&gd->vk, "channelmixerrgb", "channelmixerrgb",
+                               3, pcsize, 16, 16, 1);
 }
 
 
@@ -2483,18 +2454,14 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_channelmixer_rgb_xyz);
   dt_opencl_free_kernel(gd->kernel_channelmixer_rgb_rgb);
 #endif
-  dt_vulkan_module_kernel_unload(&gd->vk_bradford_linear);
-  dt_vulkan_module_kernel_unload(&gd->vk_bradford_full);
-  dt_vulkan_module_kernel_unload(&gd->vk_cat16);
-  dt_vulkan_module_kernel_unload(&gd->vk_xyz);
-  dt_vulkan_module_kernel_unload(&gd->vk_rgb);
+  dt_vulkan_module_kernel_unload(&gd->vk);
   free(self->data);
   self->data = NULL;
 }
 
 #ifdef HAVE_VULKAN
 // Push-constant layout matches vk_chmix_pc_t in channelmixerrgb.cl
-// byte-for-byte. ≤128 bytes (5 ints + 2 floats + 4 vec4 = 96 bytes).
+// byte-for-byte. ≤128 bytes (6 ints + 2 floats + 4 float[4] = 96 bytes).
 typedef struct
 {
   int   width;
@@ -2502,6 +2469,7 @@ typedef struct
   int   version;
   int   clip;
   int   apply_grey;
+  int   adaptation;  // VK_ADAPT_* — values match dt_adaptation_t
   float p;
   float gamut;
   float illuminant[4];
@@ -2521,21 +2489,16 @@ int process_vk(dt_iop_module_t *self,
   const dt_iop_channelmixer_rgb_global_data_t *const gd = self->global_data;
   if(piece->colors != 4) return -1;
 
-  // Pick the kernel slot for the requested adaptation mode. If the
-  // slot didn't load (glslang-only build without that entry point),
-  // bail and let the OpenCL path handle it.
-  const dt_vk_module_kernel_t *k = NULL;
-  switch(d->adaptation)
-  {
-    case DT_ADAPTATION_FULL_BRADFORD:   k = &gd->vk_bradford_full;   break;
-    case DT_ADAPTATION_LINEAR_BRADFORD: k = &gd->vk_bradford_linear; break;
-    case DT_ADAPTATION_CAT16:           k = &gd->vk_cat16;           break;
-    case DT_ADAPTATION_XYZ:             k = &gd->vk_xyz;             break;
-    case DT_ADAPTATION_RGB:
-    case DT_ADAPTATION_LAST:
-    default:                            k = &gd->vk_rgb;             break;
-  }
-  if(!k || k->kernel < 0) return -1;
+  const dt_vk_module_kernel_t *k = &gd->vk;
+  if(k->kernel < 0) return -1;
+
+  // The kernel switches on pc.adaptation at runtime; dt_adaptation_t
+  // values match the kernel-side VK_ADAPT_* constants. Anything past
+  // DT_ADAPTATION_RGB (i.e. DT_ADAPTATION_LAST) collapses to the RGB
+  // bypass, mirroring the CPU/OpenCL dispatch.
+  const int adaptation = (d->adaptation < DT_ADAPTATION_RGB)
+                           ? (int)d->adaptation
+                           : (int)DT_ADAPTATION_RGB;
 
   // Upload the 3 matrices (RGB_to_XYZ, XYZ_to_RGB, MIX) into one
   // 36-float storage buffer.  d->MIX is already 12 floats; the two
@@ -2559,6 +2522,7 @@ int process_vk(dt_iop_module_t *self,
   pc.version    = (int)d->version;
   pc.clip       = (int)d->clip;
   pc.apply_grey = (int)d->apply_grey;
+  pc.adaptation = adaptation;
   pc.p          = d->p;
   pc.gamut      = d->gamut;
   for(int i = 0; i < 4; i++) pc.illuminant[i] = d->illuminant[i];
@@ -3307,27 +3271,15 @@ void commit_params(dt_iop_module_t *self,
   }
 
 #ifdef HAVE_VULKAN
-  // All 5 adaptation kernels are ported when clspv built the .spv.
-  // For glslang-only builds only linear-Bradford survives; skip the
-  // host-staging cost for the other modes there by checking which
-  // slots actually loaded. piece->colors != 4 also rules out Vulkan.
+  // One runtime-switched kernel covers every adaptation mode on both
+  // toolchains; only a missing kernel or a non-4-channel pipe rules
+  // Vulkan out.
   if(piece->colors != 4)
     piece->process_vk_ready = FALSE;
   else
   {
     const dt_iop_channelmixer_rgb_global_data_t *const gd = self->global_data;
-    int slot = -1;
-    switch(d->adaptation)
-    {
-      case DT_ADAPTATION_FULL_BRADFORD:   slot = gd->vk_bradford_full.kernel;   break;
-      case DT_ADAPTATION_LINEAR_BRADFORD: slot = gd->vk_bradford_linear.kernel; break;
-      case DT_ADAPTATION_CAT16:           slot = gd->vk_cat16.kernel;           break;
-      case DT_ADAPTATION_XYZ:             slot = gd->vk_xyz.kernel;             break;
-      case DT_ADAPTATION_RGB:
-      case DT_ADAPTATION_LAST:
-      default:                            slot = gd->vk_rgb.kernel;             break;
-    }
-    if(slot < 0) piece->process_vk_ready = FALSE;
+    if(gd->vk.kernel < 0) piece->process_vk_ready = FALSE;
   }
 #endif
 

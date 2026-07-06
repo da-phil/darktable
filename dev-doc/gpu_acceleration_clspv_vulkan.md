@@ -229,11 +229,7 @@ in three categories.
 | `src/iop/channelmixer.c` | Legacy 3-channel mixer (the deprecated predecessor of `channelmixerrgb`). 4-binding dispatch (in, out, hsl_matrix, rgb_matrix — both 9-float storage buffers) and a single entry point that switches on `operation_mode` (RGB / GRAY / HSL_V1 / HSL_V2). 12 B PC (2 ints + 1 enum int). HSL_V1 and HSL_V2 paths reuse the existing `vk_RGB_to_HSL` / `vk_HSL_to_RGB` helpers from splittoning's color cohort. |
 | `src/iop/colorharmonizer.c` | Hue-harmonisation toward Gaussian-weighted nodes in dt UCS JCH space. First port to consume the new `vk_xyY_to_dt_UCS_JCH` / `vk_dt_UCS_JCH_to_xyY` helpers in `dt_vulkan_common.h`. Three-stage `process_vk`: a 6-binding **map** kernel (in, p_out, jch_out, matrix_in, nodes, node_saturation) converts to UCS, computes the per-pixel hue shift + saturation correction, and caches the forward UCS JCH so the apply pass doesn't redo it; the §5.10 `dt_gaussian_blur_vk` smooths the correction map (the `corrections` buffer is padded to float4 so the existing 4-channel Gaussian helper applies — only `.xy` carry data, `.zw` stays zero); a 4-binding **apply** kernel (out, matrix_out, jch_in, corrections) does the JCH→xyY→XYZ→work-profile RGB walk and writes the output. 20 B PC each. Both kernels are batched (matrix + node uploads piggyback the kernel dispatch). |
 
-*Partial (clspv: full; glslang fallback: one mode only):*
-
-| Module | Status |
-|---|---|
-| `src/iop/channelmixerrgb.c` | All 5 adaptation modes ported (linear Bradford, full Bradford, CAT16, XYZ, RGB) with full gamut mapping and per-channel saturation / lightness. clspv emits all 5 entry points into one `.spv`; the host loads the program once and creates 5 kernel slots via `dt_vulkan_module_kernel_create_from`. On glslang-only builds only the linear-Bradford entry exists (GLSL doesn't support multi-entry `.spv`); other modes fall back to OpenCL transparently. |
+| `src/iop/channelmixerrgb.c` | All 5 adaptation modes ported (linear Bradford, full Bradford, CAT16, XYZ, RGB) with full gamut mapping and per-channel saturation / lightness — as **one runtime-switched kernel**: `pc.adaptation` selects the chroma-adapt front-end and the matching LMS/XYZ/RGB working-space conversions in the shared finalize back-end. The branch is uniform across the dispatch (every invocation reads the same push constant) so there is no divergence cost, and a single entry point means the glslang fallback — which can export only one entry per `.spv` — covers every mode. This replaced the original 5-entry-point design whose 4 extra entries only existed on clspv builds (glslang users silently fell back to OpenCL for CAT16 et al., with a `[vulkan] entry '…' not in program` breadcrumb per probe). 96 B PC (6 ints + 2 floats + 4 float[4]). |
 
 *Pending Vulkan port (currently OpenCL/CPU only):*
 
@@ -627,7 +623,7 @@ Two complementary mechanisms exist:
    `enqueue_copy_image`; the Vulkan equivalent is one
    `vkCmdCopyBuffer` of the float4 pipe buffer).
 
-2. **Sub-region copy / fill kernels** (`borders.cl::borders_copy`,
+2. **Sub-region copy / fill kernels** (`borders_copy.cl::borders_copy`,
    `borders.cl::borders_fill`) — when the source or destination is
    a strict subrectangle of a larger buffer, kernel-based copies and
    fills are clearer than chains of `vkCmdCopyBuffer`s with per-row
@@ -637,7 +633,11 @@ Two complementary mechanisms exist:
    exactly over the target rectangle (since buffer storage doesn't
    get "early return outside region" for free — wasted work-items
    are real cost). The kernel translates `(lid_x, lid_y)` into a
-   write at `(dst_x + lid_x, dst_y + lid_y)`.
+   write at `(dst_x + lid_x, dst_y + lid_y)`. fill and copy ship as
+   separate single-entry `.spv` modules (each with its own `.cl` /
+   `.comp` pair) so glslang builds — one entry per `.spv` — cover
+   both; the host loads each by name via
+   `dt_vulkan_module_kernel_load`.
 
 These two are deliberately separate APIs. `dt_vulkan_copy_device_to_device`
 is cheap (no SPIR-V to load, just a transfer command), and modules
@@ -818,13 +818,15 @@ The kernels live as six separate `.cl` / `.comp` pairs under
 | `bilateral_slice`              |        3 |       32 |
 | `bilateral_slice_to_output`    |        4 |       32 |
 
-Splitting each entry into its own `.spv` (rather than the multi-
-entry-in-one-module pattern used by channelmixerrgb) is deliberate:
-the glslang fallback path can only emit one entry per build, so
-modules that consume the whole bilateral pipeline need all six
-kernels available on glslang-only systems. The clspv path still
-compiles each `.cl` separately too — the storage cost is six tiny
-`.spv` files (~5 KB each) instead of one ~25 KB blob.
+Splitting each entry into its own `.spv` is deliberate: the glslang
+fallback path can only emit one entry per build, so modules that
+consume the whole bilateral pipeline need all six kernels available
+on glslang-only systems. (The same rule later drove channelmixerrgb
+to a single runtime-switched entry and borders_copy into its own
+`.spv` — no shipped module relies on multi-entry `.spv` files
+anymore.) The clspv path still compiles each `.cl` separately too —
+the storage cost is six tiny `.spv` files (~5 KB each) instead of
+one ~25 KB blob.
 
 The host helper sizes the grid via `dt_bilateral_grid_size` from
 `src/common/bilateral.c` — same `L_range = 100` convention and
@@ -1456,7 +1458,11 @@ to migrate a kernel param struct from PC into a storage-buffer
 binding so the 124 B struct fits — the pattern unlocks any
 future port whose param block exceeds the 128 B PC budget),
 `channelmixer` (legacy 4-mode mixer; reuses the HSL cohort
-helpers).
+helpers), `colorharmonizer` (dt UCS JCH cohort; 2 batched
+kernels around the shared 4-channel Gaussian), and full glslang
+entry coverage for `channelmixerrgb` (5 entries collapsed into
+one runtime-switched kernel) + `borders_copy` (own `.spv`) — on
+glslang-only builds these modes previously fell back to OpenCL.
 
 **Path C — VK-CL zero-copy interop via DMA-BUF.** Replace the
 host roundtrip at CL↔VK boundaries with a shared physical

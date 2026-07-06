@@ -296,10 +296,9 @@ int legacy_params(dt_iop_module_t *self,
 typedef struct dt_iop_borders_global_data_t
 {
   int kernel_borders_fill;
-  // Vulkan: the two kernels share borders.spv (clspv path) or sit in
-  // two independent .spv files (glslang fallback exposes only the fill
-  // entry; modules that need the copy fall back to OpenCL/CPU).
-  int vk_program;
+  // Vulkan: fill and copy ship as separate single-entry .spv modules
+  // (borders.spv / borders_copy.spv) so both clspv and glslang builds
+  // cover both kernels.
   dt_vk_module_kernel_t vk_fill;
   dt_vk_module_kernel_t vk_copy;
 } dt_iop_borders_global_data_t;
@@ -783,24 +782,16 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_borders_fill = dt_opencl_create_kernel(program, "borders_fill");
 
   // 6 ints + 4 floats = 40 bytes; matches vk_borders_fill_pc_t and
-  // borders.cl / borders.comp push constants.
+  // borders.cl / borders.comp push constants. fill and copy ship as
+  // separate single-entry .spv modules so the glslang fallback (one
+  // entry per .spv) covers both.
   const uint32_t fill_pcs = 6 * sizeof(int) + 4 * sizeof(float);
   const uint32_t copy_pcs = 6 * sizeof(int);
-  gd->vk_program = -1;
-  gd->vk_fill = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  gd->vk_copy = (dt_vk_module_kernel_t)DT_VK_MODULE_KERNEL_INIT;
-  if(dt_vulkan_running())
-  {
-    gd->vk_program = dt_vulkan_load_program_by_name("borders");
-    if(gd->vk_program >= 0)
-    {
-      // 1 binding (out only) for fill; 2 bindings (in + out) for copy.
-      dt_vulkan_module_kernel_create_from(&gd->vk_fill, gd->vk_program,
-                                          "borders_fill", 1, fill_pcs, 16, 16, 1);
-      dt_vulkan_module_kernel_create_from(&gd->vk_copy, gd->vk_program,
-                                          "borders_copy", 2, copy_pcs, 16, 16, 1);
-    }
-  }
+  // 1 binding (out only) for fill; 2 bindings (in + out) for copy.
+  dt_vulkan_module_kernel_load(&gd->vk_fill, "borders", "borders_fill",
+                               1, fill_pcs, 16, 16, 1);
+  dt_vulkan_module_kernel_load(&gd->vk_copy, "borders_copy", "borders_copy",
+                               2, copy_pcs, 16, 16, 1);
 }
 
 

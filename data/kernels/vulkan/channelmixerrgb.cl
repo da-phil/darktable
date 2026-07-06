@@ -2,19 +2,20 @@
     This file is part of darktable,
     Copyright (C) 2026 darktable developers.
 
-    Full Vulkan port of channelmixer.cl's five adaptation kernels:
-
-       channelmixerrgb_bradford_linear  (existing, simplified port)
-       channelmixerrgb_bradford_full
-       channelmixerrgb_CAT16
-       channelmixerrgb_XYZ
-       channelmixerrgb_RGB
+    Full Vulkan port of channelmixer.cl's five adaptation kernels,
+    collapsed into a single entry point (`channelmixerrgb`) that
+    switches on pc.adaptation at runtime. The OpenCL build keeps five
+    specialized kernels so the compiler can constant-fold each mode;
+    here the switch is uniform across the dispatch (all invocations
+    read the same push constant) so there is no divergence cost — and
+    a single entry point means the glslang fallback, which exports
+    exactly one entry per .spv, covers every adaptation mode.
 
     The shared helpers below mirror the relevant subset of
     data/kernels/colorspace.h and data/kernels/channelmixer.cl
     byte-for-byte. Any drift from the OpenCL maths is a bug.
 
-    All 5 entry points share the same binding shape:
+    Binding shape:
 
       binding 0: input float4 buffer  (pipe RGB)
       binding 1: output float4 buffer (pipe RGB)
@@ -23,7 +24,7 @@
                  receive via three constant cl_mem buffers).
 
     Push constants (≤128 bytes):
-      int width, height, version, clip, apply_grey
+      int width, height, version, clip, apply_grey, adaptation
       float p, gamut
       float illuminant[4], saturation[4], lightness[4], grey[4]
 */
@@ -388,6 +389,7 @@ typedef struct vk_chmix_pc_t
   int version;
   int clip;
   int apply_grey;
+  int adaptation;   // VK_ADAPT_* (values match dt_adaptation_t)
   float p;
   float gamut;
   float illuminant[4];
@@ -413,74 +415,49 @@ static inline vk_chmix_args_t vk_chmix_load_args(const vk_chmix_pc_t pc,
   return a;
 }
 
-// ---- per-adaptation entry points ------------------------------------
+// ---- entry point -----------------------------------------------------
 //
-// Each entry runs the same finalize back-end with a different
-// chroma_adapt_* front-end. Encoded as separate kernels rather than
-// one big switch to mirror the OpenCL structure 1:1 and let clspv
-// constant-fold the adaptation-specific code.
+// One kernel switching on pc.adaptation at runtime instead of five
+// per-adaptation entries. The branch is uniform across the dispatch
+// (every invocation reads the same push constant), so there is no
+// divergence cost, and a single entry point means the glslang
+// fallback — which can only export one entry per .spv — covers every
+// adaptation mode instead of just linear Bradford.
 
-#define VK_CHMIX_HEADER                                                \
-  const int x = get_global_id(0);                                      \
-  const int y = get_global_id(1);                                      \
-  if(x >= pc.width || y >= pc.height) return;                          \
-  const int idx = idx2d(x, y, pc.width);                               \
-  float4 pix_in = in[idx];                                             \
-  float4 RGB = pix_in;                                                 \
-  RGB.w = 0.0f;                                                        \
+kernel void channelmixerrgb(global const float4 *in,
+                            global float4 *out,
+                            global const float *matrices,
+                            const vk_chmix_pc_t pc)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= pc.width || y >= pc.height) return;
+  const int idx = idx2d(x, y, pc.width);
+  float4 pix_in = in[idx];
+  float4 RGB = pix_in;
+  RGB.w = 0.0f;
   if(pc.clip) RGB = fmax(RGB, (float4)0.0f);
 
-kernel void channelmixerrgb_bradford_linear(global const float4 *in,
-                                             global float4 *out,
-                                             global const float *matrices,
-                                             const vk_chmix_pc_t pc)
-{
-  VK_CHMIX_HEADER
-  const vk_chmix_args_t a = vk_chmix_load_args(pc, VK_ADAPT_LINEAR_BRADFORD);
-  float4 XYZ = vk_chroma_adapt_bradford(RGB, matrices, a.illuminant, a.p, 0);
-  out[idx] = vk_chmix_finalize(XYZ, pix_in, matrices, a);
-}
-
-kernel void channelmixerrgb_bradford_full(global const float4 *in,
-                                           global float4 *out,
-                                           global const float *matrices,
-                                           const vk_chmix_pc_t pc)
-{
-  VK_CHMIX_HEADER
-  const vk_chmix_args_t a = vk_chmix_load_args(pc, VK_ADAPT_FULL_BRADFORD);
-  float4 XYZ = vk_chroma_adapt_bradford(RGB, matrices, a.illuminant, a.p, 1);
-  out[idx] = vk_chmix_finalize(XYZ, pix_in, matrices, a);
-}
-
-kernel void channelmixerrgb_CAT16(global const float4 *in,
-                                   global float4 *out,
-                                   global const float *matrices,
-                                   const vk_chmix_pc_t pc)
-{
-  VK_CHMIX_HEADER
-  const vk_chmix_args_t a = vk_chmix_load_args(pc, VK_ADAPT_CAT16);
-  float4 XYZ = vk_chroma_adapt_CAT16(RGB, matrices, a.illuminant, 1.0f, 0);
-  out[idx] = vk_chmix_finalize(XYZ, pix_in, matrices, a);
-}
-
-kernel void channelmixerrgb_XYZ(global const float4 *in,
-                                 global float4 *out,
-                                 global const float *matrices,
-                                 const vk_chmix_pc_t pc)
-{
-  VK_CHMIX_HEADER
-  const vk_chmix_args_t a = vk_chmix_load_args(pc, VK_ADAPT_XYZ);
-  float4 XYZ = vk_chroma_adapt_XYZ(RGB, matrices, a.illuminant);
-  out[idx] = vk_chmix_finalize(XYZ, pix_in, matrices, a);
-}
-
-kernel void channelmixerrgb_RGB(global const float4 *in,
-                                 global float4 *out,
-                                 global const float *matrices,
-                                 const vk_chmix_pc_t pc)
-{
-  VK_CHMIX_HEADER
-  const vk_chmix_args_t a = vk_chmix_load_args(pc, VK_ADAPT_RGB);
-  float4 XYZ = vk_chroma_adapt_RGB(RGB, matrices);
+  const vk_chmix_args_t a = vk_chmix_load_args(pc, pc.adaptation);
+  float4 XYZ;
+  switch(pc.adaptation)
+  {
+    case VK_ADAPT_FULL_BRADFORD:
+      XYZ = vk_chroma_adapt_bradford(RGB, matrices, a.illuminant, a.p, 1);
+      break;
+    case VK_ADAPT_LINEAR_BRADFORD:
+      XYZ = vk_chroma_adapt_bradford(RGB, matrices, a.illuminant, a.p, 0);
+      break;
+    case VK_ADAPT_CAT16:
+      XYZ = vk_chroma_adapt_CAT16(RGB, matrices, a.illuminant, 1.0f, 0);
+      break;
+    case VK_ADAPT_XYZ:
+      XYZ = vk_chroma_adapt_XYZ(RGB, matrices, a.illuminant);
+      break;
+    case VK_ADAPT_RGB:
+    default:
+      XYZ = vk_chroma_adapt_RGB(RGB, matrices);
+      break;
+  }
   out[idx] = vk_chmix_finalize(XYZ, pix_in, matrices, a);
 }
