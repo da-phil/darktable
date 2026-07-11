@@ -4,6 +4,9 @@
 **Scope:** strategy for keeping darktable's GPU pipeline portable across Linux,
 Windows, and macOS as Apple deprecates OpenCL in favour of Metal.
 **Companion code:** `tools/vulkan_compute_poc/` (this PR).
+**Companion design:** [`gpu_resident_pixelpipe_dag.md`](gpu_resident_pixelpipe_dag.md)
+— the follow-on execution-model proposal (vkdt-style DAG scheduling
+behind the linear pixelpipe) that this kernel/HAL migration enables.
 
 ---
 
@@ -2723,6 +2726,18 @@ Impact: significant on multi-pipeline scenes (~30-50% wall-time
 reduction in those traces); zero impact on single-pipeline
 exports. Effort: moderate (~150 LOC, careful audit of
 ordering invariants).
+
+**Path F — GPU-resident DAG execution.** The structural end-state
+that subsumes the per-boundary optimisations above: capture each
+pipe run into an explicit node graph behind the unchanged linear
+pixelpipe, plan its memory (liveness-aliased VRAM arena), and
+execute it as a handful of barriered Vulkan submissions — pixels
+cross PCIe only at source upload and sink readback. Path A
+(blendop kernels) is on its critical path, and it replaces the
+per-module staging, the per-module queue syncs, the §5.14
+hand-off/invalidation machinery, and Path E's lock split with
+per-graph contexts. Full design, candidate-approach comparison,
+and milestone plan: [`gpu_resident_pixelpipe_dag.md`](gpu_resident_pixelpipe_dag.md).
 
 #### Routing heuristic tightened: chain-ahead requires length ≥ 3
 

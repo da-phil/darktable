@@ -1,0 +1,876 @@
+# A GPU-resident pixelpipe: DAG execution behind the linear pipe
+
+**Status:** design proposal / discussion.
+**Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
+one scheduled unit — no CPU↔GPU pixel transfers between iops, no
+per-module queue synchronisation — while keeping darktable's linear
+module list, history stack, and darkroom UI exactly as they are.
+**Companion docs:**
+[`gpu_acceleration_clspv_vulkan.md`](gpu_acceleration_clspv_vulkan.md)
+(the clspv/Vulkan kernel + HAL migration this builds on) and
+[`pixelpipe_architecture.md`](pixelpipe_architecture.md) (the current
+pipe).
+**Prior art:** vkdt's processing graph,
+<https://github.com/hanatos/vkdt/blob/master/src/pipe/readme.md>.
+
+---
+
+## 1. Problem statement
+
+The Vulkan work so far (see the companion doc) ports *kernels* and
+*modules*. It deliberately did not change the pixelpipe's execution
+model, which is eager and module-at-a-time:
+
+```
+for each module (recursion unwind order):
+    get input          (host buffer, or cl_mem/dt_vk_mem_t if lucky)
+    alloc output
+    transform colorspace (sometimes in place, sometimes on host)
+    process kernel(s)
+    collect histogram / picker taps       (host readback)
+    transform for blend                   (host, in place)
+    blend                                 (CPU for the VK arm)
+    sync the queue                        (per module)
+    maybe write input back to host cache  (per module, screen pipes)
+```
+
+That model made sense when the GPU was an *accelerator bolted onto a
+CPU pipeline*. It is the wrong model when the goal is a GPU-*resident*
+pipeline, and no amount of per-module optimisation gets there, because
+the costs are structural. Concretely, on the RX 9060 XT trace in
+companion §10.2, a full export of a 5208×3472 image (≈289 MB as
+float4) spends ~15 s, of which almost everything is data motion and
+CPU work *between* kernels — the kernels themselves account for well
+under a second.
+
+### 1.1 Inventory of host touch points in today's run
+
+Verified against `src/develop/pixelpipe_hb.c` as of this writing.
+"Trunk" below means the main image buffer flowing module to module.
+
+| # | Touch point | Where | Cost class |
+|---|---|---|---|
+| 1 | Per-module queue sync. Even the pure-OpenCL chain calls `dt_opencl_finish_sync_pipe()` after every module; `asyncmode` defaults to FALSE and exports always sync. | `_dev_pixelpipe_process_rec` CL arm | latency × #modules |
+| 2 | VK host staging: upload input / read back output around each `process_vk`, mitigated only pairwise by the §5.14 hand-off cache. | `_pixelpipe_process_on_CPU` VK hook | 2 × trunk size × #VK modules (worst case) |
+| 3 | CL↔VK boundary: full trunk `clEnqueueReadImage` + VK upload at every backend switch. | routing heuristic, companion §10.2 | 1–2 s per export |
+| 4 | Blending after a VK module runs on CPU (`dt_develop_blend_process`), forcing readback + re-upload; the CL arm has `dt_develop_blend_process_cl` but the VK arm has no GPU blend. | `_pixelpipe_process_on_CPU` | 3–5 s per export |
+| 5 | Colorspace glue: `dt_ioppr_transform_image_colorspace()` mutates the *host* input in place on the CPU arm (and invalidates the cacheline); blend-space transforms likewise. The CL arm at least does it in `cl_mem`. Each in-place host mutation also kills the VK hand-off (the §5.14 host-mutation invariant). | both arms | trunk-sized CPU passes |
+| 6 | Histogram / color-picker taps copy the module's in/out image to a host scratch buffer and reduce on the CPU (`_histogram_collect_cl`, `_pixelpipe_picker_cl` "abuse the empty output buffer on host"). | per requesting module | trunk readback per tap |
+| 7 | Pixelpipe cache writes: on screen pipes the focused module's *input* is copied device→host every run so the host cache can serve the next edit (`important_cl_input` block). | CL arm success path | trunk readback per run |
+| 8 | Raster masks and the scharr/detail mask live in host memory (`piece->raster_masks` hash table, `pipe->scharr.data`); distortion walks between producer and consumer run on the CPU. | `dt_dev_get_raster_mask`, `dt_dev_write_scharr_mask` | mask-sized CPU work + sync |
+| 9 | CPU-only modules (`toneequal`, …) and runtime fallbacks (lcms2 colorout, unported demosaic modes) split any GPU chain with a full round-trip. | dispatch arms | 2 × trunk per island |
+| 10 | Final backcopy of the result to host (`_dev_pixelpipe_process_rec_and_backcopy`), then 8-bit conversion for the screen backbuf. | pipe tail | one trunk readback (unavoidable today) |
+
+Row 2 has been whittled down by the hand-off cache, batched uploads,
+and the buffer pool; rows 1 and 3–9 are *inherent to the execution
+model*: as long as the pipe executes modules one at a time and the
+canonical intermediate state lives in host memory, every one of these
+stays.
+
+### 1.2 The ceiling of the incremental lane
+
+The companion doc's §10.2 paths (port blendop, extend chains, DMA-BUF
+interop, split locks) all reduce the *number* of boundary crossings.
+They are worth doing and this design builds on several of them. But
+even in the limit — every module ported, blend on GPU, no CL in the
+pipe — the eager model still: synchronises per module (row 1), cannot
+alias or pre-plan buffer memory (every module allocates its own in/out
+pair from a pool), re-uploads LUTs/params one module at a time, taps
+host-side (rows 6–8), and writes the host cache synchronously (row 7).
+vkdt demonstrates what the same hardware can do when the whole frame
+is planned as one unit: full RAW → display graphs run in a handful of
+milliseconds because *nothing* leaves VRAM and the driver sees one
+submission, not eighty.
+
+That is the gap this document is about.
+
+---
+
+## 2. What vkdt actually does (and what applies to darktable)
+
+Short version of `hanatos/vkdt/src/pipe/readme.md` plus reading its
+`graph.c`/`alloc.c`, filtered through "what can dt reuse":
+
+- **Two layers.** *Modules* are the user-visible processing blocks
+  wired by connectors into a DAG. Each module expands into one or more
+  *nodes*; a node is exactly one compute shader dispatch. The node
+  layer is invisible to users.
+- **Graph compile per run.** The module DAG is topologically sorted;
+  ROIs are negotiated in two passes (sources push full extents
+  downstream, sinks pull requested regions upstream — the exact
+  analogue of dt's `modify_roi_out` forward walk in
+  `dt_dev_pixelpipe_get_dimensions()` and the `modify_roi_in`
+  backward walk in `_dev_pixelpipe_process_rec()`).
+- **Memory is planned, not allocated per node.** All intermediate
+  images live in one big `vkAllocateMemory` arena. A liveness interval
+  is computed for every buffer (first writer → last reader) and a
+  greedy allocator packs buffers into the arena so that buffers with
+  disjoint lifetimes share the same physical bytes. Peak VRAM is set
+  by the *widest point of the graph*, not by the number of nodes.
+- **One command buffer.** All dispatches are recorded with pipeline
+  barriers between dependent nodes; the queue is submitted once and
+  waited once per frame. Parameters live in uniform memory; push
+  constants are used sparingly.
+- **Run flags for incrementality.** A change is classified
+  (params-only / roi / topology) and only the necessary phases re-run:
+  upload params + resubmit, vs re-negotiate ROIs, vs rebuild
+  nodes + realloc.
+- **Sinks are graph nodes.** Display-out, histogram, color picker are
+  nodes writing GPU buffers; the CPU reads back only tiny results.
+
+**What we deliberately do *not* adopt:** the user-facing graph (dt's
+UI, history stack, presets, and iop-order semantics stay linear and
+untouched); the `.cfg` pipeline description files; GLSL as kernel
+language (our kernels stay OpenCL C via clspv); feedback connectors /
+animation; vkdt's parameter and UI systems.
+
+**The key observation that makes adoption natural:** darktable's pipe
+is *already a DAG semantically* — the linear module list is only its
+trunk. The hidden edges are:
+
+- every blended module is a *diamond*: its input feeds both its
+  kernel(s) and the blend node that mixes kernel output with that same
+  input (`dt_develop_blend_process*` takes `input` and `output`);
+- raster masks are long-range edges from a producer module's blend
+  stage to consumer modules further down, passing through per-module
+  `distort_mask` transforms on the way;
+- the scharr/detail mask is an edge from demosaic/rawprepare to every
+  module that blends on details;
+- colorspace conversions are implicit glue nodes between adjacent
+  modules whenever `input_colorspace()` disagrees with the current
+  buffer state, plus around blending (`_transform_for_blend`);
+- histogram/picker/scope taps are side sinks hanging off specific
+  module boundaries;
+- the pixelpipe cache is a set of optional taps on trunk edges.
+
+Today all of these edges are executed implicitly, eagerly, and mostly
+through host memory. The proposal is to *reify* them: build the DAG
+explicitly at run time — behind the unchanged linear pipe — plan its
+memory, record it as very few Vulkan submissions, and keep every edge
+in VRAM unless something genuinely needs host bytes.
+
+---
+
+## 3. Goals and non-goals
+
+Goals, in priority order:
+
+1. **Zero trunk-sized host transfers** in the steady state for a pipe
+   whose modules are all VK-capable: pixels cross PCIe exactly twice —
+   source upload and final sink readback (plus tiny tap results).
+2. **One (or few) queue submissions per pipe run**; barriers instead
+   of fences between modules; no per-module `vkQueueWaitIdle`
+   semantics anywhere.
+3. **Planned VRAM**: single arena per pipe context, liveness-based
+   aliasing, `VK_EXT_memory_budget`-aware; graceful degradation when
+   the arena doesn't fit.
+4. **Keep darkroom interactivity mechanisms intact or better**: the
+   pixelpipe cache's "edit module N, reprocess only N..end" property
+   must survive, ideally upgraded to "…without re-uploading N's input".
+5. **No flag-day for modules**: the 73 ported `process_vk`
+   implementations must keep working unmodified on day one of the
+   graph executor (they may run suboptimally until touched).
+6. **Bit-identical output** to the current VK arm for the same module
+   set (the existing lavapipe equality harness applies).
+
+Non-goals:
+
+- Changing what users see. No graph UI, no new history semantics, no
+  new iop-order rules. (vkdt exposes its graph; we explicitly don't.)
+- Multi-image / animation graphs, feedback edges.
+- Replacing the CPU path or the OpenCL path during the transition —
+  both remain as fallbacks (see §7).
+- GPU-side mask *drawing* (cairo rasterisation of drawn shapes stays
+  on CPU; the resulting mask planes are small uploads).
+
+---
+
+## 4. Candidate approaches
+
+Four were considered. B is recommended, with C as the designated
+end-state for the handful of modules that outgrow B.
+
+### Approach A — keep the eager model, keep optimising boundaries
+
+Continue the companion §10.2 lanes: port blendop to VK, extend chains,
+DMA-BUF interop with OpenCL, split `g_vk_lock`. No graph IR.
+
+*Why it's not enough:* §1.2. It shrinks rows 3–4 of the inventory but
+rows 1, 5–8 are load-bearing parts of the eager design. It also keeps
+compounding complexity in `pixelpipe_hb.c` — the §5.14 host-mutation
+invariant is an example of the whack-a-mole this model forces: every
+new host-side in-place mutation anywhere in the 4200-line file is a
+potential silent corruption of the hand-off cache. A planned graph
+eliminates that class of bug by construction (buffers are never
+mutated behind the scheduler's back; glue transforms write new
+temporaries).
+
+Verdict: keep as the *fallback path* and as useful groundwork (GPU
+blendop kernels are needed by B anyway), but it is not the
+destination.
+
+### Approach B — deferred command-graph capture behind the pixelpipe (recommended)
+
+Keep the linear walk in `pixelpipe_hb.c` exactly where it is, but give
+it a second mode: instead of executing each module's GPU work eagerly,
+*capture* it. The pipe walk becomes the graph builder:
+
+- module host code (`process_vk`) still runs eagerly, in pipe order,
+  exactly once per run — it computes params, builds LUTs, mutates
+  `pipe->dsc` sequentially, and calls the same HAL entry points it
+  calls today;
+- the HAL dispatch/copy/upload calls, when a capture context is
+  active, *append nodes to a graph IR* instead of submitting work;
+- glue work the pipe does between modules (colorspace transforms,
+  blending, taps, cache writes) is appended as explicit nodes by the
+  pipe itself;
+- after the walk, the graph is memory-planned, recorded into one or
+  few command buffers, submitted, and awaited once.
+
+The decisive property: **capture reuses the imperative module code we
+already have.** An audit of `src/iop/` shows every ported module goes
+through a closed set of HAL entry points — the dispatch shapes
+(`dt_vulkan_dispatch_n` ×71, `_n_batched` ×39, `_inout` ×32 call
+sites), the copies (`dt_vulkan_copy_device_to_device` ×23,
+`dt_vulkan_copy_subregion` ×1), buffer lifetime
+(`dt_vulkan_alloc_buffer`/`_free_buffer`), uploads
+(`dt_vulkan_write_to_device` ×14 plus the `dt_vk_upload_t` batches),
+and a handful of mid-module readbacks (`dt_vulkan_read_from_device`,
+7 modules — see the sync-tap discussion in §5.3). No module touches
+`VkBuffer`/`vkCmd*` directly or dereferences `dt_vk_mem_t` internals,
+and the multi-kernel helpers (gaussian, bilateral, guided filter,
+dwt, local-laplacian, resampler) bottom out in the same calls.
+Hooking capture at that boundary converts every existing port into a
+graph citizen for free.
+
+### Approach C — declarative node API (vkdt-style `create_nodes`)
+
+Modules describe their nodes and connectors declaratively; the
+pipeline is graph-native; ROIs can differ per node; multi-scale
+pyramids (diffuse, local-laplacian, wavelets) become real sub-graphs
+instead of host-orchestrated dispatch loops.
+
+*Assessment:* this is the better long-term shape for the ~10 complex
+modules whose host orchestration is itself expensive or whose
+intermediate pyramid levels would benefit from planner-visible
+lifetimes (`diffuse`'s 6 kernels × 10 scales × N iterations, demosaic
+variants, exposure-fusion basecurve, filmicrgb reconstruction). But as
+the *entry* strategy it would mean rewriting 70+ working ports before
+seeing any benefit.
+
+*Resolution:* C is layered **on top of** B, opt-in per module. A
+captured B-graph and a declared C-subgraph are the same IR after the
+build phase; a module that implements the (future, optional)
+`create_nodes_vk` callback simply skips capture. No module is forced
+to migrate.
+
+### Approach D — adopt an existing engine (vkdt's pipe, or clvk underneath)
+
+Running dt's processing on vkdt's engine founders on kernels (GLSL vs
+our OpenCL C), parameter/history semantics, and module ecosystem; we
+would inherit a whole second product's core. clvk (OpenCL ICD over
+Vulkan) solves *backend unification* — one driver stack — but keeps
+the OpenCL host model, i.e. the eager queue with per-module logic; it
+does nothing about rows 1, 4–8. Both rejected for this purpose; clvk
+remains interesting as a macOS bridge per companion §11, orthogonal to
+this design.
+
+### Comparison
+
+| | A (eager++) | **B (capture graph)** | C (declared graph) | D (foreign engine) |
+|---|---|---|---|---|
+| Removes per-module sync (row 1) | no | **yes** | yes | clvk: no |
+| Zero trunk host traffic (rows 2–5,7) | no | **yes** | yes | no |
+| GPU taps (rows 6,8) | bolt-on | **yes, as nodes** | yes | n/a |
+| Planned/aliased VRAM | no | **yes** | yes | vkdt: yes |
+| Module rewrite required | none | **none** | all | all + kernels |
+| `pixelpipe_hb.c` complexity | grows | **shrinks over time** | replaced | replaced |
+| Incremental landing | yes | **yes** | poor | no |
+
+---
+
+## 5. Architecture (approach B)
+
+### 5.1 The IR
+
+A small, flat, per-pipe-context structure. Sketch (names indicative):
+
+```c
+typedef int32_t dt_vkg_res_t;   // virtual resource id, -1 = none
+
+typedef enum dt_vkg_node_kind_t
+{
+  DT_VKG_NODE_DISPATCH,   // one compute dispatch (kernel, push const blob)
+  DT_VKG_NODE_COPY,       // vkCmdCopyBuffer (d2d, subregion rows)
+  DT_VKG_NODE_UPLOAD,     // staging-ring slice -> device buffer
+  DT_VKG_NODE_READBACK,   // device buffer -> staging slice (tap/sink)
+  DT_VKG_NODE_FILL,       // vkCmdFillBuffer (zeroing grids etc.)
+  DT_VKG_NODE_SYNC_TAP,   // capture-time flush point (see 5.3)
+} dt_vkg_node_kind_t;
+
+typedef struct dt_vkg_node_t
+{
+  dt_vkg_node_kind_t kind;
+  int kernel;                          // DISPATCH: HAL kernel index
+  uint32_t gw, gh;                     // global size
+  uint8_t push[DT_VULKAN_MAX_PUSH_CONSTANTS];
+  uint32_t push_size;
+  dt_vkg_res_t res[DT_VULKAN_MAX_BINDINGS]; // bindings / copy src+dst
+  uint32_t nres;
+  uint32_t read_mask, write_mask;      // which res[] are read vs written
+  // provenance for logs/debug: module op, instance, phase tag
+  const char *tag;
+} dt_vkg_node_t;
+
+typedef struct dt_vkg_res_desc_t
+{
+  size_t size;
+  int32_t first_node, last_node;  // liveness interval (filled by planner)
+  size_t arena_offset;            // filled by planner
+  uint32_t flags;                 // PINNED (residency cache), EXTERNAL (source/sink),
+                                  // HOSTVIS (tap results), TRANSIENT
+  dt_hash_t content_hash;         // for residency cache entries
+} dt_vkg_res_desc_t;
+
+typedef struct dt_vkg_graph_t
+{
+  GArray *nodes;                  // dt_vkg_node_t
+  GArray *res;                    // dt_vkg_res_desc_t
+  // capture-time staging ring for upload payloads (LUTs, matrices,
+  // params structs, mask planes): appended during capture, flushed
+  // as one transfer batch at submit
+  uint8_t *staging_ring; size_t staging_used, staging_cap;
+  // segments: [start,end) node ranges split at SYNC_TAPs, CPU
+  // islands, and (optionally) cancellation checkpoints
+  GArray *segments;
+  dt_hash_t topology_hash;        // for plan reuse (5.8)
+} dt_vkg_graph_t;
+```
+
+Notes:
+
+- **Buffer-only, matching the HAL.** Resources are storage buffers.
+  If/when milestone §8.5 (images + samplers) lands in the HAL, a
+  resource gains an image variant; nothing in the IR changes shape.
+- **`dt_vk_mem_t` becomes the virtual handle in capture mode.** In
+  graph mode `dt_vulkan_alloc_buffer()` returns a `dt_vk_mem_t*` whose
+  backing is not a `VkBuffer` but a `dt_vkg_res_t`. Module code cannot
+  tell the difference (it never dereferences the struct's internals —
+  verified: modules treat it as opaque). `dt_vulkan_free_buffer()`
+  ends the resource's liveness instead of freeing memory.
+- **Trunk edges are just resources** created by the pipe walk itself:
+  module N's output resource is module N+1's input resource.
+- **Upload payload snapshotting is mandatory.** Modules build LUTs and
+  matrices in stack arrays that die when `process_vk` returns, so
+  `dt_vulkan_write_to_device()` / `dt_vk_upload_t` batches must copy
+  the bytes into the graph's staging ring *at capture time*. This is
+  the same partitioned-staging scheme `dt_vulkan_dispatch_n_batched`
+  already implements — generalised from per-dispatch to per-graph.
+- Push-constant blobs are snapshotted into the node (≤128 B each).
+
+### 5.2 Plan phase: partitioning the pipe
+
+`dt_dev_pixelpipe_process()` gains a graph mode gate (per pipe run):
+
+```
+vk_graph_possible = dt_vulkan_running()
+                 && pipe has no CL-only segments the planner can't bridge
+                 && conf: pixelpipe_vulkan_graph=true
+```
+
+Before the walk, a cheap linear pre-pass over `pipe->nodes` classifies
+every enabled piece:
+
+- `VK` — `process_vk && process_vk_ready` (the predictive
+  `commit_params` gating from companion §10.2 already makes this flag
+  trustworthy);
+- `CPU` — everything else (including CL-only modules while the
+  transition lasts — see §7).
+
+Consecutive `VK` pieces form **GPU spans**; `CPU` pieces form **CPU
+islands**. The graph executor runs whenever there is at least one span
+of length ≥ 2 (degenerate case: a single-module span is exactly
+today's behaviour, so nothing is lost). Trunk buffers cross island
+boundaries via *planned* staged copies (§5.9) — the same cost the
+eager model pays there, but paid once and overlappable.
+
+This subsumes today's `vk_chain_ahead` look-ahead heuristic: routing
+stops being a per-module bet (with the mis-fire modes §10.2 documents)
+and becomes a whole-pipe plan computed from the same
+`process_vk_ready` bits.
+
+### 5.3 Capture phase
+
+The existing recursion (`_dev_pixelpipe_process_rec`) runs unchanged
+in structure — same order, same `modify_roi_in` negotiation, same
+cache-hash computation, same shutdown checks. Differences inside a GPU
+span:
+
+1. The pipe binds a **capture context** to the thread
+   (`dt_vulkan_capture_begin(graph)`); every HAL dispatch/copy/upload
+   call made from here appends nodes instead of submitting. Capture
+   context is thread-local state in `vulkan.c`, so *no module
+   signature changes*.
+2. `process_vk` runs eagerly as host code (params, LUT building,
+   `pipe->dsc` mutation — all sequential exactly as today) while its
+   GPU calls are captured.
+3. The pipe appends **glue nodes** itself (§5.4) where it currently
+   calls host/CL glue.
+4. On leaving the span (CPU island, pipe end, or capture fault), the
+   pipe calls `dt_vulkan_capture_end()` and the graph goes to
+   plan/record/submit (§5.5–5.6).
+
+**The sync-tap escape hatch.** Seven `process_vk` implementations
+call `dt_vulkan_read_from_device` mid-module today, in three shapes:
+*trunk statistics on GUI-cache miss, with preview-pipe priming*
+(`hazeremoval` ambient light, `globaltonemap` lwmax, `colormapping`
+cluster training, `ashift` parameter-fitting snapshot — the preview
+run computes and caches, full/export runs hit the cache), *small
+reduction results* (`denoiseprofile` reads back a per-tile sum buffer
+of a few KB — cheap under any model), and *host-side processing of
+the trunk* (`retouch`'s heal/clone solvers, `overexposed`'s lcms2
+branch). Under capture, a device→host read of a *not-yet-executed*
+resource cannot be served lazily. The recorder handles it
+transparently: it ends the current segment, plans/records/submits
+nodes so far, waits the fence, services the read, and resumes capture
+in a new segment. Semantics identical to today; cost identical to
+today; and — crucially — the priming-pattern modules only pay it on
+the small preview pipe, so in the full/export pipes sync-taps fire
+rarely. The capture API makes the degradation *visible* (a `SYNC_TAP`
+node in the graph dump) instead of silent.
+
+The same mechanism cleanly handles anything unexpected: a module doing
+something the recorder can't defer simply costs a segment split, never
+a wrong result.
+
+**Failure/fallback during capture.** If a captured module's HAL call
+reports an unloadable kernel (or `process_vk` returns −1 while being
+captured — modules may still do runtime gating), the recorder rolls
+back the nodes appended by that module (node array truncation — cheap
+by design), the pipe re-classifies the piece as `CPU`, splits the span
+at that point, and continues. The §8a.3 `vk_fallback_reason` plumbing
+carries over unchanged.
+
+### 5.4 Glue nodes
+
+Everything the eager pipe does between `process` calls becomes an
+explicit node (or is planned away):
+
+- **Colorspace transforms.**
+  `dt_ioppr_transform_image_colorspace_cl` already exists as kernels
+  (`colorspaces_transform_*`); the VK twins are part of the §5.12
+  plumbing. In the graph they become DISPATCH nodes writing a *new*
+  temporary — never mutating a shared buffer in place. This
+  structurally retires the §5.14 host-mutation invariant and the
+  cacheline-invalidation dance in `_pixelpipe_process_on_CPU`
+  (`dt_dev_pixelpipe_invalidate_cacheline` after in-place cst
+  changes): a graph resource has exactly one content state for its
+  whole lifetime, and its `cst` is a static property assigned at
+  capture.
+- **Blending.** Requires the blendop kernel port (companion Path A —
+  it is on the critical path of *both* designs, so it's pure overlap,
+  not extra scope). Per blended module the pipe appends: optional
+  blend-space transform nodes for input and kernel output (again into
+  temporaries), mask-generation nodes (drawn-mask plane uploaded once
+  as an UPLOAD node from the staging ring; blendif parametric mask
+  computed by kernel from input/output; feathering via the existing
+  guided-filter helper; mask blur via the gaussian helper), the mask
+  combine, then the blend-apply node mixing input and kernel output
+  into the module's final output resource. Start with the
+  normal-mode/no-blendif/no-raster subset exactly as Path A proposes,
+  fall back to a sync-tap + CPU blend for the long tail until ported.
+- **Detail (scharr) mask.** `dt_dev_write_scharr_mask_cl` already
+  computes on GPU and reads back; as a graph node the mask becomes a
+  resident single-channel resource written once after
+  demosaic/rawprepare, consumed by `develop_details`-type blend nodes,
+  with per-consumer distortion nodes (see next bullet). Host readback
+  only if a CPU island consumes it (planner knows the consumers).
+- **Raster masks.** Producer blend nodes write the mask resource
+  (VRAM). Consumers reached without crossing a CPU island get the
+  distortion chain as nodes — which requires `distort_mask` VK ports
+  for the geometry modules on the path; until those exist, the planner
+  inserts a READBACK, runs today's CPU walk (including the
+  `dt_dev_distorted_mask_cache_t` caching), and re-uploads at the
+  consumer. This degrades exactly one edge, not the trunk.
+- **Taps: histogram / scopes / pickers.** Per-module `request_histogram`
+  (preview pipe) and picker requests become DISPATCH reduction nodes
+  (subgroup + atomics; the CAS-loop `vk_atomic_add_f` and the
+  workgroup patterns from the bilateral splat are the precedent)
+  writing tiny HOSTVIS buffers, all read back together after the final
+  fence — one readback of a few KB replaces N trunk-sized copies. The
+  existing CPU reducers stay as the reference implementation for
+  validation.
+- **Pixelpipe-cache taps.** See §5.7.
+- **Format conversions** (`bpp` changes along the RAW segment, 1f→4f
+  at demosaic) are DISPATCH nodes like any other; the RAW trunk
+  segment is just resources with different element sizes.
+
+### 5.5 Memory planning
+
+After capture, per graph:
+
+1. Node order is already topological (capture order = pipe order;
+   side edges only ever point forward — dt refuses backward raster
+   references, see `dt_dev_get_raster_mask`'s iop-order check).
+2. Liveness: one linear sweep fills `first_node`/`last_node` per
+   resource from the nodes' read/write masks. Blended modules extend
+   their input's interval to the blend-apply node automatically
+   (the capture recorded that read — no special casing).
+3. Greedy interval-packing into one arena: sort resources by size
+   descending, best-fit into a free-list of `[offset, size)` holes à
+   la vkdt's `alloc.c`, honouring `minStorageBufferOffsetAlignment`
+   (and `nonCoherentAtomSize` for HOSTVIS). Implementation choice:
+   one big `VkBuffer` + descriptor offsets (simplest with our
+   buffer-only HAL: one allocation, one buffer, descriptors are
+   `{buffer, offset, range}`) — falling back to N chunk buffers when
+   `maxStorageBufferRange` (≥128 MB min spec, 4 GB on desktop
+   drivers) or budget fragmentation demands.
+4. Budget: arena size vs `VK_EXT_memory_budget`. If over budget →
+   spill planning (§5.10).
+5. PINNED resources (residency cache, §5.7) are allocated outside the
+   aliasing arena so their contents survive across runs.
+
+Expected peak for a typical stack (24 MP export, float4 trunk ≈
+384 MB): 2 trunk ping-pong buffers + 1 blend-diamond extension + the
+largest single module's scratch (heavy modules like `diffuse`/`atrous`
+run 2–6 image-sized scratch buffers, but those alias *inside* the
+module's interval) + mask planes (¼ size each) ≈ **4–7 × trunk ≈
+1.5–2.7 GB**, comfortably inside 8 GB cards and workable on 4 GB for
+screen-sized ROIs (darkroom trunk at 6 MP viewport ≈ 96 MB → arena
+< 700 MB). Today's eager model has a *similar or worse* transient
+footprint (pool buffers + staging + CL duplicates) — it's just never
+been visible in one number. The win isn't only peak; it's that
+`vkAllocateMemory`/`vkCreateBuffer` churn drops to ~zero per run
+(plan reuse, §5.8).
+
+### 5.6 Record & submit
+
+- Per segment: allocate descriptor sets from a per-graph pool (reset
+  once per run), record nodes in order; between a writer and its
+  readers a `vkCmdPipelineBarrier` (COMPUTE→COMPUTE,
+  `SHADER_WRITE→SHADER_READ`, per-buffer ranges; batch barriers for
+  adjacent nodes). UPLOAD nodes at segment head as one
+  TRANSFER batch + single TRANSFER→COMPUTE barrier — the
+  `dispatch_n_batched` pattern promoted to whole-segment scope.
+- One `vkQueueSubmit` per segment; one fence (or one timeline
+  semaphore counting segments) awaited at pipe end or at sync-taps.
+- **Cancellation** (`pipe->shutdown`, the `DT_DEV_PIXELPIPE_STOP_*`
+  protocol): a submitted command buffer can't be aborted, so segments
+  double as cancellation checkpoints. The recorder caps segments at a
+  budget (e.g. ~64 dispatches or an ms-estimate once per-kernel
+  timings accumulate), checks `_pipe_has_shutdown()` between submits,
+  and skips the remainder on stop. Today's granularity is per-module,
+  so segment-granular (a few modules) is a mild regression on
+  abort latency but a huge win on throughput; the budget knob tunes
+  the trade. Timings come from optional per-node timestamp queries
+  (`VK_QUERY_TYPE_TIMESTAMP`), which also feed `-d perf` logs and the
+  future scheduler.
+- **Queues.** Phase 1: one compute queue per device, per-pipe-context
+  submission serialised per queue (this replaces the global
+  `g_vk_lock` with per-context recording locks + a queue lock —
+  subsumes companion Path E). Phase 2 options: distinct queue for the
+  preview pipe (preview and full overlap on hardware that exposes ≥2
+  compute queues), async-transfer queue for cache-tap readbacks and
+  CPU-island staging so they overlap with compute.
+
+### 5.7 Pixelpipe cache integration (the interactivity question)
+
+The host pixelpipe cache exists to make darkroom edits cheap: change
+module N → upstream comes from cache, only N..end recompute. A
+GPU-resident pipe must preserve that, and can improve on it. Three
+layers:
+
+1. **Host cache stays, writes become async.** The cachelines and the
+   `dt_dev_pixelpipe_cache_hash` machinery are untouched (they also
+   serve CPU/CL runs and snapshot/duplicate-preview flows). What
+   changes: the "important" input write-back (inventory row 7) becomes
+   a READBACK node into a HOSTVIS staging slice recorded *in the
+   graph* (dedicated to the focused module + `IOP_FLAGS_WRITE_PIPECACHE`
+   modules, same policy as today, decided at capture from the same
+   flags), memcpy'd into the cacheline after the final fence. No
+   mid-run stall, no extra submissions.
+2. **VRAM residency cache (the real upgrade).** The graph context pins
+   a small set of trunk resources across runs — at minimum the
+   *input of the focused module* (`module == dt_dev_gui_module()`,
+   same predicate the eager path uses for `important_cl_input`),
+   tagged with the same cumulative hash the host cache uses
+   (`dt_dev_pixelpipe_cache_hash(roi, pipe, pos)`). On the next run,
+   if the hash at position N matches a pinned resource, capture
+   starts the GPU span *at N* with that resource as trunk head: the
+   upstream isn't just cache-served, it's cache-served **in VRAM**
+   with zero upload. Budgeted (e.g. 2–4 pinned lines, LRU), dropped
+   under memory pressure — correctness never depends on it because
+   layer 1 still exists.
+3. **Cache hits upstream of the span** (host cachelines from previous
+   runs, e.g. after restart or when residency was evicted) work as
+   today: the recursion terminates at the hit, and the graph's source
+   UPLOAD node takes the cacheline instead of `pipe->input`.
+
+Slider-drag steady state with layers 1+2: history commit → capture
+from module N (µs–ms, host only) → submit nodes N..end → fence →
+small backbuf readback. The trunk never crosses PCIe at all.
+
+### 5.8 Incremental re-run (the runflags analogue)
+
+vkdt classifies changes; we get the same effect from infrastructure dt
+already has:
+
+| Change | Detected via | Work re-done |
+|---|---|---|
+| params of module N (slider) | piece hash change at N (existing) | re-capture N..end (host code must re-run: params → push constants/LUTs), reuse memory plan if topology+ROIs+sizes unchanged (`topology_hash`), record + submit. With residency (§5.7) upstream is free. |
+| ROI (zoom/pan/scale) | roi set differs | full re-capture + re-plan. Arena realloc only if high-water grows (arena is monotonic per context, like the staging buffer today). |
+| topology (enable/disable/reorder/new instance) | `DT_DEV_PIPE_REMOVE/SYNCH` events (existing) | full rebuild incl. plan; residency pins whose position-hash died are dropped. |
+| nothing (cache hit at pipe end) | backbuf hash (existing) | nothing — unchanged fast path. |
+
+Re-capture is deliberately cheap (append-only arrays, no Vulkan calls;
+Vulkan objects touched only at record time: descriptor writes and
+command recording, both µs-scale per node — ~100–300 nodes for a real
+stack). We do **not** attempt vkdt's "params-only → reuse recorded
+command buffer, just update UBO" level, because our params ride in
+push constants and captured host code legitimately re-derives LUTs
+from params. If profiling ever shows record cost mattering (it
+shouldn't at 300 nodes), the C-API modules (§4/approach C) can adopt
+UBO-resident params later.
+
+### 5.9 CPU islands
+
+Until `toneequal` & friends are ported, real pipes contain CPU
+islands. The planner makes them cost exactly one exit + one entry:
+
+- span tail: READBACK node of the trunk into pinned host staging
+  (`HOST_VISIBLE|HOST_COHERENT`, persistent ring per context) — plus
+  readbacks of any masks the island consumes;
+- fence; run the island's `process()` (OpenMP) on the staged buffer
+  exactly as today (colorspace glue on CPU as today);
+- next span head: UPLOAD node from staging; continue capture.
+
+Compared with today's VK arm the *count* of transfers around a CPU
+module is the same, but they're planned (pinned memory, no
+per-transfer allocation, overlappable with the transfer queue) and
+they *don't* additionally break the surrounding chain — the spans on
+both sides remain single-submission graphs. As Path D ports land,
+islands disappear and the planner automatically fuses the spans; no
+further pipeline work needed.
+
+### 5.10 When the arena doesn't fit (tiling and huge exports)
+
+Per-module tiling (`process_tiling`) cannot run *inside* a fused
+graph — it's an eager-model concept (its `factor_cl`/`overlap`
+accounting remains authoritative for the eager fallback). Graph-mode
+strategies, in escalation order:
+
+1. **Segment spill:** split the trunk at the liveness high-water
+   point(s); earlier segment's tail spills to host staging (or stays
+   in VRAM if only scratch was the problem — spilling scratch is
+   never needed because scratch dies at module end), later segment
+   reloads. Costs 2 transfers per split — still far better than
+   per-module staging, and the planner picks split points that
+   minimise crossings (e.g. after `crop`/`finalscale` where the trunk
+   shrinks).
+2. **Graph-level tiling** (vkdt-style): run the whole span per tile
+   with accumulated overlap = Σ module overlaps along the span.
+   Overlap accumulation across many neighbourhood modules can explode
+   the halo, so this pays only for spans of mostly point ops —
+   *deferred* until data shows segment spill isn't enough.
+3. **Fallback:** run that pipe eagerly (today's path). Always
+   available, decided per run in the §5.2 gate (predicted arena vs
+   budget).
+
+Rule of thumb from §5.5's estimate: 24 MP export fits 8 GB cards
+without spilling; 61 MP on a 4 GB card takes 1–2 spills; the darkroom
+screen pipes essentially never spill.
+
+### 5.11 Error handling & the fallback ladder
+
+Mirrors the existing OpenCL discipline (`pipe->opencl_error` → restart
+without CL):
+
+- capture-time module failure → span split + CPU piece (§5.3), run
+  continues;
+- submit/fence failure or `VK_ERROR_DEVICE_LOST` → mark
+  `pipe->vulkan_error`, restart the run on the eager path (CL/CPU) —
+  identical shape to today's `goto restart` after `opencl_error`;
+- budget misprediction (alloc fail at plan time) → spill planning →
+  eager fallback;
+- every fallback logs a graph dump reference (§5.12).
+
+### 5.12 Observability
+
+Non-negotiable for something this central:
+
+- `-d vkgraph`: per-run one-line-per-node dump (tag, kernel, sizes,
+  resource ids with offsets, barriers, segment boundaries, spill
+  points, SYNC_TAP causes) — the analogue of `-d pipe` today, and the
+  thing that makes "why did my pipe split?" answerable;
+- `VK_EXT_debug_utils` labels per node (module op + phase) so
+  RenderDoc/Nsight captures read like the pipe;
+- per-node timestamps behind `-d perf`;
+- the lavapipe CI harness gains a graph-mode twin for every existing
+  module equality test (same inputs through eager VK vs graph VK must
+  be bit-identical — they dispatch the same kernels with the same
+  constants, so any diff is a scheduler bug);
+- graph invariant checks in debug builds: every read has a prior
+  write, no resource used outside its interval, barrier coverage.
+
+---
+
+## 6. Lifecycle walkthroughs
+
+**Darkroom slider drag (module N, all-VK stack, warm caches).**
+history commit → piece hash N changes → run: capture skips 0..N−1
+(residency pin at N's input matches), captures N..gamma incl. blend +
+tap nodes (~ms host) → plan reuse (topology unchanged) → record +
+submit 1 segment → fence → picker/histogram KB-readbacks + backbuf
+readback. PCIe traffic: backbuf (≈ viewport 8-bit) + taps. Today the
+same drag moves the trunk across PCIe 2–6 times.
+
+**Zoom/pan.** ROI set changes → full re-capture & re-plan (µs–ms) →
+arena already sized (monotonic) → submit. Residency pins keyed on
+position-hash+roi go stale and simply miss (drop to host-cache layer,
+which also keys on roi — unchanged semantics).
+
+**Export.** Fresh context, no residency, minimal pixelpipe cache
+(`DT_PIPECACHE_MIN`) as today. One capture over the full stack;
+islands per §5.9; segments sized for budget, not cancellation
+(exports check shutdown between segments as a bonus). Expected
+motion: source upload + final readback + islands.
+
+**Preview + full concurrently.** Two contexts, two graphs, own arenas
+and staging rings; submissions interleave on the queue (or ride two
+queues). No shared mutable state except the HAL kernel table
+(read-only after init) — the residency/bcache-style races the eager
+path had to hand-tune disappear with per-context ownership.
+
+---
+
+## 7. Coexistence with OpenCL during the transition
+
+- The graph executor is **Vulkan-only**. No CL nodes: interleaving two
+  device runtimes inside one scheduled graph multiplies sync/interop
+  complexity for a shrinking payoff (DMA-BUF interop — companion Path
+  C — remains a possible *island bridge* optimisation if profiling
+  ever justifies it; the planner treats a CL-only module simply as a
+  CPU-visible island endpoint).
+- Per pipe run, the §5.2 gate picks graph-VK vs eager (CL/CPU) — a
+  pipe whose stack is largely un-ported keeps its current CL
+  performance untouched. The existing per-module `process_cl` arm is
+  not modified by this design at all.
+- End state (companion milestone 13, OpenCL retirement) is what makes
+  the maintenance story actually *simpler than today*: one backend,
+  one scheduler, and `pixelpipe_hb.c` sheds the CL arm, the VK-hook
+  arm, the hand-off cache, and their interaction rules.
+
+## 8. Performance model
+
+Against the §10.2 export breakdown (15 s, RX 9060 XT, 18 MP):
+
+| Bucket (today) | Today | Graph mode |
+|---|---:|---|
+| CPU-only modules (toneequal ×2) | ~5.6 s | unchanged until ported (island), then ~0.1 s |
+| CPU blending after VK | ~3–5 s | GPU blend nodes: ~0.05–0.1 s |
+| CL↔VK transitions | ~1–2 s | gone (single backend per run) |
+| Per-module staging/sync residue | ~1–3 s | source upload + sink readback: ~0.15 s |
+| Kernel work | <0.5 s | <0.5 s (unchanged math) |
+| **Total** | **~15 s** | **~6 s with islands; ~1 s once toneequal ports** |
+
+Darkroom: a mid-stack slider on a 6 MP viewport today costs (upload +
+process + readback + CPU blend) ≈ 150–500 ms wall on the traced
+hardware; graph mode with residency ≈ kernel time + one fence ≈
+**10–40 ms** — the difference between "adjust, wait, look" and live
+feedback. The preview pipe benefits identically, which compounds:
+scopes and thumbnails stop competing with the full pipe for PCIe.
+
+These are estimates, not measurements; M1 (below) exists to replace
+them with numbers before the big pieces land.
+
+## 9. Migration plan
+
+Each milestone lands green and user-invisible-by-default
+(`pixelpipe_vulkan_graph` pref, default off until M5).
+
+- **M0 — blendop VK kernels** (= companion Path A, already planned).
+  Needed by eager *and* graph paths; start with normal-mode subset.
+- **M1 — capture HAL + single-span executor.** Thread-local capture
+  context; IR; naive planner (no aliasing: distinct buffers, reuse the
+  existing pool); one segment per GPU span; sync-tap flush. Ship
+  behind the pref; measure. Success criterion: an all-VK toy stack
+  runs as one submission, bit-identical to eager.
+- **M2 — glue nodes.** Colorspace transform nodes (retire in-place
+  mutations in graph mode), blend nodes (M0), format conversions.
+  First real stacks go single-submission end-to-end.
+- **M3 — memory planner.** Liveness + arena + aliasing + budget +
+  spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
+- **M4 — cache integration.** Async cache-tap readbacks; VRAM
+  residency pins; plan reuse via topology hash.
+- **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
+  end-of-run KB readbacks; scharr as resident resource. Flip pref
+  default on for darkroom pipes; export next release.
+- **M6 — islands polish.** Pinned staging ring, transfer-queue
+  overlap, planned island bridging; `distort_mask` VK ports for
+  raster-mask edges as they come.
+- **M7 — scheduler extras (opportunistic).** Per-node timestamps
+  feeding segment budgets; preview/full on separate queues; C-API
+  (`create_nodes_vk`) for `diffuse`-class modules; graph-level tiling
+  if spill data says it's worth it.
+
+Independent lanes that keep paying either way: Path B module ports
+(each un-islands a stack), Path D CPU-module ports (toneequal), §8.5
+images/samplers (unlocks the last OpenCL-only kernels).
+
+## 10. Risks and open questions
+
+- **Capture assumes modules don't inspect device buffer contents
+  synchronously.** Audited: the known offenders use the priming
+  pattern and degrade to sync-taps; but third-party/lua-adjacent
+  assumptions should be re-checked when the pref defaults on.
+- **Segment sizing vs cancellation latency** needs a real-world knob;
+  darkroom wants ~50 ms segments, exports want maximal fusion.
+- **Arena fragmentation across runs** (monotonic arenas + varying ROI
+  sets): mitigate with high-water reuse and periodic trim on idle,
+  like the staging buffer today.
+- **MoltenVK**: single big VkBuffer + offsets and timeline semaphores
+  are portability-subset-safe, but `maxStorageBufferRange` and
+  barrier granularity on Metal deserve an early smoke test (the M1
+  executor is the right vehicle).
+- **Descriptor volume**: ~300 nodes × ≤20 bindings per run is well
+  within pool limits, but per-run reset strategy vs
+  `VK_KHR_push_descriptor` is worth a micro-benchmark.
+- **Preview-pipe priming inversion**: graph mode makes the *full* pipe
+  so much faster that the preview pipe may become the laggard; may be
+  worth running preview at graph priority or deriving primes from the
+  full run instead.
+- **Where does `pipe->dsc` mutation end up** if a captured module's
+  host code depends on a *pixel-dependent* dsc field written by an
+  upstream module in the same span? Survey says current fields
+  (`processed_maximum`, temperature coeffs) are param-derived, not
+  pixel-derived, so capture order suffices — but this invariant should
+  be asserted in debug builds.
+- **Naming**: "graph mode" vs "fused pipe" vs "resident pipe" — pick
+  once before the pref ships.
+
+## 11. Summary
+
+- The eager, module-at-a-time execution model — not kernel speed — is
+  what keeps darktable's GPU pipeline shuttling pixels over PCIe;
+  ten distinct host touch points are enumerated in §1.1, and most of
+  them cannot be fixed inside that model.
+- darktable's pipe is already a DAG in disguise (blend diamonds,
+  mask edges, taps, glue transforms). The proposal reifies it: keep
+  the linear pipe, history, and UI untouched; behind them, *capture*
+  each run into an explicit node graph, plan its memory like vkdt
+  (liveness-aliased arena), and execute it as a handful of barriered
+  Vulkan submissions with pixels resident in VRAM from source upload
+  to sink readback.
+- The capture trick — hooking the six HAL dispatch/copy entry points
+  all 73 ported modules already use — means no module rewrites, an
+  incremental landing path with a permanent eager fallback, and a
+  scheduler that degrades gracefully (segment splits) instead of
+  producing wrong pixels when a module needs the CPU.
+- Interactivity improves rather than survives: the pixelpipe cache
+  gains a VRAM residency layer, so the steady-state slider drag
+  becomes "record N..end, one submit, one fence" with zero trunk
+  traffic.
+- vkdt is the proof that the destination exists; this document is the
+  route that gets darktable there without giving up its UI, its
+  history stack, its module ecosystem, or its OpenCL-C kernel
+  heritage.
