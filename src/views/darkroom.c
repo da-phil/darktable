@@ -579,6 +579,43 @@ static void _module_gui_post_expose(dt_iop_module_t *module,
   cairo_restore(cri);
 }
 
+// the crop overlay's clip is a fraction of the full processed image (see
+// crop.c _set_max_clip, which divides by full.pipe->processed_width), and the
+// image itself is painted from the full pipe. The shared overlay transform is
+// built on the preview pipe (wd = preview processed size, overlay_scale carries
+// preview_pipe->iscale); in sync the difference is sub-pixel, but a lagging
+// preview pipe pushes the frame off the image into the letterbox until the
+// next reprocess. Re-derive the transform from the full pipe instead
+static void _crop_full_basis_post_expose(dt_iop_module_t *module,
+                                         cairo_t *cri,
+                                         dt_dev_viewport_t *port,
+                                         const float wd,
+                                         const float ht,
+                                         const float overlay_scale,
+                                         const float zoom_x,
+                                         const float zoom_y,
+                                         const float pzx,
+                                         const float pzy)
+{
+  int fpw = 0, fph = 0;
+  dt_dev_get_processed_size(port, &fpw, &fph);
+  const float img_scale =
+    dt_dev_get_zoom_scale(port, port->zoom, 1 << port->closeup, FALSE);
+  // degenerate geometry: skip this frame, a valid one follows once dims settle
+  if(!fpw || !fph || overlay_scale <= 0.f || img_scale <= 0.f)
+    return;
+
+  cairo_save(cri);
+  // undo the preview-basis image transform (scale, then center translate)
+  cairo_translate(cri, 0.5f * wd + zoom_x * wd, 0.5f * ht + zoom_y * ht);
+  cairo_scale(cri, 1.0f / overlay_scale, 1.0f / overlay_scale);
+  // and reapply it in full-pipe pixels
+  cairo_scale(cri, img_scale, img_scale);
+  cairo_translate(cri, -0.5f * fpw - zoom_x * fpw, -0.5f * fph - zoom_y * fph);
+  _module_gui_post_expose(module, cri, fpw, fph, pzx, pzy, img_scale);
+  cairo_restore(cri);
+}
+
 static void _view_paint_surface(cairo_t *cr,
                                 const size_t width,
                                 const size_t height,
@@ -747,7 +784,9 @@ void expose(dt_view_t *self,
   }
 
   // adjust scroll bars
-  float zoom_x, zoom_y, boxw, boxh;
+  // zoom_x/zoom_y position the overlay below; neither call that fills them
+  // writes them while the pipe has no dimensions yet
+  float zoom_x = 0.f, zoom_y = 0.f, boxw, boxh;
   float zbound_x = FLT_MAX, zbound_y = 0.0f;
   if(!dt_dev_get_zoom_bounds(port, &zoom_x, &zoom_y, &boxw, &boxh))
   {
@@ -783,24 +822,30 @@ void expose(dt_view_t *self,
       processed size into a nonzero centre that would otherwise shift the crop
       overlay into a grey band beside the picture.
   */
-  // Mask editing (including creation) is the only state that relaxes the pan
-  // clamp to allow the viewport past the image; it is disabled while the crop
-  // overlay is active, so form_visible is NULL there.
+  // Mask editing (including creation) relaxes the pan clamp to allow the
+  // viewport past the image; it is disabled while the crop overlay is active,
+  // so form_visible is NULL there. Keep-cursor zoom also leaves the view
+  // genuinely off-center at or near fit, and its re-fit on a size change
+  // (crop entered, see _dev_zoom_move) already clears the stale center, so
+  // centering here would only detach the overlay from the image
   const gboolean mask_editing = dev->form_visible != NULL;
+  const gboolean real_center =
+    mask_editing
+    || dt_conf_get_bool("darkroom/mouse/keep_cursor_pos_when_zooming_in");
 
   float sb_zoom_x = zoom_x, sb_zoom_y = zoom_y, sb_boxw = boxw, sb_boxh = boxh;
   if(boxw > 0.95f)
   {
     sb_zoom_x = .0f;
     sb_boxw = 1.01f;
-    if(!mask_editing)
+    if(!real_center)
       zoom_x = .0f;
   }
   if(boxh > 0.95f)
   {
     sb_zoom_y = .0f;
     sb_boxh = 1.01f;
-    if(!mask_editing)
+    if(!real_center)
       zoom_y = .0f;
   }
 
@@ -1008,6 +1053,9 @@ void expose(dt_view_t *self,
 
   float pzx = FLT_MAX, pzy = 0.0f;
   float zoom_scale = dt_dev_get_zoom_scale(&dev->full, port->zoom, 1 << port->closeup, TRUE);
+  // zoom_scale is reassigned per module below (to the no-iscale pointer scale);
+  // keep the value baked into the Cairo image transform for the crop overlay
+  const float overlay_scale = zoom_scale;
 
   // Compute viewport center through the preview pipe. port->zoom_x is in full-pipe input
   // space; scale to preview-pipe input space before forward-transforming. Mask overlay
@@ -1149,7 +1197,12 @@ void expose(dt_view_t *self,
         if(dev->cropping.exposer && dev->cropping.exposer->gui_post_expose)
         {
           _get_zoom_pos_bnd(&dev->full, pointerx, pointery, zbound_x, zbound_y, &pzx, &pzy, &zoom_scale);
-          _module_gui_post_expose(dev->cropping.exposer, cri, wd, ht, pzx, pzy, zoom_scale);
+          if(dt_iop_module_is(dev->cropping.exposer, "crop"))
+            _crop_full_basis_post_expose(dev->cropping.exposer, cri, &dev->full, wd, ht,
+                                         overlay_scale, zoom_x, zoom_y, pzx, pzy);
+          else
+            _module_gui_post_expose(dev->cropping.exposer, cri, wd, ht,
+                                    pzx, pzy, zoom_scale);
         }
         guides = FALSE;
       }
@@ -1164,7 +1217,11 @@ void expose(dt_view_t *self,
                       "%dx%d, px=%d py=%d",
                       width, height, pointerx, pointery);
         _get_zoom_pos_bnd(&dev->full, pointerx, pointery, zbound_x, zbound_y, &pzx, &pzy, &zoom_scale);
-        _module_gui_post_expose(dmod, cri, wd, ht, pzx, pzy, zoom_scale);
+        if(dt_iop_module_is(dmod, "crop"))
+          _crop_full_basis_post_expose(dmod, cri, &dev->full, wd, ht,
+                                       overlay_scale, zoom_x, zoom_y, pzx, pzy);
+        else
+          _module_gui_post_expose(dmod, cri, wd, ht, pzx, pzy, zoom_scale);
         // avoid drawing later if we just did via post_expose
         if(dmod->flags() & IOP_FLAGS_GUIDES_SPECIAL_DRAW)
           guides = FALSE;
@@ -4664,8 +4721,13 @@ void mouse_moved(dt_view_t *self,
   if(ctl->button_down && ctl->button_down_which == GDK_BUTTON_PRIMARY)
   {
     if(!handled)
-      dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, -1.f, 0,
-                       x - ctl->button_x, y - ctl->button_y, TRUE);
+    {
+      // no image panning in color assessment mode: an accidental drag must not
+      // shift the image around under the fixed assessment border
+      if(!dev->full.color_assessment)
+        dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, -1.f, 0,
+                         x - ctl->button_x, y - ctl->button_y, TRUE);
+    }
     else
     {
       const int32_t bs = dev->full.border_size;
@@ -5019,6 +5081,9 @@ gboolean gesture_pan(dt_view_t *self,
   (void)y;
   (void)state;
   if(!dev) return FALSE;
+
+  // no panning in color assessment mode: the image stays put under the border
+  if(dev->full.color_assessment) return FALSE;
 
   // If pointer is over an active mask, let scroll go to the mask handler;
   // otherwise allow two-finger scroll to pan the image.
@@ -5573,8 +5638,10 @@ static void _second_window_pan(dt_develop_t *dev,
 
   dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
-  dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
-                   x - ctl->button_x, y - ctl->button_y, TRUE);
+  // no image panning in color assessment mode (see the main window handler)
+  if(!port->color_assessment)
+    dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
+                     x - ctl->button_x, y - ctl->button_y, TRUE);
   ctl->button_x = x;
   ctl->button_y = y;
 }

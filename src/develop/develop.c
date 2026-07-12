@@ -65,6 +65,11 @@
 #define MASK_HANDLE_MARGIN 0.03f
 #define MASK_CREATION_MARGIN 0.15f
 
+// max empty border a pan may reveal on any one side, as a fraction of the
+// viewport. Applies to panning only: a cursor-anchored zoom may exceed it,
+// after which panning can only shrink the border back within it
+#define MAX_BORDER_FRAC 0.10f
+
 // Forward declaration
 static inline void _dt_dev_load_raw(dt_develop_t *dev, const dt_imgid_t imgid);
 
@@ -3460,15 +3465,28 @@ static void _dev_zoom_move(dt_dev_viewport_t *port,
   const float old_pts1 = pts[1];
   const float old_zoom_scale = port->zoom_scale;
   const dt_dev_zoom_t old_zoom = port->zoom;
+  // the requested action; zoom itself is reassigned below
+  const dt_dev_zoom_t req_zoom = zoom;
   int old_closeup = port->closeup;
 
   int procw = 0, proch = 0;
   dt_dev_get_processed_size(port, &procw, &proch);
 
+  // detect an aspect/orientation change (crop toggled, image rotated) since the
+  // last call, so the validation pass below can re-fit the view for it
+  const gboolean dims_changed =
+    (procw != port->last_procw) || (proch != port->last_proch);
+  port->last_procw = procw;
+  port->last_proch = proch;
+
   float zoom_x = (procw > 0) ? (pts[0] / procw - 0.5f) : 0.0f;
   float zoom_y = (proch > 0) ? (pts[1] / proch - 0.5f) : 0.0f;
 
   const float cur_scale = dt_dev_get_zoom_scale(port, port->zoom, 1<<port->closeup, FALSE);
+
+  // keep-cursor preference, used below for the fit-scale snap and the clamp
+  const gboolean keep_cursor =
+    dt_conf_get_bool("darkroom/mouse/keep_cursor_pos_when_zooming_in");
 
   if(zoom == DT_ZOOM_POSITION)
   {
@@ -3547,7 +3565,10 @@ static void _dev_zoom_move(dt_dev_viewport_t *port,
       }
 
       if(fabsf(scale - 1.0f) < 0.001f) zoom = DT_ZOOM_1;
-      if(fabsf(scale - fitscale) < 0.001f) zoom = DT_ZOOM_FIT;
+      // snapping to a centered DT_ZOOM_FIT here is the jump keep_cursor must
+      // avoid as a scroll crosses fit-scale: stay DT_ZOOM_FREE so the anchor
+      // below holds the cursor point. The scale still lands exactly on fit
+      if(fabsf(scale - fitscale) < 0.001f && !keep_cursor) zoom = DT_ZOOM_FIT;
     }
     else if(zoom == DT_ZOOM_FULL_PREVIEW)
     {
@@ -3604,16 +3625,73 @@ static void _dev_zoom_move(dt_dev_viewport_t *port,
       zoom_y += mouse_off_y / cur_scale - mouse_off_y / new_scale;
     }
 
-    // While editing a mask, allow panning beyond the canvas to reach
-    // handles that lie outside the image (see helper for the details).
     // the held allowance, not the raw occlusion: an overlay that has just been
     // hidden still has its allowance until the view stops needing it
     const float pw = procw * new_scale;
     const float occl0 = pw > 0.0f ? port->occlusion_hold_left / pw : 0.0f;
     const float occl1 = pw > 0.0f ? port->occlusion_hold_right / pw : 0.0f;
     float used0 = 0.0f, used1 = 0.0f;
-    _clamp_zoom_to_mask(dev, boxw, boxh, occl0, occl1, &used0, &used1,
-                        &zoom_x, &zoom_y, use_mask_overlay);
+
+    // with keep-cursor on, the viewport never recenters itself on a zoom, a pan
+    // or a same-size history commit (mask move, exposure tweak); it moves only
+    // by user input. The no-offset DT_ZOOM_MOVE validation pass recenters only
+    // to re-fit: a new image, or an aspect/orientation change (crop toggled,
+    // rotate) that resized it. Color assessment always recenters
+    const gboolean refit =
+      (req_zoom == DT_ZOOM_MOVE) && (x == 0.0f) && (y == 0.0f)
+      && ((port->pipe && port->pipe->loading) || dims_changed);
+    const gboolean relax = keep_cursor && !refit && !port->color_assessment;
+
+    if(relax && (req_zoom == DT_ZOOM_MOVE || req_zoom == DT_ZOOM_POSITION))
+    {
+      // panning: cap the border a pan may reveal on a side at MAX_BORDER_FRAC
+      // of the viewport. The border fraction on a side is
+      // (±zoom + box/2 - 0.5)/box, so the cap bounds zoom by ±(0.5 - slack*box).
+      // Each side is ratcheted against the position before this event (prev_s*)
+      // so a border a zoom left over the cap can shrink but not grow. A cap
+      // below 0 (the image can't meet it even centered) is taken as 0: the axis
+      // may then only move toward the center, and freezes there. While loading,
+      // the old position belongs to the previous image (see restore_zoom), so
+      // there is nothing to ratchet against
+      const float slack = 0.5f - MAX_BORDER_FRAC;
+      const float cap_x = MAX(0.0f, 0.5f - slack * boxw);
+      const float cap_y = MAX(0.0f, 0.5f - slack * boxh);
+      const gboolean has_prev = !(port->pipe && port->pipe->loading);
+      const float prev_sx = has_prev ? old_pts0 / procw - 0.5f : 0.0f;
+      const float prev_sy = has_prev ? old_pts1 / proch - 0.5f : 0.0f;
+      // an overlay covering the canvas widens the x range by the strip it
+      // hides, as _clamp_zoom_to_mask() does, so that strip stays reachable
+      const float bx0 = MAX(-0.5f, MIN(-cap_x, prev_sx));
+      const float bx1 = MIN(0.5f, MAX(cap_x, prev_sx));
+      zoom_x = CLAMP(zoom_x, bx0 - occl0, bx1 + occl1);
+      zoom_y = CLAMP(zoom_y, MAX(-0.5f, MIN(-cap_y, prev_sy)),
+                             MIN(0.5f, MAX(cap_y, prev_sy)));
+      used0 = fmaxf(0.0f, bx0 - zoom_x);
+      used1 = fmaxf(0.0f, zoom_x - bx1);
+    }
+    else if(relax)
+    {
+      // zooming: the cursor anchor rules, so clamp only to keep the viewport
+      // center inside the image (plus any occluded strip); a box-dependent cap
+      // would fight the anchor mid-gesture. Opt-in exception: when zooming out,
+      // recenter an axis once it letterboxes (box > 1), judged per axis
+      const gboolean center_out =
+        (new_scale < cur_scale)
+        && dt_conf_get_bool("darkroom/mouse/recenter_letterbox_when_zooming_out");
+      zoom_x = (center_out && boxw > 1.0f)
+        ? 0.0f
+        : CLAMP(zoom_x, -0.5f - occl0, 0.5f + occl1);
+      zoom_y = (center_out && boxh > 1.0f) ? 0.0f : CLAMP(zoom_y, -0.5f, 0.5f);
+      used0 = fmaxf(0.0f, -0.5f - zoom_x);
+      used1 = fmaxf(0.0f, zoom_x - 0.5f);
+    }
+    else
+    {
+      // keep-cursor off, re-fit or color assessment: the plain clamp, which
+      // also honors the mask canvas and occlusion
+      _clamp_zoom_to_mask(dev, boxw, boxh, occl0, occl1, &used0, &used1,
+                          &zoom_x, &zoom_y, use_mask_overlay);
+    }
 
     // give back whatever the settled position no longer leans on, but never
     // below what is covered right now

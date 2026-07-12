@@ -363,6 +363,45 @@ static void _draw_offview_arrow(cairo_t *cr,
   cairo_stroke(cr);
 }
 
+// a box in [-0.5, 0.5] image space: center and extent
+typedef struct _nav_box_t
+{
+  float x, y, w, h;
+} _nav_box_t;
+
+// what the center view shows, in image space. `view` is the viewport itself,
+// which may reach past the image (letterbox, or panned out to an off-image
+// mask node); it maps the screen exactly and its extent is never 0. `vis` is
+// the part of the image inside it, the box to outline: unlike
+// dt_dev_get_zoom_bounds() it also reflects a pan at or below fit, where one
+// side reveals letterbox while the other is clipped out of view. It is empty
+// when the viewport lies wholly off the image. Returns FALSE when the whole
+// image is visible, so there is nothing to outline
+static gboolean _nav_view_boxes(dt_dev_viewport_t *port,
+                                _nav_box_t *view,
+                                _nav_box_t *vis)
+{
+  float zx = 0.0f, zy = 0.0f;
+  int procw = 0, proch = 0;
+  dt_dev_get_viewport_params(port, NULL, NULL, &zx, &zy);
+  dt_dev_get_processed_size(port, &procw, &proch);
+  const float scale = dt_dev_get_zoom_scale(port, port->zoom, 1 << port->closeup, FALSE);
+  view->x = zx;
+  view->y = zy;
+  view->w = procw ? port->width / (procw * scale) : 1.0f;
+  view->h = proch ? port->height / (proch * scale) : 1.0f;
+
+  const float lox = fmaxf(-0.5f, zx - 0.5f * view->w);
+  const float hix = fminf(0.5f, zx + 0.5f * view->w);
+  const float loy = fmaxf(-0.5f, zy - 0.5f * view->h);
+  const float hiy = fminf(0.5f, zy + 0.5f * view->h);
+  vis->w = fmaxf(0.0f, hix - lox);
+  vis->h = fmaxf(0.0f, hiy - loy);
+  vis->x = 0.5f * (lox + hix);
+  vis->y = 0.5f * (loy + hiy);
+  return vis->w < 0.999f || vis->h < 0.999f;
+}
+
 static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
                                               cairo_t *crf,
                                               gpointer user_data)
@@ -405,10 +444,14 @@ static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
     cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
     cairo_fill(cr);
 
-    // draw box where we are
-    float zoom_x, zoom_y, boxw, boxh;
-    if(dt_dev_get_zoom_bounds(&dev->full, &zoom_x, &zoom_y, &boxw, &boxh))
+    // draw box where we are (the visible image region, so a pan at fit that
+    // clips one side out of view is shown, not only a zoom past fit)
+    _nav_box_t view, vis;
+    if(_nav_view_boxes(&dev->full, &view, &vis))
     {
+      const float zoom_x = vis.x, zoom_y = vis.y;
+      float boxw = vis.w, boxh = vis.h;
+
       // Add a dark overlay on the picture to make it fade
       cairo_rectangle(cr, 0, 0, wd, ht);
       cairo_set_source_rgba(cr, 0, 0, 0, 0.5);
@@ -440,7 +483,9 @@ static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
       // While editing a mask the viewport can be panned outside the image; the
       // view box then shrinks against the thumbnail edge and disappears, losing
       // any sense of where one is looking. Point an arrow the way it has gone.
-      _draw_offview_arrow(cr, wd, ht, zoom_x, zoom_y, scale);
+      // this needs the viewport center, not the region center above, which is
+      // clamped into the image and so never reads as off-view
+      _draw_offview_arrow(cr, wd, ht, view.x, view.y, scale);
     }
     cairo_restore(cr);
 
@@ -567,18 +612,17 @@ static gboolean _lib_navigation_widget_to_center(GtkEventController *controller,
   const double x_nav_img = in_x - (alloc_nav.width - nav_img_w) / 2.0;
   const double y_nav_img = in_y - (alloc_nav.height - nav_img_h) / 2.0;
 
-  // visible part of image in center widget in navigation widget
-  // coords with zoom-to-fit defaults
-  float zoom_x, zoom_y, boxw, boxh;
-  if(!dt_dev_get_zoom_bounds(port, &zoom_x, &zoom_y, &boxw, &boxh))
-  { // zoom-to-fit
-    zoom_x = zoom_y = 0.0;
-    boxw = boxh = 1.0;
-  }
-  const double vis_w = nav_img_w * boxw;
-  const double vis_h = nav_img_h * boxh;
-  const double vis_x = nav_img_w * (0.5 + zoom_x) - vis_w * 0.5;
-  const double vis_y = nav_img_h * (0.5 + zoom_y) - vis_h * 0.5;
+  // the center widget shows the whole viewport box, letterbox included, so map
+  // through that rather than through the visible image region: the region is
+  // smaller whenever a side is clipped, and empty when the view is off-image
+  _nav_box_t view, vis;
+  _nav_view_boxes(port, &view, &vis);
+  if(view.w <= 0.0f || view.h <= 0.0f) // viewport not configured yet
+    return FALSE;
+  const double vis_w = nav_img_w * view.w;
+  const double vis_h = nav_img_h * view.h;
+  const double vis_x = nav_img_w * (0.5 + view.x) - vis_w * 0.5;
+  const double vis_y = nav_img_h * (0.5 + view.y) - vis_h * 0.5;
 
   // navigation image coords to center widget coords
   *out_x = (x_nav_img - vis_x) / vis_w * alloc_center.width;
