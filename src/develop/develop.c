@@ -60,6 +60,11 @@
 #define MASK_HANDLE_MARGIN 0.03f
 #define MASK_CREATION_MARGIN 0.15f
 
+// Max empty border a pan may reveal on any one side, as a fraction of the
+// viewport. Applies to panning only - a cursor-anchored zoom may temporarily
+// exceed it, after which panning can only shrink the border back within it.
+#define MAX_BORDER_FRAC 0.05f
+
 // Forward declaration
 static inline void _dt_dev_load_raw(dt_develop_t *dev, const dt_imgid_t imgid);
 
@@ -3250,15 +3255,29 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   const float old_pts1 = pts[1];
   const float old_zoom_scale = port->zoom_scale;
   const dt_dev_zoom_t old_zoom = port->zoom;
+  const dt_dev_zoom_t req_zoom = zoom; // the requested action, before it is reassigned below
   int old_closeup = port->closeup;
 
   int procw, proch;
   dt_dev_get_processed_size(port, &procw, &proch);
 
+  // detect an aspect/orientation change (crop toggled, image rotated) since the
+  // last call, so the validation pass below can re-fit the view for it
+  const gboolean dims_changed =
+    (procw != port->last_procw) || (proch != port->last_proch);
+  port->last_procw = procw;
+  port->last_proch = proch;
+
   float zoom_x = pts[0] / procw - 0.5f;
   float zoom_y = pts[1] / proch - 0.5f;
 
   const float cur_scale = dt_dev_get_zoom_scale(port, port->zoom, 1<<port->closeup, FALSE);
+
+  // Keep-cursor preference (defaults on); used below for the fit-scale snap and
+  // the recentering clamp. Gate on dt_conf_key_exists() since dt_conf_get_bool()
+  // returns false for a key an incremental build hasn't regenerated defaults for.
+  const char *const keep_key = "darkroom/mouse/keep_cursor_pos_when_zooming_in";
+  const gboolean keep_cursor = !dt_conf_key_exists(keep_key) || dt_conf_get_bool(keep_key);
 
   if(zoom == DT_ZOOM_POSITION)
   {
@@ -3337,7 +3356,10 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       }
 
       if(fabsf(scale - 1.0f) < 0.001f) zoom = DT_ZOOM_1;
-      if(fabsf(scale - fitscale) < 0.001f) zoom = DT_ZOOM_FIT;
+      // Snapping to a centred DT_ZOOM_FIT here is the jump keep_cursor must avoid
+      // as a scroll crosses fit-scale; stay DT_ZOOM_FREE so the anchor below holds
+      // the cursor point. Scale still lands exactly on fit, only recentring drops.
+      if(fabsf(scale - fitscale) < 0.001f && !keep_cursor) zoom = DT_ZOOM_FIT;
     }
     else if(zoom == DT_ZOOM_FULL_PREVIEW)
     {
@@ -3394,9 +3416,55 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       zoom_y += mouse_off_y / cur_scale - mouse_off_y / new_scale;
     }
 
-    // While editing a mask, allow panning beyond the canvas to reach
-    // handles that lie outside the image (see helper for the details).
-    _clamp_zoom_to_mask(dev, boxw, boxh, &zoom_x, &zoom_y);
+    // With keep-cursor on the viewport never recentres itself on a zoom, a pan,
+    // or a same-size history commit (mask move, exposure tweak); it only moves
+    // by the user's input. The no-offset DT_ZOOM_MOVE validation pass recentres
+    // only when it must re-fit: loading a new image, or an aspect/orientation
+    // change (crop toggled, rotate) that resized the image. Colour assessment
+    // always recentres too.
+    const gboolean refit =
+      (req_zoom == DT_ZOOM_MOVE) && (x == 0.0f) && (y == 0.0f)
+      && ((port->pipe && port->pipe->loading) || dims_changed);
+    const gboolean relax = keep_cursor && !refit && !port->color_assessment;
+
+    if(relax && (req_zoom == DT_ZOOM_MOVE || req_zoom == DT_ZOOM_POSITION))
+    {
+      // Panning: cap the border a pan may reveal on any side at MAX_BORDER_FRAC
+      // of the viewport, ratcheted per side against the position before this
+      // event (prev_s*) so a border a zoom left over the cap can shrink but not
+      // grow. Border fraction on a side is (±zoom + box/2 - 0.5)/box, so the cap
+      // bounds zoom by ±(0.5 - slack*box); a negative bound (image too small to
+      // meet the cap even centred) freezes the axis, so panning a fully visible
+      // image is a no-op. The no-offset validation pass is unchanged here: its
+      // position equals prev, always in bounds.
+      const float slack = 0.5f - MAX_BORDER_FRAC;
+      const float cap_x = 0.5f - slack * boxw;
+      const float cap_y = 0.5f - slack * boxh;
+      const float prev_sx = old_pts0 / procw - 0.5f;
+      const float prev_sy = old_pts1 / proch - 0.5f;
+      zoom_x = CLAMP(zoom_x, MAX(-0.5f, MIN(-cap_x, prev_sx)),
+                             MIN( 0.5f, MAX( cap_x, prev_sx)));
+      zoom_y = CLAMP(zoom_y, MAX(-0.5f, MIN(-cap_y, prev_sy)),
+                             MIN( 0.5f, MAX( cap_y, prev_sy)));
+    }
+    else if(relax)
+    {
+      // Zooming: the cursor anchor rules; clamp only to keep the viewport centre
+      // inside the image (a box-dependent cap would fight the anchor mid-gesture).
+      // Opt-in exception: when zooming OUT, recentre an axis once it letterboxes
+      // (box > 1), judged per axis and off by default. Zooming in never recentres.
+      const gboolean center_out =
+        (new_scale < cur_scale)
+        && dt_conf_get_bool("darkroom/mouse/recenter_letterbox_when_zooming_out");
+      zoom_x = (center_out && boxw > 1.0f) ? 0.0f : CLAMP(zoom_x, -0.5f, 0.5f);
+      zoom_y = (center_out && boxh > 1.0f) ? 0.0f : CLAMP(zoom_y, -0.5f, 0.5f);
+    }
+    else
+    {
+      // Non keep-cursor (or re-fit / colour assessment): the plain clamp, which
+      // also honours the mask canvas when one is active.
+      _clamp_zoom_to_mask(dev, boxw, boxh, &zoom_x, &zoom_y);
+    }
   }
 
   pts[0] = (zoom_x + 0.5f) * procw;

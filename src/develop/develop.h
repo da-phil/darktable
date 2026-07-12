@@ -134,6 +134,10 @@ typedef struct dt_dev_viewport_t
   gboolean restore_zoom;
   float restore_zoom_x, restore_zoom_y;
 
+  // processed image size at the last zoom validation, to detect an aspect or
+  // orientation change (crop toggled, image rotated) that needs a re-fit
+  int last_procw, last_proch;
+
   // image processing pipeline with caching
   struct dt_dev_pixelpipe_t *pipe;
   
