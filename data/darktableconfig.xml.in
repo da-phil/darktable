@@ -1632,6 +1632,20 @@
     <shortdescription>middle mouse button zooms to 200%</shortdescription>
     <longdescription>if enabled, the zoom level will cycle between 100%, 200% and fit to viewport on middle mouse clicks. if disabled, it will toggle between viewport size and 100%, and the 'ctrl' key can be used to control the zoom level.</longdescription>
   </dtconfig>
+  <dtconfig prefs="darkroom" section="general">
+    <name>darkroom/mouse/keep_cursor_pos_when_zooming_in</name>
+    <type>bool</type>
+    <default>true</default>
+    <shortdescription>keep image position under cursor when zooming</shortdescription>
+    <longdescription>when zooming, keep the image content under the cursor fixed instead of recentering the view. the view may show some border while zooming or panning off-centre; panning cannot reveal more than a small border margin. when disabled, the view recenters as before.</longdescription>
+  </dtconfig>
+  <dtconfig prefs="darkroom" section="general">
+    <name>darkroom/mouse/recenter_letterbox_when_zooming_out</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>recenter letterboxed axis when zooming out</shortdescription>
+    <longdescription>only applies when 'keep image position under cursor when zooming' is enabled. when zooming out, recenter the view on an axis at the moment the image becomes smaller than the viewport on that axis (i.e. that side starts to letterbox). the horizontal and vertical axes are handled independently. when disabled, zooming out keeps the point under the cursor fixed like zooming in.</longdescription>
+  </dtconfig>
   <dtconfig prefs="darkroom" section="modules">
     <name>channel_display</name>
     <type>
