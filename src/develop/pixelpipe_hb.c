@@ -1680,6 +1680,22 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     }
   }
 
+#ifdef HAVE_VULKAN
+  /* Every path above that produced this module's output WITHOUT going
+     through the VK hook — CPU process(), CPU tiling, blend-cache
+     replay — leaves the §5.14 hand-off buffer stale: it still holds
+     the *previous* module's device output, which for any 1:1 module
+     has exactly the size the next module's hook checks for, so the
+     next process_vk would silently consume pre-module pixels. The
+     hook's own paths either replace the hand-off (success) or
+     invalidate it (fallback); this catches all the others at one
+     choke point. Pre-existing bug found while auditing the hand-off
+     invariants for graph capture (gpu_resident_pixelpipe_dag.md §4A's
+     "whack-a-mole" class). */
+  if(!(*pixelpipe_flow & PIXELPIPE_FLOW_PROCESSED_ON_GPU))
+    _vk_handoff_invalidate(pipe);
+#endif
+
   if(pfm_dump)
   {
     dt_dump_pipe_pfm(module->op, *output, roi_out->width, roi_out->height, bpp,
