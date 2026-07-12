@@ -493,6 +493,13 @@
     <shortdescription>use Vulkan compute backend</shortdescription>
     <longdescription>if enabled and the Vulkan backend was compiled in (USE_VULKAN), pixelpipe modules with a process_vk implementation are dispatched via Vulkan compute (clspv/SPIR-V) in preference to OpenCL. Only a small set of modules currently support Vulkan; others fall back to OpenCL or CPU transparently.</longdescription>
   </dtconfig>
+  <dtconfig prefs="processing" section="opencl" capability="opencl" restart="true">
+    <name>pixelpipe_vulkan_graph</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>capture Vulkan work into batched submissions</shortdescription>
+    <longdescription>if enabled, each Vulkan module's GPU work (uploads, kernel dispatches, copies) is captured and submitted to the driver as a single batch instead of one synchronous submission per call. First milestone of the GPU-resident pipeline design (dev-doc/gpu_resident_pixelpipe_dag.md); experimental, output is verified bit-identical to the unbatched path.</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="platform" capability="nonapple" restart="true">
     <name>clplatform_intelropenclhdgraphics</name>
     <type>bool</type>

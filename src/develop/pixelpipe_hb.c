@@ -1564,6 +1564,20 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
         const int devid = dt_vulkan_lock_device();
         if(devid >= 0)
         {
+          // DAG M1 (gpu_resident_pixelpipe_dag.md §9): capture this
+          // module's HAL calls into ONE queue submission instead of
+          // one per upload/dispatch/copy. Module-scoped for now: the
+          // capture opens here and closes before the output readback
+          // (which sync-taps the flush), so every inter-module
+          // contract — hand-off, cachelines, blending, taps — behaves
+          // exactly as in eager mode. Span-scoped capture with
+          // deferred readback is the next milestone; it needs the
+          // §5.3 sync-point audit before it can land.
+          static int graph_pref = -1;
+          if(graph_pref < 0)
+            graph_pref = dt_conf_get_bool("pixelpipe_vulkan_graph") ? 1 : 0;
+          const gboolean graph = graph_pref && dt_vulkan_capture_begin(devid);
+
           // §5.14: VK→VK chain skip. If the previous VK module
           // left a live output buffer whose size matches this
           // module's input, reuse it directly and skip the host
@@ -1593,9 +1607,16 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
           // from a previous module can't leak into this dispatch's
           // fallback log line.
           pipe->vk_fallback_reason = NULL;
+          // The trunk upload: under capture, borrow the host pointer
+          // instead of snapshotting — `input` is this module's pipe
+          // cacheline and outlives the readback-triggered flush below,
+          // and snapshotting would memcpy the whole trunk into the
+          // capture ring.
           const gboolean upload_ok = vin_from_cache
               ? TRUE
-              : (vin && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0);
+              : (vin && (graph
+                         ? dt_vulkan_write_to_device_borrowed(devid, vin, input, in_size)
+                         : dt_vulkan_write_to_device(devid, vin, input, in_size)) == 0);
           const char *failure_phase = NULL;
           if(!vin)            failure_phase = "alloc-in-failed";
           else if(!vout)      failure_phase = "alloc-out-failed";
@@ -1605,6 +1626,8 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             const int rc = module->process_vk(module, piece, vin, vout, roi_in, roi_out);
             if(rc == 0)
             {
+              // Under capture this readback is the sync tap that
+              // flushes the whole module segment as one submission.
               if(dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
               {
                 processed = TRUE;
@@ -1612,8 +1635,9 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                 *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
                 dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
                               pipe, module, DT_DEVICE_VK, roi_in, roi_out,
-                              "%dx%d%s", roi_in->width, roi_in->height,
-                              vin_from_cache ? " [vk handoff]" : "");
+                              "%dx%d%s%s", roi_in->width, roi_in->height,
+                              vin_from_cache ? " [vk handoff]" : "",
+                              graph ? " [vk graph]" : "");
                 // Hand off vout to the next module instead of freeing
                 // it. If the next module is non-VK or has a mismatched
                 // size, it'll get dropped on that branch.
@@ -1624,6 +1648,16 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
               else failure_phase = "host-readback-failed";
             }
             else failure_phase = "process_vk";
+          }
+          // Close the capture before the frees below so they run
+          // eagerly: success leaves an empty segment (the readback
+          // already flushed it), failure drops the partial nodes —
+          // the CPU fallback then reprocesses from the intact host
+          // input.
+          if(graph)
+          {
+            if(processed) dt_vulkan_capture_end(devid);
+            else          dt_vulkan_capture_abort(devid);
           }
           dt_vulkan_free_buffer(devid, vin);
           if(vout) dt_vulkan_free_buffer(devid, vout);
