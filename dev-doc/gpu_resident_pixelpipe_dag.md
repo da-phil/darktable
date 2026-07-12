@@ -1,6 +1,9 @@
 # A GPU-resident pixelpipe: DAG execution behind the linear pipe
 
-**Status:** design proposal / discussion.
+**Status:** in implementation — M1 (capture HAL + segment executor +
+module-scoped pixelpipe integration) landed; see §11 for the living
+implementation log and §9 for per-milestone state. §1–§10 are the
+design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
 one scheduled unit — no CPU↔GPU pixel transfers between iops, no
 per-module queue synchronisation — while keeping darktable's linear
@@ -368,6 +371,19 @@ Notes:
   already implements — generalised from per-dispatch to per-graph.
 - Push-constant blobs are snapshotted into the node (≤128 B each).
 
+**M1 status note (landed).** The shipped M1 IR
+(`src/common/vulkan.c`, `_capture_node_t` / `dt_vk_capture_ctx_t`) is
+one notch simpler than the sketch above: nodes reference *real*
+`dt_vk_mem_t` buffers allocated from the existing pool exactly as in
+eager mode, and buffer-reuse correctness is guaranteed by deferring
+`dt_vulkan_free_buffer` to the segment flush instead of by liveness
+analysis (an eager free could destroy the `VkBuffer` under pending
+nodes when the pool is full, or hand it to a concurrent eager thread).
+Virtual resource ids and interval aliasing arrive with the M3 planner;
+the node shape doesn't change for it. Trunk-sized caller-owned uploads
+get `dt_vulkan_write_to_device_borrowed` so they aren't duplicated
+into the ring; module-owned payloads keep the safe snapshot default.
+
 ### 5.2 Plan phase: partitioning the pipe
 
 `dt_dev_pixelpipe_process()` gains a graph mode gate (per pipe run):
@@ -442,6 +458,16 @@ node in the graph dump) instead of silent.
 The same mechanism cleanly handles anything unexpected: a module doing
 something the recorder can't defer simply costs a segment split, never
 a wrong result.
+
+**M1 status note (landed).** The capture API shipped as designed:
+`dt_vulkan_capture_begin/active/pending/flush/end/abort` plus
+`dt_vulkan_capture_mark/rollback` for the module-fault path; the sync
+tap lives inside `dt_vulkan_read_from_device` itself, so callers—and
+the seven readback modules—needed zero changes. Unit-tested on
+lavapipe (`src/tests/unittests/common/test_vulkan_capture.c`):
+bit-identical to eager, exactly one submission per segment, snapshot
+survival after host-array clobber, deferred-free non-aliasing,
+rollback, sync-tap continuation, abort.
 
 **Failure/fallback during capture.** If a captured module's HAL call
 reports an unloadable kernel (or `process_vk` returns −1 while being
@@ -701,7 +727,11 @@ Non-negotiable for something this central:
 - `-d vkgraph`: per-run one-line-per-node dump (tag, kernel, sizes,
   resource ids with offsets, barriers, segment boundaries, spill
   points, SYNC_TAP causes) — the analogue of `-d pipe` today, and the
-  thing that makes "why did my pipe split?" answerable;
+  thing that makes "why did my pipe split?" answerable.
+  *M1 status: the flag exists (`DT_DEBUG_VKGRAPH`) and logs per-segment
+  summaries (node/dispatch/upload/copy counts, staged bytes, submit
+  result) plus sync-tap and rollback events; the per-node dump comes
+  with the M3 planner where offsets exist to print;*
 - `VK_EXT_debug_utils` labels per node (module op + phase) so
   RenderDoc/Nsight captures read like the pipe;
 - per-node timestamps behind `-d perf`;
@@ -790,12 +820,26 @@ Each milestone lands green and user-invisible-by-default
 
 - **M0 — blendop VK kernels** (= companion Path A, already planned).
   Needed by eager *and* graph paths; start with normal-mode subset.
-- **M1 — capture HAL + single-span executor.** Thread-local capture
-  context; IR; naive planner (no aliasing: distinct buffers, reuse the
-  existing pool); one segment per GPU span; sync-tap flush. Ship
-  behind the pref; measure. Success criterion: an all-VK toy stack
-  runs as one submission, bit-identical to eager.
-- **M2 — glue nodes.** Colorspace transform nodes (retire in-place
+- **M1 — capture HAL + single-segment executor.** ✅ **landed** (see
+  the §11 implementation log). Thread-local capture context; IR; naive
+  planner (no aliasing: real pool buffers + deferred frees); one
+  command buffer / one submit / one fence per segment; sync-tap flush;
+  mark/rollback for module faults; `-d vkgraph`; unit tests on
+  lavapipe. Success criterion met: a captured multi-kernel chain runs
+  as one submission, bit-identical to eager (asserted in
+  `test_vulkan_capture`). Pixelpipe integration shipped
+  **module-scoped** behind `pixelpipe_vulkan_graph` (default off):
+  each module's uploads + dispatches + copies reach the queue as one
+  submission with every inter-module contract unchanged;
+  darktable-cli exports verified bit-identical pref on vs off.
+- **M2 — span capture + glue nodes.** Widen the capture window from
+  module to GPU span, which requires the §5.3 sync-point audit first
+  (a deferred output readback must be serviced at: colorspace
+  transforms, blend transforms, histogram/picker collection, the
+  tiling and blend-cache branches, non-VK modules, the final
+  backcopy, and teardown/restart paths) — the hand-off staleness bug
+  found during M1 (§11) is a preview of why that audit must be
+  exhaustive. Then colorspace transform nodes (retire in-place
   mutations in graph mode), blend nodes (M0), format conversions.
   First real stacks go single-submission end-to-end.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
@@ -848,7 +892,72 @@ images/samplers (unlocks the last OpenCL-only kernels).
 - **Naming**: "graph mode" vs "fused pipe" vs "resident pipe" — pick
   once before the pref ships.
 
-## 11. Summary
+## 11. Implementation log
+
+Living section, newest first. Every landing that touches the design
+gets an entry here; where the implementation deviates from the
+proposal, the affected section carries an inline **status note** and
+the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-12 — M1 landed: capture HAL, segment executor, module-scoped pipe integration
+
+Commits: `b5f0e23` (HAL + executor + tests), `dcf5c66` (hand-off
+staleness fix), `6cf9b18` (pixelpipe integration + pref).
+
+What shipped, against the plan:
+
+- **Capture HAL + executor** (`src/common/vulkan.{c,h}`): thread-local
+  `dt_vk_capture_ctx_t`; all dispatch shapes, both copies, and both
+  upload flavours captured at the entry points the modules already
+  use; `read_from_device` doubles as the §5.3 sync tap;
+  `mark`/`rollback` implement the module-fault path; the executor
+  plans staging offsets in one pass, stages every upload with a
+  single map/memcpy, allocates one descriptor pool per segment, and
+  replays the nodes into one command buffer with conservative
+  adjacent-node memory barriers — one `vkQueueSubmit`, one fence.
+  A per-device `submit_count` makes the collapse assertable.
+- **Design deltas, with reasons.** (1) The M1 "planner" uses *real*
+  pool buffers plus flush-deferred frees instead of virtual resource
+  ids — deferral is what actually protects correctness here (an eager
+  free can destroy the `VkBuffer` under pending nodes or hand it to a
+  concurrent eager thread); virtual ids without interval-aliasing
+  would be ceremony. §5.1 carries the matching status note. (2) A
+  `dt_vulkan_write_to_device_borrowed` variant was added for
+  trunk-sized caller-owned uploads; the snapshot default stands for
+  module-owned LUTs (they really do die before the flush — the unit
+  test clobbers one to prove it matters). (3) `-d vkgraph` logs
+  segment summaries now; the per-node dump waits for M3 offsets.
+- **Pixelpipe integration is module-scoped, not span-scoped.** The
+  capture opens after the device lock in the VK hook and closes
+  before the buffer frees; the module's output readback is the sync
+  tap that flushes the segment. Chosen deliberately: it collapses
+  per-call submissions (an nlmeans-class module is ~140 today) while
+  keeping every inter-module contract — hand-off, cachelines,
+  blending, taps, CPU fallback — bit-for-bit the eager behaviour,
+  which made it honestly testable this session. Span capture needs a
+  deferred-readback audit across every host consumer of the trunk
+  (enumerated in the M2 milestone) and lands separately.
+- **Pre-existing bug found and fixed** while auditing hand-off
+  invariants for the integration: the CPU-tiling and blend-cache
+  paths in `_pixelpipe_process_on_CPU` never invalidated the §5.14
+  hand-off, so a following VK module with a matching size could
+  consume the *previous* module's pixels. Fixed at one choke point
+  (invalidate whenever a module's output was produced off the GPU
+  hook). Exactly the §4A "whack-a-mole" class this design retires
+  structurally.
+- **Evidence.** Unit suite `test_vulkan_capture` (9 tests, lavapipe):
+  captured chain bit-identical to eager and exactly 1 submission
+  where eager takes 5; sync-tap; snapshot-vs-clobber; borrowed
+  uploads; deferred-free non-aliasing; rollback; COPY/COPY_ROWS;
+  abort; nested-begin refusal. Integration: `darktable-cli` PFM
+  exports bit-identical with `pixelpipe_vulkan_graph` off vs on;
+  `-d vkgraph` shows e.g. colorin as one 7-node segment (1 dispatch +
+  6 uploads, 4.9 MB staged) in 1 submit. Full ctest green.
+
+Next up (M2): the span-capture sync-point audit, then glue nodes;
+blendop kernels (M0) can proceed in parallel.
+
+## 12. Summary
 
 - The eager, module-at-a-time execution model — not kernel speed — is
   what keeps darktable's GPU pipeline shuttling pixels over PCIe;
@@ -865,7 +974,9 @@ images/samplers (unlocks the last OpenCL-only kernels).
   all 73 ported modules already use — means no module rewrites, an
   incremental landing path with a permanent eager fallback, and a
   scheduler that degrades gracefully (segment splits) instead of
-  producing wrong pixels when a module needs the CPU.
+  producing wrong pixels when a module needs the CPU. M1 (§11) proved
+  this end-to-end: the executor landed with zero module changes and
+  bit-identical output.
 - Interactivity improves rather than survives: the pixelpipe cache
   gains a VRAM residency layer, so the steady-state slider drag
   becomes "record N..end, one submit, one fence" with zero trunk
