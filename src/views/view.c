@@ -1943,8 +1943,11 @@ void dt_view_paint_surface(cairo_t *cr,
   cairo_translate(cr, 0.5 * width, 0.5 * height);
   dt_pthread_mutex_lock(&pp->backbuf_mutex);
 
-  const int maxw = MIN(port->width, backbuf_scale * processed_width * (1<<closeup) / ppd);
-  const int maxh = MIN(port->height, backbuf_scale * processed_height * (1<<closeup) / ppd);
+  // full on-screen size of the image at the current zoom
+  const double img_w = backbuf_scale * processed_width  * (1<<closeup) / ppd;
+  const double img_h = backbuf_scale * processed_height * (1<<closeup) / ppd;
+  const int maxw = MIN(port->width, img_w);
+  const int maxh = MIN(port->height, img_h);
 
   if(port->color_assessment
      && window != DT_WINDOW_SLIDESHOW)
@@ -1958,31 +1961,80 @@ void dt_view_paint_surface(cairo_t *cr,
     cairo_fill(cr);
   }
 
-  cairo_rectangle(cr, -0.5 * maxw, -0.5 * maxh, maxw, maxh);
+  // Clip to the visible image region, not a box centred on the viewport: the
+  // image centre slides by -zoom as we pan, so a centred clip would leave the
+  // letterbox bars sitting on top of image content instead of glued to its edges.
+  const double img_cx = -zoom_x * img_w;
+  const double img_cy = -zoom_y * img_h;
+  const double clip_l = MAX(img_cx - 0.5 * img_w, -0.5 * port->width);
+  const double clip_r = MIN(img_cx + 0.5 * img_w,  0.5 * port->width);
+  const double clip_t = MAX(img_cy - 0.5 * img_h, -0.5 * port->height);
+  const double clip_b = MIN(img_cy + 0.5 * img_h,  0.5 * port->height);
+  cairo_rectangle(cr, clip_l, clip_t, MAX(0.0, clip_r - clip_l), MAX(0.0, clip_b - clip_t));
   cairo_clip(cr);
   const double back_scale = (buf_scale == 0 ? 1.0 : backbuf_scale / buf_scale) * (1<<closeup) / ppd;
   const double trans_x = (offset_x - zoom_x) * processed_width * buf_scale - 0.5 * buf_width;
   const double trans_y = (offset_y - zoom_y) * processed_height * buf_scale - 0.5 * buf_height;
 
-  // Check if we should use the preview pipe for fallback rendering
-  // This is only valid for the main develop (not for pinned images which have dev != darktable.develop)
-  const gboolean use_preview_fallback =
+  // How far the image reaches from the viewport centre on each side, in backbuf
+  // pixels, capped to the image part of the viewport (never the border) so a
+  // cursor-anchored zoom showing border doesn't needlessly fall back to preview.
+  const double need_x = maxw / 2 / back_scale;
+  const double need_y = maxh / 2 / back_scale;
+  const double need_left  = MIN(need_x, MAX(0.0, (0.5 + zoom_x) * processed_width  * buf_scale));
+  const double need_right = MIN(need_x, MAX(0.0, (0.5 - zoom_x) * processed_width  * buf_scale));
+  const double need_top   = MIN(need_y, MAX(0.0, (0.5 + zoom_y) * processed_height * buf_scale));
+  const double need_bot   = MIN(need_y, MAX(0.0, (0.5 - zoom_y) * processed_height * buf_scale));
+
+  // Two separate decisions on the main develop pipe (full / preview2, not pinned
+  // images): needs_reprocess marks the pipe DIRTY on scale mismatch or coverage
+  // gap, so a zoom-in actually recomputes at the new scale instead of upscaling
+  // a stale buffer. use_preview_fallback paints the preview pipe this frame, but
+  // ONLY on a coverage gap, never merely on scale mismatch - the preview and
+  // full-pipe paths position the image differently on a letterboxed axis, and
+  // flipping on every zoom step caused an auto-centering jump.
+  const gboolean is_main_port =
      (dev == darktable.develop)
      && pp->output_imgid == dev->image_storage.id
-     && (port->pipe->output_imgid != dev->image_storage.id
-         || fabsf(backbuf_scale / buf_scale - 1.0f) > .09f
-         || floor(maxw / 2 / back_scale) - 1 > MIN(- trans_x, trans_x + buf_width)
-         || floor(maxh / 2 / back_scale) - 1 > MIN(- trans_y, trans_y + buf_height))
      && (port == &dev->full || port == &dev->preview2);
 
-  if(use_preview_fallback)
+  const gboolean coverage_gap =
+        port->pipe->output_imgid != dev->image_storage.id
+     || floor(need_left)  - 1 > - trans_x
+     || floor(need_right) - 1 > trans_x + buf_width
+     || floor(need_top)   - 1 > - trans_y
+     || floor(need_bot)   - 1 > trans_y + buf_height;
+
+  const gboolean scale_mismatch =
+     buf_scale != 0 && fabsf(backbuf_scale / buf_scale - 1.0f) > .09f;
+
+  const gboolean needs_reprocess = is_main_port && (scale_mismatch || coverage_gap);
+  const gboolean use_preview_fallback = is_main_port && coverage_gap;
+
+  if(port == &dev->full)
+    dt_print(DT_DEBUG_CONTROL,
+      "[paint] fallback=%d reprocess=%d scale_mm=%d cover_gap=%d "
+      "zoom_x=%.4f zoom_y=%.4f offset_x=%.4f offset_y=%.4f "
+      "trans=(%.1f,%.1f) buf=%dx%d need_l/r=(%.1f,%.1f) have_l/r=(%.1f,%.1f) "
+      "need_t/b=(%.1f,%.1f) have_t/b=(%.1f,%.1f) zoom_scale=%.4f backbuf_scale=%.4f\n",
+      use_preview_fallback, needs_reprocess, scale_mismatch, coverage_gap,
+      zoom_x, zoom_y, offset_x, offset_y,
+      trans_x, trans_y, buf_width, buf_height,
+      need_left, need_right, -trans_x, trans_x + buf_width,
+      need_top, need_bot, -trans_y, trans_y + buf_height,
+      zoom_scale, backbuf_scale);
+
+  if(needs_reprocess)
   {
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_EXPOSE | DT_DEBUG_VERBOSE,
       "dt_view_paint_surface sets DT_DEV_PIPE_ZOOMED", port->pipe, NULL, DT_DEVICE_NONE, NULL, NULL);
     port->pipe->changed |= DT_DEV_PIPE_ZOOMED;
     if(port->pipe->status == DT_DEV_PIXELPIPE_VALID)
       port->pipe->status = DT_DEV_PIXELPIPE_DIRTY;
+  }
 
+  if(use_preview_fallback)
+  {
     // draw preview
     const int full_pipe_width = dev->full.pipe ? dev->full.pipe->processed_width : 1;
     const float wd = processed_width * pp->processed_width / MAX(1, full_pipe_width);

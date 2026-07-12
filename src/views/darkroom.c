@@ -3878,8 +3878,13 @@ void mouse_moved(dt_view_t *self,
   if(ctl->button_down && ctl->button_down_which == GDK_BUTTON_PRIMARY)
   {
     if(!handled)
-      dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, -1.f, 0,
-                       x - ctl->button_x, y - ctl->button_y, TRUE);
+    {
+      // No image panning in color assessment mode: an accidental drag must not
+      // shift the image around under the fixed assessment border.
+      if(!dev->full.color_assessment)
+        dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, -1.f, 0,
+                         x - ctl->button_x, y - ctl->button_y, TRUE);
+    }
     else
     {
       const int32_t bs = dev->full.border_size;
@@ -4216,6 +4221,9 @@ gboolean gesture_pan(dt_view_t *self,
   (void)y;
   (void)state;
   if(!dev) return FALSE;
+
+  // No panning in color assessment mode - the image stays put under the border.
+  if(dev->full.color_assessment) return FALSE;
 
   // If pointer is over an active mask, let scroll go to the mask handler;
   // otherwise allow two-finger scroll to pan the image.
@@ -4644,8 +4652,10 @@ static gboolean _second_window_mouse_moved_callback(GtkWidget *w,
 
     dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
 
-    dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
-                     event->x - ctl->button_x, event->y - ctl->button_y, TRUE);
+    // No image panning in color assessment mode (see main window handler).
+    if(!port->color_assessment)
+      dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
+                       event->x - ctl->button_x, event->y - ctl->button_y, TRUE);
     ctl->button_x = event->x;
     ctl->button_y = event->y;
     return TRUE;

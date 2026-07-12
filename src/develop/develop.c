@@ -52,6 +52,10 @@
 
 #define DT_DEV_AVERAGE_DELAY_COUNT 5
 
+// Max empty border on any one side while zoom-anchoring, as a fraction of the
+// viewport (0.5 = centre may reach the image edge).
+#define MAX_BORDER_FRAC 0.15f
+
 // Forward declaration
 static inline void _dt_dev_load_raw(dt_develop_t *dev, const dt_imgid_t imgid);
 
@@ -3087,6 +3091,7 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   const float old_pts1 = pts[1];
   const float old_zoom_scale = port->zoom_scale;
   const dt_dev_zoom_t old_zoom = port->zoom;
+  const dt_dev_zoom_t req_zoom = zoom; // the requested action, before it is reassigned below
   int old_closeup = port->closeup;
 
   int procw, proch;
@@ -3096,6 +3101,12 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   float zoom_y = pts[1] / proch - 0.5f;
 
   const float cur_scale = dt_dev_get_zoom_scale(port, port->zoom, 1<<port->closeup, FALSE);
+
+  // Keep-cursor preference (defaults on); used below for the fit-scale snap and
+  // the recentering clamp. Gate on dt_conf_key_exists() since dt_conf_get_bool()
+  // returns false for a key an incremental build hasn't regenerated defaults for.
+  const char *const keep_key = "darkroom/mouse/keep_cursor_pos_when_zooming_in";
+  const gboolean keep_cursor = !dt_conf_key_exists(keep_key) || dt_conf_get_bool(keep_key);
 
   if(zoom == DT_ZOOM_POSITION)
   {
@@ -3174,7 +3185,10 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       }
 
       if(fabsf(scale - 1.0f) < 0.001f) zoom = DT_ZOOM_1;
-      if(fabsf(scale - fitscale) < 0.001f) zoom = DT_ZOOM_FIT;
+      // Snapping to a centred DT_ZOOM_FIT here is the jump keep_cursor must avoid
+      // as a scroll crosses fit-scale; stay DT_ZOOM_FREE so the anchor below holds
+      // the cursor point. Scale still lands exactly on fit, only recentring drops.
+      if(fabsf(scale - fitscale) < 0.001f && !keep_cursor) zoom = DT_ZOOM_FIT;
     }
     else if(zoom == DT_ZOOM_FULL_PREVIEW)
     {
@@ -3231,8 +3245,60 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       zoom_y += mouse_off_y / cur_scale - mouse_off_y / new_scale;
     }
 
-    zoom_x = boxw > 1.0f ? 0.0f : CLAMP(zoom_x, boxw / 2 - .5, .5 - boxw / 2);
-    zoom_y = boxh > 1.0f ? 0.0f : CLAMP(zoom_y, boxh / 2 - .5, .5 - boxh / 2);
+    // Keep the point under the cursor fixed while zooming: leave the position
+    // free (clamped only to keep the viewport centre inside the image) instead
+    // of auto-centring, so a little border near an edge or letterboxed axis is
+    // fine. A zoom-direction test and hard-centring a letterboxed axis were both
+    // tried and dropped - each snapped the view mid-gesture (jitter and drift).
+    //
+    // Two cases still recentre: the load/validation pass (DT_ZOOM_MOVE with no
+    // offset, so a freshly opened image fills the viewport instead of restoring
+    // a stale position), and color assessment mode (image must stay centred in
+    // the white/grey frame).
+    const gboolean load_validation =
+      (req_zoom == DT_ZOOM_MOVE) && (x == 0.0f) && (y == 0.0f);
+    const gboolean relax = keep_cursor && !load_validation && !port->color_assessment;
+
+    const float pre_clamp_x = zoom_x, pre_clamp_y = zoom_y;
+
+    if(relax)
+    {
+      // Cap the empty border on any side to MAX_BORDER_FRAC. Border fraction on
+      // a side is (zoom + box/2 - 0.5)/box, so holding it at f gives the bound
+      // zoom = 0.5 - (0.5 - f)*box.
+      const float slack = 0.5f - MAX_BORDER_FRAC;
+      float bx = 0.5f - slack * boxw;
+      float by = 0.5f - slack * boxh;
+      // The cap must never pull an already off-centre view back toward centre -
+      // that snap is the auto-centring jump we must avoid. Two escape hatches:
+      //  - when the box is so small the cap can't be met even centred
+      //    (box > 1/slack, bound < 0), allow the full range;
+      //  - otherwise never clamp tighter than the offset committed before this
+      //    event (prev_*), so a zoom-in from a panned/letterboxed position holds
+      //    its place. The cap then only stops the border from *growing*; the
+      //    cursor anchor shrinks any over-cap border smoothly as the zoom
+      //    proceeds, and the cap resumes once the view is back within it.
+      const float prev_x = fabsf(old_pts0 / procw - 0.5f);
+      const float prev_y = fabsf(old_pts1 / proch - 0.5f);
+      bx = (bx < 0.0f) ? 0.5f : MIN(0.5f, MAX(bx, prev_x));
+      by = (by < 0.0f) ? 0.5f : MIN(0.5f, MAX(by, prev_y));
+      zoom_x = CLAMP(zoom_x, -bx, bx);
+      zoom_y = CLAMP(zoom_y, -by, by);
+    }
+    else
+    {
+      // load/validation: recentre so the image fills the viewport
+      zoom_x = boxw > 1.0f ? 0.0f : CLAMP(zoom_x, boxw / 2 - .5, .5 - boxw / 2);
+      zoom_y = boxh > 1.0f ? 0.0f : CLAMP(zoom_y, boxh / 2 - .5, .5 - boxh / 2);
+    }
+
+    dt_print(DT_DEBUG_CONTROL,
+      "[zoom_move] req=%d constrain=%d cur_scale=%.4f new_scale=%.4f "
+      "boxw=%.3f boxh=%.3f keep=%d load_val=%d relax=%d "
+      "cursor=(%.0f,%.0f) zoom pre=(%.4f,%.4f) post=(%.4f,%.4f)\n",
+      req_zoom, constrain, cur_scale, new_scale, boxw, boxh,
+      keep_cursor, load_validation, relax, x, y,
+      pre_clamp_x, pre_clamp_y, zoom_x, zoom_y);
   }
 
   pts[0] = (zoom_x + 0.5f) * procw;
@@ -3254,6 +3320,12 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
 
   dt_pthread_mutex_unlock(&dev->history_mutex);
   dt_pthread_mutex_unlock(&darktable.control->global_mutex);
+
+  dt_print(DT_DEBUG_CONTROL,
+    "[zoom_move] result req=%d has_moved=%d moved_thr=%.1f "
+    "port->zoom_x=%.2f port->zoom_y=%.2f zoom=%d closeup=%d zoom_scale=%.4f\n",
+    req_zoom, has_moved, moved_threshold,
+    port->zoom_x, port->zoom_y, port->zoom, port->closeup, port->zoom_scale);
 
   if(!has_moved
      && fabsf(old_zoom_scale - port->zoom_scale) < 0.01f
