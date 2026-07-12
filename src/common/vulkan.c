@@ -119,6 +119,111 @@ static uint32_t _find_memtype(const dt_vk_device_t *d,
   return UINT32_MAX;
 }
 
+// ---- capture / deferred graph execution (DAG milestone M1) -----------
+//
+// dev-doc/gpu_resident_pixelpipe_dag.md §5.1-§5.3. The M1 IR is
+// deliberately simpler than the design sketch: nodes reference *real*
+// dt_vk_mem_t buffers (allocated from the pool exactly as in eager
+// mode) instead of virtual resource ids, and correctness of buffer
+// reuse is guaranteed by deferring dt_vulkan_free_buffer until the
+// segment flush rather than by liveness analysis. The M3 planner
+// swaps this for interval-aliased arena offsets without touching the
+// node shape.
+
+typedef enum _capture_node_kind_t
+{
+  _NODE_DISPATCH = 0,
+  _NODE_UPLOAD,     // staging slice -> dst buffer (payload snapshotted or borrowed)
+  _NODE_COPY,       // src buffer -> dst buffer, one region at offset 0
+  _NODE_COPY_ROWS,  // src -> dst, one region per row (subregion copy)
+} _capture_node_kind_t;
+
+typedef struct _capture_node_t
+{
+  _capture_node_kind_t kind;
+
+  // _NODE_DISPATCH
+  int          kernel;                        // device kernel slot
+  uint32_t     gx, gy, gz;                    // resolved workgroup counts
+  uint32_t     nbufs;
+  dt_vk_mem_t *bufs[DT_VULKAN_MAX_BINDINGS];
+  uint32_t     push_size;
+  uint8_t      push[DT_VULKAN_MAX_PUSH_CONSTANTS];
+
+  // _NODE_UPLOAD / _NODE_COPY / _NODE_COPY_ROWS
+  dt_vk_mem_t       *dst;
+  const dt_vk_mem_t *src;         // COPY / COPY_ROWS
+  size_t             size;        // UPLOAD / COPY byte count
+  const void        *borrowed;    // UPLOAD: borrowed host pointer, or NULL
+  size_t             ring_off;    // UPLOAD: offset into the snapshot ring
+  VkDeviceSize       staging_off; // UPLOAD: staging offset, assigned at flush
+
+  // _NODE_COPY_ROWS geometry (see dt_vulkan_copy_subregion)
+  size_t sox, soy, dox, doy, rw, rh, srp, drp, bpp;
+} _capture_node_t;
+
+typedef struct dt_vk_capture_ctx_t
+{
+  gboolean   active;
+  int        devid;
+  GArray    *nodes;      // of _capture_node_t
+  uint8_t   *ring;       // snapshot payloads (uploads whose host ptr dies)
+  size_t     ring_used;
+  size_t     ring_cap;
+  GPtrArray *dfree;      // dt_vk_mem_t* whose free is deferred to flush
+  uint32_t   flushes;    // segments submitted since begin (diagnostics)
+} dt_vk_capture_ctx_t;
+
+// One context per thread: parallel pipelines (full / preview / export)
+// capture independently and only serialise on the device lock at
+// flush time. __thread has precedent in src/control/jobs.c and is
+// checked by the build system (src/CMakeLists.txt tests it).
+static __thread dt_vk_capture_ctx_t *g_capture = NULL;
+
+// Active context of the calling thread, or NULL in eager mode.
+static inline dt_vk_capture_ctx_t *_cap(void)
+{
+  return (g_capture && g_capture->active) ? g_capture : NULL;
+}
+
+static _capture_node_t *_capture_append(dt_vk_capture_ctx_t *c)
+{
+  _capture_node_t z;
+  memset(&z, 0, sizeof(z));
+  g_array_append_val(c->nodes, z);
+  return &g_array_index(c->nodes, _capture_node_t, c->nodes->len - 1);
+}
+
+// Copy an upload payload into the snapshot ring (4-byte aligned so the
+// flush can reuse the offsets as vkCmdCopyBuffer staging offsets).
+static int _capture_ring_push(dt_vk_capture_ctx_t *c,
+                              const void *data, size_t size, size_t *off)
+{
+  const size_t base = (c->ring_used + 3u) & ~(size_t)3u;
+  if(base + size > c->ring_cap)
+  {
+    size_t cap = c->ring_cap ? c->ring_cap : (size_t)1 << 20;
+    while(cap < base + size) cap *= 2;
+    uint8_t *ring = realloc(c->ring, cap);
+    if(!ring) return -1;
+    c->ring = ring;
+    c->ring_cap = cap;
+  }
+  memcpy(c->ring + base, data, size);
+  *off = base;
+  c->ring_used = base + size;
+  return 0;
+}
+
+// Wind the context back to a checkpoint (failed append inside one HAL
+// call, or module-granular rollback via dt_vulkan_capture_rollback).
+static void _capture_truncate(dt_vk_capture_ctx_t *c,
+                              uint32_t nodes, size_t ring_used)
+{
+  if(c->nodes->len > nodes) g_array_set_size(c->nodes, nodes);
+  if(c->ring_used > ring_used) c->ring_used = ring_used;
+}
+
 // ---- init / cleanup --------------------------------------------------
 
 static gboolean _create_device(dt_vk_device_t *d, VkPhysicalDevice phys)
@@ -594,7 +699,30 @@ void dt_vulkan_free_buffer(int devid, dt_vk_mem_t *mem)
 {
   if(!mem || !dt_vulkan_running()) return;
   (void)devid;
+
+  // Under capture, pending nodes may still reference this buffer —
+  // the GPU work hasn't run yet. Defer the release to the segment
+  // flush (or rollback), which happens after the fence wait.
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    g_ptr_array_add(cap->dfree, mem);
+    return;
+  }
+
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  if(_pool_put(d, mem)) return;
+  if(mem->buffer) vkDestroyBuffer(d->device, mem->buffer, NULL);
+  if(mem->memory) vkFreeMemory(d->device, mem->memory, NULL);
+  free(mem);
+}
+
+// Really release a buffer: pool if possible, destroy otherwise.
+// The no-capture branch of dt_vulkan_free_buffer, callable from the
+// flush/rollback paths that drain the deferred-free list.
+static void _release_buffer(dt_vk_device_t *d, dt_vk_mem_t *mem)
+{
+  if(!mem) return;
   if(_pool_put(d, mem)) return;
   if(mem->buffer) vkDestroyBuffer(d->device, mem->buffer, NULL);
   if(mem->memory) vkFreeMemory(d->device, mem->memory, NULL);
@@ -650,6 +778,7 @@ static int _submit_one_shot(dt_vk_device_t *d, _record_cb fn, void *user)
   VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                       .commandBufferCount = 1, .pCommandBuffers = &cmd };
   VKCHECK(vkQueueSubmit(d->queue, 1, &si, d->oneshot_fence));
+  d->submit_count++;
   VKCHECK(vkWaitForFences(d->device, 1, &d->oneshot_fence, VK_TRUE, UINT64_MAX));
   rc = 0;
 
@@ -702,13 +831,30 @@ static dt_vk_mem_t *_ensure_staging(dt_vk_device_t *d, size_t size)
   return d->staging;
 }
 
-int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
-                              const void *host, size_t size)
+// Shared body for the snapshot / borrowed upload flavours.
+static int _write_to_device(int devid, dt_vk_mem_t *dst,
+                            const void *host, size_t size,
+                            gboolean borrow)
 {
-  if(!dt_vulkan_running() || !dst) return -1;
+  if(!dt_vulkan_running() || !dst || !host) return -1;
   (void)devid;
-  dt_vk_device_t *d = &darktable.vulkan->dev[0];
 
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    size_t ring_off = 0;
+    if(!borrow && _capture_ring_push(cap, host, size, &ring_off) != 0)
+      return -1;
+    _capture_node_t *n = _capture_append(cap);
+    n->kind = _NODE_UPLOAD;
+    n->dst = dst;
+    n->size = size;
+    n->borrowed = borrow ? host : NULL;
+    n->ring_off = ring_off;
+    return 0;
+  }
+
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
   dt_vk_mem_t *staging = _ensure_staging(d, size);
   if(!staging) return -1;
 
@@ -722,11 +868,37 @@ int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
   return _submit_one_shot(d, _record_copy, &a);
 }
 
+int dt_vulkan_write_to_device(int devid, dt_vk_mem_t *dst,
+                              const void *host, size_t size)
+{
+  return _write_to_device(devid, dst, host, size, FALSE);
+}
+
+int dt_vulkan_write_to_device_borrowed(int devid, dt_vk_mem_t *dst,
+                                       const void *host, size_t size)
+{
+  return _write_to_device(devid, dst, host, size, TRUE);
+}
+
 int dt_vulkan_read_from_device(int devid, void *host,
                                const dt_vk_mem_t *src, size_t size)
 {
   if(!dt_vulkan_running() || !src) return -1;
   (void)devid;
+
+  // Sync tap (dev-doc/gpu_resident_pixelpipe_dag.md §5.3): a read of a
+  // buffer whose producing nodes haven't executed can't be served
+  // lazily. Flush the pending segment (submit + fence), then serve
+  // the read eagerly. Capture stays active for the next segment.
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    dt_print(DT_DEBUG_VKGRAPH,
+             "[vkgraph] sync tap: flushing %u node(s) to serve a %zu byte readback",
+             cap->nodes->len, size);
+    if(dt_vulkan_capture_flush(cap->devid) != 0) return -1;
+  }
+
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
 
   dt_vk_mem_t *staging = _ensure_staging(d, size);
@@ -749,6 +921,18 @@ int dt_vulkan_copy_device_to_device(int devid, dt_vk_mem_t *dst,
 {
   if(!dt_vulkan_running() || !dst || !src) return -1;
   (void)devid;
+
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    _capture_node_t *n = _capture_append(cap);
+    n->kind = _NODE_COPY;
+    n->dst = dst;
+    n->src = src;
+    n->size = size;
+    return 0;
+  }
+
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
   _copy_args_t a = { src->buffer, dst->buffer, (VkDeviceSize)size };
   return _submit_one_shot(d, _record_copy, &a);
@@ -766,6 +950,22 @@ int dt_vulkan_copy_subregion(int devid,
   if(!dt_vulkan_running() || !dst || !src) return -1;
   if(region_w == 0 || region_h == 0) return 0;
   (void)devid;
+
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    _capture_node_t *n = _capture_append(cap);
+    n->kind = _NODE_COPY_ROWS;
+    n->dst = dst;
+    n->src = src;
+    n->sox = src_offset_x; n->soy = src_offset_y;
+    n->dox = dst_offset_x; n->doy = dst_offset_y;
+    n->rw = region_w; n->rh = region_h;
+    n->srp = src_row_pixels; n->drp = dst_row_pixels;
+    n->bpp = bytes_per_pixel;
+    return 0;
+  }
+
   dt_vk_device_t *d = &darktable.vulkan->dev[0];
 
   // One VkBufferCopy region per row. For small region_h this is a
@@ -873,6 +1073,372 @@ static int _record_batched(VkCommandBuffer cmd, void *u)
   return 0;
 }
 
+// ---- capture executor (plan / record / submit one segment) -----------
+
+typedef struct _graph_record_args_t
+{
+  dt_vk_capture_ctx_t *cap;
+  dt_vk_device_t      *d;
+  VkBuffer             staging;  // VK_NULL_HANDLE when no uploads
+  VkDescriptorSet     *dsets;    // parallel to nodes; only DISPATCH slots set
+} _graph_record_args_t;
+
+// M1 barrier policy: correctness over overlap. A full memory barrier
+// between every pair of adjacent nodes, staged by the node kinds —
+// except between two uploads with distinct destinations, which cannot
+// hazard each other (their common staging source is read-only here,
+// and ordering against *earlier* nodes flows transitively through the
+// stage-scoped barriers already emitted). The M3 planner narrows this
+// to per-resource dependencies once liveness intervals exist.
+static gboolean _graph_needs_barrier(const _capture_node_t *prev,
+                                     const _capture_node_t *cur)
+{
+  if(prev->kind == _NODE_UPLOAD && cur->kind == _NODE_UPLOAD
+     && prev->dst != cur->dst)
+    return FALSE;
+  return TRUE;
+}
+
+static int _record_graph(VkCommandBuffer cmd, void *user)
+{
+  const _graph_record_args_t *a = user;
+  const dt_vk_capture_ctx_t *cap = a->cap;
+
+  for(guint i = 0; i < cap->nodes->len; i++)
+  {
+    const _capture_node_t *n = &g_array_index(cap->nodes, _capture_node_t, i);
+
+    if(i > 0)
+    {
+      const _capture_node_t *p = &g_array_index(cap->nodes, _capture_node_t, i - 1);
+      if(_graph_needs_barrier(p, n))
+      {
+        const gboolean src_compute = (p->kind == _NODE_DISPATCH);
+        const gboolean dst_compute = (n->kind == _NODE_DISPATCH);
+        const VkMemoryBarrier mb = {
+          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+          .srcAccessMask = src_compute ? VK_ACCESS_SHADER_WRITE_BIT
+                                       : VK_ACCESS_TRANSFER_WRITE_BIT,
+          .dstAccessMask = dst_compute ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+                                       : (VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+        };
+        vkCmdPipelineBarrier(cmd,
+                             src_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             dst_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+      }
+    }
+
+    switch(n->kind)
+    {
+      case _NODE_UPLOAD:
+      {
+        const VkBufferCopy r = { n->staging_off, 0, (VkDeviceSize)n->size };
+        vkCmdCopyBuffer(cmd, a->staging, n->dst->buffer, 1, &r);
+        break;
+      }
+      case _NODE_COPY:
+      {
+        const VkBufferCopy r = { 0, 0, (VkDeviceSize)n->size };
+        vkCmdCopyBuffer(cmd, n->src->buffer, n->dst->buffer, 1, &r);
+        break;
+      }
+      case _NODE_COPY_ROWS:
+      {
+        // Same per-row region math as the eager dt_vulkan_copy_subregion.
+        VkBufferCopy *regions = malloc(sizeof(VkBufferCopy) * n->rh);
+        if(!regions) return -1;
+        const VkDeviceSize row_bytes  = (VkDeviceSize)n->rw * n->bpp;
+        const VkDeviceSize src_stride = (VkDeviceSize)n->srp * n->bpp;
+        const VkDeviceSize dst_stride = (VkDeviceSize)n->drp * n->bpp;
+        for(size_t r = 0; r < n->rh; r++)
+        {
+          regions[r].srcOffset = (VkDeviceSize)(n->soy + r) * src_stride
+                               + (VkDeviceSize)n->sox * n->bpp;
+          regions[r].dstOffset = (VkDeviceSize)(n->doy + r) * dst_stride
+                               + (VkDeviceSize)n->dox * n->bpp;
+          regions[r].size = row_bytes;
+        }
+        vkCmdCopyBuffer(cmd, n->src->buffer, n->dst->buffer,
+                        (uint32_t)n->rh, regions);
+        free(regions);  // vkCmdCopyBuffer consumes pRegions at record time
+        break;
+      }
+      case _NODE_DISPATCH:
+      {
+        const dt_vk_kernel_t *k = &a->d->kernels[n->kernel];
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                k->pipeline_layout, 0, 1, &a->dsets[i], 0, NULL);
+        if(n->push_size)
+          vkCmdPushConstants(cmd, k->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                             0, n->push_size, n->push);
+        vkCmdDispatch(cmd, n->gx, n->gy, n->gz);
+        break;
+      }
+    }
+  }
+  return 0;
+}
+
+gboolean dt_vulkan_capture_begin(int devid)
+{
+  if(!dt_vulkan_running() || devid != 0) return FALSE;
+  if(g_capture && g_capture->active)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[vkgraph] capture_begin while a capture is already active on "
+             "this thread — the nested caller stays on the eager path");
+    return FALSE;
+  }
+  if(!g_capture)
+  {
+    g_capture = calloc(1, sizeof(*g_capture));
+    if(!g_capture) return FALSE;
+    g_capture->nodes = g_array_new(FALSE, FALSE, sizeof(_capture_node_t));
+    g_capture->dfree = g_ptr_array_new();
+  }
+  g_capture->active = TRUE;
+  g_capture->devid = devid;
+  g_capture->ring_used = 0;
+  g_capture->flushes = 0;
+  return TRUE;
+}
+
+gboolean dt_vulkan_capture_active(void)
+{
+  return _cap() != NULL;
+}
+
+uint32_t dt_vulkan_capture_pending(void)
+{
+  const dt_vk_capture_ctx_t *cap = _cap();
+  return cap ? cap->nodes->len : 0;
+}
+
+int dt_vulkan_capture_flush(int devid)
+{
+  (void)devid;
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(!cap) return 0;
+
+  if(!dt_vulkan_running())
+  {
+    // Device went away mid-capture (shutdown). Drop everything; the
+    // deferred buffers die with the device.
+    g_array_set_size(cap->nodes, 0);
+    cap->ring_used = 0;
+    g_ptr_array_set_size(cap->dfree, 0);
+    return -1;
+  }
+
+  dt_vk_device_t *d = &darktable.vulkan->dev[0];
+  const guint nn = cap->nodes->len;
+  int rc = 0;
+
+  if(nn > 0)
+  {
+    // ---- plan: staging offsets for uploads, descriptor demand ----
+    VkDeviceSize staging_total = 0;
+    guint n_dispatch = 0, n_upload = 0, n_copy = 0;
+    uint32_t total_bindings = 0;
+    for(guint i = 0; i < nn; i++)
+    {
+      _capture_node_t *n = &g_array_index(cap->nodes, _capture_node_t, i);
+      if(n->kind == _NODE_UPLOAD)
+      {
+        n->staging_off = staging_total;
+        staging_total += (VkDeviceSize)n->size;
+        staging_total = (staging_total + 3u) & ~(VkDeviceSize)3u;
+        n_upload++;
+      }
+      else if(n->kind == _NODE_DISPATCH)
+      {
+        n_dispatch++;
+        total_bindings += n->nbufs;
+      }
+      else
+        n_copy++;
+    }
+
+    // ---- stage all upload payloads in one map/memcpy pass ----
+    dt_vk_mem_t *staging = NULL;
+    if(rc == 0 && staging_total > 0)
+    {
+      staging = _ensure_staging(d, (size_t)staging_total);
+      if(!staging) rc = -1;
+      void *p = NULL;
+      if(rc == 0
+         && vkMapMemory(d->device, staging->memory, 0, staging_total, 0, &p) != VK_SUCCESS)
+        rc = -1;
+      if(rc == 0)
+      {
+        for(guint i = 0; i < nn; i++)
+        {
+          const _capture_node_t *n = &g_array_index(cap->nodes, _capture_node_t, i);
+          if(n->kind != _NODE_UPLOAD) continue;
+          const void *src = n->borrowed ? n->borrowed : cap->ring + n->ring_off;
+          memcpy((char *)p + n->staging_off, src, n->size);
+        }
+        vkUnmapMemory(d->device, staging->memory);
+      }
+    }
+
+    // ---- one descriptor pool + set per dispatch for this segment ----
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet *dsets = NULL;
+    if(rc == 0 && n_dispatch > 0)
+    {
+      const VkDescriptorPoolSize psz = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                         .descriptorCount = total_bindings };
+      const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                                .maxSets = n_dispatch,
+                                                .poolSizeCount = 1, .pPoolSizes = &psz };
+      if(vkCreateDescriptorPool(d->device, &dpci, NULL, &pool) != VK_SUCCESS)
+        rc = -1;
+      dsets = rc == 0 ? calloc(nn, sizeof(VkDescriptorSet)) : NULL;
+      if(rc == 0 && !dsets) rc = -1;
+      for(guint i = 0; rc == 0 && i < nn; i++)
+      {
+        const _capture_node_t *n = &g_array_index(cap->nodes, _capture_node_t, i);
+        if(n->kind != _NODE_DISPATCH) continue;
+        const dt_vk_kernel_t *k = &d->kernels[n->kernel];
+        const VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &k->dset_layout };
+        if(vkAllocateDescriptorSets(d->device, &dsai, &dsets[i]) != VK_SUCCESS)
+        {
+          rc = -1;
+          break;
+        }
+        VkDescriptorBufferInfo bi[DT_VULKAN_MAX_BINDINGS];
+        VkWriteDescriptorSet   ws[DT_VULKAN_MAX_BINDINGS];
+        for(uint32_t b = 0; b < n->nbufs; b++)
+        {
+          bi[b] = (VkDescriptorBufferInfo){ .buffer = n->bufs[b]->buffer,
+                                            .offset = 0, .range = n->bufs[b]->size };
+          ws[b] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = dsets[i], .dstBinding = b,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                          .pBufferInfo = &bi[b] };
+        }
+        vkUpdateDescriptorSets(d->device, n->nbufs, ws, 0, NULL);
+      }
+    }
+
+    // ---- record + submit once, wait once ----
+    if(rc == 0)
+    {
+      _graph_record_args_t ga = { .cap = cap, .d = d,
+                                  .staging = staging ? staging->buffer : VK_NULL_HANDLE,
+                                  .dsets = dsets };
+      rc = _submit_one_shot(d, _record_graph, &ga);
+    }
+
+    if(pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(d->device, pool, NULL);
+    free(dsets);
+
+    dt_print(DT_DEBUG_VKGRAPH,
+             "[vkgraph] flush #%u: %u nodes (%u dispatch, %u upload / %.1f MB staged, "
+             "%u copy) -> %s",
+             cap->flushes, nn, n_dispatch, n_upload, 1e-6 * (double)staging_total,
+             n_copy, rc == 0 ? "1 submit" : "FAILED, segment dropped");
+  }
+
+  // ---- segment epilogue: reset capture state, run deferred frees ----
+  // After the fence wait (or after dropping the nodes) nothing pending
+  // references the deferred buffers any more.
+  g_array_set_size(cap->nodes, 0);
+  cap->ring_used = 0;
+  for(guint i = 0; i < cap->dfree->len; i++)
+    _release_buffer(d, g_ptr_array_index(cap->dfree, i));
+  g_ptr_array_set_size(cap->dfree, 0);
+  cap->flushes++;
+  return rc;
+}
+
+int dt_vulkan_capture_end(int devid)
+{
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(!cap) return 0;
+  const int rc = dt_vulkan_capture_flush(devid);
+  cap->active = FALSE;
+  // Don't let a trunk-sized snapshot ring linger on a pooled pipeline
+  // thread between spans.
+  free(cap->ring);
+  cap->ring = NULL;
+  cap->ring_cap = cap->ring_used = 0;
+  return rc;
+}
+
+void dt_vulkan_capture_abort(int devid)
+{
+  (void)devid;
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(!cap) return;
+  if(cap->nodes->len)
+    dt_print(DT_DEBUG_VKGRAPH,
+             "[vkgraph] abort: dropping %u pending node(s)", cap->nodes->len);
+  g_array_set_size(cap->nodes, 0);
+  cap->ring_used = 0;
+  if(dt_vulkan_running())
+  {
+    dt_vk_device_t *d = &darktable.vulkan->dev[0];
+    for(guint i = 0; i < cap->dfree->len; i++)
+      _release_buffer(d, g_ptr_array_index(cap->dfree, i));
+  }
+  g_ptr_array_set_size(cap->dfree, 0);
+  cap->active = FALSE;
+  free(cap->ring);
+  cap->ring = NULL;
+  cap->ring_cap = 0;
+}
+
+dt_vk_capture_mark_t dt_vulkan_capture_mark(void)
+{
+  dt_vk_capture_mark_t m = { 0, 0, 0 };
+  const dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    m.nodes = cap->nodes->len;
+    m.dfrees = cap->dfree->len;
+    m.ring = cap->ring_used;
+  }
+  return m;
+}
+
+void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark)
+{
+  (void)devid;
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(!cap || !mark) return;
+  if(cap->nodes->len > mark->nodes)
+    dt_print(DT_DEBUG_VKGRAPH,
+             "[vkgraph] rollback: dropping %u node(s)",
+             cap->nodes->len - mark->nodes);
+  _capture_truncate(cap, mark->nodes, mark->ring);
+  // Frees deferred after the mark belong to the rolled-back module's
+  // scratch; no surviving node references them, so release them now.
+  if(dt_vulkan_running())
+  {
+    dt_vk_device_t *d = &darktable.vulkan->dev[0];
+    for(guint i = mark->dfrees; i < cap->dfree->len; i++)
+      _release_buffer(d, g_ptr_array_index(cap->dfree, i));
+  }
+  g_ptr_array_set_size(cap->dfree, mark->dfrees);
+}
+
+uint64_t dt_vulkan_submission_count(int devid)
+{
+  if(!dt_vulkan_running()) return 0;
+  (void)devid;
+  return darktable.vulkan->dev[0].submit_count;
+}
+
 // ---- module helpers --------------------------------------------------
 //
 // Reduce the per-module wiring boilerplate to ~3 lines. See the
@@ -972,6 +1538,39 @@ int dt_vulkan_dispatch_n_batched(const dt_vk_module_kernel_t *k,
   if(!kk->used) return -1;
   if(buffer_count != kk->num_storage_buffer_bindings) return -1;
   if(push_constant_size != kk->push_constant_size)    return -1;
+
+  // Capture: the uploads become UPLOAD nodes (payloads snapshotted —
+  // they are typically stack-local LUTs that die with the caller) and
+  // the kernel becomes a DISPATCH node via the enqueue path's capture
+  // branch. Any failure winds the context back so a -1 here leaves
+  // the graph exactly as before the call.
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    const uint32_t n0 = cap->nodes->len;
+    const size_t   r0 = cap->ring_used;
+    for(size_t i = 0; i < upload_count; i++)
+    {
+      size_t off = 0;
+      if(!uploads[i].dst || !uploads[i].host
+         || _capture_ring_push(cap, uploads[i].host, uploads[i].size, &off) != 0)
+      {
+        _capture_truncate(cap, n0, r0);
+        return -1;
+      }
+      _capture_node_t *n = _capture_append(cap);
+      n->kind = _NODE_UPLOAD;
+      n->dst = uploads[i].dst;
+      n->size = uploads[i].size;
+      n->ring_off = off;
+    }
+    const int rc = dt_vulkan_enqueue_kernel_2d(0, k->kernel,
+                                               global_w, global_h,
+                                               buffers, buffer_count,
+                                               push_constants, push_constant_size);
+    if(rc != 0) _capture_truncate(cap, n0, r0);
+    return rc;
+  }
 
   // Pack all uploads contiguously in the shared staging buffer. Each
   // upload's staging offset is 4-byte aligned (Vulkan requires this
@@ -1081,6 +1680,29 @@ int dt_vulkan_enqueue_kernel_2d(int devid, int kernel,
   if(!k->used) return -1;
   if(buffer_count != k->num_storage_buffer_bindings) return -1;
   if(push_constant_size != k->push_constant_size)    return -1;
+  for(size_t i = 0; i < buffer_count; ++i)
+    if(!buffers[i]) return -1;
+
+  // Capture: same validation as the eager path just ran, so a module
+  // whose dispatch would fail eagerly fails identically here and its
+  // fallback logic stays truthful. Workgroup counts are resolved now;
+  // push constants are snapshotted (module-local storage).
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(cap)
+  {
+    _capture_node_t *n = _capture_append(cap);
+    n->kind = _NODE_DISPATCH;
+    n->kernel = kernel;
+    n->gx = (uint32_t)((global_w + k->local_size_x - 1) / k->local_size_x);
+    n->gy = (uint32_t)((global_h + k->local_size_y - 1) / k->local_size_y);
+    n->gz = 1;
+    n->nbufs = (uint32_t)buffer_count;
+    for(size_t i = 0; i < buffer_count; ++i) n->bufs[i] = buffers[i];
+    n->push_size = (uint32_t)push_constant_size;
+    if(push_constant_size && push_constants)
+      memcpy(n->push, push_constants, push_constant_size);
+    return 0;
+  }
 
   // Allocate a descriptor set from the device pool.
   VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,

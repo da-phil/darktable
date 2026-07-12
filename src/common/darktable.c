@@ -1173,6 +1173,7 @@ int dt_init(int argc,
           !strcmp(darg, "expose") ? DT_DEBUG_EXPOSE :
           !strcmp(darg, "picker") ? DT_DEBUG_PICKER :
           !strcmp(darg, "ai") ? DT_DEBUG_AI : // AI related stuff.
+          !strcmp(darg, "vkgraph") ? DT_DEBUG_VKGRAPH : // captured Vulkan graph execution
           0;
         if(dadd)
           darktable.unmuted |= dadd;

@@ -149,6 +149,14 @@ typedef struct dt_vk_device_t
   // pair on every submission.
   VkCommandBuffer     oneshot_cmd;
   VkFence             oneshot_fence;
+
+  // Monotonic count of successful vkQueueSubmit calls on this device
+  // (eager dispatches, staging copies, and capture flushes alike).
+  // Diagnostic only: lets the capture unit tests and the -d vkgraph
+  // log verify that a captured span really collapsed into one
+  // submission. Updated under the same g_vk_lock discipline all
+  // submitters already follow.
+  uint64_t            submit_count;
 } dt_vk_device_t;
 
 #define DT_VULKAN_BUF_POOL_CAP 64
@@ -358,6 +366,105 @@ int dt_vulkan_copy_subregion(int devid,
                              size_t src_row_pixels, size_t dst_row_pixels,
                              size_t bytes_per_pixel);
 
+// ---- capture / deferred graph execution (DAG milestone M1) -----------
+//
+// See dev-doc/gpu_resident_pixelpipe_dag.md §5. When a capture context
+// is active on the calling thread, the dispatch and copy entry points
+// above stop submitting one-shot command buffers and instead append
+// *nodes* to a per-thread graph:
+//
+//   dispatch_*            -> DISPATCH node (push constants snapshotted)
+//   write_to_device       -> UPLOAD node (payload snapshotted — module
+//                            LUTs/matrices live in stack arrays that
+//                            die before the flush)
+//   write_to_device_borrowed -> UPLOAD node borrowing the host pointer
+//                            (caller guarantees it outlives the flush)
+//   copy_device_to_device -> COPY node
+//   copy_subregion        -> COPY node (row regions built at record)
+//   free_buffer           -> deferred until the next flush, since
+//                            pending nodes may still reference the
+//                            buffer (naive M1 liveness; the M3 planner
+//                            replaces this with interval aliasing)
+//   read_from_device      -> SYNC TAP: flushes the pending segment,
+//                            waits, then serves the read eagerly —
+//                            mid-module host readbacks keep working
+//                            unmodified, at eager-path cost
+//
+// dt_vulkan_capture_flush records every pending node into ONE command
+// buffer — a leading staging map/memcpy for all uploads, pipeline
+// barriers between dependent nodes, one descriptor pool for the whole
+// segment — submits once and waits one fence. Node capture itself
+// touches no device state and needs no lock; begin/mark/rollback are
+// lock-free too. flush/end/abort/rollback release or submit device
+// resources and follow the same rule as the eager entry points: the
+// caller holds the device lock (dt_vulkan_lock_device).
+//
+// Error contract: a failed capture append returns -1 from the same
+// entry point that would have failed eagerly, with the context wound
+// back to its pre-call state — the caller's existing fallback path
+// (module returns -1, pixelpipe rolls back and goes CPU) works
+// unchanged. A failed flush drops the segment and returns -1; buffer
+// contents produced by the dropped nodes are undefined, matching the
+// eager path's contract after a failed dispatch.
+
+typedef struct dt_vk_capture_mark_t
+{
+  uint32_t nodes;   // node count at mark time
+  uint32_t dfrees;  // deferred-free count at mark time
+  size_t   ring;    // snapshot-ring bytes used at mark time
+} dt_vk_capture_mark_t;
+
+/** Enter capture mode on the calling thread. Returns FALSE (and stays
+ *  in eager mode) if Vulkan isn't running, devid is invalid, or a
+ *  capture is already active on this thread. */
+gboolean dt_vulkan_capture_begin(int devid);
+
+/** TRUE iff the calling thread has an active capture context. */
+gboolean dt_vulkan_capture_active(void);
+
+/** Number of nodes captured but not yet flushed (0 outside capture). */
+uint32_t dt_vulkan_capture_pending(void);
+
+/** Submit the pending segment (one command buffer, one fence wait),
+ *  then execute deferred frees. Capture stays active — subsequent HAL
+ *  calls start a new segment. No-op segment (0 nodes) skips the
+ *  submit entirely. Returns 0 on success. Caller holds the device
+ *  lock. */
+int dt_vulkan_capture_flush(int devid);
+
+/** Flush, then leave capture mode. Returns the flush result. Caller
+ *  holds the device lock. */
+int dt_vulkan_capture_end(int devid);
+
+/** Drop all pending nodes WITHOUT executing them, run deferred frees,
+ *  leave capture mode. For error/shutdown paths where the results are
+ *  being abandoned. Caller holds the device lock. */
+void dt_vulkan_capture_abort(int devid);
+
+/** Checkpoint for module-granular rollback. Take a mark before
+ *  calling a module's process_vk under capture; if the module fails,
+ *  dt_vulkan_capture_rollback truncates the graph back to the mark
+ *  (dropping the module's nodes and snapshots) and immediately frees
+ *  buffers whose free was deferred after the mark — they can no
+ *  longer be referenced. Lock-free to take; rollback needs the
+ *  device lock (it releases buffers). */
+dt_vk_capture_mark_t dt_vulkan_capture_mark(void);
+void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark);
+
+/** Like dt_vulkan_write_to_device, but under capture the host pointer
+ *  is borrowed instead of snapshotted: the caller guarantees it stays
+ *  valid and unmodified until the next flush/end. Outside capture the
+ *  two calls are identical. For trunk-sized uploads whose lifetime
+ *  the caller controls — snapshotting those would double peak host
+ *  memory. */
+int dt_vulkan_write_to_device_borrowed(int devid, dt_vk_mem_t *dst,
+                                       const void *host, size_t size);
+
+/** Diagnostic: successful vkQueueSubmit count on this device so far.
+ *  Tests assert an N-dispatch captured span submits once; the eager
+ *  path submits ≥N times. */
+uint64_t dt_vulkan_submission_count(int devid);
+
 // ---- dispatch --------------------------------------------------------
 
 /** Bind storage buffers (count must match the kernel's registered
@@ -433,6 +540,23 @@ static inline int dt_vulkan_copy_subregion(int devid, dt_vk_mem_t *d,
                                            size_t srp, size_t drp, size_t bpp)
 { (void)devid; (void)d; (void)s; (void)sox; (void)soy; (void)dox; (void)doy;
   (void)rw; (void)rh; (void)srp; (void)drp; (void)bpp; return -1; }
+
+// Capture API stubs (see the HAVE_VULKAN branch for semantics).
+typedef struct dt_vk_capture_mark_t { int _unused; } dt_vk_capture_mark_t;
+static inline gboolean dt_vulkan_capture_begin(int devid) { (void)devid; return FALSE; }
+static inline gboolean dt_vulkan_capture_active(void) { return FALSE; }
+static inline uint32_t dt_vulkan_capture_pending(void) { return 0; }
+static inline int dt_vulkan_capture_flush(int devid) { (void)devid; return 0; }
+static inline int dt_vulkan_capture_end(int devid) { (void)devid; return 0; }
+static inline void dt_vulkan_capture_abort(int devid) { (void)devid; }
+static inline dt_vk_capture_mark_t dt_vulkan_capture_mark(void)
+{ dt_vk_capture_mark_t m = { 0 }; return m; }
+static inline void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark)
+{ (void)devid; (void)mark; }
+static inline int dt_vulkan_write_to_device_borrowed(int devid, dt_vk_mem_t *dst,
+                                                     const void *host, size_t size)
+{ (void)devid; (void)dst; (void)host; (void)size; return -1; }
+static inline uint64_t dt_vulkan_submission_count(int devid) { (void)devid; return 0; }
 
 static inline void dt_vulkan_init(dt_vulkan_t *vk)    { (void)vk; }
 static inline void dt_vulkan_cleanup(dt_vulkan_t *vk) { (void)vk; }

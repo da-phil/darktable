@@ -1,0 +1,18 @@
+// GLSL twin used by test_vulkan_capture.c: out = in + k.
+// Bindings and push-constant layout follow the HAL convention
+// (storage buffers at set 0 binding 0.., scalar args as push
+// constants), local size 8x8 like the module kernels.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, set = 0, binding = 0) buffer InBuf  { float v[]; } inb;
+layout(std430, set = 0, binding = 1) buffer OutBuf { float v[]; } outb;
+layout(push_constant) uniform PC { int width; int height; float k; } pc;
+
+void main()
+{
+  const uint x = gl_GlobalInvocationID.x;
+  const uint y = gl_GlobalInvocationID.y;
+  if(x >= uint(pc.width) || y >= uint(pc.height)) return;
+  const uint i = y * uint(pc.width) + x;
+  outb.v[i] = inb.v[i] + pc.k;
+}
