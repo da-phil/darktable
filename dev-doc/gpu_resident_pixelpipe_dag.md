@@ -1,7 +1,8 @@
 # A GPU-resident pixelpipe: DAG execution behind the linear pipe
 
 **Status:** in implementation — M1 (capture HAL + segment executor +
-module-scoped pixelpipe integration) landed; see §11 for the living
+module-scoped pixelpipe integration) and M0 (VK blend kernels,
+uniform-mask blending on-device) landed; see §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -505,6 +506,21 @@ explicit node (or is planned away):
   into the module's final output resource. Start with the
   normal-mode/no-blendif/no-raster subset exactly as Path A proposes,
   fall back to a sync-tap + CPU blend for the long tail until ported.
+  **M0 status note (landed).** The kernel port shipped *wider on modes,
+  narrower on masks* than the sketch: `blendop_{lab,rgb_hsl,rgb_jzczhz}`
+  (`data/kernels/vulkan/`) carry the full mode switch of all three
+  non-RAW blend colorspaces — the switch is one kernel either way —
+  while the host path (`dt_develop_blend_process_vk`,
+  `src/develop/blend.c`) accepts only uniform-opacity masks
+  (`mask_mode == DEVELOP_MASK_ENABLED`) until the blendif/feathering/
+  blur node set arrives with the M2 glue work. Two structural deltas:
+  the blend applies **in place on the module's output buffer** (the CL
+  path's `dev_tmp` copy exists only because image objects can't be
+  read and written by the same kernel; buffers can), and when the
+  module is a raster-mask source the uniform mask is published
+  host-side by `dt_iop_image_fill` — same values as the device mask,
+  no readback. The eager VK hook already uses this path today;
+  the graph-node form reuses the same kernels unchanged.
 - **Detail (scharr) mask.** `dt_dev_write_scharr_mask_cl` already
   computes on GPU and reads back; as a graph node the mask becomes a
   resident single-channel resource written once after
@@ -819,7 +835,11 @@ Each milestone lands green and user-invisible-by-default
 (`pixelpipe_vulkan_graph` pref, default off until M5).
 
 - **M0 — blendop VK kernels** (= companion Path A, already planned).
-  Needed by eager *and* graph paths; start with normal-mode subset.
+  Needed by eager *and* graph paths. ✅ **landed** (see §11): all
+  blend modes of the Lab / RGB display / RGB scene colorspaces plus
+  the mask fill, wired into the eager VK hook for uniform-opacity
+  masks via `dt_develop_blend_process_vk`; drawn/parametric/raster
+  masks and RAW keep the CPU blend until the M2+ node set.
 - **M1 — capture HAL + single-segment executor.** ✅ **landed** (see
   the §11 implementation log). Thread-local capture context; IR; naive
   planner (no aliasing: real pool buffers + deferred frees); one
@@ -898,6 +918,65 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-12 — M0 landed: VK blend kernels, uniform-mask blending in the eager hook
+
+Commit: `d98a0b0` (kernels + host path + pipe wiring + tests).
+
+What shipped, against the plan:
+
+- **Kernels** (`data/kernels/vulkan/blendop_{lab,rgb_hsl,rgb_jzczhz,
+  set_mask}.{cl,comp}` + `dt_vulkan_blendop.h`): straight ports of the
+  three `blendop_*` kernels in `data/kernels/blendop.cl`, each carrying
+  the *complete* mode switch — arithmetic and lighten/darken families,
+  HSL/HSV/LCH recombinations, `DEVELOP_BLEND_REVERSE` operand swap,
+  `blend_parameter`, `mask_display` alpha transfer. Buffer-based like
+  the rest of the VK kernel set: `iwidth` + `offx/offy` express the
+  roi_in offset the CL image path got for free from `read_imagef`
+  coordinates.
+- **Host path** (`dt_develop_blend_process_vk`, `src/develop/blend.c`):
+  mirrors the CL blend driver's structure with the M0 gates up front —
+  returns FALSE (nothing touched, caller keeps the CPU blend) unless
+  the mask is uniform (`mask_mode == DEVELOP_MASK_ENABLED`), the blend
+  colorspace equals the module output colorspace, 4-channel, non-RAW.
+- **Pipe wiring** (`pixelpipe_hb.c` VK hook): after a successful
+  module `process`, the hook tries the device blend before the
+  readback; success sets `PIXELPIPE_FLOW_BLENDED_ON_GPU` and skips the
+  CPU `_transform_for_blend` + blend-apply. Gated off when a picker or
+  mask display needs host data, and when the fast-blend cache wants to
+  store the pre-blend input (`want_bcache`) — the eager cache contract
+  stays intact.
+- **Design deltas, with reasons.** (1) *Wider on modes, narrower on
+  masks* than the planned "normal-mode subset": the mode switch is one
+  kernel either way, and sweeping every mode against independent C
+  references cost less than curating a subset; drawn/parametric masks
+  need the blendif/feathering/blur node set that belongs with M2's
+  glue work. (2) The blend applies **in place on the module's output
+  buffer** — the CL path's `dev_tmp` round-trip exists only because
+  image objects can't be read and written by the same kernel; buffers
+  can, so the copy and its allocation are gone. (3) A raster-source
+  module publishes the uniform mask host-side via `dt_iop_image_fill`
+  (bit-identical values, no readback). §5.4 carries the matching
+  status note.
+- **Testing lessons recorded.** cmocka assertions longjmp out of the
+  test; the first cut asserted while holding the device lock, so one
+  comparison failure deadlocked every later test on `g_vk_lock`. The
+  suite now runs each device sequence to completion, unlocks, then
+  asserts. Comparisons use a scale-aware error (absolute below
+  |ref| = 1, relative above): HSV round-trips on out-of-gamut inputs
+  legitimately produce channels of magnitude ~1e2, where GPU fma
+  reassociation exceeds any absolute epsilon calibrated near 1.
+- **Evidence.** `test_vulkan_blendop` (7 tests, lavapipe): per-mode
+  device-vs-reference sweeps in all three colorspaces (REVERSE,
+  blend_parameter, mask_display, roi offsets covered), the mask fill,
+  an end-to-end uniform blend through `dt_develop_blend_process_vk`,
+  and the subset-gate refusals. Full ctest green; `darktable-cli`
+  exports remain bit-identical with `pixelpipe_vulkan_graph` off vs
+  on (`-d vkgraph` confirms capture active on the graph run).
+
+Next up: M2 span capture, starting with the sync-point audit the
+milestone lists; the M0 blend gates (colorspace equality, uniform
+mask) are exactly the seams M2's glue nodes widen.
 
 ### 2026-07-12 — M1 landed: capture HAL, segment executor, module-scoped pipe integration
 
