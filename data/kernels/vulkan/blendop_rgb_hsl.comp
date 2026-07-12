@@ -1,0 +1,404 @@
+// GLSL twin of blendop_rgb_hsl.cl. Used by the CMake build when
+// clspv isn't installed. Must stay behaviour-equivalent — if
+// blendop_rgb_hsl.cl changes, mirror the change here.
+//
+// The OpenCL vector ternaries (`la > halfmax ? X : Y`) are
+// component-wise selects; they translate to mix(Y, X, bvec4) — the
+// boolean-mix overload selects per component WITHOUT arithmetic, so
+// inf/NaN in the discarded operand can't leak into the result
+// (a plain float mix() would turn inf*0 into NaN).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InA  { vec4 v[]; } in_a;
+layout(std430, binding = 1)          buffer Out  { vec4 v[]; } outb;
+layout(std430, binding = 2) readonly buffer Mask { float v[]; } mask;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    int   iwidth;
+    uint  blend_mode;
+    float blend_parameter;
+    int   offx;
+    int   offy;
+    int   mask_display;
+} pc;
+
+// blend-mode constants — keep in sync with dt_vulkan_blendop.h
+#define DEVELOP_BLEND_LIGHTEN          0x02u
+#define DEVELOP_BLEND_DARKEN           0x03u
+#define DEVELOP_BLEND_MULTIPLY         0x04u
+#define DEVELOP_BLEND_AVERAGE          0x05u
+#define DEVELOP_BLEND_ADD              0x06u
+#define DEVELOP_BLEND_SUBTRACT         0x07u
+#define DEVELOP_BLEND_DIFFERENCE       0x08u
+#define DEVELOP_BLEND_SCREEN           0x09u
+#define DEVELOP_BLEND_OVERLAY          0x0Au
+#define DEVELOP_BLEND_SOFTLIGHT        0x0Bu
+#define DEVELOP_BLEND_HARDLIGHT        0x0Cu
+#define DEVELOP_BLEND_VIVIDLIGHT       0x0Du
+#define DEVELOP_BLEND_LINEARLIGHT      0x0Eu
+#define DEVELOP_BLEND_PINLIGHT         0x0Fu
+#define DEVELOP_BLEND_LIGHTNESS        0x10u
+#define DEVELOP_BLEND_CHROMA           0x11u
+#define DEVELOP_BLEND_HUE              0x12u
+#define DEVELOP_BLEND_COLOR            0x13u
+#define DEVELOP_BLEND_COLORADJUST      0x16u
+#define DEVELOP_BLEND_DIFFERENCE2      0x17u
+#define DEVELOP_BLEND_NORMAL2          0x18u
+#define DEVELOP_BLEND_BOUNDED          0x19u
+#define DEVELOP_BLEND_LAB_LIGHTNESS    0x1Au
+#define DEVELOP_BLEND_LAB_COLOR        0x1Bu
+#define DEVELOP_BLEND_HSV_LIGHTNESS    0x1Cu
+#define DEVELOP_BLEND_HSV_COLOR        0x1Du
+#define DEVELOP_BLEND_LAB_L            0x1Eu
+#define DEVELOP_BLEND_LAB_A            0x1Fu
+#define DEVELOP_BLEND_LAB_B            0x20u
+#define DEVELOP_BLEND_RGB_R            0x21u
+#define DEVELOP_BLEND_RGB_G            0x22u
+#define DEVELOP_BLEND_RGB_B            0x23u
+#define DEVELOP_BLEND_REVERSE          0x80000000u
+#define DEVELOP_BLEND_MODE_MASK        0xFFu
+
+#define DT_2PI_F 6.28318530717958647692
+
+// mirrors dt_vulkan_common.h::vk_RGB_to_HSL (colorspace.h byte-for-byte)
+vec4 RGB_to_HSL(vec4 RGB)
+{
+    float H = 0.0, S = 0.0;
+    float R = RGB.x, G = RGB.y, B = RGB.z;
+    float var_Min = min(R, min(G, B));
+    float var_Max = max(R, max(G, B));
+    float del_Max = var_Max - var_Min;
+    float L = (var_Max + var_Min) * 0.5;
+
+    if (abs(var_Max) > 1e-6 && abs(del_Max) > 1e-6) {
+        S = (L < 0.5)
+            ? del_Max / (var_Max + var_Min)
+            : del_Max / (2.0 - var_Max - var_Min);
+
+        float del_R = (((var_Max - R) / 6.0) + (del_Max / 2.0)) / del_Max;
+        float del_G = (((var_Max - G) / 6.0) + (del_Max / 2.0)) / del_Max;
+        float del_B = (((var_Max - B) / 6.0) + (del_Max / 2.0)) / del_Max;
+
+        if (R == var_Max)      H = del_B - del_G;
+        else if (G == var_Max) H = (1.0 / 3.0) + del_R - del_B;
+        else if (B == var_Max) H = (2.0 / 3.0) + del_G - del_R;
+
+        if (H < 0.0) H += 1.0;
+        if (H > 1.0) H -= 1.0;
+    }
+    return vec4(H, S, L, RGB.w);
+}
+
+float hue_to_rgb(float v1, float v2, float vH)
+{
+    if (vH < 0.0) vH += 1.0;
+    if (vH > 1.0) vH -= 1.0;
+    if (6.0 * vH < 1.0) return v1 + (v2 - v1) * 6.0 * vH;
+    if (2.0 * vH < 1.0) return v2;
+    if (3.0 * vH < 2.0) return v1 + (v2 - v1) * ((2.0 / 3.0) - vH) * 6.0;
+    return v1;
+}
+
+vec4 HSL_to_RGB(vec4 HSL)
+{
+    float H = HSL.x, S = HSL.y, L = HSL.z;
+    if (S < 1e-6)
+        return vec4(L, L, L, HSL.w);
+
+    float var_2 = (L < 0.5) ? L * (1.0 + S) : (L + S) - (S * L);
+    float var_1 = 2.0 * L - var_2;
+    return vec4(hue_to_rgb(var_1, var_2, H + 1.0 / 3.0),
+                hue_to_rgb(var_1, var_2, H),
+                hue_to_rgb(var_1, var_2, H - 1.0 / 3.0),
+                HSL.w);
+}
+
+// mirrors dt_vulkan_common.h::vk_RGB_to_HSV / vk_HSV_to_RGB
+vec4 RGB_to_HSV(vec4 RGB)
+{
+    vec4 HSV;
+    float minv = min(RGB.x, min(RGB.y, RGB.z));
+    float maxv = max(RGB.x, max(RGB.y, RGB.z));
+    float delta = maxv - minv;
+
+    HSV.z = maxv;
+    HSV.w = RGB.w;
+
+    if (abs(maxv) > 1e-6 && abs(delta) > 1e-6) {
+        HSV.y = delta / maxv;
+    } else {
+        HSV.x = 0.0;
+        HSV.y = 0.0;
+        return HSV;
+    }
+
+    if (RGB.x == maxv)      HSV.x = (RGB.y - RGB.z) / delta;
+    else if (RGB.y == maxv) HSV.x = 2.0 + (RGB.z - RGB.x) / delta;
+    else                    HSV.x = 4.0 + (RGB.x - RGB.y) / delta;
+
+    HSV.x /= 6.0;
+    HSV.x -= floor(HSV.x);
+    return HSV;
+}
+
+vec4 HSV_to_RGB(vec4 HSV)
+{
+    if (abs(HSV.y) < 1e-6)
+        return vec4(HSV.z, HSV.z, HSV.z, HSV.w);
+
+    int   i = int(floor(6.0 * HSV.x));
+    float v = HSV.z;
+    float w = HSV.w;
+    float p = v * (1.0 - HSV.y);
+    float q = v * (1.0 - HSV.y * (6.0 * HSV.x - float(i)));
+    float t = v * (1.0 - HSV.y * (1.0 - (6.0 * HSV.x - float(i))));
+
+    switch (i) {
+    case 0:  return vec4(v, t, p, w);
+    case 1:  return vec4(q, v, p, w);
+    case 2:  return vec4(p, v, t, w);
+    case 3:  return vec4(p, q, v, w);
+    case 4:  return vec4(t, p, v, w);
+    default: return vec4(v, p, q, w);  // case 5 + wrap
+    }
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    int idx  = y * pc.width + x;
+    int iidx = (y + pc.offy) * pc.iwidth + (x + pc.offx);
+
+    vec4 a, b, o;
+    vec4 ta, tb, to;
+    float d, s;
+
+    if ((pc.blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE) {
+        b = in_a.v[iidx];
+        a = outb.v[idx];
+    } else {
+        a = in_a.v[iidx];
+        b = outb.v[idx];
+    }
+    float opacity = mask.v[idx];
+
+    const vec4 cmin = vec4(0.0, 0.0, 0.0, 1.0);
+    const vec4 cmax = vec4(1.0, 1.0, 1.0, 1.0);
+    const vec4 lmin = vec4(0.0, 0.0, 0.0, 1.0);
+    const vec4 lmax = vec4(1.0, 1.0, 1.0, 1.0);       /* max + fabs(min) */
+    const vec4 halfmax = vec4(0.5, 0.5, 0.5, 1.0);    /* lmax / 2.0f */
+    const vec4 doublemax = vec4(2.0, 2.0, 2.0, 1.0);  /* lmax * 2.0f */
+    float opacity2 = opacity * opacity;
+
+    vec4 la = clamp(a + abs(cmin), lmin, lmax);
+    vec4 lb = clamp(b + abs(cmin), lmin, lmax);
+
+    switch (pc.blend_mode & DEVELOP_BLEND_MODE_MASK) {
+    case DEVELOP_BLEND_LIGHTEN:
+        o = clamp(a * (1.0 - opacity) + max(a, b) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_DARKEN:
+        o = clamp(a * (1.0 - opacity) + min(a, b) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_MULTIPLY:
+        o = clamp(a * (1.0 - opacity) + a * b * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_AVERAGE:
+        o = clamp(a * (1.0 - opacity) + (a + b) / 2.0 * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_ADD:
+        o = clamp(a * (1.0 - opacity) + (a + b) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_SUBTRACT:
+        o = clamp(a * (1.0 - opacity) + (b + a - abs(cmin + cmax)) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_DIFFERENCE:
+    case DEVELOP_BLEND_DIFFERENCE2:
+        o = clamp(la * (1.0 - opacity) + abs(la - lb) * opacity, lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_SCREEN:
+        o = clamp(la * (1.0 - opacity) + (lmax - (lmax - la) * (lmax - lb)) * opacity, lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_OVERLAY:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(doublemax * la * lb,
+                        lmax - (lmax - doublemax * (la - halfmax)) * (lmax - lb),
+                        greaterThan(la, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_SOFTLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(la * (lb + halfmax),
+                        lmax - (lmax - la) * (lmax - (lb - halfmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_HARDLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(doublemax * la * lb,
+                        lmax - (lmax - doublemax * (la - halfmax)) * (lmax - lb),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_VIVIDLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(mix(lmax - (lmax - la) / (doublemax * lb), lmin, lessThanEqual(lb, lmin)),
+                        mix(la / (doublemax * (lmax - lb)), lmax, greaterThanEqual(lb, lmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_LINEARLIGHT:
+        o = clamp(la * (1.0 - opacity2) + (la + doublemax * lb - lmax) * opacity2, lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_PINLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(min(la, doublemax * lb),
+                        max(la, doublemax * (lb - halfmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_LIGHTNESS:
+        ta = RGB_to_HSL(clamp(a, cmin, cmax));
+        tb = RGB_to_HSL(clamp(b, cmin, cmax));
+        to.x = ta.x;
+        to.y = ta.y;
+        to.z = (ta.z * (1.0 - opacity)) + (tb.z * opacity);
+        to.w = a.w;
+        o = clamp(HSL_to_RGB(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_CHROMA:
+        ta = RGB_to_HSL(clamp(a, cmin, cmax));
+        tb = RGB_to_HSL(clamp(b, cmin, cmax));
+        to.x = ta.x;
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        to.z = ta.z;
+        to.w = a.w;
+        o = clamp(HSL_to_RGB(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_HUE:
+        ta = RGB_to_HSL(clamp(a, cmin, cmax));
+        tb = RGB_to_HSL(clamp(b, cmin, cmax));
+        d = abs(ta.x - tb.x);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.x = mod((ta.x * (1.0 - s)) + (tb.x * s) + 1.0, 1.0);
+        to.y = ta.y;
+        to.z = ta.z;
+        to.w = a.w;
+        o = clamp(HSL_to_RGB(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_COLOR:
+        ta = RGB_to_HSL(clamp(a, cmin, cmax));
+        tb = RGB_to_HSL(clamp(b, cmin, cmax));
+        d = abs(ta.x - tb.x);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.x = mod((ta.x * (1.0 - s)) + (tb.x * s) + 1.0, 1.0);
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        to.z = ta.z;
+        to.w = a.w;
+        o = clamp(HSL_to_RGB(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_COLORADJUST:
+        ta = RGB_to_HSL(clamp(a, cmin, cmax));
+        tb = RGB_to_HSL(clamp(b, cmin, cmax));
+        d = abs(ta.x - tb.x);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.x = mod((ta.x * (1.0 - s)) + (tb.x * s) + 1.0, 1.0);
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        to.z = tb.z;
+        to.w = a.w;
+        o = clamp(HSL_to_RGB(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_BOUNDED:
+        o = clamp((a * (1.0 - opacity)) + (b * opacity), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_LAB_LIGHTNESS:
+    case DEVELOP_BLEND_LAB_COLOR:
+    case DEVELOP_BLEND_LAB_L:
+    case DEVELOP_BLEND_LAB_A:
+    case DEVELOP_BLEND_LAB_B:
+        o = a; // Noop for RGB (without clamping)
+        break;
+
+    case DEVELOP_BLEND_HSV_LIGHTNESS:
+        ta = RGB_to_HSV(a);
+        tb = RGB_to_HSV(b);
+        to.x = ta.x;
+        to.y = ta.y;
+        to.z = (ta.z * (1.0 - opacity)) + (tb.z * opacity);
+        to.w = a.w;
+        o = HSV_to_RGB(to);
+        break;
+
+    case DEVELOP_BLEND_HSV_COLOR:
+        ta = RGB_to_HSV(a);
+        tb = RGB_to_HSV(b);
+        // blend color vectors of input and output
+        d = ta.y * cos(float(DT_2PI_F) * ta.x) * (1.0 - opacity) + tb.y * cos(float(DT_2PI_F) * tb.x) * opacity;
+        s = ta.y * sin(float(DT_2PI_F) * ta.x) * (1.0 - opacity) + tb.y * sin(float(DT_2PI_F) * tb.x) * opacity;
+        to.x = mod(atan(s, d) / float(DT_2PI_F) + 1.0, 1.0);
+        to.y = sqrt(s * s + d * d);
+        to.z = ta.z;
+        to.w = a.w;
+        o = HSV_to_RGB(to);
+        break;
+
+    case DEVELOP_BLEND_RGB_R:
+        o.x = (a.x * (1.0 - opacity)) + (b.x * opacity);
+        o.y = a.y;
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_RGB_G:
+        o.x = a.x;
+        o.y = (a.y * (1.0 - opacity)) + (b.y * opacity);
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_RGB_B:
+        o.x = a.x;
+        o.y = a.y;
+        o.z = (a.z * (1.0 - opacity)) + (b.z * opacity);
+        o.w = a.w;
+        break;
+
+    /* fallback to normal blend */
+    case DEVELOP_BLEND_NORMAL2:
+    default:
+        o = (a * (1.0 - opacity)) + (b * opacity);
+        break;
+    }
+
+    /* we transfer alpha channel of input if mask_display is set, else we save opacity into alpha channel */
+    o.w = pc.mask_display != 0 ? a.w : opacity;
+
+    outb.v[idx] = o;
+}

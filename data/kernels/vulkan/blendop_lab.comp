@@ -1,0 +1,370 @@
+// GLSL twin of blendop_lab.cl. Used by the CMake build when clspv
+// isn't installed. Must stay behaviour-equivalent — if
+// blendop_lab.cl changes, mirror the change here.
+//
+// OpenCL vector ternaries translate to the boolean-mix select (see
+// the note in blendop_rgb_hsl.comp).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InA  { vec4 v[]; } in_a;
+layout(std430, binding = 1)          buffer Out  { vec4 v[]; } outb;
+layout(std430, binding = 2) readonly buffer Mask { float v[]; } mask;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    int   iwidth;
+    uint  blend_mode;
+    float blend_parameter;
+    int   offx;
+    int   offy;
+    int   mask_display;
+} pc;
+
+// blend-mode constants — keep in sync with dt_vulkan_blendop.h
+#define DEVELOP_BLEND_LIGHTEN          0x02u
+#define DEVELOP_BLEND_DARKEN           0x03u
+#define DEVELOP_BLEND_MULTIPLY         0x04u
+#define DEVELOP_BLEND_AVERAGE          0x05u
+#define DEVELOP_BLEND_ADD              0x06u
+#define DEVELOP_BLEND_SUBTRACT         0x07u
+#define DEVELOP_BLEND_DIFFERENCE       0x08u
+#define DEVELOP_BLEND_SCREEN           0x09u
+#define DEVELOP_BLEND_OVERLAY          0x0Au
+#define DEVELOP_BLEND_SOFTLIGHT        0x0Bu
+#define DEVELOP_BLEND_HARDLIGHT        0x0Cu
+#define DEVELOP_BLEND_VIVIDLIGHT       0x0Du
+#define DEVELOP_BLEND_LINEARLIGHT      0x0Eu
+#define DEVELOP_BLEND_PINLIGHT         0x0Fu
+#define DEVELOP_BLEND_LIGHTNESS        0x10u
+#define DEVELOP_BLEND_CHROMA           0x11u
+#define DEVELOP_BLEND_HUE              0x12u
+#define DEVELOP_BLEND_COLOR            0x13u
+#define DEVELOP_BLEND_COLORADJUST      0x16u
+#define DEVELOP_BLEND_DIFFERENCE2      0x17u
+#define DEVELOP_BLEND_NORMAL2          0x18u
+#define DEVELOP_BLEND_BOUNDED          0x19u
+#define DEVELOP_BLEND_LAB_LIGHTNESS    0x1Au
+#define DEVELOP_BLEND_LAB_COLOR        0x1Bu
+#define DEVELOP_BLEND_HSV_LIGHTNESS    0x1Cu
+#define DEVELOP_BLEND_HSV_COLOR        0x1Du
+#define DEVELOP_BLEND_LAB_L            0x1Eu
+#define DEVELOP_BLEND_LAB_A            0x1Fu
+#define DEVELOP_BLEND_LAB_B            0x20u
+#define DEVELOP_BLEND_RGB_R            0x21u
+#define DEVELOP_BLEND_RGB_G            0x22u
+#define DEVELOP_BLEND_RGB_B            0x23u
+#define DEVELOP_BLEND_REVERSE          0x80000000u
+#define DEVELOP_BLEND_MODE_MASK        0xFFu
+
+#define DT_2PI_F 6.28318530717958647692
+
+// mirrors dt_vulkan_common.h::vk_Lab_2_LCH / vk_LCH_2_Lab
+// (hue normalized to [0,1))
+vec4 Lab_to_LCH(vec4 Lab)
+{
+    float H = atan(Lab.z, Lab.y);
+    H = (H > 0.0) ? H / float(DT_2PI_F) : 1.0 - abs(H) / float(DT_2PI_F);
+    float L = Lab.x;
+    float C = sqrt(Lab.y * Lab.y + Lab.z * Lab.z);
+    return vec4(L, C, H, Lab.w);
+}
+
+vec4 LCH_to_Lab(vec4 LCH)
+{
+    float L = LCH.x;
+    float a = cos(float(DT_2PI_F) * LCH.z) * LCH.y;
+    float b = sin(float(DT_2PI_F) * LCH.z) * LCH.y;
+    return vec4(L, a, b, LCH.w);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    int idx  = y * pc.width + x;
+    int iidx = (y + pc.offy) * pc.iwidth + (x + pc.offx);
+
+    vec4 a, b, o;
+    vec4 ta, tb, to;
+    float d, s;
+
+    if ((pc.blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE) {
+        b = in_a.v[iidx];
+        a = outb.v[idx];
+    } else {
+        a = in_a.v[iidx];
+        b = outb.v[idx];
+    }
+    float opacity = mask.v[idx];
+
+    /* scale L down to [0; 1] and a,b to [-1; 1] */
+    const vec4 lscale = vec4(100.0, 128.0, 128.0, 1.0);
+    a /= lscale;
+    b /= lscale;
+
+    const vec4 cmin = vec4(0.0, -1.0, -1.0, 0.0);
+    const vec4 cmax = vec4(1.0, 1.0, 1.0, 1.0);
+    const vec4 lmin = vec4(0.0, 0.0, 0.0, 1.0);
+    const vec4 lmax = vec4(1.0, 2.0, 2.0, 1.0);       /* max + fabs(min) */
+    const vec4 halfmax = vec4(0.5, 1.0, 1.0, 0.5);    /* lmax / 2.0f */
+    const vec4 doublemax = vec4(2.0, 4.0, 4.0, 2.0);  /* lmax * 2.0f */
+    float opacity2 = opacity * opacity;
+
+    vec4 la = clamp(a + abs(cmin), lmin, lmax);
+    vec4 lb = clamp(b + abs(cmin), lmin, lmax);
+
+    switch (pc.blend_mode & DEVELOP_BLEND_MODE_MASK) {
+    case DEVELOP_BLEND_LIGHTEN:
+        o = clamp(a * (1.0 - opacity) + mix(b, a, greaterThan(a, b)) * opacity, cmin, cmax);
+        o.y = clamp(a.y * (1.0 - abs(o.x - a.x)) + 0.5 * (a.y + b.y) * abs(o.x - a.x), cmin.y, cmax.y);
+        o.z = clamp(a.z * (1.0 - abs(o.x - a.x)) + 0.5 * (a.z + b.z) * abs(o.x - a.x), cmin.z, cmax.z);
+        break;
+
+    case DEVELOP_BLEND_DARKEN:
+        o = clamp(a * (1.0 - opacity) + mix(b, a, lessThan(a, b)) * opacity, cmin, cmax);
+        o.y = clamp(a.y * (1.0 - abs(o.x - a.x)) + 0.5 * (a.y + b.y) * abs(o.x - a.x), cmin.y, cmax.y);
+        o.z = clamp(a.z * (1.0 - abs(o.x - a.x)) + 0.5 * (a.z + b.z) * abs(o.x - a.x), cmin.z, cmax.z);
+        break;
+
+    case DEVELOP_BLEND_MULTIPLY:
+        o = clamp(a * (1.0 - opacity) + a * b * opacity, cmin, cmax);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity) + (a.y + b.y) * o.x / a.x * opacity, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity) + (a.z + b.z) * o.x / a.x * opacity, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity) + (a.y + b.y) * o.x / 0.01 * opacity, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity) + (a.z + b.z) * o.x / 0.01 * opacity, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_AVERAGE:
+        o = clamp(a * (1.0 - opacity) + (a + b) / 2.0 * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_ADD:
+        o = clamp(a * (1.0 - opacity) + (a + b) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_SUBTRACT:
+        o = clamp(a * (1.0 - opacity) + (b + a - abs(cmin + cmax)) * opacity, cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_DIFFERENCE:
+        o = clamp(la * (1.0 - opacity) + abs(la - lb) * opacity, lmin, lmax) - abs(cmin);
+        break;
+
+    case DEVELOP_BLEND_DIFFERENCE2:
+        to = abs(a - b) / abs(cmax - cmin);
+        to.x = max(to.x, max(to.y, to.z));
+        o = clamp(la * (1.0 - opacity) + to * opacity, lmin, lmax);
+        o.y = 0.0;
+        o.z = 0.0;
+        break;
+
+    case DEVELOP_BLEND_SCREEN:
+        o = clamp(la * (1.0 - opacity) + (lmax - (lmax - la) * (lmax - lb)) * opacity, lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity) + 0.5 * (a.y + b.y) * o.x / a.x * opacity, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity) + 0.5 * (a.z + b.z) * o.x / a.x * opacity, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity) + 0.5 * (a.y + b.y) * o.x / 0.01 * opacity, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity) + 0.5 * (a.z + b.z) * o.x / 0.01 * opacity, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_OVERLAY:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(doublemax * la * lb,
+                        lmax - (lmax - doublemax * (la - halfmax)) * (lmax - lb),
+                        greaterThan(la, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / a.x * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / a.x * opacity2, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / 0.01 * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / 0.01 * opacity2, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_SOFTLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(la * (lb + halfmax),
+                        lmax - (lmax - la) * (lmax - (lb - halfmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / a.x * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / a.x * opacity2, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / 0.01 * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / 0.01 * opacity2, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_HARDLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(doublemax * la * lb,
+                        lmax - (lmax - doublemax * (la - halfmax)) * (lmax - lb),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / a.x * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / a.x * opacity2, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / 0.01 * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / 0.01 * opacity2, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_VIVIDLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(mix(lmax - (lmax - la) / (doublemax * lb), lmin, lessThanEqual(lb, lmin)),
+                        mix(la / (doublemax * (lmax - lb)), lmax, greaterThanEqual(lb, lmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / a.x * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / a.x * opacity2, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / 0.01 * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / 0.01 * opacity2, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_LINEARLIGHT:
+        o = clamp(la * (1.0 - opacity2) + (la + doublemax * lb - lmax) * opacity2, lmin, lmax) - abs(cmin);
+        if (a.x > 0.01) {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / a.x * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / a.x * opacity2, cmin.z, cmax.z);
+        } else {
+            o.y = clamp(a.y * (1.0 - opacity2) + (a.y + b.y) * o.x / 0.01 * opacity2, cmin.y, cmax.y);
+            o.z = clamp(a.z * (1.0 - opacity2) + (a.z + b.z) * o.x / 0.01 * opacity2, cmin.z, cmax.z);
+        }
+        break;
+
+    case DEVELOP_BLEND_PINLIGHT:
+        o = clamp(la * (1.0 - opacity2)
+                  + mix(min(la, doublemax * lb),
+                        max(la, doublemax * (lb - halfmax)),
+                        greaterThan(lb, halfmax)) * opacity2,
+                  lmin, lmax) - abs(cmin);
+        o.y = clamp(a.y, cmin.y, cmax.y);
+        o.z = clamp(a.z, cmin.z, cmax.z);
+        break;
+
+    case DEVELOP_BLEND_LIGHTNESS:
+        // no need to transfer to LCH as we only work on L, which is the same as in Lab
+        o.x = clamp((a.x * (1.0 - opacity)) + (b.x * opacity), cmin.x, cmax.x);
+        o.y = clamp(a.y, cmin.y, cmax.y);
+        o.z = clamp(a.z, cmin.z, cmax.z);
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_CHROMA:
+        ta = Lab_to_LCH(clamp(a, cmin, cmax));
+        tb = Lab_to_LCH(clamp(b, cmin, cmax));
+        to.x = ta.x;
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        to.z = ta.z;
+        to.w = a.w;
+        o = clamp(LCH_to_Lab(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_HUE:
+        ta = Lab_to_LCH(clamp(a, cmin, cmax));
+        tb = Lab_to_LCH(clamp(b, cmin, cmax));
+        to.x = ta.x;
+        to.y = ta.y;
+        d = abs(ta.z - tb.z);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.z = mod((ta.z * (1.0 - s)) + (tb.z * s) + 1.0, 1.0);
+        to.w = a.w;
+        o = clamp(LCH_to_Lab(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_COLOR:
+        ta = Lab_to_LCH(clamp(a, cmin, cmax));
+        tb = Lab_to_LCH(clamp(b, cmin, cmax));
+        to.x = ta.x;
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        d = abs(ta.z - tb.z);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.z = mod((ta.z * (1.0 - s)) + (tb.z * s) + 1.0, 1.0);
+        to.w = a.w;
+        o = clamp(LCH_to_Lab(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_COLORADJUST:
+        ta = Lab_to_LCH(clamp(a, cmin, cmax));
+        tb = Lab_to_LCH(clamp(b, cmin, cmax));
+        to.x = tb.x;
+        to.y = (ta.y * (1.0 - opacity)) + (tb.y * opacity);
+        d = abs(ta.z - tb.z);
+        s = d > 0.5 ? -opacity * (1.0 - d) / d : opacity;
+        to.z = mod((ta.z * (1.0 - s)) + (tb.z * s) + 1.0, 1.0);
+        to.w = a.w;
+        o = clamp(LCH_to_Lab(to), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_BOUNDED:
+        o = clamp((a * (1.0 - opacity)) + (b * opacity), cmin, cmax);
+        break;
+
+    case DEVELOP_BLEND_LAB_LIGHTNESS:
+    case DEVELOP_BLEND_LAB_L:
+        o.x = (a.x * (1.0 - opacity)) + (b.x * opacity);
+        o.y = a.y;
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_LAB_A:
+        o.x = a.x;
+        o.y = (a.y * (1.0 - opacity)) + (b.y * opacity);
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_LAB_B:
+        o.x = a.x;
+        o.y = a.y;
+        o.z = (a.z * (1.0 - opacity)) + (b.z * opacity);
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_LAB_COLOR:
+        o.x = a.x;
+        o.y = (a.y * (1.0 - opacity)) + (b.y * opacity);
+        o.z = (a.z * (1.0 - opacity)) + (b.z * opacity);
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_HSV_LIGHTNESS:
+    case DEVELOP_BLEND_HSV_COLOR:
+    case DEVELOP_BLEND_RGB_R:
+    case DEVELOP_BLEND_RGB_G:
+    case DEVELOP_BLEND_RGB_B:
+        o = a; // Noop for Lab (without clamping)
+        break;
+
+    /* fallback to normal blend */
+    case DEVELOP_BLEND_NORMAL2:
+    default:
+        o = (a * (1.0 - opacity)) + (b * opacity);
+        break;
+    }
+
+    /* scale L back to [0; 100] and a,b to [-128; 128] */
+    o *= lscale;
+
+    /* we transfer alpha channel of input if mask_display is set, else we save opacity into alpha channel */
+    o.w = pc.mask_display != 0 ? a.w : opacity;
+
+    outb.v[idx] = o;
+}

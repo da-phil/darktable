@@ -1373,6 +1373,180 @@ error:
 }
 #endif
 
+#ifdef HAVE_VULKAN
+
+// DAG milestone M0 (dev-doc/gpu_resident_pixelpipe_dag.md §9): GPU
+// blend for the uniform-mask subset. Push-constant layouts must match
+// the scalar-argument order of the blendop_* kernels in
+// data/kernels/vulkan/ (clspv path) and the push_constant blocks of
+// their .comp twins.
+
+typedef struct _vk_blend_pc_t
+{
+  int32_t width, height, iwidth;
+  uint32_t blend_mode;
+  float blend_parameter;
+  int32_t offx, offy, mask_display;
+} _vk_blend_pc_t;
+
+typedef struct _vk_setmask_pc_t
+{
+  int32_t width, height;
+  float value;
+} _vk_setmask_pc_t;
+
+static dt_vk_module_kernel_t _vk_blend_set_mask   = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_blend_lab        = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_blend_rgb_hsl    = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_blend_rgb_jzczhz = DT_VK_MODULE_KERNEL_INIT;
+static gboolean _vk_blend_tried_load = FALSE;
+
+// Lazy one-shot load on first use. Unlike the per-module kernels
+// there is no owning init_global/cleanup_global pair; the slots live
+// until dt_vulkan_cleanup reclaims everything, mirroring the comment
+// in dt_vulkan_module_kernel_unload. Caller holds the device lock
+// (the pixelpipe hook does), which also serialises the first-load
+// race between pipelines.
+static void _vk_blend_load_kernels(void)
+{
+  if(_vk_blend_tried_load) return;
+  _vk_blend_tried_load = TRUE;
+  dt_vulkan_module_kernel_load(&_vk_blend_set_mask,
+                               "blendop_set_mask", "blendop_set_mask",
+                               1, sizeof(_vk_setmask_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_blend_lab,
+                               "blendop_lab", "blendop_lab",
+                               3, sizeof(_vk_blend_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_blend_rgb_hsl,
+                               "blendop_rgb_hsl", "blendop_rgb_hsl",
+                               3, sizeof(_vk_blend_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_blend_rgb_jzczhz,
+                               "blendop_rgb_jzczhz", "blendop_rgb_jzczhz",
+                               3, sizeof(_vk_blend_pc_t), 16, 16, 1);
+}
+
+gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     dt_vk_mem_t *dev_in,
+                                     dt_vk_mem_t *dev_out,
+                                     const dt_iop_roi_t *roi_in,
+                                     const dt_iop_roi_t *roi_out,
+                                     const dt_iop_colorspace_type_t cst_in,
+                                     const dt_iop_colorspace_type_t cst_out)
+{
+  const dt_develop_blend_params_t *const d = piece->blendop_data;
+  if(!d || !dev_in || !dev_out) return FALSE;
+  if(!dt_vulkan_running()) return FALSE;
+
+  // ---- subset gate ----------------------------------------------------
+  // uniform mask only: plain global opacity, no drawn/parametric/raster
+  // mask and none of their post ops (feather/blur/tone curve act on
+  // non-uniform masks only, matching the `uniform` shortcut the CPU
+  // and CL paths take)
+  if(d->mask_mode != DEVELOP_MASK_ENABLED) return FALSE;
+  // 4-channel float buffers only (RAW 1ch blending stays CPU/CL)
+  if(piece->colors != 4) return FALSE;
+
+  dt_vk_module_kernel_t *kernel = NULL;
+  switch(d->blend_cst)
+  {
+    case DEVELOP_BLEND_CS_LAB:         kernel = &_vk_blend_lab;        break;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY: kernel = &_vk_blend_rgb_hsl;    break;
+    case DEVELOP_BLEND_CS_RGB_SCENE:   kernel = &_vk_blend_rgb_jzczhz; break;
+    default:                           return FALSE; // RAW/NONE: CPU path
+  }
+
+  // both buffers must already live in the blend colorspace — the
+  // in-place host transforms the CPU path performs around blending
+  // become M2 glue nodes; until then, mismatches fall back
+  const dt_iop_colorspace_type_t blend_ist =
+    dt_develop_blend_colorspace(piece, cst_out);
+  if(cst_in != blend_ist || cst_out != blend_ist) return FALSE;
+
+  // work-area feasibility, mirroring dt_develop_blend_process_cl —
+  // on failure the CPU path prints its "skip blending" diagnostic
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const int dx = roi_out->x - roi_in->x;
+  const int dy = roi_out->y - roi_in->y;
+  if((roi_in->width - dx < owidth) || (roi_in->height - dy < oheight))
+    return FALSE;
+
+  _vk_blend_load_kernels();
+  if(kernel->kernel < 0 || _vk_blend_set_mask.kernel < 0) return FALSE;
+
+  const float opacity = CLIP(d->opacity / 100.0f);
+
+  dt_vk_mem_t *dev_mask =
+    dt_vulkan_alloc_buffer(0, sizeof(float) * owidth * oheight);
+  if(!dev_mask) return FALSE;
+
+  const _vk_setmask_pc_t mpc = { owidth, oheight, opacity };
+  gboolean ok = dt_vulkan_dispatch_n(&_vk_blend_set_mask,
+                                     (dt_vk_mem_t *[]){ dev_mask }, 1,
+                                     owidth, oheight, &mpc, sizeof(mpc)) == 0;
+  if(ok)
+  {
+    const _vk_blend_pc_t pc = {
+      .width = owidth,
+      .height = oheight,
+      .iwidth = roi_in->width,
+      .blend_mode = d->blend_mode,
+      .blend_parameter = exp2f(d->blend_parameter),
+      .offx = dx,
+      .offy = dy,
+      // only non-zero if mask_display was set by an _earlier_ module
+      .mask_display = (int32_t)piece->pipe->mask_display,
+    };
+    dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_mask };
+    ok = dt_vulkan_dispatch_n(kernel, bufs, 3,
+                              owidth, oheight, &pc, sizeof(pc)) == 0;
+  }
+
+  dt_vulkan_free_buffer(0, dev_mask);
+
+  if(!ok)
+  {
+    // Nothing image-visible ran: the blend dispatch is the only node
+    // that touches dev_out, and it failed to issue. The CPU blend
+    // path can take over cleanly.
+    dt_print_pipe(DT_DEBUG_PIPE,
+                  "blend vk failed", piece->pipe, self, DT_DEVICE_VK,
+                  roi_in, roi_out, "falling back to CPU blending");
+    return FALSE;
+  }
+
+  // Raster-mask publication: the uniform mask is a constant plane, so
+  // build the host copy directly — no device readback needed.
+  if(dt_iop_piece_is_raster_mask_used(piece, BLEND_RASTER_ID))
+  {
+    float *mask = dt_alloc_align_float((size_t)owidth * oheight);
+    if(mask)
+    {
+      dt_iop_image_fill(mask, opacity, owidth, oheight, 1);
+      dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
+    }
+    else
+    {
+      // the blend itself already ran on the device; publishing no
+      // mask (and invalidating any stale one) is the recoverable path
+      dt_iop_piece_clear_raster(piece, NULL);
+      dt_print_pipe(DT_DEBUG_ALWAYS,
+                    "blend vk", piece->pipe, self, DT_DEVICE_VK,
+                    roi_in, roi_out, "could not allocate raster mask");
+    }
+  }
+  else
+    dt_iop_piece_clear_raster(piece, NULL);
+
+  dt_print_pipe(DT_DEBUG_PIPE,
+                "blend vk", piece->pipe, self, DT_DEVICE_VK, roi_in, roi_out,
+                "%s, %s", dt_iop_colorspace_to_name(blend_ist),
+                _develop_blend_colorspace_to_str(d->blend_cst));
+  return TRUE;
+}
+#endif // HAVE_VULKAN
+
 /** global init of blendops */
 dt_blendop_cl_global_t *dt_develop_blend_init_cl_global(void)
 {

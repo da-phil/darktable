@@ -36,7 +36,18 @@ add_dependencies(test_vulkan_capture test_vulkan_capture_kernels)
 target_compile_definitions(test_vulkan_capture
                            PRIVATE TEST_VK_KERNEL_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 
+# Blendop kernel + host-path tests (DAG milestone M0). These load the
+# production .spv modules from the build datadir, so they depend on
+# the kernel build target.
+add_cmocka_test(test_vulkan_blendop
+                SOURCES test_vulkan_blendop.c
+                LINK_LIBRARIES lib_darktable cmocka)
+add_dependencies(test_vulkan_blendop build_vulkan_kernels)
+target_compile_definitions(test_vulkan_blendop
+                           PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_vulkan_capture lib_darktable)
+    _copy_required_library(test_vulkan_blendop lib_darktable)
 endif(WIN32)

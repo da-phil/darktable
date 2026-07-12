@@ -1,0 +1,155 @@
+// GLSL twin of blendop_rgb_jzczhz.cl. Used by the CMake build when
+// clspv isn't installed. Must stay behaviour-equivalent — if
+// blendop_rgb_jzczhz.cl changes, mirror the change here.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InA  { vec4 v[]; } in_a;
+layout(std430, binding = 1)          buffer Out  { vec4 v[]; } outb;
+layout(std430, binding = 2) readonly buffer Mask { float v[]; } mask;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    int   iwidth;
+    uint  blend_mode;
+    float blend_parameter;
+    int   offx;
+    int   offy;
+    int   mask_display;
+} pc;
+
+// blend-mode constants — keep in sync with dt_vulkan_blendop.h
+// (GLSL has no #include)
+#define DEVELOP_BLEND_MULTIPLY         0x04u
+#define DEVELOP_BLEND_AVERAGE          0x05u
+#define DEVELOP_BLEND_ADD              0x06u
+#define DEVELOP_BLEND_SUBTRACT         0x07u
+#define DEVELOP_BLEND_DIFFERENCE       0x08u
+#define DEVELOP_BLEND_LIGHTNESS        0x10u
+#define DEVELOP_BLEND_CHROMA           0x11u
+#define DEVELOP_BLEND_DIFFERENCE2      0x17u
+#define DEVELOP_BLEND_NORMAL2          0x18u
+#define DEVELOP_BLEND_BOUNDED          0x19u
+#define DEVELOP_BLEND_RGB_R            0x21u
+#define DEVELOP_BLEND_RGB_G            0x22u
+#define DEVELOP_BLEND_RGB_B            0x23u
+#define DEVELOP_BLEND_SUBTRACT_INVERSE 0x25u
+#define DEVELOP_BLEND_DIVIDE           0x26u
+#define DEVELOP_BLEND_DIVIDE_INVERSE   0x27u
+#define DEVELOP_BLEND_GEOMETRIC_MEAN   0x28u
+#define DEVELOP_BLEND_HARMONIC_MEAN    0x29u
+#define DEVELOP_BLEND_REVERSE          0x80000000u
+#define DEVELOP_BLEND_MODE_MASK        0xFFu
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    int idx  = y * pc.width + x;
+    int iidx = (y + pc.offy) * pc.iwidth + (x + pc.offx);
+
+    vec4 a, b, o;
+
+    if ((pc.blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE) {
+        b = in_a.v[iidx];
+        a = outb.v[idx];
+    } else {
+        a = in_a.v[iidx];
+        b = outb.v[idx];
+    }
+    float opacity = mask.v[idx];
+    float norm_a;
+    float norm_b;
+
+    switch (pc.blend_mode & DEVELOP_BLEND_MODE_MASK) {
+    case DEVELOP_BLEND_MULTIPLY:
+        o = a * (1.0 - opacity) + a * b * pc.blend_parameter * opacity;
+        break;
+
+    case DEVELOP_BLEND_AVERAGE:
+        o = a * (1.0 - opacity) + 0.5 * (a + b) * opacity;
+        break;
+
+    case DEVELOP_BLEND_ADD:
+        o = a * (1.0 - opacity) + (a + pc.blend_parameter * b) * opacity;
+        break;
+
+    case DEVELOP_BLEND_SUBTRACT:
+        o = a * (1.0 - opacity) + max(a - pc.blend_parameter * b, vec4(0.0)) * opacity;
+        break;
+
+    case DEVELOP_BLEND_SUBTRACT_INVERSE:
+        o = a * (1.0 - opacity) + max(b - pc.blend_parameter * a, vec4(0.0)) * opacity;
+        break;
+
+    case DEVELOP_BLEND_DIFFERENCE:
+    case DEVELOP_BLEND_DIFFERENCE2:
+        o = a * (1.0 - opacity) + abs(a - b) * opacity;
+        break;
+
+    case DEVELOP_BLEND_LIGHTNESS:
+        norm_a = max(sqrt(a.x * a.x + a.y * a.y + a.z * a.z), 1e-6);
+        norm_b = max(sqrt(b.x * b.x + b.y * b.y + b.z * b.z), 1e-6);
+        o = a * (1.0 - opacity) + a * norm_b / norm_a * opacity;
+        break;
+
+    case DEVELOP_BLEND_CHROMA:
+        norm_a = max(sqrt(a.x * a.x + a.y * a.y + a.z * a.z), 1e-6);
+        norm_b = max(sqrt(b.x * b.x + b.y * b.y + b.z * b.z), 1e-6);
+        o = a * (1.0 - opacity) + b * norm_a / norm_b * opacity;
+        break;
+
+    case DEVELOP_BLEND_RGB_R:
+        o.x = (a.x * (1.0 - opacity)) + (pc.blend_parameter * b.x * opacity);
+        o.y = a.y;
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_RGB_G:
+        o.x = a.x;
+        o.y = (a.y * (1.0 - opacity)) + (pc.blend_parameter * b.y * opacity);
+        o.z = a.z;
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_RGB_B:
+        o.x = a.x;
+        o.y = a.y;
+        o.z = (a.z * (1.0 - opacity)) + (pc.blend_parameter * b.z * opacity);
+        o.w = a.w;
+        break;
+
+    case DEVELOP_BLEND_DIVIDE:
+        o = a * (1.0 - opacity) + a / max(b * pc.blend_parameter, vec4(1e-6)) * opacity;
+        break;
+
+    case DEVELOP_BLEND_DIVIDE_INVERSE:
+        o = a * (1.0 - opacity) + b / max(a * pc.blend_parameter, vec4(1e-6)) * opacity;
+        break;
+
+    case DEVELOP_BLEND_GEOMETRIC_MEAN:
+        o = a * (1.0 - opacity) + sqrt(max(a * b, vec4(0.0))) * opacity;
+        break;
+
+    case DEVELOP_BLEND_HARMONIC_MEAN:
+        o = a * (1.0 - opacity) + 2.0 * a * b / (max(a, vec4(5e-7)) + max(b, vec4(5e-7))) * opacity;
+        break;
+
+    /* fallback to normal blend */
+    case DEVELOP_BLEND_BOUNDED:
+    case DEVELOP_BLEND_NORMAL2:
+    default:
+        o = (a * (1.0 - opacity)) + (b * opacity);
+        break;
+    }
+
+    /* we transfer alpha channel of input if mask_display is set, else we save opacity into alpha channel */
+    o.w = pc.mask_display != 0 ? a.w : opacity;
+
+    outb.v[idx] = o;
+}

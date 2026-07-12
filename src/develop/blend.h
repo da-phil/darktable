@@ -521,6 +521,33 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
                                      const dt_iop_roi_t *roi_out);
 #endif
 
+#ifdef HAVE_VULKAN
+/** Apply blending on the Vulkan device for the uniform-mask subset
+ *  (DAG milestone M0, dev-doc/gpu_resident_pixelpipe_dag.md §9).
+ *
+ *  Covers mask_mode == DEVELOP_MASK_ENABLED (plain global opacity —
+ *  no drawn/parametric/raster mask) in the Lab, display-RGB, and
+ *  scene-RGB blend colorspaces, all blend modes; the math is a
+ *  faithful port of the blendop.cl apply kernels. `cst_in`/`cst_out`
+ *  are the actual colorspaces of dev_in/dev_out; when they differ
+ *  from the blend colorspace the CPU path's transform step would be
+ *  needed, so this returns FALSE (transform nodes arrive with M2).
+ *
+ *  Blends dev_out in place (reading dev_in at the roi offset). On
+ *  TRUE the caller must skip the CPU blend AND the host blend
+ *  colorspace transforms; on FALSE nothing was touched and the
+ *  eager CPU path applies unchanged. Caller holds the device lock;
+ *  works both under graph capture and eagerly. */
+gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     dt_vk_mem_t *dev_in,
+                                     dt_vk_mem_t *dev_out,
+                                     const dt_iop_roi_t *roi_in,
+                                     const dt_iop_roi_t *roi_out,
+                                     const dt_iop_colorspace_type_t cst_in,
+                                     const dt_iop_colorspace_type_t cst_out);
+#endif
+
 #define _BLEND_FUNC_PROTO(align, uni) DT_OMP_DECLARE_SIMD(aligned align uniform uni) static void
 
 G_END_DECLS

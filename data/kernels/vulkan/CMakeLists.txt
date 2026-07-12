@@ -238,7 +238,11 @@ set(VK_KERNELS
     denoiseprofile_synthesize:denoiseprofile_synthesize
     denoiseprofile_reduce_tile:denoiseprofile_reduce_tile
     demosaic_passthrough_monochrome:demosaic_passthrough_monochrome
-    demosaic_passthrough_color:demosaic_passthrough_color)
+    demosaic_passthrough_color:demosaic_passthrough_color
+    blendop_set_mask:blendop_set_mask
+    blendop_lab:blendop_lab
+    blendop_rgb_hsl:blendop_rgb_hsl
+    blendop_rgb_jzczhz:blendop_rgb_jzczhz)
 
 # Kernels that must use the glslang .comp twin even when clspv is
 # available. These use the portable float-atomic-add idiom (a
@@ -281,7 +285,9 @@ foreach(SPEC IN LISTS VK_KERNELS)
               -I "${CMAKE_CURRENT_SOURCE_DIR}"
               -o "${SPV_OUT}"
               "${CL_SRC}"
-      DEPENDS "${CL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/dt_vulkan_common.h"
+      DEPENDS "${CL_SRC}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/dt_vulkan_common.h"
+              "${CMAKE_CURRENT_SOURCE_DIR}/dt_vulkan_blendop.h"
       COMMENT "clspv: ${K}.cl -> ${K}.spv  (entry: ${ENTRY})"
     )
   else()

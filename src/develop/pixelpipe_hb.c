@@ -1626,6 +1626,24 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             const int rc = module->process_vk(module, piece, vin, vout, roi_in, roi_out);
             if(rc == 0)
             {
+              // DAG M0: blend on the device for the uniform-mask
+              // subset, before the readback — host buffer, pipe
+              // cache, and the §5.14 hand-off then all carry the
+              // blended result, and the module no longer forces the
+              // chain through the CPU blend round-trip. Conservative
+              // gates: GUI mask display, color pickers, and the
+              // fast-blend cache keep the CPU path (they need host
+              // buffers or the pre-blend output).
+              if(_piece_wants_blending(piece)
+                 && dt_pipe_no_mask_display(pipe)
+                 && !_request_color_pick(pipe, dev, module)
+                 && !want_bcache
+                 && dt_develop_blend_process_vk(module, piece, vin, vout,
+                                                roi_in, roi_out, cst_to, cst_out))
+              {
+                *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_GPU;
+                *pixelpipe_flow &= ~PIXELPIPE_FLOW_BLENDED_ON_CPU;
+              }
               // Under capture this readback is the sync tap that
               // flushes the whole module segment as one submission.
               if(dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
@@ -1766,8 +1784,16 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
   if(_pipe_has_shutdown(pipe))
     return TRUE;
 
-  // blend needs input/output images with default colorspace
-  if(_transform_for_blend(module, piece))
+  // blend needs input/output images with default colorspace.
+  // When the blend already ran on the Vulkan device (M0 uniform-mask
+  // subset) the device output IS the final result: skip the host
+  // transforms and the CPU blend below — that's the whole point of
+  // blending on-device.
+  if(_transform_for_blend(module, piece)
+#ifdef HAVE_VULKAN
+     && !(*pixelpipe_flow & PIXELPIPE_FLOW_BLENDED_ON_GPU)
+#endif
+    )
   {
 #ifdef HAVE_VULKAN
     // §5.14: about to in-place transform host *output for blending.
@@ -1803,8 +1829,13 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     }
   }
 
-  /* process blending on CPU */
-  if(_piece_wants_blending(piece))
+  /* process blending on CPU (skipped when the M0 device blend
+     already produced the final output in the VK hook above) */
+  if(_piece_wants_blending(piece)
+#ifdef HAVE_VULKAN
+     && !(*pixelpipe_flow & PIXELPIPE_FLOW_BLENDED_ON_GPU)
+#endif
+    )
   {
     dt_develop_blend_process(module, piece, input, *output, roi_in, roi_out);
     *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_CPU;

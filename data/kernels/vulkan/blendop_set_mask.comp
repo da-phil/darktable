@@ -1,0 +1,23 @@
+// GLSL twin of blendop_set_mask.cl. Used by the CMake build when
+// clspv isn't installed. Must stay behaviour-equivalent — if
+// blendop_set_mask.cl changes, mirror the change here.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer MaskBuf { float v[]; } mask;
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    float value;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height) return;
+
+    mask.v[y * pc.width + x] = pc.value;
+}
