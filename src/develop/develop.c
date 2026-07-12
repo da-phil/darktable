@@ -3292,7 +3292,7 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
       zoom_y = boxh > 1.0f ? 0.0f : CLAMP(zoom_y, boxh / 2 - .5, .5 - boxh / 2);
     }
 
-    dt_print(DT_DEBUG_CONTROL,
+    dt_print(DT_DEBUG_CONTROL | DT_DEBUG_VERBOSE,
       "[zoom_move] req=%d constrain=%d cur_scale=%.4f new_scale=%.4f "
       "boxw=%.3f boxh=%.3f keep=%d load_val=%d relax=%d "
       "cursor=(%.0f,%.0f) zoom pre=(%.4f,%.4f) post=(%.4f,%.4f)\n",
@@ -3321,7 +3321,7 @@ void dt_dev_zoom_move(dt_dev_viewport_t *port,
   dt_pthread_mutex_unlock(&dev->history_mutex);
   dt_pthread_mutex_unlock(&darktable.control->global_mutex);
 
-  dt_print(DT_DEBUG_CONTROL,
+  dt_print(DT_DEBUG_CONTROL | DT_DEBUG_VERBOSE,
     "[zoom_move] result req=%d has_moved=%d moved_thr=%.1f "
     "port->zoom_x=%.2f port->zoom_y=%.2f zoom=%d closeup=%d zoom_scale=%.4f\n",
     req_zoom, has_moved, moved_threshold,

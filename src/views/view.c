@@ -2012,7 +2012,7 @@ void dt_view_paint_surface(cairo_t *cr,
   const gboolean use_preview_fallback = is_main_port && coverage_gap;
 
   if(port == &dev->full)
-    dt_print(DT_DEBUG_CONTROL,
+    dt_print(DT_DEBUG_CONTROL | DT_DEBUG_VERBOSE,
       "[paint] fallback=%d reprocess=%d scale_mm=%d cover_gap=%d "
       "zoom_x=%.4f zoom_y=%.4f offset_x=%.4f offset_y=%.4f "
       "trans=(%.1f,%.1f) buf=%dx%d need_l/r=(%.1f,%.1f) have_l/r=(%.1f,%.1f) "
