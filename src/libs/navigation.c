@@ -306,6 +306,33 @@ void gui_cleanup(dt_lib_module_t *self)
   self->data = NULL;
 }
 
+// Visible IMAGE region (viewport box intersected with the image) as centre +
+// extent in [-0.5, 0.5] image space. Unlike dt_dev_get_zoom_bounds() this also
+// reflects a pan at or below fit, where one side reveals letterbox while the
+// other is clipped out of view. Returns FALSE when the whole image is visible
+// and centred (nothing to outline).
+static gboolean _nav_visible_region(dt_dev_viewport_t *port,
+                                    float *cx,
+                                    float *cy,
+                                    float *bw,
+                                    float *bh)
+{
+  float zx = 0.0f, zy = 0.0f;
+  int procw = 0, proch = 0;
+  dt_dev_get_viewport_params(port, NULL, NULL, &zx, &zy);
+  dt_dev_get_processed_size(port, &procw, &proch);
+  const float scale = dt_dev_get_zoom_scale(port, port->zoom, 1 << port->closeup, FALSE);
+  const float raww = procw ? port->width  / (procw * scale) : 1.0f;
+  const float rawh = proch ? port->height / (proch * scale) : 1.0f;
+  const float lox = fmaxf(-0.5f, zx - 0.5f * raww), hix = fminf(0.5f, zx + 0.5f * raww);
+  const float loy = fmaxf(-0.5f, zy - 0.5f * rawh), hiy = fminf(0.5f, zy + 0.5f * rawh);
+  *bw = hix - lox;
+  *bh = hiy - loy;
+  *cx = 0.5f * (lox + hix);
+  *cy = 0.5f * (loy + hiy);
+  return *bw < 0.999f || *bh < 0.999f;
+}
+
 static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
                                               cairo_t *crf,
                                               gpointer user_data)
@@ -348,9 +375,10 @@ static gboolean _lib_navigation_draw_callback(GtkWidget *widget,
     cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
     cairo_fill(cr);
 
-    // draw box where we are
+    // draw box where we are (the visible image region, so a pan at fit that
+    // clips one side out of view is shown, not only a zoom past fit)
     float zoom_x, zoom_y, boxw, boxh;
-    if(dt_dev_get_zoom_bounds(&dev->full, &zoom_x, &zoom_y, &boxw, &boxh))
+    if(_nav_visible_region(&dev->full, &zoom_x, &zoom_y, &boxw, &boxh))
     {
       // Add a dark overlay on the picture to make it fade
       cairo_rectangle(cr, 0, 0, wd, ht);
@@ -504,8 +532,8 @@ static gboolean _lib_navigation_widget_to_center(GtkEventController *controller,
   // visible part of image in center widget in navigation widget
   // coords with zoom-to-fit defaults
   float zoom_x, zoom_y, boxw, boxh;
-  if(!dt_dev_get_zoom_bounds(port, &zoom_x, &zoom_y, &boxw, &boxh))
-  { // zoom-to-fit
+  if(!_nav_visible_region(port, &zoom_x, &zoom_y, &boxw, &boxh))
+  { // whole image visible and centred
     zoom_x = zoom_y = 0.0;
     boxw = boxh = 1.0;
   }
