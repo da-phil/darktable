@@ -568,7 +568,7 @@ void dt_color_picker_helper(const dt_iop_buffer_dsc_t *dsc,
 // ---- Vulkan color-picker reduction (DAG M5) -------------------------
 // Cached kernel slot, lazily loaded — same pattern as the histogram
 // and colorspaces VK helpers.
-typedef struct { int width, box_x0, box_y0, box_x1, box_y1; } _vk_picker_pc_t;
+typedef struct { int width, box_x0, box_y0, box_x1, box_y1, mode; } _vk_picker_pc_t;
 
 static dt_vk_module_kernel_t _vk_picker = DT_VK_MODULE_KERNEL_INIT;
 static gboolean              _vk_picker_loaded = FALSE;
@@ -593,11 +593,15 @@ gboolean dt_color_picker_helper_vk(int devid,
                                    const dt_iop_colorspace_type_t picker_cst)
 {
   if(denoise) return FALSE; // blur not ported yet
-  // only the no-conversion path (mirrors dt_color_picker_helper's
-  // effective_cst == picker_cst / picker_cst == NONE branches)
+  // map the cst pair to a kernel mode, mirroring dt_color_picker_helper's
+  // branches. JzCzhz needs the profile and isn't ported.
   const dt_iop_colorspace_type_t eff =
     (image_cst == IOP_CS_RAW) ? IOP_CS_RGB : image_cst;
-  if(!(eff == picker_cst || picker_cst == IOP_CS_NONE)) return FALSE;
+  int mode;
+  if(eff == picker_cst || picker_cst == IOP_CS_NONE)              mode = 0;
+  else if(eff == IOP_CS_LAB && picker_cst == IOP_CS_LCH)          mode = 1;
+  else if(eff == IOP_CS_RGB && picker_cst == IOP_CS_HSL)          mode = 2;
+  else return FALSE;
   // non-empty, in-bounds box
   if(!box || box[2] <= box[0] || box[3] <= box[1]) return FALSE;
   if(box[0] < 0 || box[1] < 0 || box[2] > width || box[3] > height) return FALSE;
@@ -616,7 +620,7 @@ gboolean dt_color_picker_helper_vk(int devid,
   gboolean ok = FALSE;
   if(dt_vulkan_write_to_device(devid, dev_stats, acc, sizeof(acc)) == 0)
   {
-    const _vk_picker_pc_t pc = { width, box[0], box[1], box[2], box[3] };
+    const _vk_picker_pc_t pc = { width, box[0], box[1], box[2], box[3], mode };
     dt_vk_mem_t *bufs[2] = { dev_in, dev_stats };
     if(dt_vulkan_dispatch_n(&_vk_picker, bufs, 2,
                             box[2] - box[0], box[3] - box[1], &pc, sizeof(pc)) == 0

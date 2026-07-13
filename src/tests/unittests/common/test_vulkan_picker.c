@@ -97,9 +97,16 @@ static float frand(float lo, float hi)
   return lo + (hi - lo) * ((s_rng >> 8) & 0xFFFFFF) / (float)0xFFFFFF;
 }
 
-// Run the GPU picker over `box`, comparing against the CPU picker.
-// Runs the device sequence, releases the lock, then asserts.
-static void run_box(const float *pixels, const int *box, const char *tag)
+// Run the GPU picker over `box` in the given colorspace pair, comparing
+// against the CPU picker. Runs the device sequence, releases the lock,
+// then asserts. `exact_extrema` selects whether min/max must match
+// exactly (no-conversion path) or within a tolerance (converting paths,
+// where the GPU/CPU conversions differ by a few ulp so a different
+// pixel may hold the extremum).
+static void run_box_cst(const float *pixels, const int *box,
+                        const dt_iop_colorspace_type_t image_cst,
+                        const dt_iop_colorspace_type_t picker_cst,
+                        const gboolean exact_extrema, const char *tag)
 {
   const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
   dt_iop_buffer_dsc_t dsc;
@@ -110,7 +117,7 @@ static void run_box(const float *pixels, const int *box, const char *tag)
 
   lib_colorpicker_stats cpu, gpu;
   dt_color_picker_helper(&dsc, pixels, &roi, box, FALSE, cpu,
-                         IOP_CS_RGB, IOP_CS_RGB, NULL);
+                         image_cst, picker_cst, NULL);
 
   const size_t bytes = TN * 4 * sizeof(float);
   const int dev = dt_vulkan_lock_device();
@@ -125,7 +132,7 @@ static void run_box(const float *pixels, const int *box, const char *tag)
   if(!rc) rc = dt_vulkan_write_to_device(dev, din, pixels, bytes);
   if(!rc)
     ran = dt_color_picker_helper_vk(dev, din, TW, TH, box, FALSE, gpu,
-                                    IOP_CS_RGB, IOP_CS_RGB);
+                                    image_cst, picker_cst);
   if(din) dt_vulkan_free_buffer(dev, din);
   if(dev == 0) dt_vulkan_unlock_device(dev);
 
@@ -133,16 +140,26 @@ static void run_box(const float *pixels, const int *box, const char *tag)
   assert_true(ran);
   for(int c = 0; c < 4; c++)
   {
-    // min/max are order-independent -> exact
-    assert_float_equal(gpu[DT_PICK_MIN][c], cpu[DT_PICK_MIN][c], 0.0f);
-    assert_float_equal(gpu[DT_PICK_MAX][c], cpu[DT_PICK_MAX][c], 0.0f);
+    const float scale = fmaxf(1.0f, fabsf(cpu[DT_PICK_MEAN][c]));
+    const float ext_eps = exact_extrema ? 0.0f : 5e-4f * scale;
+    if(fabsf(gpu[DT_PICK_MIN][c] - cpu[DT_PICK_MIN][c]) > ext_eps)
+      fail_msg("%s: min ch%d gpu %g vs cpu %g", tag, c,
+               (double)gpu[DT_PICK_MIN][c], (double)cpu[DT_PICK_MIN][c]);
+    if(fabsf(gpu[DT_PICK_MAX][c] - cpu[DT_PICK_MAX][c]) > ext_eps)
+      fail_msg("%s: max ch%d gpu %g vs cpu %g", tag, c,
+               (double)gpu[DT_PICK_MAX][c], (double)cpu[DT_PICK_MAX][c]);
     // mean: summation order differs, scale-aware tolerance
-    const float eps = 1e-4f * fmaxf(1.0f, fabsf(cpu[DT_PICK_MEAN][c]));
+    const float eps = (exact_extrema ? 1e-4f : 5e-4f) * scale;
     if(fabsf(gpu[DT_PICK_MEAN][c] - cpu[DT_PICK_MEAN][c]) > eps)
       fail_msg("%s: mean ch%d gpu %g vs cpu %g (eps %g)",
                tag, c, (double)gpu[DT_PICK_MEAN][c],
                (double)cpu[DT_PICK_MEAN][c], (double)eps);
   }
+}
+
+static void run_box(const float *pixels, const int *box, const char *tag)
+{
+  run_box_cst(pixels, box, IOP_CS_RGB, IOP_CS_RGB, TRUE, tag);
 }
 
 static void fill(float *p)
@@ -190,6 +207,41 @@ static void test_single_pixel_box(void **state)
   dt_free_align(p);
 }
 
+static void test_hsl_picker(void **state)
+{
+  (void)state; REQUIRE_DEVICE();
+  s_rng = 0x44;
+  float *p = dt_alloc_align_float(TN * 4);
+  assert_non_null(p);
+  // RGB image, HSL picker: keep values in gamut so the HSL conversion
+  // is well-conditioned
+  for(size_t i = 0; i < TN; i++)
+  {
+    p[i*4+0] = frand(0.0f, 1.0f); p[i*4+1] = frand(0.0f, 1.0f);
+    p[i*4+2] = frand(0.0f, 1.0f); p[i*4+3] = 1.0f;
+  }
+  const int box[4] = { 4, 6, 4 + 50, 6 + 40 };
+  run_box_cst(p, box, IOP_CS_RGB, IOP_CS_HSL, FALSE, "hsl picker");
+  dt_free_align(p);
+}
+
+static void test_lch_picker(void **state)
+{
+  (void)state; REQUIRE_DEVICE();
+  s_rng = 0x55;
+  float *p = dt_alloc_align_float(TN * 4);
+  assert_non_null(p);
+  // Lab image, LCH picker
+  for(size_t i = 0; i < TN; i++)
+  {
+    p[i*4+0] = frand(0.0f, 100.0f); p[i*4+1] = frand(-90.0f, 90.0f);
+    p[i*4+2] = frand(-90.0f, 90.0f); p[i*4+3] = 1.0f;
+  }
+  const int box[4] = { 4, 6, 4 + 50, 6 + 40 };
+  run_box_cst(p, box, IOP_CS_LAB, IOP_CS_LCH, FALSE, "lch picker");
+  dt_free_align(p);
+}
+
 static void test_subset_gates(void **state)
 {
   (void)state; REQUIRE_DEVICE();
@@ -202,7 +254,7 @@ static void test_subset_gates(void **state)
 
   const int dev = dt_vulkan_lock_device();
   int rc = (dev == 0) ? 0 : -100;
-  gboolean denoise_g = TRUE, convert_g = TRUE, badbox_g = TRUE, oob_g = TRUE;
+  gboolean denoise_g = TRUE, jzczhz_g = TRUE, badbox_g = TRUE, oob_g = TRUE;
   dt_vk_mem_t *din = NULL;
   if(!rc)
   {
@@ -215,9 +267,9 @@ static void test_subset_gates(void **state)
     // denoise not ported
     denoise_g = dt_color_picker_helper_vk(dev, din, TW, TH, box, TRUE, out,
                                           IOP_CS_RGB, IOP_CS_RGB);
-    // colorspace-converting picker not ported (RGB image, HSL picker)
-    convert_g = dt_color_picker_helper_vk(dev, din, TW, TH, box, FALSE, out,
-                                          IOP_CS_RGB, IOP_CS_HSL);
+    // JzCzhz picker needs the profile -> not ported
+    jzczhz_g = dt_color_picker_helper_vk(dev, din, TW, TH, box, FALSE, out,
+                                         IOP_CS_RGB, IOP_CS_JZCZHZ);
     // empty/inverted box
     badbox_g = dt_color_picker_helper_vk(dev, din, TW, TH, bad_box, FALSE, out,
                                          IOP_CS_RGB, IOP_CS_RGB);
@@ -232,7 +284,7 @@ static void test_subset_gates(void **state)
 
   assert_int_equal(rc, 0);
   assert_false(denoise_g);
-  assert_false(convert_g);
+  assert_false(jzczhz_g);
   assert_false(badbox_g);
   assert_false(oob_g);
 }
@@ -243,6 +295,8 @@ int main(void)
     cmocka_unit_test(test_full_box),
     cmocka_unit_test(test_sub_box),
     cmocka_unit_test(test_single_pixel_box),
+    cmocka_unit_test(test_hsl_picker),
+    cmocka_unit_test(test_lch_picker),
     cmocka_unit_test(test_subset_gates),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

@@ -18,8 +18,15 @@
 //                         [0..3]  sum  = 0
 //                         [4..7]  min  = +FLT_MAX
 //                         [8..11] max  = -FLT_MAX
-// Push constants: 5 ints = 20 bytes. width, box_x0, box_y0, box_x1,
-// box_y1 — the half-open box [x0,x1) x [y0,y1), as dt_iop_roi box.
+// Push constants: 6 ints = 24 bytes. width, box_x0, box_y0, box_x1,
+// box_y1 — the half-open box [x0,x1) x [y0,y1) — and mode:
+//   0 = raw 4 channels (no conversion, _color_picker_rgb_or_lab)
+//   1 = Lab -> LCH  (_color_picker_lch)
+//   2 = RGB -> HSL  (_color_picker_hsl)
+// For the converting modes the 4th channel is a rotated copy of the
+// 3rd, exactly as the CPU _update_stats_4ch does, so hue min/max/mean
+// avoid the 0/1 wraparound. The JzCzhz picker (needs the profile) and
+// the denoise blur are not ported and refuse to the CPU path.
 //
 // Dispatch over the box extent; global id (gx,gy) maps to pixel
 // (box_x0+gx, box_y0+gy).
@@ -33,7 +40,8 @@ kernel void picker_rgb
    const int box_x0,
    const int box_y0,
    const int box_x1,
-   const int box_y1)
+   const int box_y1,
+   const int mode)
 {
   const int gx = get_global_id(0);
   const int gy = get_global_id(1);
@@ -43,7 +51,12 @@ kernel void picker_rgb
 
   const int x = box_x0 + gx;
   const int y = box_y0 + gy;
-  const float4 px = in[idx2d(x, y, width)];
+  float4 px = in[idx2d(x, y, width)];
+
+  if(mode == 1)      px = vk_Lab_2_LCH(px);
+  else if(mode == 2) px = vk_RGB_to_HSL(px);
+  if(mode != 0)
+    px.w = (px.z < 0.5f) ? px.z + 0.5f : px.z - 0.5f;
 
   vk_atomic_add_f(&stats[0], px.x);
   vk_atomic_add_f(&stats[1], px.y);

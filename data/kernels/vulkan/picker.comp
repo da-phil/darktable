@@ -13,7 +13,40 @@ layout(push_constant) uniform PC {
     int box_y0;
     int box_x1;
     int box_y1;
+    int mode;      // 0 raw, 1 Lab->LCH, 2 RGB->HSL
 } pc;
+
+const float DT_2PI = 6.2831853071795864769;
+
+// Lab -> LCH, matching dt_vulkan_common.h::vk_Lab_2_LCH / dt_Lab_2_LCH.
+vec4 Lab_2_LCH(vec4 Lab) {
+    float H = atan(Lab.z, Lab.y);
+    H = (H > 0.0) ? H / DT_2PI : 1.0 - abs(H) / DT_2PI;
+    float C = length(Lab.yz);
+    return vec4(Lab.x, C, H, Lab.w);
+}
+
+// RGB -> HSL, matching dt_vulkan_common.h::vk_RGB_to_HSL / dt_RGB_2_HSL.
+vec4 RGB_2_HSL(vec4 RGB) {
+    float R = RGB.x, G = RGB.y, B = RGB.z;
+    float vmin = min(R, min(G, B));
+    float vmax = max(R, max(G, B));
+    float dmax = vmax - vmin;
+    float L = (vmax + vmin) * 0.5;
+    float H = 0.0, S = 0.0;
+    if(abs(vmax) > 1e-6 && abs(dmax) > 1e-6) {
+        S = (L < 0.5) ? dmax / (vmax + vmin) : dmax / (2.0 - vmax - vmin);
+        float dR = (((vmax - R) / 6.0) + (dmax / 2.0)) / dmax;
+        float dG = (((vmax - G) / 6.0) + (dmax / 2.0)) / dmax;
+        float dB = (((vmax - B) / 6.0) + (dmax / 2.0)) / dmax;
+        if(R == vmax)      H = dB - dG;
+        else if(G == vmax) H = (1.0 / 3.0) + dR - dB;
+        else if(B == vmax) H = (2.0 / 3.0) + dG - dR;
+        if(H < 0.0) H += 1.0;
+        if(H > 1.0) H -= 1.0;
+    }
+    return vec4(H, S, L, RGB.w);
+}
 
 // Float atomics via reinterpret-CAS (no native float atomics in core
 // GLSL), matching dt_vulkan_common.h::vk_atomic_{add,min,max}_f.
@@ -57,6 +90,11 @@ void main() {
     int x = pc.box_x0 + gx;
     int y = pc.box_y0 + gy;
     vec4 px = in_buf.data[y * pc.width + x];
+
+    if(pc.mode == 1)      px = Lab_2_LCH(px);
+    else if(pc.mode == 2) px = RGB_2_HSL(px);
+    if(pc.mode != 0)
+        px.w = (px.z < 0.5) ? px.z + 0.5 : px.z - 0.5;
 
     atomic_add_f(0u, px.x);
     atomic_add_f(1u, px.y);
