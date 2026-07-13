@@ -559,6 +559,26 @@ M0/M2 (uniform fill or CPU blend at a boundary), so raster consumers
 always run behind a flushed span; `pipe->scharr` is likewise produced
 on host paths only.
 
+**M2 status note (span capture landed).** The contract above is
+implemented in `pixelpipe_hb.{c,h}` (commit `4ac3479`): one capture
+context per run (opened at the first VK module, closed at the
+recursion root), `pipe->vk_graph_run` decided once at the root (debug
+modes that read per-module pixels — NaN scan, pfm dumps, benchmarks —
+simply run eager), readbacks skipped via
+`dt_dev_pixelpipe_invalidate_cacheline` + a single
+`vk_span_host_stale` marker, and `_vk_span_sync_host` wired at sites
+1, 2, 3, 9, 10, 11, 15, 16 plus the root's final sync (19) and
+capture close (20). Two refinements the implementation added: only
+the *newest* skipped line can ever be consumed again, so one stale
+pointer suffices (cleared when its module's successor completes, so
+cacheline reuse can't false-match it); and a module fault that had
+already consumed the hand-off as its input restores the host input
+from the still-intact buffer before the CPU fallback runs. Site 8
+became the debug-mode gate rather than a sync. Verified bit-identical
+eager-vs-graph on lavapipe (PFM bytes, PNG pixel streams). Spans
+currently flush at every host colorspace transform (site 1) — the
+glue nodes below are what let them chain.
+
 ### 5.4 Glue nodes
 
 Everything the eager pipe does between `process` calls becomes an
@@ -934,17 +954,15 @@ Each milestone lands green and user-invisible-by-default
   submission with every inter-module contract unchanged;
   darktable-cli exports verified bit-identical pref on vs off.
 - **M2 — span capture + glue nodes.** Widen the capture window from
-  module to GPU span. The prerequisite **sync-point audit is done** —
-  §5.3.1 carries the full consumer table, the two cacheline-lifetime
-  facts that shape it, and the resulting contract (snapshot span-entry
-  uploads; skip interior readbacks by invalidating their cachelines;
-  sync-at-need into the current module's protected lines; boundaries
-  at tiling/bcache/picker/CPU-blend/CL/CPU modules) — the hand-off
-  staleness bug found during M1 (§11) is a preview of why that audit
-  had to be exhaustive. Remaining: implement span state on the pipe
-  per that contract, then colorspace transform nodes (retire in-place
-  mutations in graph mode), blend nodes (M0), format conversions.
-  First real stacks go single-submission end-to-end.
+  module to GPU span. The **sync-point audit is done** (§5.3.1: full
+  consumer table, the two cacheline-lifetime facts, the resulting
+  contract) and the **span machinery is landed** (§5.3.1 status
+  note): run-scoped capture, deferred interior readbacks,
+  sync-at-need sites, root final sync — verified bit-identical
+  eager-vs-graph. Remaining: **glue nodes** — colorspace transform
+  nodes (retire the in-place host mutations that currently flush
+  every span at site 1), blend-space transforms, format conversions.
+  First real stacks then go single-submission end-to-end.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
   spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
 - **M4 — cache integration.** Async cache-tap readbacks; VRAM
@@ -1001,6 +1019,58 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M2 span capture landed: run-scoped context, deferred readbacks
+
+Commit: `4ac3479` (pixelpipe span state + sync sites + root scope).
+
+What shipped, against the §5.3.1 contract:
+
+- **Run-scoped capture.** One context per pipe run: opened lazily at
+  the first VK module's hook, flushed by sync taps and sync-at-need
+  reads, closed (or aborted, on error/shutdown) at the recursion
+  root. `pipe->vk_graph_run` is decided once at the root so the mode
+  can't flip mid-span; the pixel-reading debug modes (NaN scan, pfm
+  dumps, module benchmarks) get their per-module host visibility by
+  running eager.
+- **Deferred readbacks.** A module with no host consumer of its
+  output in its own scope (no pending CPU blend, no fast-blend cache,
+  no picker, no mask display) skips the device→host readback;
+  the cacheline is invalidated (later-run cache hits impossible) and
+  marked stale via a single `vk_span_host_stale` pointer — one
+  suffices because only the newest skipped line is ever consumable
+  again, and it's cleared once its successor module completes so
+  cacheline reuse can't false-match. Sync-at-need
+  (`_vk_span_sync_host`) is wired at audit sites 1, 2, 3, 9, 10, 11,
+  15, 16; the root serves site 19 (final output) and 20 (context
+  close).
+- **Snapshot uploads under capture** (audit decision 1): the M1
+  borrowed-pointer trunk upload is retired in graph mode — the flush
+  may now happen modules later than the borrowing module, outside
+  the pipe cache's two protected lines. Costs one ring memcpy per
+  span entry; interior modules ride the hand-off and upload nothing.
+- **Fault handling.** Per-module capture marks + rollback replace the
+  M1 per-module end/abort, so a fault drops only the faulting
+  module's nodes. If the fault had already consumed the hand-off as
+  `vin` while the host input was never materialized, the input is
+  restored from the still-intact buffer before the CPU fallback —
+  closing the one path where the M1-era semantics would have read
+  garbage.
+- **Cross-run hygiene**: the hand-off is dropped at run start (it is
+  keyed by size alone; parameters may have changed), and the span
+  state never survives the run.
+- **Evidence.** lavapipe A/B: PFM exports byte-identical pref off vs
+  on; PNG exports pixel-stream-identical (file md5 differs only in
+  metadata timestamp chunks — verified by decompressing IDAT). `-d
+  vkgraph` shows all three VK modules of the test pipe deferring
+  ("run done: 3 readbacks deferred"), the two mid-span
+  cst-transform syncs, and the final root sync. Full ctest green.
+- **Reality check, kept honest in §9:** submissions per run didn't
+  drop yet — the default pipe has a host colorspace transform between
+  every VK module pair, so each span flushes at site 1 before the
+  next module starts. That is exactly the remaining M2 work (glue
+  nodes); the defer/sync machinery this landing proves is what makes
+  those transforms *worth* porting.
 
 ### 2026-07-13 — M2a done: the span-capture sync-point audit
 
