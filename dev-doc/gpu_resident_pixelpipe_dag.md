@@ -478,6 +478,87 @@ by design), the pipe re-classifies the piece as `CPU`, splits the span
 at that point, and continues. The §8a.3 `vk_fallback_reason` plumbing
 carries over unchanged.
 
+#### 5.3.1 Sync-point audit (M2a — the contract for span capture)
+
+Result of auditing every host consumer of the trunk against the M1
+module-scoped hook, so that the M2 span capture (capture stays open
+across module boundaries; interior readbacks skipped) is
+correct-by-construction rather than whack-a-mole. Line references are
+to the audited revision (`d98a0b0`); the mechanism names are stable.
+
+**Two load-bearing facts about the pipe cache**
+(`src/develop/pixelpipe_cache.c`) shape the whole contract:
+
+- **Only the current module's input and output cachelines are
+  protected.** Victim selection (`_get_oldest_cacheline`, :203)
+  excludes just `lastline` and lines aged ≤ 1; every older line —
+  including the span-entry input two modules back — is reclaimable by
+  any later `dt_dev_pixelpipe_cache_get`, and reclaim may
+  `dt_free_align` the buffer on size change (:330–345).
+- **Export and thumbnail pipes have exactly two cachelines** that
+  alternate blindly (`_get_cacheline`, :245): a line is *guaranteed*
+  reused two `cache_get`s later. Precisely the pipes where spans pay
+  most.
+
+Hence two design decisions for M2:
+
+1. **Span-entry trunk uploads are snapshotted, not borrowed.** A
+   borrowed host pointer is only safe while its cacheline is
+   protected, i.e. within the module that borrowed it — the
+   module-scoped M1 hook keeps the borrow; span mode pays one trunk
+   memcpy into the capture ring per span *entry* (interior modules
+   ride the §5.14 hand-off buffer and upload nothing). Cacheline
+   pinning could remove that copy for the many-line darkroom pipes,
+   but can never work for the 2-line pipes; revisit with the M3
+   planner if profiles say the memcpy matters.
+2. **A deferred readback never writes host cachelines at flush.**
+   Interior modules' host outputs are simply never produced: their
+   cachelines are invalidated (`DT_INVALID_HASH`) at capture time, the
+   trunk stays in the hand-off device buffer, and any host consumer
+   that fires mid-span performs a **sync-at-need**: flush the capture,
+   then read the live trunk into the *current* module's input or
+   output line — the only two lines that are provably still owned
+   (fact 1). A later-run cache hit on a span interior is impossible
+   (invalid hash), which keeps the cache-hit path (:2044) sound. The
+   cost — span interiors stop populating the pipe cache in graph
+   mode — is the documented interactivity trade until M4's async
+   cache taps re-fill important lines from the graph.
+
+**The consumer table.** Every host touch point between `process_vk`
+and the next module's dispatch, with its span action
+(`pixelpipe_hb.c` lines at `d98a0b0`):
+
+| # | site | fires when | span action |
+|---|------|-----------|-------------|
+| 1 | input cst transform, in-place host (:1447) | module input cst ≠ pipe cst | **sync-at-need** now; becomes a device glue node (§5.4) later in M2 |
+| 2 | `_collect_histogram_on_CPU` on input (:1468) | `request_histogram` | sync-at-need (GPU reduction tap lands M5) |
+| 3 | CPU tiling arm (:1497) | module won't fit device | **boundary** (host process; hand-off choke point :1747 already invalidates) |
+| 4 | blend-cache replay / store (:1508, :1543, :1713) | `want_bcache` | **boundary** — the M0 hook already refuses device blend for these |
+| 5 | trunk upload (:1615) | span entry only | snapshot (decision 1); interior modules use the hand-off, no upload |
+| 6 | M0 device blend (:1637) | uniform-mask subset | stays in capture; its refusal gates (picker, mask display, bcache, cs mismatch) all imply a boundary below |
+| 7 | output readback (:1649) | every module today | interior: **skipped**, output line invalidated (decision 2); boundary/last module: sync tap exactly as M1 |
+| 8 | pfm dump / NaN scan (:1751, :3183) | debug flags | sync-at-need (debug runs trade speed for visibility) |
+| 9 | module color picker (:1767) | picker request | **boundary** (picker also forces CPU blend → :11) |
+| 10 | blend cst transforms, in-place host (:1792) | CPU blend pending | **boundary** |
+| 11 | CPU blend (:1834) | blending outside M0 subset | **boundary** |
+| 12 | mask-display bypass copy (:2307) | GUI masking | sync-at-need (rare, GUI-only) |
+| 13 | output `cache_get` (:2266) | every module | no pixel read; hazards removed by decisions 1+2 |
+| 14 | cache-hit early return (:2044) | later runs | safe: span interiors carry invalid hashes |
+| 15 | CL routing / host→image copy (:2513, :2536) | module prefers OpenCL | **boundary** (:2519 already invalidates the hand-off) |
+| 16 | CPU module `process` (:1711) | non-VK module | **boundary** (choke point :1747) |
+| 17 | preview-gamma picker + scope proxy (:3246) | preview pipe at gamma | no action: gamma is a CPU module, so a boundary already flushed at :16 |
+| 18 | importance hints / `invalidate_later` (:3165, cache) | GUI | metadata only, no pixel access |
+| 19 | final backcopy → backbuf/export (:3333, :3543) | pipe end | **final sync** at recursion root after the last module |
+| 20 | shutdown early-returns (:1465, :1784, :2257 …) and pipe teardown (:422) | cancellation | capture abort at the recursion root's unwind — the span state lives on the pipe, is created and destroyed inside one `process_rec` run, and never survives it |
+
+Items 3, 4, 9–11, 15, 16 end the span *between* modules (the capture
+flushes at the previous module's readback, exactly like M1, then the
+host path runs); items 1, 2, 8, 12 flush mid-module and the span
+continues after the host read. Raster-mask producers stay host-only in
+M0/M2 (uniform fill or CPU blend at a boundary), so raster consumers
+always run behind a flushed span; `pipe->scharr` is likewise produced
+on host paths only.
+
 ### 5.4 Glue nodes
 
 Everything the eager pipe does between `process` calls becomes an
@@ -853,13 +934,15 @@ Each milestone lands green and user-invisible-by-default
   submission with every inter-module contract unchanged;
   darktable-cli exports verified bit-identical pref on vs off.
 - **M2 — span capture + glue nodes.** Widen the capture window from
-  module to GPU span, which requires the §5.3 sync-point audit first
-  (a deferred output readback must be serviced at: colorspace
-  transforms, blend transforms, histogram/picker collection, the
-  tiling and blend-cache branches, non-VK modules, the final
-  backcopy, and teardown/restart paths) — the hand-off staleness bug
-  found during M1 (§11) is a preview of why that audit must be
-  exhaustive. Then colorspace transform nodes (retire in-place
+  module to GPU span. The prerequisite **sync-point audit is done** —
+  §5.3.1 carries the full consumer table, the two cacheline-lifetime
+  facts that shape it, and the resulting contract (snapshot span-entry
+  uploads; skip interior readbacks by invalidating their cachelines;
+  sync-at-need into the current module's protected lines; boundaries
+  at tiling/bcache/picker/CPU-blend/CL/CPU modules) — the hand-off
+  staleness bug found during M1 (§11) is a preview of why that audit
+  had to be exhaustive. Remaining: implement span state on the pipe
+  per that contract, then colorspace transform nodes (retire in-place
   mutations in graph mode), blend nodes (M0), format conversions.
   First real stacks go single-submission end-to-end.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
@@ -918,6 +1001,32 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M2a done: the span-capture sync-point audit
+
+Doc-only landing; no behaviour change. §5.3.1 is the deliverable: the
+table of every host consumer of the trunk between `process_vk` and the
+next module's dispatch, and the span contract derived from it. The
+audit turned up two cacheline-lifetime facts that decided the design
+before any code was written:
+
+- `dt_dev_pixelpipe_cache_get` protects only the current module's
+  input and output lines (victim selection excludes just `lastline`
+  and age ≤ 1, `pixelpipe_cache.c:203`), and reclaim may free the
+  buffer outright on size change (:330). A borrowed span-entry upload
+  would dangle as soon as the span crosses its second module.
+- Export/thumbnail pipes alternate exactly two cachelines (:245) — a
+  line is *guaranteed* reused two modules later, in exactly the pipes
+  where spans pay most.
+
+Consequences (now §5.3.1's decisions 1+2): span-entry uploads are
+snapshotted into the capture ring (the M1 borrow stays for the
+module-scoped mode, where the flush happens inside the borrowing
+module); interior readbacks are skipped by invalidating the output
+cacheline rather than deferring a host write into memory the cache may
+hand to someone else; every mid-span host consumer syncs at need into
+the current module's still-protected lines. The M2 milestone in §9 now
+tracks only the implementation work.
 
 ### 2026-07-12 — M0 landed: VK blend kernels, uniform-mask blending in the eager hook
 
