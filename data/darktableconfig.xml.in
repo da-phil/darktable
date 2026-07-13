@@ -498,7 +498,7 @@
     <type>bool</type>
     <default>false</default>
     <shortdescription>capture Vulkan work into batched submissions</shortdescription>
-    <longdescription>if enabled, each Vulkan module's GPU work (uploads, kernel dispatches, copies) is captured and submitted to the driver as a single batch instead of one synchronous submission per call. First milestone of the GPU-resident pipeline design (dev-doc/gpu_resident_pixelpipe_dag.md); experimental, output is verified bit-identical to the unbatched path.</longdescription>
+    <longdescription>if enabled, the GPU work of consecutive Vulkan modules (uploads, kernel dispatches, copies) is captured across module boundaries and submitted to the driver in large batches, and intermediate device-to-host readbacks are skipped when no CPU consumer needs them. Part of the GPU-resident pipeline design (dev-doc/gpu_resident_pixelpipe_dag.md); experimental, output is verified bit-identical to the eager path.</longdescription>
   </dtconfig>
   <dtconfig prefs="processing" section="platform" capability="nonapple" restart="true">
     <name>clplatform_intelropenclhdgraphics</name>

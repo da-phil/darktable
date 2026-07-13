@@ -274,6 +274,21 @@ typedef struct dt_dev_pixelpipe_t
   dt_vk_mem_t *vk_handoff_buf;
   size_t       vk_handoff_size;
 
+  // DAG M2 span capture (gpu_resident_pixelpipe_dag.md §5.3.1).
+  // vk_graph_run: this run captures across module boundaries; decided
+  // once at the recursion root (pref on, device up, no debug modes
+  // that want per-module host visibility) so the decision can't flip
+  // mid-span. vk_span_host_stale: the host cacheline of the newest
+  // module whose device→host readback was skipped — its real pixels
+  // live in vk_handoff_buf; a sync-at-need site reads them back
+  // before any host consumer touches the buffer, and only the newest
+  // skipped line is ever consumed again (older interiors carry
+  // DT_INVALID_HASH and nothing addresses them). vk_span_skips
+  // counts skipped readbacks for the -d vkgraph run summary.
+  gboolean vk_graph_run;
+  void    *vk_span_host_stale;
+  uint32_t vk_span_skips;
+
   // §8a.3 in gpu_acceleration_clspv_vulkan.md — diagnostic tag set
   // by a module's process_vk just before it returns -1 so the
   // pixelpipe "vulkan -> CPU fallback" log can tell designed

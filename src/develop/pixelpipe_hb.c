@@ -78,6 +78,44 @@ static inline void _vk_handoff_invalidate(dt_dev_pixelpipe_t *pipe)
   pipe->vk_handoff_buf  = NULL;
   pipe->vk_handoff_size = 0;
 }
+
+// DAG M2 sync-at-need (gpu_resident_pixelpipe_dag.md §5.3.1): `host`
+// is about to be consumed on the CPU, but if it is the cacheline of a
+// module whose readback was skipped mid-span, its pixels still live
+// in the hand-off device buffer. Read them back now — under an active
+// capture dt_vulkan_read_from_device flushes the pending segment
+// first, so this also submits every deferred node the trunk depends
+// on. The hand-off stays valid (read-only): the caller may keep the
+// VK chain going. Only ever a hit for the *newest* skipped line, so a
+// single stale pointer suffices.
+static inline void _vk_span_sync_host(dt_dev_pixelpipe_t *pipe,
+                                      void *host,
+                                      const size_t size,
+                                      const char *why)
+{
+  if(!pipe->vk_span_host_stale || pipe->vk_span_host_stale != host)
+    return;
+  const int vdev = dt_vulkan_lock_device();
+  if(vdev >= 0)
+  {
+    if(pipe->vk_handoff_buf && pipe->vk_handoff_size == size)
+    {
+      if(dt_vulkan_read_from_device(vdev, host, pipe->vk_handoff_buf, size) == 0)
+        dt_print(DT_DEBUG_VKGRAPH, "[vkgraph] sync-at-need (%s) %zu bytes", why, size);
+      else
+        dt_print(DT_DEBUG_ALWAYS, "[vkgraph] ERROR: sync-at-need (%s) readback failed", why);
+    }
+    else
+      // the stale marker outliving its hand-off buffer means a
+      // boundary forgot to sync first — a bug in the span contract
+      dt_print(DT_DEBUG_ALWAYS,
+               "[vkgraph] ERROR: sync-at-need (%s) without matching hand-off"
+               " (want %zu bytes, have %zu)",
+               why, size, pipe->vk_handoff_size);
+    dt_vulkan_unlock_device(vdev);
+  }
+  pipe->vk_span_host_stale = NULL;
+}
 #endif
 
 // forward declarations for mask cache helpers
@@ -334,6 +372,9 @@ gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   memset(pipe->mask_distort_buf_size, 0, sizeof(pipe->mask_distort_buf_size));
   pipe->vk_handoff_buf  = NULL;
   pipe->vk_handoff_size = 0;
+  pipe->vk_graph_run = FALSE;
+  pipe->vk_span_host_stale = NULL;
+  pipe->vk_span_skips = 0;
   return dt_dev_pixelpipe_cache_init(pipe, entries, size, memlimit);
 }
 
@@ -1223,6 +1264,13 @@ static void _collect_histogram_on_CPU(dt_dev_pixelpipe_t *pipe,
   if((dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
      && (piece->request_histogram & DT_REQUEST_ON))
   {
+#ifdef HAVE_VULKAN
+    // M2 §5.3.1 site 2: the histogram reads the module's host input
+    _vk_span_sync_host(pipe, (void *)input,
+                       (size_t)roi_in->width * roi_in->height
+                         * dt_iop_buffer_dsc_to_bpp(&piece->dsc_in),
+                       "input histogram");
+#endif
     _histogram_collect(piece, input, roi_in, &piece->histogram, piece->histogram_max);
     *pixelpipe_flow |= (PIXELPIPE_FLOW_HISTOGRAM_ON_CPU);
     *pixelpipe_flow &= ~(PIXELPIPE_FLOW_HISTOGRAM_NONE | PIXELPIPE_FLOW_HISTOGRAM_ON_GPU);
@@ -1435,6 +1483,12 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                     ? dt_colorspaces_get_name(work_profile->type, work_profile->filename)
                     : "no work profile");
 #ifdef HAVE_VULKAN
+    // M2 §5.3.1 site 1: the in-place transform reads `input` — if the
+    // previous module deferred its readback, materialize it first.
+    _vk_span_sync_host(pipe, input,
+                       (size_t)roi_in->width * roi_in->height
+                         * dt_iop_buffer_dsc_to_bpp(input_format),
+                       "input cst transform");
     // §5.14: the host buffer is about to be mutated in place. Any
     // VK→VK hand-off cache from the previous module becomes stale —
     // it still holds the pre-transform GPU contents, but the next
@@ -1509,6 +1563,12 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     }
     else
     {
+#ifdef HAVE_VULKAN
+      // M2 §5.3.1 site 3: tiled CPU processing reads the host input
+      _vk_span_sync_host(pipe, input,
+                         (size_t)roi_in->width * roi_in->height * in_bpp,
+                         "cpu tiling");
+#endif
       module->process_tiling(module, piece, input, *output, roi_in, roi_out, in_bpp);
       if(want_bcache)
       {
@@ -1564,19 +1624,15 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
         const int devid = dt_vulkan_lock_device();
         if(devid >= 0)
         {
-          // DAG M1 (gpu_resident_pixelpipe_dag.md §9): capture this
-          // module's HAL calls into ONE queue submission instead of
-          // one per upload/dispatch/copy. Module-scoped for now: the
-          // capture opens here and closes before the output readback
-          // (which sync-taps the flush), so every inter-module
-          // contract — hand-off, cachelines, blending, taps — behaves
-          // exactly as in eager mode. Span-scoped capture with
-          // deferred readback is the next milestone; it needs the
-          // §5.3 sync-point audit before it can land.
-          static int graph_pref = -1;
-          if(graph_pref < 0)
-            graph_pref = dt_conf_get_bool("pixelpipe_vulkan_graph") ? 1 : 0;
-          const gboolean graph = graph_pref && dt_vulkan_capture_begin(devid);
+          // DAG M2 (gpu_resident_pixelpipe_dag.md §5.3.1): under
+          // pipe->vk_graph_run a single capture context spans the
+          // whole pipe run — opened lazily at the first VK module,
+          // flushed by sync taps and sync-at-need reads, closed at
+          // the recursion root. Each module takes a mark so a fault
+          // rolls back just its own nodes and the span survives.
+          const gboolean graph = pipe->vk_graph_run
+              && (dt_vulkan_capture_active() || dt_vulkan_capture_begin(devid));
+          const dt_vk_capture_mark_t cmark = dt_vulkan_capture_mark();
 
           // §5.14: VK→VK chain skip. If the previous VK module
           // left a live output buffer whose size matches this
@@ -1607,16 +1663,15 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
           // from a previous module can't leak into this dispatch's
           // fallback log line.
           pipe->vk_fallback_reason = NULL;
-          // The trunk upload: under capture, borrow the host pointer
-          // instead of snapshotting — `input` is this module's pipe
-          // cacheline and outlives the readback-triggered flush below,
-          // and snapshotting would memcpy the whole trunk into the
-          // capture ring.
+          // The trunk upload. Under capture this snapshots into the
+          // ring (§5.3.1 decision 1): the flush may now happen
+          // modules later, and `input` is a pipe cacheline the cache
+          // may reclaim — or free outright — long before that
+          // (borrowing is only safe when the flush is guaranteed
+          // within the borrowing module, which span capture is not).
           const gboolean upload_ok = vin_from_cache
               ? TRUE
-              : (vin && (graph
-                         ? dt_vulkan_write_to_device_borrowed(devid, vin, input, in_size)
-                         : dt_vulkan_write_to_device(devid, vin, input, in_size)) == 0);
+              : (vin && dt_vulkan_write_to_device(devid, vin, input, in_size) == 0);
           const char *failure_phase = NULL;
           if(!vin)            failure_phase = "alloc-in-failed";
           else if(!vout)      failure_phase = "alloc-out-failed";
@@ -1644,18 +1699,47 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                 *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_GPU;
                 *pixelpipe_flow &= ~PIXELPIPE_FLOW_BLENDED_ON_CPU;
               }
-              // Under capture this readback is the sync tap that
-              // flushes the whole module segment as one submission.
-              if(dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
+              // §5.3.1 decision 2: mid-span, skip the device→host
+              // readback when no host consumer of *output can fire
+              // in this module's own scope — the audited
+              // sync-at-need sites service every later consumer. The
+              // skipped cacheline is invalidated (its content is
+              // garbage; a later-run cache hit must be impossible)
+              // and marked stale so a sync site can materialize it
+              // from the hand-off.
+              const gboolean blend_pending = _piece_wants_blending(piece)
+                  && !(*pixelpipe_flow & PIXELPIPE_FLOW_BLENDED_ON_GPU);
+              const gboolean defer_readback = graph
+                  && !blend_pending
+                  && !want_bcache
+                  && dt_pipe_no_mask_display(pipe)
+                  && !_request_color_pick(pipe, dev, module);
+              if(defer_readback)
               {
                 processed = TRUE;
+                dt_dev_pixelpipe_invalidate_cacheline(pipe, *output);
+                pipe->vk_span_host_stale = *output;
+                pipe->vk_span_skips++;
+              }
+              else
+              {
+                // Under capture this readback is the sync tap that
+                // flushes everything pending as one submission.
+                if(dt_vulkan_read_from_device(devid, *output, vout, out_size) == 0)
+                  processed = TRUE;
+                else
+                  failure_phase = "host-readback-failed";
+              }
+              if(processed)
+              {
                 *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
                 *pixelpipe_flow &= ~PIXELPIPE_FLOW_PROCESSED_ON_CPU;
                 dt_print_pipe(DT_DEBUG_OPENCL, "process_vk",
                               pipe, module, DT_DEVICE_VK, roi_in, roi_out,
-                              "%dx%d%s%s", roi_in->width, roi_in->height,
+                              "%dx%d%s%s%s", roi_in->width, roi_in->height,
                               vin_from_cache ? " [vk handoff]" : "",
-                              graph ? " [vk graph]" : "");
+                              graph ? " [vk graph]" : "",
+                              defer_readback ? " [readback deferred]" : "");
                 // Hand off vout to the next module instead of freeing
                 // it. If the next module is non-VK or has a mismatched
                 // size, it'll get dropped on that branch.
@@ -1663,20 +1747,32 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                 pipe->vk_handoff_size = out_size;
                 vout = NULL;
               }
-              else failure_phase = "host-readback-failed";
             }
             else failure_phase = "process_vk";
           }
-          // Close the capture before the frees below so they run
-          // eagerly: success leaves an empty segment (the readback
-          // already flushed it), failure drops the partial nodes —
-          // the CPU fallback then reprocesses from the intact host
-          // input.
-          if(graph)
+          // Failure under capture: truncate the graph back to this
+          // module's mark so only its nodes are dropped and the span
+          // survives for the modules before/after. If the hand-off
+          // was consumed as vin while the host input was never
+          // materialized (a deferred readback upstream), restore it
+          // from vin — still intact, its producer sits before the
+          // mark — so the CPU fallback below reads real pixels.
+          if(graph && !processed)
           {
-            if(processed) dt_vulkan_capture_end(devid);
-            else          dt_vulkan_capture_abort(devid);
+            dt_vulkan_capture_rollback(devid, &cmark);
+            if(vin_from_cache && pipe->vk_span_host_stale == input)
+            {
+              if(dt_vulkan_read_from_device(devid, input, vin, in_size) == 0)
+                pipe->vk_span_host_stale = NULL;
+              else
+                dt_print_pipe(DT_DEBUG_ALWAYS, "vulkan span",
+                              pipe, module, DT_DEVICE_VK, roi_in, roi_out,
+                              "ERROR: host input not restorable after module fault");
+            }
           }
+          // Under an open capture these frees are deferred to the
+          // next flush automatically — pending nodes may still
+          // reference the buffers.
           dt_vulkan_free_buffer(devid, vin);
           if(vout) dt_vulkan_free_buffer(devid, vout);
           dt_vulkan_unlock_device(devid);
@@ -1703,6 +1799,12 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
       if(!processed)
       {
 #ifdef HAVE_VULKAN
+        // M2 §5.3.1 site 16: the CPU path reads the host input —
+        // materialize a deferred readback before dropping the
+        // hand-off it would read from.
+        _vk_span_sync_host(pipe, input,
+                           (size_t)roi_in->width * roi_in->height * in_bpp,
+                           "cpu process");
         // §5.14: any VK→VK hand-off is stale once a CPU module
         // runs (output now lives in host memory, the cached VK
         // buffer no longer matches).
@@ -1766,6 +1868,14 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
   // color picking for module
   if(_request_color_pick(pipe, dev, module) && !blend_picking)
   {
+#ifdef HAVE_VULKAN
+    // M2 §5.3.1 site 9: the picker reads the module's host input.
+    // (*output was read back for sure: a module with a picker
+    // request never skips its own readback.)
+    _vk_span_sync_host(pipe, input,
+                       (size_t)roi_in->width * roi_in->height * in_bpp,
+                       "module picker");
+#endif
     _pixelpipe_picker(module, piece, &piece->dsc_in, (float *)input, roi_in,
                       module->picked_color,
                       module->picked_color_min,
@@ -1796,6 +1906,13 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     )
   {
 #ifdef HAVE_VULKAN
+    // M2 §5.3.1 site 10: the blend transforms read the host input
+    // (the CPU blend below reads it as operand `a` too). *output was
+    // read back for sure: a module heading into the CPU blend never
+    // skips its own readback.
+    _vk_span_sync_host(pipe, input,
+                       (size_t)roi_in->width * roi_in->height * in_bpp,
+                       "blend transform");
     // §5.14: about to in-place transform host *output for blending.
     // The previous process_vk staged its raw output into the hand-off
     // cache; the upcoming module's vin_from_cache path would read the
@@ -1837,10 +1954,29 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
 #endif
     )
   {
+#ifdef HAVE_VULKAN
+    // M2 §5.3.1 site 11: the CPU blend reads the host input as
+    // operand `a`. No-op when site 10 already synced; needed on its
+    // own for the blends _transform_for_blend excludes (e.g. RAW).
+    _vk_span_sync_host(pipe, input,
+                       (size_t)roi_in->width * roi_in->height * in_bpp,
+                       "cpu blend");
+#endif
     dt_develop_blend_process(module, piece, input, *output, roi_in, roi_out);
     *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_CPU;
     *pixelpipe_flow &= ~PIXELPIPE_FLOW_BLENDED_ON_GPU;
   }
+
+#ifdef HAVE_VULKAN
+  // M2 span hygiene: once this module is done, the previous module's
+  // skipped host line (our `input`) is beyond every consumer that
+  // could legally read it (§5.3.1 table) — clear the marker so a
+  // later cacheline reuse of the same pointer can't false-match a
+  // sync-at-need check. Our own deferred output (if any) carries the
+  // marker onward instead.
+  if(pipe->vk_span_host_stale == input)
+    pipe->vk_span_host_stale = NULL;
+#endif
 
   return _pipe_has_shutdown(pipe);
 }
@@ -2513,6 +2649,12 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     if(possible_cl)
     {
 #ifdef HAVE_VULKAN
+      // M2 §5.3.1 site 15: the CL arm uploads from the host input
+      // (dt_opencl_copy_host_to_image below) — materialize a deferred
+      // readback before releasing the hand-off it reads from.
+      _vk_span_sync_host(pipe, input,
+                         (size_t)roi_in.width * roi_in.height * in_bpp,
+                         "opencl routing");
       // §5.14: any prior VK→VK hand-off becomes stale once we
       // switch to the OpenCL chain. Release it so the buffer
       // memory comes back to the driver pool.
@@ -3341,9 +3483,74 @@ static gboolean _dev_pixelpipe_process_rec_and_backcopy(dt_dev_pixelpipe_t *pipe
                                                         const int pos)
 {
   dt_pthread_mutex_lock(&pipe->busy_mutex);
+#ifdef HAVE_VULKAN
+  // DAG M2 run scope (gpu_resident_pixelpipe_dag.md §5.3.1): decide
+  // graph mode once per run — never mid-span — and start from clean
+  // span state. The debug modes that read trunk pixels per module
+  // (NaN scan, pfm dumps, module benchmarks) get eager per-module
+  // readbacks by simply not running in graph mode. A hand-off buffer
+  // surviving from a previous run is dropped: it is keyed by size
+  // alone, and this run's parameters may have changed what those
+  // pixels should be.
+  {
+    static int graph_pref = -1;
+    if(graph_pref < 0)
+      graph_pref = dt_conf_get_bool("pixelpipe_vulkan_graph") ? 1 : 0;
+    pipe->vk_graph_run = graph_pref && dt_vulkan_running()
+        && !darktable.dump_pfm_pipe
+        && !darktable.bench_module
+        && !(darktable.unmuted & DT_DEBUG_NAN);
+    pipe->vk_span_host_stale = NULL;
+    pipe->vk_span_skips = 0;
+    _vk_handoff_invalidate(pipe);
+  }
+#endif
   gboolean ret = _dev_pixelpipe_process_rec(pipe, dev, output,
                                             cl_mem_output, out_format, roi_out,
                                             modules, pieces, pos);
+#ifdef HAVE_VULKAN
+  if(pipe->vk_graph_run)
+  {
+    const int vdev = dt_vulkan_lock_device();
+    if(vdev >= 0)
+    {
+      // §5.3.1 site 19, the final sync: if the last module deferred
+      // its readback, the pipe's output pixels only exist in the
+      // hand-off buffer — materialize them into *output now.
+      if(!ret && *output && pipe->vk_span_host_stale == *output)
+      {
+        const size_t bytes = (size_t)roi_out->width * roi_out->height
+                             * dt_iop_buffer_dsc_to_bpp(*out_format);
+        if(pipe->vk_handoff_buf && pipe->vk_handoff_size == bytes
+           && dt_vulkan_read_from_device(vdev, *output, pipe->vk_handoff_buf, bytes) == 0)
+        {
+          dt_print(DT_DEBUG_VKGRAPH, "[vkgraph] final sync: %zu bytes", bytes);
+        }
+        else
+        {
+          dt_print_pipe(DT_DEBUG_ALWAYS, "vulkan span",
+                        pipe, NULL, DT_DEVICE_VK, NULL, roi_out,
+                        "ERROR: final output not materializable (want %zu, have %zu)",
+                        bytes, pipe->vk_handoff_size);
+          ret = TRUE;
+        }
+      }
+      // §5.3.1 site 20: the run's capture context never survives the
+      // run. Flush leftovers (deferred frees, unconsumed nodes) on
+      // success, drop them on error/shutdown.
+      if(dt_vulkan_capture_active())
+      {
+        if(ret) dt_vulkan_capture_abort(vdev);
+        else    dt_vulkan_capture_end(vdev);
+      }
+      dt_vulkan_unlock_device(vdev);
+    }
+    pipe->vk_span_host_stale = NULL;
+    if(pipe->vk_span_skips)
+      dt_print(DT_DEBUG_VKGRAPH, "[vkgraph] run done: %u readbacks deferred%s",
+               pipe->vk_span_skips, ret ? " (run failed)" : "");
+  }
+#endif
 #ifdef HAVE_OPENCL
   // copy back final opencl buffer (if any) to CPU
   if(ret)
