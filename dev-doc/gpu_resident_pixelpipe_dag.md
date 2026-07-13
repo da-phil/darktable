@@ -5,9 +5,10 @@ M0 (VK blend kernels, uniform-mask blending on-device), and M2 (run-
 scoped span capture with deferred readbacks + the module-input
 colorspace glue node) landed; a `colorin → … → colorout` span now
 captures as a single GPU submission. M5 in progress: the GPU histogram
-reduction kernel and the deferred-readback tap registry are landed and
-validated (pipe wiring pending a darkroom bench). See §11 for the
-living implementation log and §9 for per-milestone state. §1–§10 are the
+and color-picker reduction kernels and the deferred-readback tap
+registry are landed and validated (pipe wiring pending a darkroom
+bench). See §11 for the living implementation log and §9 for
+per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
 one scheduled unit — no CPU↔GPU pixel transfers between iops, no
@@ -666,20 +667,28 @@ explicit node (or is planned away):
   fence — one readback of a few KB replaces N trunk-sized copies. The
   existing CPU reducers stay as the reference implementation for
   validation.
-  **M5 status note (histogram reduction landed).** The first tap
-  kernel is `histogram_rgb` (`data/kernels/vulkan/histogram.cl`),
-  driven by `dt_histogram_helper_vk` (`src/common/histogram.c`): plain
-  `uint` atomic increments (native, no CAS needed — that idiom is only
-  for *float* accumulation) binning a float4 image into a
-  `bins_count·4` histogram, matching the CPU `dt_histogram_helper` for
-  the RGB / Lab / Lab→LCh binnings (RAW and profile-compensated RGB
-  refuse to the CPU path). Validated against the CPU reducer to *exact*
-  bin counts on rounding-invariant inputs (`test_vulkan_histogram`).
-  This is the reduction *primitive*; the readback is not yet deferred
-  to the end-of-run fence — that needs the **tap registry** below and
-  is the next M5 increment. Until it lands, calling the tap mid-span
-  would still flush (its readback is a §5.3 sync tap like any other),
-  so it is not yet wired into the pipe.
+  **M5 status note (two reduction kernels + registry landed).** Two
+  tap kernels are ported, each validated against its CPU reducer:
+  - `histogram_rgb` (`data/kernels/vulkan/histogram.cl`), driven by
+    `dt_histogram_helper_vk` (`src/common/histogram.c`): plain `uint`
+    atomic increments (native, no CAS — that idiom is only for *float*
+    accumulation) binning a float4 image into a `bins_count·4`
+    histogram, matching `dt_histogram_helper` for the RGB / Lab /
+    Lab→LCh binnings (RAW and profile-compensated RGB refuse to the CPU
+    path). Exact bin counts on rounding-invariant inputs
+    (`test_vulkan_histogram`).
+  - `picker_rgb` (`data/kernels/vulkan/picker.cl`), driven by
+    `dt_color_picker_helper_vk` (`src/common/color_picker.c`): reduces
+    the picker box to per-channel sum/min/max with *float* atomics
+    (`vk_atomic_{add,min,max}_f` — the min/max siblings added here,
+    reinterpret-CAS with an early return), host dividing the sum by the
+    box size for the mean. Matches `_color_picker_rgb_or_lab` (the
+    no-conversion path); converting pickers, denoise, and 1-ch raw
+    refuse. Validated against `dt_color_picker_helper` — min/max exact,
+    mean within a summation-order tolerance (`test_vulkan_picker`).
+
+  These are the reduction *primitives*; the readback is deferred to the
+  end-of-run fence by the **tap registry** below.
   - **Tap registry (landed).** `dt_vulkan_tap_register` (vulkan.c) is a
     per-run list of `(device buffer, host destination, size)` pending
     taps: the caller appends the reduction DISPATCH and registers the
@@ -1054,15 +1063,16 @@ Each milestone lands green and user-invisible-by-default
 - **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
   end-of-run KB readbacks; scharr as resident resource. Flip pref
   default on for darkroom pipes; export next release. *In progress:*
-  two tested mechanisms landed (§5.4 status note, §11) — the
-  **histogram reduction kernel** (validated against the CPU reducer)
-  and the **tap registry** (`dt_vulkan_tap_register`, deferring a
-  tap's readback to the end-of-run fence so it stops splitting the
-  span). Remaining: **M5c** — compose them in the pipe (dispatch the
-  histogram on the hand-off at site 2, register it to
-  `piece->histogram`, compute max/stats at drain), plus the
-  picker/scope reduction kernels. M5c is preview-pipe behaviour, so it
-  wants a darkroom/GPU bench to validate end to end.
+  three tested mechanisms landed (§5.4 status note, §11) — the
+  **histogram** and **color-picker** reduction kernels (each validated
+  against its CPU reducer) and the **tap registry**
+  (`dt_vulkan_tap_register`, deferring a tap's readback to the
+  end-of-run fence so it stops splitting the span). Remaining: **M5c**
+  — compose kernel + registry in the pipe (histogram at §5.3.1 site 2
+  → `piece->histogram`; picker at its request site → `module->picked_*`;
+  max/stats at drain), the scope reductions, and the denoise/converting
+  picker variants. M5c is preview/darkroom behaviour, so it wants a
+  darkroom/GPU bench to validate end to end.
 - **M6 — islands polish.** Pinned staging ring, transfer-queue
   overlap, planned island bridging; `distort_mask` VK ports for
   raster-mask edges as they come.
@@ -1112,6 +1122,29 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M5 second tap landed: GPU color-picker reduction kernel
+
+Commit: `cf6be88` (kernel + host dispatcher + float atomic min/max + test).
+
+`picker_rgb` reduces the picker box to per-channel sum/min/max with
+float atomics; `dt_color_picker_helper_vk` drives it and divides the
+sum by the box size for the mean. Matches the CPU
+`_color_picker_rgb_or_lab` — the common no-conversion picker path;
+converting pickers (LCH/HSL/JzCzhz), the denoise blur, 1-ch raw, and
+empty/out-of-bounds boxes all refuse to the CPU reducer.
+
+The sum reused `vk_atomic_add_f`; min/max needed float atomics too, so
+`vk_atomic_min_f` / `vk_atomic_max_f` were added next to it in
+`dt_vulkan_common.h` (reinterpret-CAS with an early return, so an
+uncontended lane touches memory only through the initial atomic read).
+The GLSL twin carries the `atomicCompSwap` equivalents.
+
+Validated in `test_vulkan_picker` against `dt_color_picker_helper`:
+min/max are order-independent → exact; the mean is compared with a
+scale-aware tolerance because the atomic accumulation order differs
+from the OMP reduction. Full box, sub-box, and a 1×1 box
+(mean == min == max) covered, plus the gate refusals.
 
 ### 2026-07-13 — M5 tap registry landed: deferred reduction readbacks
 
