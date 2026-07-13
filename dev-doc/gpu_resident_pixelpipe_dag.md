@@ -4,8 +4,9 @@
 M0 (VK blend kernels, uniform-mask blending on-device), and M2 (run-
 scoped span capture with deferred readbacks + the module-input
 colorspace glue node) landed; a `colorin → … → colorout` span now
-captures as a single GPU submission. See §11 for the living
-implementation log and §9 for per-milestone state. §1–§10 are the
+captures as a single GPU submission. M5 in progress: the GPU histogram
+reduction kernel (first tap) is landed and validated. See §11 for the
+living implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
 one scheduled unit — no CPU↔GPU pixel transfers between iops, no
@@ -664,6 +665,29 @@ explicit node (or is planned away):
   fence — one readback of a few KB replaces N trunk-sized copies. The
   existing CPU reducers stay as the reference implementation for
   validation.
+  **M5 status note (histogram reduction landed).** The first tap
+  kernel is `histogram_rgb` (`data/kernels/vulkan/histogram.cl`),
+  driven by `dt_histogram_helper_vk` (`src/common/histogram.c`): plain
+  `uint` atomic increments (native, no CAS needed — that idiom is only
+  for *float* accumulation) binning a float4 image into a
+  `bins_count·4` histogram, matching the CPU `dt_histogram_helper` for
+  the RGB / Lab / Lab→LCh binnings (RAW and profile-compensated RGB
+  refuse to the CPU path). Validated against the CPU reducer to *exact*
+  bin counts on rounding-invariant inputs (`test_vulkan_histogram`).
+  This is the reduction *primitive*; the readback is not yet deferred
+  to the end-of-run fence — that needs the **tap registry** below and
+  is the next M5 increment. Until it lands, calling the tap mid-span
+  would still flush (its readback is a §5.3 sync tap like any other),
+  so it is not yet wired into the pipe.
+  - **Tap registry (next).** A per-run list of `(device buffer, host
+    destination, kind)` pending taps: capture appends the reduction
+    DISPATCH and registers the tiny result buffer instead of reading
+    it back; the recursion root — where the M2 final-sync already runs
+    — drains the registry in one batch after the last fence. Keeps the
+    tap buffers alive across the span (they must survive to run-end),
+    and fills `piece->histogram` / picker fields there, which is safe
+    because those are consumed by the GUI only after the pipe
+    completes.
 - **Pixelpipe-cache taps.** See §5.7.
 - **Format conversions** (`bpp` changes along the RAW segment, 1f→4f
   at demosaic) are DISPATCH nodes like any other; the RAW trunk
@@ -1019,7 +1043,14 @@ Each milestone lands green and user-invisible-by-default
   residency pins; plan reuse via topology hash.
 - **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
   end-of-run KB readbacks; scharr as resident resource. Flip pref
-  default on for darkroom pipes; export next release.
+  default on for darkroom pipes; export next release. *In progress:*
+  the **histogram reduction kernel** is landed and validated against
+  the CPU reducer (§5.4 status note, §11) — the primitive that
+  replaces a trunk-sized readback with a few-KB one. Remaining: the
+  tap registry (defer the readback to the end-of-run fence so the tap
+  stops splitting the span), the picker/scope reduction kernels, and
+  the pipe wiring — the piece that wants a darkroom/GPU bench to
+  validate end to end, since taps fire in the preview pipe, not export.
 - **M6 — islands polish.** Pinned staging ring, transfer-queue
   overlap, planned island bridging; `distort_mask` VK ports for
   raster-mask edges as they come.
@@ -1069,6 +1100,40 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M5 first tap landed: GPU histogram reduction kernel
+
+Commit: `e191085` (kernel + host dispatcher + test).
+
+What shipped:
+
+- **Kernel.** `histogram_rgb` (`data/kernels/vulkan/histogram.{cl,comp}`)
+  bins a float4 image into a `bins_count·4` uint histogram with
+  **native `uint` atomic increments** — the `vk_atomic_add_f` CAS idiom
+  is only needed for *float* accumulation, integer counters use
+  `atomic_add`/`atomicAdd` directly. One kernel, a mode switch over the
+  three 4-channel-float binnings (RGB, Lab, Lab→LCh) with the same
+  scale/shift/clamp-and-truncate as the CPU reducers.
+- **Host dispatcher.** `dt_histogram_helper_vk` (`src/common/histogram.c`)
+  zeroes the small device histogram (a few-KB upload), dispatches, and
+  reads the result back. Subset gates mirror `dt_histogram_helper`'s
+  switch: RAW and middle-grey-compensated RGB return FALSE so the
+  caller keeps the CPU reducer.
+- **Validation shift, again.** Bin counts *can* differ between CPU and
+  GPU when a pixel's scaled value lands next to a bin boundary and the
+  two float paths round it across. `test_vulkan_histogram` handles that
+  with two regimes: rounding-invariant *bin-centre* inputs must match
+  the CPU histogram **exactly** (proves the bin indices and atomic
+  counting), and random inputs are bounded by a <1% total-variation
+  budget (proves no gross error), across RGB/Lab/LCh. Both paths must
+  also bin every sampled pixel exactly once per channel.
+- **Deliberately not wired yet.** This is the reduction *primitive*.
+  Wired into the pipe mid-span today its readback would still flush
+  (it's a §5.3 sync tap), so there is no span benefit until the tap
+  registry defers the readback to the end-of-run fence (§5.4). That
+  registry + the pipe wiring is the next M5 increment and wants a
+  darkroom/GPU bench: taps fire in the preview pipe, which this
+  headless export harness doesn't exercise.
 
 ### 2026-07-13 — M2 glue node landed: module-input colorspace transform on-device
 
