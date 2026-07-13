@@ -1084,6 +1084,15 @@ What shipped:
   1 submit. The eager path stays byte-for-byte the pre-M2 baseline
   (PFM md5 unchanged); graph output differs from eager by max ~2e-5 /
   mean ~2e-7, nothing over 1e-3. Full ctest green (5 suites).
+- **Deep-pipe check.** The same PPM re-exported through a ~60-module
+  benchmark XMP (`src/tests/benchmark/darktable-bench-4.2.xmp`) at
+  702×465 to stress real spans: 46 modules defer their readback, and
+  the biggest span fuses **565 nodes (525 dispatches) into one
+  submit**. Graph-vs-eager agreement holds at scale — max abs diff
+  5.2e-4 on a 0.85 value (0.06% relative), mean 6.4e-6, zero floats
+  past 1e-2 — confirming the span/defer/glue machinery composes
+  correctly across a realistic module stack, not just the 3-module
+  case.
 
 ### 2026-07-13 — M2 span capture landed: run-scoped context, deferred readbacks
 
