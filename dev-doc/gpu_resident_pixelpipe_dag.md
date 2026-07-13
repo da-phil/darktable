@@ -951,6 +951,34 @@ scopes and thumbnails stop competing with the full pipe for PCIe.
 These are estimates, not measurements; M1 (below) exists to replace
 them with numbers before the big pieces land.
 
+### 8.1 First measurement: what actually bounds span length (post-M2)
+
+The M2 deep-pipe run (§11, ~60-module benchmark XMP on lavapipe) gives
+the first empirical picture, and it matches the model's premise. The
+run collapsed into 11 submissions, and **every interior break was a
+`sync-at-need (cpu process)`** — a CPU-island module (no `process_vk`,
+or a runtime fallback) reading the trunk. Not one break came from the
+DAG machinery itself: no capture faults, and the one non-`cpu process`
+sync was a profile-without-matrix colorspace transform the glue node
+correctly declined. Spans grew until they hit a CPU module and no
+further — the largest reached 565 nodes / 525 dispatches in a single
+submit.
+
+Two consequences for milestone priority:
+
+- **The span core is at its ceiling for a given VK coverage.** More
+  fusion now comes from *shrinking the CPU islands*, i.e. Path B
+  module ports (the independent lane) — not from more DAG-core work.
+  Each ported mid-stack module merges the two spans it currently
+  separates.
+- **Among the remaining DAG milestones, M5 (GPU taps) outranks M3
+  (memory aliasing) for interactivity.** The breaks that will matter
+  most in darkroom/preview are the picker/histogram/scope readbacks;
+  those are M5. M3's win is peak VRAM, which (a) this software-Vulkan
+  test bench can't measure and (b) doesn't change submission count.
+  M3 stays queued but is no longer the obvious next step it looked
+  like on paper.
+
 ## 9. Migration plan
 
 Each milestone lands green and user-invisible-by-default
