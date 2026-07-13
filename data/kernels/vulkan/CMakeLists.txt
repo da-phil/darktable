@@ -94,6 +94,8 @@ set(VK_KERNELS
     overexposed:overexposed
     basicadj:basicadj
     colorspaces:colorspaces_transform_rgb_matrix_to_rgb
+    colorspaces_rgb_to_lab:colorspaces_transform_rgb_matrix_to_lab
+    colorspaces_lab_to_rgb:colorspaces_transform_lab_to_rgb_matrix
     lowlight:lowlight
     bilateral_zero:bilateral_zero
     bilateral_splat:bilateral_splat

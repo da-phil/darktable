@@ -2091,6 +2091,106 @@ cleanup:
   dt_ioppr_free_iccprofile_params_vk(&info_to,   &lut_to,   &dev_info_to,   &dev_lut_to,   devid);
   return ok;
 }
+
+// Cached kernel slots for the Lab<->RGB working-space transforms
+// (glue nodes for the GPU-resident pipeline, DAG M2). Both take
+// 4 storage buffers (in, out, profile_info, lut) and 2 push ints.
+typedef struct { int width; int height; } vk_colorspace_lab_pc_t;
+static dt_vk_module_kernel_t _vk_colorspaces_rgb2lab = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_colorspaces_lab2rgb = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_colorspaces_lab_loaded = FALSE;
+
+static void _vk_colorspaces_ensure_lab_kernels(void)
+{
+  if(_vk_colorspaces_lab_loaded) return;
+  if(!dt_vulkan_running()) return;
+  const int p_r2l = dt_vulkan_load_program_by_name("colorspaces_rgb_to_lab");
+  if(p_r2l >= 0)
+    dt_vulkan_module_kernel_create_from(&_vk_colorspaces_rgb2lab, p_r2l,
+                                        "colorspaces_transform_rgb_matrix_to_lab",
+                                        4, sizeof(vk_colorspace_lab_pc_t), 16, 16, 1);
+  const int p_l2r = dt_vulkan_load_program_by_name("colorspaces_lab_to_rgb");
+  if(p_l2r >= 0)
+    dt_vulkan_module_kernel_create_from(&_vk_colorspaces_lab2rgb, p_l2r,
+                                        "colorspaces_transform_lab_to_rgb_matrix",
+                                        4, sizeof(vk_colorspace_lab_pc_t), 16, 16, 1);
+  _vk_colorspaces_lab_loaded = TRUE;
+}
+
+gboolean dt_ioppr_transform_image_colorspace_vk(const int devid,
+                                                dt_vk_mem_t *dev_img_in,
+                                                dt_vk_mem_t *dev_img_out,
+                                                const int width,
+                                                const int height,
+                                                const dt_iop_colorspace_type_t cst_from,
+                                                const dt_iop_colorspace_type_t cst_to,
+                                                dt_iop_colorspace_type_t *converted_cst,
+                                                const dt_iop_order_iccprofile_info_t *const profile_info,
+                                                const char *message)
+{
+  const gboolean inplace = dev_img_in == dev_img_out;
+  const size_t bytes = sizeof(float) * 4 * (size_t)width * height;
+
+  *converted_cst = cst_to;
+  if(cst_from == cst_to)
+  {
+    if(!inplace)
+      return dt_vulkan_copy_device_to_device(devid, dev_img_out, dev_img_in, bytes) == 0;
+    return TRUE;
+  }
+
+  // Same policy as the CL twin: without a usable matrix profile, or
+  // for RAW, we can't convert on-device. Report the unchanged cst
+  // and (for the out-of-place case) pass the pixels through, so the
+  // caller sees exactly what dt_ioppr_transform_image_colorspace_cl
+  // would have produced and can decide to sync + CPU-convert.
+  const gboolean anyraw = cst_to == IOP_CS_RAW || cst_from == IOP_CS_RAW;
+  if(profile_info == NULL || profile_info->type == DT_COLORSPACE_NONE || anyraw
+     || !dt_is_valid_colormatrix(profile_info->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info->matrix_out[0][0]))
+  {
+    *converted_cst = cst_from;
+    if(!inplace && !anyraw)
+      return dt_vulkan_copy_device_to_device(devid, dev_img_out, dev_img_in, bytes) == 0;
+    return FALSE;
+  }
+
+  _vk_colorspaces_ensure_lab_kernels();
+  dt_vk_module_kernel_t *kernel = NULL;
+  if(cst_from == IOP_CS_RGB && cst_to == IOP_CS_LAB)
+    kernel = &_vk_colorspaces_rgb2lab;
+  else if(cst_from == IOP_CS_LAB && cst_to == IOP_CS_RGB)
+    kernel = &_vk_colorspaces_lab2rgb;
+  if(!kernel || kernel->kernel < 0)
+  {
+    *converted_cst = cst_from;
+    return FALSE;
+  }
+
+  dt_colorspaces_iccprofile_info_vk_t *info = NULL;
+  float *lut = NULL;
+  dt_vk_mem_t *dev_info = NULL, *dev_lut = NULL;
+  if(dt_ioppr_build_iccprofile_params_vk(profile_info, devid, &info, &lut,
+                                         &dev_info, &dev_lut) != 0)
+  {
+    *converted_cst = cst_from;
+    return FALSE;
+  }
+
+  const vk_colorspace_lab_pc_t pc = { width, height };
+  dt_vk_mem_t *buffers[] = { dev_img_in, dev_img_out, dev_info, dev_lut };
+  const gboolean ok = (dt_vulkan_dispatch_n(kernel, buffers, 4,
+                                            width, height, &pc, sizeof(pc)) == 0);
+  if(ok)
+    dt_print(DT_DEBUG_PIPE, "dt_ioppr_transform_image_colorspace_VK %s -> %s [%s]",
+             dt_iop_colorspace_to_name(cst_from), dt_iop_colorspace_to_name(cst_to),
+             message ? message : "");
+  else
+    *converted_cst = cst_from;
+
+  dt_ioppr_free_iccprofile_params_vk(&info, &lut, &dev_info, &dev_lut, devid);
+  return ok;
+}
 #endif
 
 #undef DT_IOP_ORDER_PROFILE

@@ -1,0 +1,99 @@
+// GLSL fallback for colorspaces_transform_lab_to_rgb_matrix.
+// See the .cl header for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In  { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Out { vec4 data[]; } out_buf;
+
+layout(std430, binding = 2) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+
+layout(std430, binding = 3) readonly buffer Lut { float data[]; } lut;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+} pc;
+
+float lerp_lookup(float x, float c0, float c1, float c2, int n_lut)
+{
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return lut.data[base + t] * (1.0 - f) + lut.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+
+vec4 apply_trc_out(vec4 rgb) {
+    float R = lerp_lookup(rgb.x,
+        profile_info.unbounded_coeffs_out[0],
+        profile_info.unbounded_coeffs_out[1],
+        profile_info.unbounded_coeffs_out[2], 3);
+    float G = lerp_lookup(rgb.y,
+        profile_info.unbounded_coeffs_out[3],
+        profile_info.unbounded_coeffs_out[4],
+        profile_info.unbounded_coeffs_out[5], 4);
+    float B = lerp_lookup(rgb.z,
+        profile_info.unbounded_coeffs_out[6],
+        profile_info.unbounded_coeffs_out[7],
+        profile_info.unbounded_coeffs_out[8], 5);
+    return vec4(R, G, B, rgb.w);
+}
+
+// Lab -> XYZ (D50), matching dt_vulkan_common.h::vk_Lab_to_XYZ.
+vec4 lab_f_inv(vec4 x) {
+    const vec4 epsilon = vec4(0.20689655172413796); // cbrt(216/24389)
+    const vec4 kappa   = vec4(24389.0 / 27.0);
+    vec4 gt = x * x * x;
+    vec4 le = (vec4(116.0) * x - vec4(16.0)) / kappa;
+    return mix(le, gt, greaterThan(x, epsilon));
+}
+
+vec4 Lab_to_XYZ(vec4 Lab) {
+    const vec4 d50 = vec4(0.9642, 1.0, 0.8249, 0.0);
+    vec4 f;
+    f.y = (Lab.x + 16.0) / 116.0;
+    f.x = Lab.y / 500.0 + f.y;
+    f.z = f.y - Lab.z / 200.0;
+    f.w = 0.0;
+    vec4 xyz = d50 * lab_f_inv(f);
+    xyz.w = Lab.w;
+    return xyz;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    int idx = y * pc.width + x;
+
+    vec4 xyz = Lab_to_XYZ(in_buf.data[idx]);
+
+    vec4 pixel;
+    pixel.x = profile_info.matrix_out[0] * xyz.x + profile_info.matrix_out[1] * xyz.y
+            + profile_info.matrix_out[2] * xyz.z;
+    pixel.y = profile_info.matrix_out[3] * xyz.x + profile_info.matrix_out[4] * xyz.y
+            + profile_info.matrix_out[5] * xyz.z;
+    pixel.z = profile_info.matrix_out[6] * xyz.x + profile_info.matrix_out[7] * xyz.y
+            + profile_info.matrix_out[8] * xyz.z;
+    pixel.w = xyz.w;
+
+    out_buf.data[idx] = (profile_info.nonlinearlut != 0)
+                          ? apply_trc_out(pixel) : pixel;
+}

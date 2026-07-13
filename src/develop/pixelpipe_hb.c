@@ -116,6 +116,66 @@ static inline void _vk_span_sync_host(dt_dev_pixelpipe_t *pipe,
   }
   pipe->vk_span_host_stale = NULL;
 }
+
+// DAG M2 glue node (gpu_resident_pixelpipe_dag.md §5.4): the module's
+// input colorspace transform, run on the device instead of flushing
+// the span to convert on the host. Only fires when the input lives in
+// the hand-off (its readback was deferred) and the module about to run
+// will consume it on-device — otherwise the transformed pixels would
+// just be synced straight back. Transforms the hand-off into a fresh
+// buffer, swaps it in (the old one is freed — deferred under capture,
+// still read by the transform dispatch), advances *io_cst, and leaves
+// the host line deferred: a later sync-at-need reads the transformed
+// hand-off, which now carries cst_to just as a host transform would.
+// Returns TRUE when it handled the transform so the caller skips the
+// host path. Lab<->RGB matrix hops only (the VK transform's coverage);
+// LCH/lcms pairs return FALSE and fall back to sync + CPU convert.
+static gboolean _vk_span_cst_glue(dt_dev_pixelpipe_t *pipe,
+                                  void *input,
+                                  const dt_iop_module_t *module,
+                                  const dt_dev_pixelpipe_iop_t *piece,
+                                  const dt_iop_roi_t *roi_in,
+                                  const size_t in_bpp,
+                                  const dt_iop_colorspace_type_t cst_from,
+                                  const dt_iop_colorspace_type_t cst_to,
+                                  dt_iop_colorspace_type_t *io_cst,
+                                  const dt_iop_order_iccprofile_info_t *work_profile)
+{
+  if(!pipe->vk_graph_run) return FALSE;
+  if(pipe->vk_span_host_stale != input) return FALSE;
+  // no point converting on-device if the module won't read the
+  // hand-off there (a CPU module would sync it right back)
+  if(!module->process_vk || !piece->process_vk_ready) return FALSE;
+  const size_t in_size = (size_t)roi_in->width * roi_in->height * in_bpp;
+  if(!pipe->vk_handoff_buf || pipe->vk_handoff_size != in_size) return FALSE;
+
+  const int vdev = dt_vulkan_lock_device();
+  if(vdev < 0) return FALSE;
+  gboolean ok = FALSE;
+  dt_vk_mem_t *vout = dt_vulkan_alloc_buffer(vdev, in_size);
+  if(vout)
+  {
+    dt_iop_colorspace_type_t conv = cst_from;
+    if(dt_ioppr_transform_image_colorspace_vk(vdev, pipe->vk_handoff_buf, vout,
+                                              roi_in->width, roi_in->height,
+                                              cst_from, cst_to, &conv,
+                                              work_profile, "span glue")
+       && conv == cst_to)
+    {
+      dt_vulkan_free_buffer(vdev, pipe->vk_handoff_buf);
+      pipe->vk_handoff_buf = vout;   // size unchanged (Lab/RGB both 4f)
+      *io_cst = cst_to;
+      ok = TRUE;
+      dt_print(DT_DEBUG_VKGRAPH, "[vkgraph] cst glue node %s -> %s (%zu bytes)",
+               dt_iop_colorspace_to_name(cst_from), dt_iop_colorspace_to_name(cst_to),
+               in_size);
+    }
+    else
+      dt_vulkan_free_buffer(vdev, vout);
+  }
+  dt_vulkan_unlock_device(vdev);
+  return ok;
+}
 #endif
 
 // forward declarations for mask cache helpers
@@ -1472,6 +1532,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
 
   dt_dev_prepare_piece_cfa(piece, roi_in);
 
+  gboolean cst_on_device = FALSE;
   if(cst_from != cst_to)
   {
     dt_print_pipe(DT_DEBUG_PIPE,
@@ -1483,38 +1544,50 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                     ? dt_colorspaces_get_name(work_profile->type, work_profile->filename)
                     : "no work profile");
 #ifdef HAVE_VULKAN
-    // M2 §5.3.1 site 1: the in-place transform reads `input` — if the
-    // previous module deferred its readback, materialize it first.
-    _vk_span_sync_host(pipe, input,
-                       (size_t)roi_in->width * roi_in->height
-                         * dt_iop_buffer_dsc_to_bpp(input_format),
-                       "input cst transform");
-    // §5.14: the host buffer is about to be mutated in place. Any
-    // VK→VK hand-off cache from the previous module becomes stale —
-    // it still holds the pre-transform GPU contents, but the next
-    // module's parameters will be chosen against the post-transform
-    // host state. Drop it now so the next process_vk uploads fresh.
-    _vk_handoff_invalidate(pipe);
+    // M2 §5.4 glue node: convert the module input on the device so the
+    // span survives the hop. Only when the input lives in the deferred
+    // hand-off and the module will consume it on-device; otherwise
+    // fall through to sync-at-need (§5.3.1 site 1) + host transform.
+    cst_on_device = _vk_span_cst_glue(pipe, input, module, piece, roi_in,
+                                      dt_iop_buffer_dsc_to_bpp(input_format),
+                                      cst_from, cst_to, &input_format->cst,
+                                      work_profile);
+    if(!cst_on_device)
+    {
+      _vk_span_sync_host(pipe, input,
+                         (size_t)roi_in->width * roi_in->height
+                           * dt_iop_buffer_dsc_to_bpp(input_format),
+                         "input cst transform");
+      // §5.14: the host buffer is about to be mutated in place. Any
+      // VK→VK hand-off cache from the previous module becomes stale —
+      // it still holds the pre-transform GPU contents, but the next
+      // module's parameters will be chosen against the post-transform
+      // host state. Drop it now so the next process_vk uploads fresh.
+      _vk_handoff_invalidate(pipe);
+    }
 #endif
   }
 
-  // transform to module input colorspace
-  dt_ioppr_transform_image_colorspace(module, input, input,
-                                      roi_in->width, roi_in->height,
-                                      cst_from, cst_to, &input_format->cst,
-                                      work_profile);
-  /*  We just have changed the input data if cst_from != cst_to so
-      the cacheline cst does not reflect the module input colorspace any more!
-      Note: in opencl code path this is different as the in-data colorspace conversion
-      is always done in cl_mem and thus does not affect pipecache.
+  if(!cst_on_device)
+  {
+    // transform to module input colorspace
+    dt_ioppr_transform_image_colorspace(module, input, input,
+                                        roi_in->width, roi_in->height,
+                                        cst_from, cst_to, &input_format->cst,
+                                        work_profile);
+    /*  We just have changed the input data if cst_from != cst_to so
+        the cacheline cst does not reflect the module input colorspace any more!
+        Note: in opencl code path this is different as the in-data colorspace conversion
+        is always done in cl_mem and thus does not affect pipecache.
 
-      Possible ways to handle this:
-      1. for now we just invalidate that cacheline so if the pipe is reprocessed we won't
-          use wrong data.
-      2. we should implement code for the pipe cache that modifies the data cst.
-  */
-  if(cst_from != cst_to)
-    dt_dev_pixelpipe_invalidate_cacheline(pipe, input);
+        Possible ways to handle this:
+        1. for now we just invalidate that cacheline so if the pipe is reprocessed we won't
+            use wrong data.
+        2. we should implement code for the pipe cache that modifies the data cst.
+    */
+    if(cst_from != cst_to)
+      dt_dev_pixelpipe_invalidate_cacheline(pipe, input);
+  }
 
   if(_pipe_has_shutdown(pipe))
     return TRUE;

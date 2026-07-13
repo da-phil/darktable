@@ -46,8 +46,19 @@ add_dependencies(test_vulkan_blendop build_vulkan_kernels)
 target_compile_definitions(test_vulkan_blendop
                            PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
 
+# Colorspace glue-node tests (DAG milestone M2). Load the production
+# .spv modules from the build datadir, so they depend on the kernel
+# build target.
+add_cmocka_test(test_vulkan_colorspace
+                SOURCES test_vulkan_colorspace.c
+                LINK_LIBRARIES lib_darktable cmocka)
+add_dependencies(test_vulkan_colorspace build_vulkan_kernels)
+target_compile_definitions(test_vulkan_colorspace
+                           PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_vulkan_capture lib_darktable)
     _copy_required_library(test_vulkan_blendop lib_darktable)
+    _copy_required_library(test_vulkan_colorspace lib_darktable)
 endif(WIN32)

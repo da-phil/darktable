@@ -325,6 +325,25 @@ gboolean dt_ioppr_transform_image_colorspace_rgb_vk
    const dt_iop_order_iccprofile_info_t *const profile_info_from,
    const dt_iop_order_iccprofile_info_t *const profile_info_to,
    const char *message);
+
+/** Vulkan equivalent of dt_ioppr_transform_image_colorspace_cl for the
+ *  Lab<->RGB working-space hops (module-input and blend-space
+ *  transforms). Both buffers carry float4 pixels. Sets *converted_cst
+ *  and returns TRUE when the transform ran on device; returns FALSE
+ *  (with *converted_cst == cst_from) when it can't — no matrix, an
+ *  unsupported pair, RAW — so the caller can sync and fall back to the
+ *  CPU transform. Matches the CL twin's pass-through/no-op policy. */
+gboolean dt_ioppr_transform_image_colorspace_vk
+  (const int devid,
+   dt_vk_mem_t *dev_img_in,
+   dt_vk_mem_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_colorspace_type_t cst_from,
+   const dt_iop_colorspace_type_t cst_to,
+   dt_iop_colorspace_type_t *converted_cst,
+   const dt_iop_order_iccprofile_info_t *const profile_info,
+   const char *message);
 #endif
 
 /** the following must have the matrix_in and matrix_out generated */
