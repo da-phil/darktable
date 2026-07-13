@@ -564,6 +564,78 @@ void dt_color_picker_helper(const dt_iop_buffer_dsc_t *dsc,
            dt_get_lap_time(&start_time.clock), dt_get_lap_utime(&start_time.user));
 }
 
+#ifdef HAVE_VULKAN
+// ---- Vulkan color-picker reduction (DAG M5) -------------------------
+// Cached kernel slot, lazily loaded — same pattern as the histogram
+// and colorspaces VK helpers.
+typedef struct { int width, box_x0, box_y0, box_x1, box_y1; } _vk_picker_pc_t;
+
+static dt_vk_module_kernel_t _vk_picker = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_picker_loaded = FALSE;
+
+static void _vk_picker_ensure_kernel(void)
+{
+  if(_vk_picker_loaded) return;
+  if(!dt_vulkan_running()) return;
+  dt_vulkan_module_kernel_load(&_vk_picker, "picker", "picker_rgb",
+                               2, sizeof(_vk_picker_pc_t), 16, 16, 1);
+  _vk_picker_loaded = TRUE;
+}
+
+gboolean dt_color_picker_helper_vk(int devid,
+                                   dt_vk_mem_t *dev_in,
+                                   int width,
+                                   int height,
+                                   const int *const box,
+                                   const gboolean denoise,
+                                   lib_colorpicker_stats pick,
+                                   const dt_iop_colorspace_type_t image_cst,
+                                   const dt_iop_colorspace_type_t picker_cst)
+{
+  if(denoise) return FALSE; // blur not ported yet
+  // only the no-conversion path (mirrors dt_color_picker_helper's
+  // effective_cst == picker_cst / picker_cst == NONE branches)
+  const dt_iop_colorspace_type_t eff =
+    (image_cst == IOP_CS_RAW) ? IOP_CS_RGB : image_cst;
+  if(!(eff == picker_cst || picker_cst == IOP_CS_NONE)) return FALSE;
+  // non-empty, in-bounds box
+  if(!box || box[2] <= box[0] || box[3] <= box[1]) return FALSE;
+  if(box[0] < 0 || box[1] < 0 || box[2] > width || box[3] > height) return FALSE;
+
+  _vk_picker_ensure_kernel();
+  if(_vk_picker.kernel < 0) return FALSE;
+
+  const size_t size = (size_t)(box[3] - box[1]) * (box[2] - box[0]);
+  // 12 accumulators: [0..3] sum=0, [4..7] min=+FLT_MAX, [8..11] max=-FLT_MAX
+  float acc[12];
+  for(int c = 0; c < 4; c++) { acc[c] = 0.0f; acc[4 + c] = FLT_MAX; acc[8 + c] = -FLT_MAX; }
+
+  dt_vk_mem_t *dev_stats = dt_vulkan_alloc_buffer(devid, sizeof(acc));
+  if(!dev_stats) return FALSE;
+
+  gboolean ok = FALSE;
+  if(dt_vulkan_write_to_device(devid, dev_stats, acc, sizeof(acc)) == 0)
+  {
+    const _vk_picker_pc_t pc = { width, box[0], box[1], box[2], box[3] };
+    dt_vk_mem_t *bufs[2] = { dev_in, dev_stats };
+    if(dt_vulkan_dispatch_n(&_vk_picker, bufs, 2,
+                            box[2] - box[0], box[3] - box[1], &pc, sizeof(pc)) == 0
+       && dt_vulkan_read_from_device(devid, acc, dev_stats, sizeof(acc)) == 0)
+    {
+      for(int c = 0; c < 4; c++)
+      {
+        pick[DT_PICK_MEAN][c] = acc[c] / (float)size;
+        pick[DT_PICK_MIN][c]  = acc[4 + c];
+        pick[DT_PICK_MAX][c]  = acc[8 + c];
+      }
+      ok = TRUE;
+    }
+  }
+  dt_vulkan_free_buffer(devid, dev_stats);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

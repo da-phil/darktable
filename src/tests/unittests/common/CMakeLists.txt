@@ -66,10 +66,19 @@ add_dependencies(test_vulkan_histogram build_vulkan_kernels)
 target_compile_definitions(test_vulkan_histogram
                            PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
 
+# Color-picker reduction-tap tests (DAG milestone M5).
+add_cmocka_test(test_vulkan_picker
+                SOURCES test_vulkan_picker.c
+                LINK_LIBRARIES lib_darktable cmocka)
+add_dependencies(test_vulkan_picker build_vulkan_kernels)
+target_compile_definitions(test_vulkan_picker
+                           PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_vulkan_capture lib_darktable)
     _copy_required_library(test_vulkan_blendop lib_darktable)
     _copy_required_library(test_vulkan_colorspace lib_darktable)
     _copy_required_library(test_vulkan_histogram lib_darktable)
+    _copy_required_library(test_vulkan_picker lib_darktable)
 endif(WIN32)

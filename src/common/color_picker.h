@@ -55,6 +55,28 @@ void dt_color_picker_helper(const struct dt_iop_buffer_dsc_t *dsc,
                             const enum dt_iop_colorspace_type_t picker_cst,
                             const dt_iop_order_iccprofile_info_t *const profile);
 
+#ifdef HAVE_VULKAN
+/** Vulkan color-picker reduction (DAG milestone M5,
+ *  gpu_resident_pixelpipe_dag.md §5.4). Reduces the box of the device
+ *  image `dev_in` (float4, width×height) to per-channel mean/min/max
+ *  in `pick`, on the GPU with float atomics, matching the CPU
+ *  `dt_color_picker_helper` for the no-conversion picker path
+ *  (image colorspace already equals the picker colorspace). Returns
+ *  FALSE — leaving the caller on the CPU reducer — for the unported
+ *  cases: denoise (needs the blur), a colorspace-converting picker
+ *  (LCH/HSL/JzCzhz), or an out-of-bounds/empty box. `box` is the
+ *  half-open [x0,y0,x1,y1] region. Caller holds the device lock. */
+gboolean dt_color_picker_helper_vk(int devid,
+                                   dt_vk_mem_t *dev_in,
+                                   int width,
+                                   int height,
+                                   const int *const box,
+                                   const gboolean denoise,
+                                   lib_colorpicker_stats pick,
+                                   const enum dt_iop_colorspace_type_t image_cst,
+                                   const enum dt_iop_colorspace_type_t picker_cst);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

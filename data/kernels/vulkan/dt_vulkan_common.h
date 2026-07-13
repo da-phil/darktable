@@ -461,6 +461,37 @@ static inline void vk_atomic_add_f(global float *val, const float delta)
   while(atomic_cmpxchg(ival, old_val.i, new_val.i) != old_val.i);
 }
 
+// Float atomic min/max via the same reinterpret-CAS idiom (no native
+// float atomics under our buffer-only kernel convention). The early
+// return means a lane that isn't extending the extremum touches memory
+// only through the initial atomic read, so uncontended pixels are
+// cheap; contention degrades to a retry loop, not a wrong result.
+static inline void vk_atomic_min_f(global float *val, const float v)
+{
+  global volatile uint *ival = (global volatile uint *)val;
+  union { float f; uint i; } old_val, new_val;
+  do
+  {
+    old_val.i = atomic_add(ival, 0u);
+    if(old_val.f <= v) return;
+    new_val.f = v;
+  }
+  while(atomic_cmpxchg(ival, old_val.i, new_val.i) != old_val.i);
+}
+
+static inline void vk_atomic_max_f(global float *val, const float v)
+{
+  global volatile uint *ival = (global volatile uint *)val;
+  union { float f; uint i; } old_val, new_val;
+  do
+  {
+    old_val.i = atomic_add(ival, 0u);
+    if(old_val.f >= v) return;
+    new_val.f = v;
+  }
+  while(atomic_cmpxchg(ival, old_val.i, new_val.i) != old_val.i);
+}
+
 // Fast 2^-x approximation. Matches data/kernels/common.h::fast_mexp2f
 // byte-for-byte (the union bit-pun is clspv-safe — same idiom as
 // vk_atomic_add_f / colorchecker's fastlog2). Used by nlmeans.

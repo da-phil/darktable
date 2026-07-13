@@ -1,0 +1,75 @@
+// GLSL fallback for picker.cl :: picker_rgb.
+// See the .cl header for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In    { vec4  data[]; } in_buf;
+layout(std430, binding = 1)          buffer Stats { uint  data[]; } stats;
+
+layout(push_constant) uniform PC {
+    int width;
+    int box_x0;
+    int box_y0;
+    int box_x1;
+    int box_y1;
+} pc;
+
+// Float atomics via reinterpret-CAS (no native float atomics in core
+// GLSL), matching dt_vulkan_common.h::vk_atomic_{add,min,max}_f.
+void atomic_add_f(uint idx, float v) {
+    uint old = stats.data[idx];
+    uint expected;
+    do {
+        expected = old;
+        float nv = uintBitsToFloat(expected) + v;
+        old = atomicCompSwap(stats.data[idx], expected, floatBitsToUint(nv));
+    } while(old != expected);
+}
+
+void atomic_min_f(uint idx, float v) {
+    uint old = stats.data[idx];
+    uint expected;
+    do {
+        if(uintBitsToFloat(old) <= v) return;
+        expected = old;
+        old = atomicCompSwap(stats.data[idx], expected, floatBitsToUint(v));
+    } while(old != expected);
+}
+
+void atomic_max_f(uint idx, float v) {
+    uint old = stats.data[idx];
+    uint expected;
+    do {
+        if(uintBitsToFloat(old) >= v) return;
+        expected = old;
+        old = atomicCompSwap(stats.data[idx], expected, floatBitsToUint(v));
+    } while(old != expected);
+}
+
+void main() {
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int bw = pc.box_x1 - pc.box_x0;
+    int bh = pc.box_y1 - pc.box_y0;
+    if(gx >= bw || gy >= bh) return;
+
+    int x = pc.box_x0 + gx;
+    int y = pc.box_y0 + gy;
+    vec4 px = in_buf.data[y * pc.width + x];
+
+    atomic_add_f(0u, px.x);
+    atomic_add_f(1u, px.y);
+    atomic_add_f(2u, px.z);
+    atomic_add_f(3u, px.w);
+
+    atomic_min_f(4u, px.x);
+    atomic_min_f(5u, px.y);
+    atomic_min_f(6u, px.z);
+    atomic_min_f(7u, px.w);
+
+    atomic_max_f(8u,  px.x);
+    atomic_max_f(9u,  px.y);
+    atomic_max_f(10u, px.z);
+    atomic_max_f(11u, px.w);
+}
