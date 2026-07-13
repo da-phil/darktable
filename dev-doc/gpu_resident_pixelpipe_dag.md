@@ -5,7 +5,8 @@ M0 (VK blend kernels, uniform-mask blending on-device), and M2 (run-
 scoped span capture with deferred readbacks + the module-input
 colorspace glue node) landed; a `colorin → … → colorout` span now
 captures as a single GPU submission. M5 in progress: the GPU histogram
-reduction kernel (first tap) is landed and validated. See §11 for the
+reduction kernel and the deferred-readback tap registry are landed and
+validated (pipe wiring pending a darkroom bench). See §11 for the
 living implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -679,15 +680,24 @@ explicit node (or is planned away):
   is the next M5 increment. Until it lands, calling the tap mid-span
   would still flush (its readback is a §5.3 sync tap like any other),
   so it is not yet wired into the pipe.
-  - **Tap registry (next).** A per-run list of `(device buffer, host
-    destination, kind)` pending taps: capture appends the reduction
-    DISPATCH and registers the tiny result buffer instead of reading
-    it back; the recursion root — where the M2 final-sync already runs
-    — drains the registry in one batch after the last fence. Keeps the
-    tap buffers alive across the span (they must survive to run-end),
-    and fills `piece->histogram` / picker fields there, which is safe
-    because those are consumed by the GUI only after the pipe
-    completes.
+  - **Tap registry (landed).** `dt_vulkan_tap_register` (vulkan.c) is a
+    per-run list of `(device buffer, host destination, size)` pending
+    taps: the caller appends the reduction DISPATCH and registers the
+    tiny result buffer instead of reading it back; `dt_vulkan_capture_end`
+    drains the registry in one batch after the final fence (reads
+    eagerly, since capture is already inactive) and frees the buffers.
+    The buffers live on their own list — not the deferred-free list —
+    so they survive every mid-span sync-tap flush and only retire at
+    run end; `capture_abort` and a rollback past the registration
+    point free them without reading (producing dispatch gone), the
+    capture mark carrying a tap count for the latter. Unit-tested in
+    `test_vulkan_capture` (deferred-until-end, survives-a-flush,
+    abort/rollback-drop). **Remaining (M5c):** wire the histogram tap
+    in at §5.3.1 site 2 — dispatch on the hand-off, register the result
+    to `piece->histogram`, and compute `histogram_max`/stats at drain.
+    That is preview-pipe behaviour (histograms don't fire in headless
+    export), so it wants a darkroom/GPU bench to validate; the two
+    mechanisms it composes are each already tested.
 - **Pixelpipe-cache taps.** See §5.7.
 - **Format conversions** (`bpp` changes along the RAW segment, 1f→4f
   at demosaic) are DISPATCH nodes like any other; the RAW trunk
@@ -1044,13 +1054,15 @@ Each milestone lands green and user-invisible-by-default
 - **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
   end-of-run KB readbacks; scharr as resident resource. Flip pref
   default on for darkroom pipes; export next release. *In progress:*
-  the **histogram reduction kernel** is landed and validated against
-  the CPU reducer (§5.4 status note, §11) — the primitive that
-  replaces a trunk-sized readback with a few-KB one. Remaining: the
-  tap registry (defer the readback to the end-of-run fence so the tap
-  stops splitting the span), the picker/scope reduction kernels, and
-  the pipe wiring — the piece that wants a darkroom/GPU bench to
-  validate end to end, since taps fire in the preview pipe, not export.
+  two tested mechanisms landed (§5.4 status note, §11) — the
+  **histogram reduction kernel** (validated against the CPU reducer)
+  and the **tap registry** (`dt_vulkan_tap_register`, deferring a
+  tap's readback to the end-of-run fence so it stops splitting the
+  span). Remaining: **M5c** — compose them in the pipe (dispatch the
+  histogram on the hand-off at site 2, register it to
+  `piece->histogram`, compute max/stats at drain), plus the
+  picker/scope reduction kernels. M5c is preview-pipe behaviour, so it
+  wants a darkroom/GPU bench to validate end to end.
 - **M6 — islands polish.** Pinned staging ring, transfer-queue
   overlap, planned island bridging; `distort_mask` VK ports for
   raster-mask edges as they come.
@@ -1100,6 +1112,35 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M5 tap registry landed: deferred reduction readbacks
+
+Commit: `4505357` (registry + capture-context integration + tests).
+
+`dt_vulkan_tap_register(devid, buf, host_dst, size)` records a pending
+tap on the capture context; `dt_vulkan_capture_end` drains them all
+after the final fence. The design points that made it correct:
+
+- **Own list, not the deferred-free list.** Tap buffers must outlive
+  every *mid-span* sync-tap flush (their result is read only at run
+  end), whereas the deferred-free list is drained on each flush. So
+  taps sit in a separate array and retire only at `capture_end`.
+- **Drain reads eagerly.** `capture_end` sets `active = FALSE` before
+  draining, so each tap readback takes the plain (non-capturing) read
+  path instead of trying to re-flush an already-ended capture.
+- **Rollback/abort drop, don't read.** A module fault removes the
+  producing dispatch, so the tap result is meaningless — the mark
+  gained a `taps` field and rollback frees the buffers registered
+  after it without reading; abort does the same for the whole list.
+- **Ownership.** The registry owns the buffer and frees it at drain,
+  so the caller registers and walks away (must not also free it).
+
+Tested in `test_vulkan_capture` (now 12): the deferred value is absent
+mid-span and present only after `capture_end`; a tap survives a
+mid-span sync-tap flush of a different buffer; abort and rollback drop
+taps without reading. This is the mechanism half of the histogram
+tap; composing it with the kernel in the pipe (M5c) is preview-pipe
+work for a darkroom bench.
 
 ### 2026-07-13 — M5 first tap landed: GPU histogram reduction kernel
 
