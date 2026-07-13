@@ -48,6 +48,31 @@ void dt_histogram_helper(dt_dev_histogram_collection_params_t *histogram_params,
                          const gboolean compensate_middle_grey,
                          const dt_iop_order_iccprofile_info_t *const profile_info);
 
+#ifdef HAVE_VULKAN
+/** Vulkan histogram reduction (DAG milestone M5,
+ *  gpu_resident_pixelpipe_dag.md §5.4). Bins the device image
+ *  `dev_in` (float4, width×height, row-major) into `histogram`
+ *  (bins_count·4 uint32, layout hist[bin*4+k]) on the GPU with atomic
+ *  increments, matching the CPU `dt_histogram_helper` for the RGB /
+ *  Lab / Lab→LCh binnings. The caller supplies the pre-zeroed host
+ *  `histogram` (it is (re)zeroed on device internally). Returns FALSE
+ *  — leaving the caller to fall back to the CPU reducer — for the
+ *  unported cases: RAW (uint16), and middle-grey-compensated RGB
+ *  (needs the profile TRC). Caller holds the device lock. Under an
+ *  active capture the dispatch is captured and the small readback
+ *  flushes the span, exactly like any other sync tap. */
+gboolean dt_histogram_helper_vk(int devid,
+                                dt_vk_mem_t *dev_in,
+                                int width,
+                                int height,
+                                const dt_histogram_roi_t *roi,
+                                int bins_count,
+                                dt_iop_colorspace_type_t cst,
+                                dt_iop_colorspace_type_t cst_to,
+                                gboolean compensate_middle_grey,
+                                uint32_t *histogram);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

@@ -56,9 +56,20 @@ add_dependencies(test_vulkan_colorspace build_vulkan_kernels)
 target_compile_definitions(test_vulkan_colorspace
                            PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
 
+# Histogram reduction-tap tests (DAG milestone M5). Load the production
+# .spv modules from the build datadir, so they depend on the kernel
+# build target.
+add_cmocka_test(test_vulkan_histogram
+                SOURCES test_vulkan_histogram.c
+                LINK_LIBRARIES lib_darktable cmocka)
+add_dependencies(test_vulkan_histogram build_vulkan_kernels)
+target_compile_definitions(test_vulkan_histogram
+                           PRIVATE TEST_VK_DATADIR="${DARKTABLE_DATADIR}")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_vulkan_capture lib_darktable)
     _copy_required_library(test_vulkan_blendop lib_darktable)
     _copy_required_library(test_vulkan_colorspace lib_darktable)
+    _copy_required_library(test_vulkan_histogram lib_darktable)
 endif(WIN32)

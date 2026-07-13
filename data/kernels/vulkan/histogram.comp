@@ -1,0 +1,58 @@
+// GLSL fallback for histogram.cl :: histogram_rgb.
+// See the .cl header for design notes.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer In   { vec4 data[]; } in_buf;
+layout(std430, binding = 1)           buffer Hist { uint data[]; } hist;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int crop_x;
+    int crop_y;
+    int crop_right;
+    int crop_bottom;
+    int bins_count;
+    int mode;
+} pc;
+
+// Lab -> LCh matching dt_vulkan_common.h::vk_Lab_2_LCH (and the CPU
+// dt_Lab_2_LCH the reducer uses).
+const float DT_2PI = 6.2831853071795864769;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if(x >= pc.width || y >= pc.height) return;
+    if(x < pc.crop_x || x >= pc.width - pc.crop_right) return;
+    if(y < pc.crop_y || y >= pc.height - pc.crop_bottom) return;
+
+    float max_bin = float(pc.bins_count - 1);
+    vec4 px = in_buf.data[y * pc.width + x];
+
+    vec4 v;
+    if(pc.mode == 0) {
+        v = px * max_bin;
+    } else if(pc.mode == 1) {
+        vec4 scale = vec4(max_bin / 100.0, max_bin / 256.0, max_bin / 256.0, 0.0);
+        vec4 shift = vec4(0.0, 128.0, 128.0, 0.0);
+        v = scale * (px + shift);
+    } else {
+        float H = atan(px.z, px.y);
+        H = (H > 0.0) ? H / DT_2PI : 1.0 - abs(H) / DT_2PI;
+        float C = length(px.yz);
+        vec4 lch = vec4(px.x, C, H, px.w);
+        vec4 scale = vec4(max_bin / 100.0, max_bin / (128.0 * 1.4142135623730951), max_bin, 0.0);
+        v = scale * lch;
+    }
+
+    int b0 = int(clamp(v.x, 0.0, max_bin));
+    int b1 = int(clamp(v.y, 0.0, max_bin));
+    int b2 = int(clamp(v.z, 0.0, max_bin));
+
+    atomicAdd(hist.data[b0 * 4 + 0], 1u);
+    atomicAdd(hist.data[b1 * 4 + 1], 1u);
+    atomicAdd(hist.data[b2 * 4 + 2], 1u);
+}

@@ -294,6 +294,88 @@ void dt_histogram_helper(dt_dev_histogram_collection_params_t *histogram_params,
             dt_get_lap_time(&start_time.clock), dt_get_lap_utime(&start_time.user));
 }
 
+#ifdef HAVE_VULKAN
+// ---- Vulkan histogram reduction (DAG M5) ----------------------------
+//
+// Cached kernel slot, lazily loaded on first call — same pattern as
+// the gaussian/colorspaces VK helpers, no darktable-global plumbing.
+typedef struct
+{
+  int32_t width, height, crop_x, crop_y, crop_right, crop_bottom;
+  int32_t bins_count, mode;
+} _vk_hist_pc_t;
+
+static dt_vk_module_kernel_t _vk_histogram = DT_VK_MODULE_KERNEL_INIT;
+static gboolean              _vk_histogram_loaded = FALSE;
+
+static void _vk_histogram_ensure_kernel(void)
+{
+  if(_vk_histogram_loaded) return;
+  if(!dt_vulkan_running()) return;
+  dt_vulkan_module_kernel_load(&_vk_histogram, "histogram", "histogram_rgb",
+                               2, sizeof(_vk_hist_pc_t), 16, 16, 1);
+  _vk_histogram_loaded = TRUE;
+}
+
+gboolean dt_histogram_helper_vk(int devid,
+                                dt_vk_mem_t *dev_in,
+                                int width,
+                                int height,
+                                const dt_histogram_roi_t *roi,
+                                int bins_count,
+                                dt_iop_colorspace_type_t cst,
+                                dt_iop_colorspace_type_t cst_to,
+                                gboolean compensate_middle_grey,
+                                uint32_t *histogram)
+{
+  // subset gates (mirror dt_histogram_helper's switch): only the three
+  // 4-channel float binnings are ported.
+  int mode;
+  switch(cst)
+  {
+    case IOP_CS_RGB:
+      if(compensate_middle_grey) return FALSE; // needs the profile TRC
+      mode = 0;
+      break;
+    case IOP_CS_LAB:
+      mode = (cst_to == IOP_CS_LCH) ? 2 : 1;
+      break;
+    default: // IOP_CS_RAW and anything else
+      return FALSE;
+  }
+  if(bins_count <= 1 || !dev_in || !histogram) return FALSE;
+
+  _vk_histogram_ensure_kernel();
+  if(_vk_histogram.kernel < 0) return FALSE;
+
+  const size_t hist_elems = (size_t)bins_count * 4;
+  const size_t hist_bytes = hist_elems * sizeof(uint32_t);
+
+  dt_vk_mem_t *dev_hist = dt_vulkan_alloc_buffer(devid, hist_bytes);
+  if(!dev_hist) return FALSE;
+
+  gboolean ok = FALSE;
+  // zero the device histogram (upload host zeros — a few KB), then
+  // atomic-accumulate, then read the small result back.
+  memset(histogram, 0, hist_bytes);
+  if(dt_vulkan_write_to_device(devid, dev_hist, histogram, hist_bytes) == 0)
+  {
+    const _vk_hist_pc_t pc = { width, height,
+                               roi->crop_x, roi->crop_y,
+                               roi->crop_right, roi->crop_bottom,
+                               bins_count, mode };
+    dt_vk_mem_t *bufs[2] = { dev_in, dev_hist };
+    if(dt_vulkan_dispatch_n(&_vk_histogram, bufs, 2, width, height,
+                            &pc, sizeof(pc)) == 0
+       && dt_vulkan_read_from_device(devid, histogram, dev_hist, hist_bytes) == 0)
+      ok = TRUE;
+  }
+
+  dt_vulkan_free_buffer(devid, dev_hist);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
