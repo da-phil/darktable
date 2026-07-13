@@ -1,8 +1,10 @@
 # A GPU-resident pixelpipe: DAG execution behind the linear pipe
 
-**Status:** in implementation — M1 (capture HAL + segment executor +
-module-scoped pixelpipe integration) and M0 (VK blend kernels,
-uniform-mask blending on-device) landed; see §11 for the living
+**Status:** in implementation — M1 (capture HAL + segment executor),
+M0 (VK blend kernels, uniform-mask blending on-device), and M2 (run-
+scoped span capture with deferred readbacks + the module-input
+colorspace glue node) landed; a `colorin → … → colorout` span now
+captures as a single GPU submission. See §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -595,6 +597,25 @@ explicit node (or is planned away):
   changes): a graph resource has exactly one content state for its
   whole lifetime, and its `cst` is a static property assigned at
   capture.
+  **M2 status note (module-input transform landed).** The Lab↔RGB
+  matrix kernels are ported (`colorspaces_transform_rgb_matrix_to_lab`
+  / `..._lab_to_rgb_matrix`, dedicated single-entry `.cl`/`.comp`
+  siblings for the glslang path) with a general host dispatcher
+  `dt_ioppr_transform_image_colorspace_vk` matching the CL twin's
+  coverage (matrix profiles only; RAW/LCH/non-matrix fall back). The
+  pipe uses it at §5.3.1 site 1 (`_vk_span_cst_glue`): rather than a
+  fresh temporary, the live hand-off is transformed into a new buffer
+  and swapped in — the resource is still write-once, but the buffer
+  churn waits for the M3 planner. Fires only when the input is a
+  deferred hand-off *and* the next module consumes it on-device; the
+  host input stays deferred (a later sync reads the transformed
+  hand-off). Because this moves the transform CPU→GPU, graph output
+  stops being bit-identical to eager and becomes float-precision
+  equivalent — validated at the source by `test_vulkan_colorspace`
+  (VK vs darktable's own CPU transform, <1e-4 linear / <3e-3 sRGB
+  gamma). Still host-side: the blend-space transform (site 10, always
+  a CPU-blend boundary in M0) and the RGB↔RGB output transform
+  (`_rgb_vk` exists but isn't wired into a span yet).
 - **Blending.** Requires the blendop kernel port (companion Path A —
   it is on the critical path of *both* designs, so it's pure overlap,
   not extra scope). Per blended module the pipe appends: optional
@@ -954,15 +975,16 @@ Each milestone lands green and user-invisible-by-default
   submission with every inter-module contract unchanged;
   darktable-cli exports verified bit-identical pref on vs off.
 - **M2 — span capture + glue nodes.** Widen the capture window from
-  module to GPU span. The **sync-point audit is done** (§5.3.1: full
-  consumer table, the two cacheline-lifetime facts, the resulting
-  contract) and the **span machinery is landed** (§5.3.1 status
-  note): run-scoped capture, deferred interior readbacks,
-  sync-at-need sites, root final sync — verified bit-identical
-  eager-vs-graph. Remaining: **glue nodes** — colorspace transform
-  nodes (retire the in-place host mutations that currently flush
-  every span at site 1), blend-space transforms, format conversions.
-  First real stacks then go single-submission end-to-end.
+  module to GPU span. **Landed:** the sync-point audit (§5.3.1), the
+  span machinery (run-scoped capture, deferred interior readbacks,
+  sync-at-need sites, root final sync — bit-identical eager-vs-graph),
+  and the **module-input colorspace glue node** (§5.4 status note:
+  Lab↔RGB matrix transforms on-device, so a `colorin → … → colorout`
+  span now captures as one submission; float-precision equivalent to
+  eager, kernels validated against the CPU transform). Remaining:
+  blend-space transforms (they gate on CPU blend today, so they wait
+  for blendif/mask nodes) and format conversions; then the RGB↔RGB
+  output transform wired into the export tail.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
   spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
 - **M4 — cache integration.** Async cache-tap readbacks; VRAM
@@ -1019,6 +1041,49 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-13 — M2 glue node landed: module-input colorspace transform on-device
+
+Commit: `6622949` (Lab↔RGB kernels + host dispatcher + pipe wiring +
+tests).
+
+What shipped:
+
+- **Kernels.** `colorspaces_transform_rgb_matrix_to_lab` and
+  `..._lab_to_rgb_matrix` ported to `colorspaces.cl` (multi-entry for
+  clspv) plus dedicated single-entry `.cl`/`.comp` siblings so the
+  glslang fallback exposes each — the same pattern gaussian/blendop
+  use. Straight ports of the CL twins: input TRC LUT, matrix from the
+  profile struct, XYZ↔Lab.
+- **Host dispatcher.** `dt_ioppr_transform_image_colorspace_vk`
+  mirrors the CL function's structure and pass-through policy — matrix
+  profiles only, RAW/unsupported pairs return FALSE with
+  `*converted_cst == cst_from` so the caller can sync + CPU-convert.
+  Reuses the existing `build/free_iccprofile_params_vk` plumbing
+  (capture-safe: profile uploads snapshot into the ring).
+- **Pipe wiring.** `_vk_span_cst_glue` at §5.3.1 site 1 transforms the
+  live hand-off into a new buffer and swaps it in, advancing the cst
+  and leaving the host line deferred — the span survives the hop.
+  Gated to fire only when the input is a deferred hand-off and the
+  module will consume it on-device (else a CPU module would sync the
+  transformed pixels straight back). The fault path already restores
+  the host input from the transformed hand-off.
+- **Testing shift.** The glue node moves math CPU→GPU, so graph output
+  is no longer bit-identical to eager — the M1/M2b bit-identity signal
+  doesn't apply to it. Replaced with `test_vulkan_colorspace`: feed
+  one constructed sRGB profile through darktable's *own* CPU
+  `dt_ioppr_transform_image_colorspace` and through the VK path,
+  require agreement to <1e-4 (linear TRC) / <3e-3 (sRGB gamma) both
+  directions, plus a round-trip inversion <1e-4. This caught a real
+  setup bug (the CPU path reads `matrix_*_transposed`, which a naive
+  fixture leaves invalid → NaN) — a good sign the comparison is
+  actually exercising the CPU reference.
+- **Evidence.** lavapipe: `-d vkgraph` on the test export shows the
+  three VK modules and two cst glue nodes collapse from three
+  submissions (the M2b span-capture number) to **one** — 18 nodes,
+  1 submit. The eager path stays byte-for-byte the pre-M2 baseline
+  (PFM md5 unchanged); graph output differs from eager by max ~2e-5 /
+  mean ~2e-7, nothing over 1e-3. Full ctest green (5 suites).
 
 ### 2026-07-13 — M2 span capture landed: run-scoped context, deferred readbacks
 
