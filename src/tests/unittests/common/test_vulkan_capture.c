@@ -515,6 +515,139 @@ static void test_abort_discards_pending_work(void **state)
   free(in); free(out);
 }
 
+// GPU tap (DAG M5, §5.4): a registered result buffer's readback is
+// deferred to capture_end — the value is NOT materialised mid-span,
+// and appears in the host destination only after the run's final
+// fence.
+static void test_gpu_tap_deferred_readback(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  float *in = malloc(TBYTES), *tap_dst = malloc(TBYTES), *ref = malloc(TBYTES);
+  assert_non_null(in); assert_non_null(tap_dst); assert_non_null(ref);
+  _fill_input(in);
+  const pc_addmul_t pc = { TW, TH, 3.0f };
+  for(size_t i = 0; i < TN; i++) ref[i] = in[i] + 3.0f;
+  memset(tap_dst, 0, TBYTES); // sentinel: must stay 0 until the drain
+
+  const int dev = dt_vulkan_lock_device();
+  assert_int_equal(dev, 0);
+  dt_vk_mem_t *a = dt_vulkan_alloc_buffer(dev, TBYTES);
+  dt_vk_mem_t *tap = dt_vulkan_alloc_buffer(dev, TBYTES); // owned by the registry after register
+  assert_non_null(a); assert_non_null(tap);
+
+  const uint64_t s0 = dt_vulkan_submission_count(dev);
+  assert_true(dt_vulkan_capture_begin(dev));
+  assert_int_equal(dt_vulkan_write_to_device(dev, a, in, TBYTES), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, a, tap, TW, TH, &pc, sizeof(pc)), 0);
+  assert_true(dt_vulkan_tap_register(dev, tap, tap_dst, TBYTES));
+  // deferred: nothing submitted yet, destination still the sentinel
+  assert_int_equal((int)(dt_vulkan_submission_count(dev) - s0), 0);
+  assert_float_equal(tap_dst[0], 0.0f, 0.0f);
+  assert_float_equal(tap_dst[TN - 1], 0.0f, 0.0f);
+  // the span itself is one captured unit (upload + dispatch)
+  assert_int_equal(dt_vulkan_capture_pending(), 2);
+
+  assert_int_equal(dt_vulkan_capture_end(dev), 0);
+  // now the tap has been read back after the fence
+  for(size_t i = 0; i < TN; i++)
+    assert_float_equal(tap_dst[i], ref[i], 1e-4);
+
+  dt_vulkan_free_buffer(dev, a); // tap is owned+freed by the registry
+  dt_vulkan_unlock_device(dev);
+  free(in); free(tap_dst); free(ref);
+}
+
+// A tap must survive a mid-span sync-tap flush: its producing dispatch
+// executes in that flush, but the result buffer is not read or freed
+// until capture_end.
+static void test_gpu_tap_survives_sync_flush(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  float *in = malloc(TBYTES), *mid = malloc(TBYTES), *tap_dst = malloc(TBYTES);
+  assert_non_null(in); assert_non_null(mid); assert_non_null(tap_dst);
+  _fill_input(in);
+  const pc_addmul_t pc_tap = { TW, TH, 5.0f };
+  const pc_addmul_t pc_mid = { TW, TH, 1.0f };
+  memset(tap_dst, 0, TBYTES);
+
+  const int dev = dt_vulkan_lock_device();
+  assert_int_equal(dev, 0);
+  dt_vk_mem_t *a = dt_vulkan_alloc_buffer(dev, TBYTES);
+  dt_vk_mem_t *b = dt_vulkan_alloc_buffer(dev, TBYTES);
+  dt_vk_mem_t *tap = dt_vulkan_alloc_buffer(dev, TBYTES);
+  assert_non_null(a); assert_non_null(b); assert_non_null(tap);
+
+  assert_true(dt_vulkan_capture_begin(dev));
+  assert_int_equal(dt_vulkan_write_to_device(dev, a, in, TBYTES), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, a, tap, TW, TH, &pc_tap, sizeof(pc_tap)), 0);
+  assert_true(dt_vulkan_tap_register(dev, tap, tap_dst, TBYTES));
+  // a mid-span readback of a DIFFERENT buffer forces a flush (executing
+  // the tap's dispatch too), but must not touch the pending tap
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, a, b, TW, TH, &pc_mid, sizeof(pc_mid)), 0);
+  assert_int_equal(dt_vulkan_read_from_device(dev, mid, b, TBYTES), 0);
+  for(size_t i = 0; i < TN; i++) assert_float_equal(mid[i], in[i] + 1.0f, 1e-4);
+  // still deferred after the sync-tap flush
+  assert_float_equal(tap_dst[0], 0.0f, 0.0f);
+
+  assert_int_equal(dt_vulkan_capture_end(dev), 0);
+  for(size_t i = 0; i < TN; i++) assert_float_equal(tap_dst[i], in[i] + 5.0f, 1e-4);
+
+  dt_vulkan_free_buffer(dev, a);
+  dt_vulkan_free_buffer(dev, b); // tap owned by the registry
+  dt_vulkan_unlock_device(dev);
+  free(in); free(mid); free(tap_dst);
+}
+
+// abort and rollback must drop pending taps without reading them.
+static void test_gpu_tap_abort_and_rollback(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  float *in = malloc(TBYTES), *tap_dst = malloc(TBYTES);
+  assert_non_null(in); assert_non_null(tap_dst);
+  _fill_input(in);
+  const pc_addmul_t pc = { TW, TH, 2.0f };
+
+  const int dev = dt_vulkan_lock_device();
+  assert_int_equal(dev, 0);
+
+  // --- abort drops the tap (destination untouched) ---
+  memset(tap_dst, 0, TBYTES);
+  dt_vk_mem_t *a = dt_vulkan_alloc_buffer(dev, TBYTES);
+  dt_vk_mem_t *tap = dt_vulkan_alloc_buffer(dev, TBYTES);
+  assert_non_null(a); assert_non_null(tap);
+  assert_true(dt_vulkan_capture_begin(dev));
+  assert_int_equal(dt_vulkan_write_to_device(dev, a, in, TBYTES), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, a, tap, TW, TH, &pc, sizeof(pc)), 0);
+  assert_true(dt_vulkan_tap_register(dev, tap, tap_dst, TBYTES));
+  dt_vulkan_capture_abort(dev); // frees tap without reading
+  assert_float_equal(tap_dst[0], 0.0f, 0.0f);
+  dt_vulkan_free_buffer(dev, a);
+
+  // --- rollback past the mark drops a tap registered after it ---
+  memset(tap_dst, 0, TBYTES);
+  dt_vk_mem_t *a2 = dt_vulkan_alloc_buffer(dev, TBYTES);
+  dt_vk_mem_t *tap2 = dt_vulkan_alloc_buffer(dev, TBYTES);
+  assert_non_null(a2); assert_non_null(tap2);
+  assert_true(dt_vulkan_capture_begin(dev));
+  assert_int_equal(dt_vulkan_write_to_device(dev, a2, in, TBYTES), 0);
+  const dt_vk_capture_mark_t mark = dt_vulkan_capture_mark();
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, a2, tap2, TW, TH, &pc, sizeof(pc)), 0);
+  assert_true(dt_vulkan_tap_register(dev, tap2, tap_dst, TBYTES));
+  dt_vulkan_capture_rollback(dev, &mark); // drops the dispatch AND the tap
+  assert_int_equal(dt_vulkan_capture_end(dev), 0);
+  assert_float_equal(tap_dst[0], 0.0f, 0.0f); // never read
+  dt_vulkan_free_buffer(dev, a2);
+
+  dt_vulkan_unlock_device(dev);
+  free(in); free(tap_dst);
+}
+
 // A second begin on the same thread must refuse (and report inactive
 // again once the first capture ends).
 static void test_nested_begin_refused(void **state)
@@ -543,6 +676,9 @@ int main(void)
     cmocka_unit_test(test_rollback_drops_failed_module),
     cmocka_unit_test(test_copy_nodes),
     cmocka_unit_test(test_abort_discards_pending_work),
+    cmocka_unit_test(test_gpu_tap_deferred_readback),
+    cmocka_unit_test(test_gpu_tap_survives_sync_flush),
+    cmocka_unit_test(test_gpu_tap_abort_and_rollback),
     cmocka_unit_test(test_nested_begin_refused),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

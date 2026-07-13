@@ -412,6 +412,7 @@ typedef struct dt_vk_capture_mark_t
   uint32_t nodes;   // node count at mark time
   uint32_t dfrees;  // deferred-free count at mark time
   size_t   ring;    // snapshot-ring bytes used at mark time
+  uint32_t taps;    // registered-tap count at mark time
 } dt_vk_capture_mark_t;
 
 /** Enter capture mode on the calling thread. Returns FALSE (and stays
@@ -450,6 +451,19 @@ void dt_vulkan_capture_abort(int devid);
  *  device lock (it releases buffers). */
 dt_vk_capture_mark_t dt_vulkan_capture_mark(void);
 void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark);
+
+/** Register a GPU tap (DAG M5, gpu_resident_pixelpipe_dag.md §5.4): a
+ *  small device result buffer whose readback is deferred to the end of
+ *  the run instead of forcing a mid-span flush. Under an active
+ *  capture the registry takes ownership of `buf` and, at
+ *  dt_vulkan_capture_end, reads `size` bytes from it into `host_dst`
+ *  (after the final fence, so the producing dispatch has executed)
+ *  and frees it; on dt_vulkan_capture_abort or a rollback past this
+ *  point the buffer is freed without a read. Returns TRUE when
+ *  registered. Returns FALSE outside capture — the caller should then
+ *  read `buf` back itself (eager path). Caller holds the device lock. */
+gboolean dt_vulkan_tap_register(int devid, dt_vk_mem_t *buf,
+                                void *host_dst, size_t size);
 
 /** Like dt_vulkan_write_to_device, but under capture the host pointer
  *  is borrowed instead of snapshotted: the caller guarantees it stays
@@ -553,6 +567,9 @@ static inline dt_vk_capture_mark_t dt_vulkan_capture_mark(void)
 { dt_vk_capture_mark_t m = { 0 }; return m; }
 static inline void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark)
 { (void)devid; (void)mark; }
+static inline gboolean dt_vulkan_tap_register(int devid, dt_vk_mem_t *buf,
+                                              void *host_dst, size_t size)
+{ (void)devid; (void)buf; (void)host_dst; (void)size; return FALSE; }
 static inline int dt_vulkan_write_to_device_borrowed(int devid, dt_vk_mem_t *dst,
                                                      const void *host, size_t size)
 { (void)devid; (void)dst; (void)host; (void)size; return -1; }

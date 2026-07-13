@@ -162,6 +162,16 @@ typedef struct _capture_node_t
   size_t sox, soy, dox, doy, rw, rh, srp, drp, bpp;
 } _capture_node_t;
 
+// A pending GPU tap (DAG M5, §5.4): a small device result buffer whose
+// readback is deferred to the end of the run so the reduction doesn't
+// split the span. `buf` is owned by the registry (freed at drain).
+typedef struct _capture_tap_t
+{
+  dt_vk_mem_t *buf;   // device result, written by a captured dispatch
+  void        *dst;   // host destination, filled at drain
+  size_t       size;  // bytes
+} _capture_tap_t;
+
 typedef struct dt_vk_capture_ctx_t
 {
   gboolean   active;
@@ -171,6 +181,7 @@ typedef struct dt_vk_capture_ctx_t
   size_t     ring_used;
   size_t     ring_cap;
   GPtrArray *dfree;      // dt_vk_mem_t* whose free is deferred to flush
+  GArray    *taps;       // of _capture_tap_t, drained at capture_end
   uint32_t   flushes;    // segments submitted since begin (diagnostics)
 } dt_vk_capture_ctx_t;
 
@@ -729,6 +740,37 @@ static void _release_buffer(dt_vk_device_t *d, dt_vk_mem_t *mem)
   free(mem);
 }
 
+// Drain the M5 tap registry down to `keep` entries. `do_read` reads
+// each tap's device buffer into its host destination (used at
+// capture_end, once the final fence has retired the producing
+// dispatches); otherwise the results are abandoned (abort / rollback)
+// and the buffers are just released. Caller holds the device lock and
+// must have already left capture (active == FALSE) when do_read is
+// TRUE, so the readback runs eagerly instead of re-flushing.
+static void _drain_taps(dt_vk_capture_ctx_t *cap, dt_vk_device_t *d,
+                        int devid, guint keep, gboolean do_read)
+{
+  for(guint i = keep; i < cap->taps->len; i++)
+  {
+    _capture_tap_t *t = &g_array_index(cap->taps, _capture_tap_t, i);
+    if(do_read && t->dst && t->buf)
+      dt_vulkan_read_from_device(devid, t->dst, t->buf, t->size);
+    if(t->buf) _release_buffer(d, t->buf);
+  }
+  g_array_set_size(cap->taps, keep);
+}
+
+gboolean dt_vulkan_tap_register(int devid, dt_vk_mem_t *buf,
+                                void *host_dst, size_t size)
+{
+  (void)devid;
+  dt_vk_capture_ctx_t *cap = _cap();
+  if(!cap || !buf) return FALSE;
+  const _capture_tap_t t = { buf, host_dst, size };
+  g_array_append_val(cap->taps, t);
+  return TRUE;
+}
+
 // Generic one-shot command-buffer helper: record fn into the
 // persistent command buffer, submit on the queue, wait on the
 // persistent fence, return. Reuses d->oneshot_cmd and
@@ -1199,6 +1241,7 @@ gboolean dt_vulkan_capture_begin(int devid)
     if(!g_capture) return FALSE;
     g_capture->nodes = g_array_new(FALSE, FALSE, sizeof(_capture_node_t));
     g_capture->dfree = g_ptr_array_new();
+    g_capture->taps  = g_array_new(FALSE, FALSE, sizeof(_capture_tap_t));
   }
   g_capture->active = TRUE;
   g_capture->devid = devid;
@@ -1367,6 +1410,18 @@ int dt_vulkan_capture_end(int devid)
   if(!cap) return 0;
   const int rc = dt_vulkan_capture_flush(devid);
   cap->active = FALSE;
+  // M5 §5.4: the final fence has retired every captured dispatch, so
+  // the tap result buffers are ready — read them back in one batch
+  // (active is now FALSE, so these reads run eagerly, no re-flush) and
+  // free them. Skip the reads if the flush failed; the results are
+  // undefined then.
+  if(dt_vulkan_running())
+  {
+    dt_vk_device_t *d = &darktable.vulkan->dev[0];
+    if(cap->taps->len)
+      dt_print(DT_DEBUG_VKGRAPH, "[vkgraph] draining %u GPU tap(s)", cap->taps->len);
+    _drain_taps(cap, d, devid, 0, rc == 0);
+  }
   // Don't let a trunk-sized snapshot ring linger on a pooled pipeline
   // thread between spans.
   free(cap->ring);
@@ -1390,6 +1445,8 @@ void dt_vulkan_capture_abort(int devid)
     dt_vk_device_t *d = &darktable.vulkan->dev[0];
     for(guint i = 0; i < cap->dfree->len; i++)
       _release_buffer(d, g_ptr_array_index(cap->dfree, i));
+    // abandoned run: free tap buffers without reading (results void)
+    _drain_taps(cap, d, devid, 0, FALSE);
   }
   g_ptr_array_set_size(cap->dfree, 0);
   cap->active = FALSE;
@@ -1400,13 +1457,14 @@ void dt_vulkan_capture_abort(int devid)
 
 dt_vk_capture_mark_t dt_vulkan_capture_mark(void)
 {
-  dt_vk_capture_mark_t m = { 0, 0, 0 };
+  dt_vk_capture_mark_t m = { 0, 0, 0, 0 };
   const dt_vk_capture_ctx_t *cap = _cap();
   if(cap)
   {
     m.nodes = cap->nodes->len;
     m.dfrees = cap->dfree->len;
     m.ring = cap->ring_used;
+    m.taps = cap->taps->len;
   }
   return m;
 }
@@ -1428,6 +1486,9 @@ void dt_vulkan_capture_rollback(int devid, const dt_vk_capture_mark_t *mark)
     dt_vk_device_t *d = &darktable.vulkan->dev[0];
     for(guint i = mark->dfrees; i < cap->dfree->len; i++)
       _release_buffer(d, g_ptr_array_index(cap->dfree, i));
+    // taps registered by the rolled-back module: their producing
+    // dispatch is gone, so free the result buffers without reading.
+    _drain_taps(cap, d, devid, mark->taps, FALSE);
   }
   g_ptr_array_set_size(cap->dfree, mark->dfrees);
 }
