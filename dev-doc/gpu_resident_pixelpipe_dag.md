@@ -6,9 +6,10 @@ scoped span capture with deferred readbacks + the module-input
 colorspace glue node) landed; a `colorin → … → colorout` span now
 captures as a single GPU submission. M5 in progress: the GPU histogram
 and color-picker reduction kernels and the deferred-readback tap
-registry are landed and validated (pipe wiring pending a darkroom
-bench). See §11 for the living implementation log and §9 for
-per-milestone state. §1–§10 are the
+registry are landed and validated, and the histogram tap is wired into
+the pipe — validated headless through levels-automatic (picker/scope
+wiring still pending a darkroom bench). See §11 for the living
+implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
 one scheduled unit — no CPU↔GPU pixel transfers between iops, no
@@ -711,12 +712,18 @@ explicit node (or is planned away):
     point free them without reading (producing dispatch gone), the
     capture mark carrying a tap count for the latter. Unit-tested in
     `test_vulkan_capture` (deferred-until-end, survives-a-flush,
-    abort/rollback-drop). **Remaining (M5c):** wire the histogram tap
-    in at §5.3.1 site 2 — dispatch on the hand-off, register the result
-    to `piece->histogram`, and compute `histogram_max`/stats at drain.
-    That is preview-pipe behaviour (histograms don't fire in headless
-    export), so it wants a darkroom/GPU bench to validate; the two
-    mechanisms it composes are each already tested.
+    abort/rollback-drop). **The histogram tap is wired at §5.3.1
+    site 2** (`dt_histogram_helper_vk_collect` in
+    `_collect_histogram_on_CPU`): when the module input lives in the
+    deferred hand-off, the reduction runs on the device and only the
+    few-KB histogram is read back — the trunk stays resident and the
+    span continues, where previously the request materialized the
+    whole trunk. The readback is a *sync* tap by design, not
+    registry-deferred: modules that consume their own input histogram
+    inside `process` (levels automatic) need it before they run.
+    Deferring through the registry is only valid for GUI-only
+    consumers (`DT_REQUEST_ONLY_IN_GUI`) and remains a preview-pipe
+    increment, as does wiring the picker at its request sites.
 - **Pixelpipe-cache taps.** See §5.7.
 - **Format conversions** (`bpp` changes along the RAW segment, 1f→4f
   at demosaic) are DISPATCH nodes like any other; the RAW trunk
@@ -1073,16 +1080,17 @@ Each milestone lands green and user-invisible-by-default
 - **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
   end-of-run KB readbacks; scharr as resident resource. Flip pref
   default on for darkroom pipes; export next release. *In progress:*
-  three tested mechanisms landed (§5.4 status note, §11) — the
-  **histogram** and **color-picker** reduction kernels (each validated
-  against its CPU reducer) and the **tap registry**
-  (`dt_vulkan_tap_register`, deferring a tap's readback to the
-  end-of-run fence so it stops splitting the span). Remaining: **M5c**
-  — compose kernel + registry in the pipe (histogram at §5.3.1 site 2
-  → `piece->histogram`; picker at its request site → `module->picked_*`;
-  max/stats at drain), the scope reductions, and the denoise/converting
-  picker variants. M5c is preview/darkroom behaviour, so it wants a
-  darkroom/GPU bench to validate end to end.
+  the **histogram** and **color-picker** reduction kernels (each
+  validated against its CPU reducer, picker covering all four picker
+  colorspaces), the **tap registry** (`dt_vulkan_tap_register`), and —
+  landed after the "needs a darkroom bench" assessment was revisited —
+  the **histogram tap wired at §5.3.1 site 2**, validated headless end
+  to end through levels-automatic (which self-consumes its input
+  histogram in export; §11 entry with the determinism analysis).
+  Remaining: the registry-deferred variant for GUI-only histogram
+  consumers, the picker wiring at its request sites, and the scope
+  reductions — those genuinely are preview/darkroom behaviour — plus
+  the denoise picker blur.
 - **M6 — islands polish.** Pinned staging ring, transfer-queue
   overlap, planned island bridging; `distort_mask` VK ports for
   raster-mask edges as they come.
@@ -1132,6 +1140,58 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-14 — M5 histogram tap wired into the pipe, validated headless
+
+Commit: `f81ab14` (collect-level helper + site-2 wiring + tests).
+
+The "M5c needs a darkroom bench" assessment was wrong for the
+histogram, and revisiting it found a headless testbed:
+**levels in automatic mode** clears `DT_REQUEST_ONLY_IN_GUI` in
+non-GUI runs (`levels.c` `commit_params`), collects a 16384-bin Lab
+histogram of its input in *export*, and computes its black/grey/white
+points from it inside `process` — its pixel output is a direct
+function of the histogram. Flipping the benchmark XMP's levels entry
+to automatic (params hex: mode 0→1, percentiles 5/50/95) exercises
+the whole wiring in `darktable-cli`.
+
+What shipped:
+
+- `dt_histogram_helper_vk_collect` (`src/common/histogram.c`): the
+  collect-level sibling of `dt_histogram_helper` — same buffer
+  (re)allocation contract, stats fill, and channel-maxima rules, with
+  the reduction on the device. Unit-tested against the CPU helper for
+  the *whole* contract (bins, maxima, stats), exact on
+  rounding-invariant inputs.
+- Site-2 wiring in `_collect_histogram_on_CPU`: input in the deferred
+  hand-off → device reduction, few-KB readback, trunk stays resident,
+  hand-off survives, span continues. Unported cases fall through to
+  sync-at-need + CPU. `PIXELPIPE_FLOW_HISTOGRAM_ON_GPU` reports it.
+- **Sync by design, not registry-deferred:** the result must land in
+  `piece->histogram` *before* `module->process` for self-consumers
+  like levels-auto. The registry-deferred variant is only valid for
+  GUI-only consumers and stays a preview-pipe increment.
+
+Evidence, including a determinism analysis worth keeping:
+
+- `-d vkgraph` shows `histogram tap: 16384 bins on device, trunk
+  stays resident` between two readback-deferred VK modules, and
+  levels itself then rides the hand-off (`[vk handoff] … [readback
+  deferred]`); `-d perf` reports `collected histogram on GPU`.
+- **Repeated runs of the same config differ by up to ~6e-4** in this
+  deep pipe — *pre-existing* OMP accumulation noise (present in
+  eager runs without any graph code) amplified by levels-auto's
+  percentile step function. Graph runs are exactly as repeatable as
+  eager runs (max 5.1e-4 vs 6.3e-4 across repeats).
+- Eager-vs-graph differs stably by max 4.6e-2 on 13 of 979k pixels
+  (0.001%), clustered near the white point with sign flips — the
+  signature of the 95th-percentile threshold landing one bin apart
+  between the two float paths, not a bias (the unit tests pin the
+  kernel to exact bin counts, and per-channel totals always equal the
+  pixel count). This is the same divergence class darktable already
+  accepts between its CPU and CL paths; any percentile-driven module
+  amplifies CPU↔GPU heterogeneity this way regardless of where the
+  histogram is computed.
 
 ### 2026-07-13 — M5 second tap landed: GPU color-picker reduction kernel
 
