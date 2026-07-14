@@ -682,14 +682,20 @@ explicit node (or is planned away):
     the picker box to per-channel sum/min/max with *float* atomics
     (`vk_atomic_{add,min,max}_f` — the min/max siblings added here,
     reinterpret-CAS with an early return), host dividing the sum by the
-    box size for the mean. A mode switch covers the no-conversion path
-    (`_color_picker_rgb_or_lab`) plus the Lab→LCH and RGB→HSL pickers
-    (`_color_picker_lch/hsl`, with the same rotated-4th-channel hue
-    handling); JzCzhz (needs the profile), denoise, and 1-ch raw
-    refuse. Validated against `dt_color_picker_helper` — min/max exact
-    on the no-conversion path, within a ulp-tolerance on the converting
-    paths (a different pixel may hold the extremum), mean within a
-    summation-order tolerance (`test_vulkan_picker`).
+    box size for the mean. Covers **all four picker colorspaces**: a
+    mode switch in `picker_rgb` handles no-conversion
+    (`_color_picker_rgb_or_lab`), Lab→LCH and RGB→HSL
+    (`_color_picker_lch/hsl`, rotated-4th-channel hue handling), and a
+    separate profile-bearing `picker_jzczhz` runs the full
+    RGB→XYZ_D50→XYZ_D65→JzAzBz→JzCzhz chain for the scene-referred
+    picker (`_color_picker_jzczhz`). Only denoise (the b-spline blur)
+    and the no-matrix/lcms JzCzhz profile refuse to the CPU path.
+    Validated against `dt_color_picker_helper` — min/max exact on the
+    no-conversion path, within a ulp-tolerance on the converting paths
+    (a different pixel may hold the extremum), mean within a
+    summation-order tolerance (`test_vulkan_picker`, incl. a JzCzhz
+    case with a constructed sRGB profile that exercises the whole
+    chain in both toolchains).
 
   These are the reduction *primitives*; the readback is deferred to the
   end-of-run fence by the **tap registry** below.
@@ -1150,14 +1156,19 @@ scale-aware tolerance because the atomic accumulation order differs
 from the OMP reduction. Full box, sub-box, and a 1×1 box
 (mean == min == max) covered, plus the gate refusals.
 
-A follow-up (`14843f0`) extends the kernel with a mode switch for the
-Lab→LCH and RGB→HSL pickers (`_color_picker_lch/hsl`): convert, set the
-4th channel to the rotated 3rd (hue-wraparound handling, matching
-`_update_stats_4ch`), then reduce. On these paths the GPU/CPU
-conversions differ by a few ulp so a different pixel can hold the
-extremum — the test compares min/max within a tolerance there while
-keeping the exact check on the no-conversion path. JzCzhz still needs
-the profile plumbing and refuses.
+Two follow-ups complete the picker's colorspace coverage. `14843f0`
+adds a mode switch for the Lab→LCH and RGB→HSL pickers
+(`_color_picker_lch/hsl`): convert, set the 4th channel to the rotated
+3rd (hue-wraparound handling, matching `_update_stats_4ch`), then
+reduce. `236477e` adds the scene-referred JzCzhz picker as a separate
+profile-bearing kernel (`picker_jzczhz`, 4 bindings) running the full
+RGB→XYZ_D50→XYZ_D65→JzAzBz→JzCzhz chain, with `dt_color_picker_helper_vk`
+gaining a profile argument and the `dt_ioppr_build_iccprofile_params_vk`
+plumbing; the no-matrix/lcms profile refuses to the CPU path. On all
+converting paths the GPU/CPU conversions differ by a few ulp so a
+different pixel can hold the extremum — the test compares min/max
+within a tolerance there while keeping the exact check on the
+no-conversion path. Only the denoise blur remains unported.
 
 ### 2026-07-13 — M5 tap registry landed: deferred reduction readbacks
 
