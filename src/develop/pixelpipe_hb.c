@@ -1324,16 +1324,52 @@ static void _collect_histogram_on_CPU(dt_dev_pixelpipe_t *pipe,
   if((dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
      && (piece->request_histogram & DT_REQUEST_ON))
   {
+    gboolean on_gpu = FALSE;
 #ifdef HAVE_VULKAN
-    // M2 §5.3.1 site 2: the histogram reads the module's host input
-    _vk_span_sync_host(pipe, (void *)input,
-                       (size_t)roi_in->width * roi_in->height
-                         * dt_iop_buffer_dsc_to_bpp(&piece->dsc_in),
-                       "input histogram");
+    // M5 §5.4 histogram tap: when the module input lives in the
+    // deferred hand-off, reduce it on the device — the readback is the
+    // few-KB histogram instead of the whole trunk, the hand-off stays
+    // valid, and the result lands in piece->histogram *before*
+    // module->process, so self-consumers (levels automatic) see it
+    // exactly as with the CPU collection. Falls through to
+    // sync-at-need + CPU for the unported cases (RAW bins,
+    // middle-grey-compensated, mismatched module roi).
+    if(pipe->vk_graph_run
+       && pipe->vk_span_host_stale == input
+       && pipe->vk_handoff_buf
+       && pipe->vk_handoff_size == (size_t)roi_in->width * roi_in->height
+                                   * 4 * sizeof(float)
+       && dt_iop_buffer_dsc_to_bpp(&piece->dsc_in) == 4 * sizeof(float))
+    {
+      const dt_iop_colorspace_type_t cst =
+        module->input_colorspace(module, pipe, piece);
+      on_gpu = dt_histogram_helper_vk_collect(&piece->histogram_params,
+                                              &piece->histogram_stats,
+                                              cst, module->histogram_cst,
+                                              pipe->vk_handoff_buf,
+                                              roi_in->width, roi_in->height,
+                                              &piece->histogram,
+                                              piece->histogram_max,
+                                              module->histogram_middle_grey);
+      if(on_gpu)
+        dt_print(DT_DEBUG_VKGRAPH,
+                 "[vkgraph] histogram tap: %u bins on device, trunk stays resident",
+                 piece->histogram_stats.bins_count);
+    }
+    if(!on_gpu)
+      // M2 §5.3.1 site 2: the CPU histogram reads the module's host input
+      _vk_span_sync_host(pipe, (void *)input,
+                         (size_t)roi_in->width * roi_in->height
+                           * dt_iop_buffer_dsc_to_bpp(&piece->dsc_in),
+                         "input histogram");
 #endif
-    _histogram_collect(piece, input, roi_in, &piece->histogram, piece->histogram_max);
-    *pixelpipe_flow |= (PIXELPIPE_FLOW_HISTOGRAM_ON_CPU);
-    *pixelpipe_flow &= ~(PIXELPIPE_FLOW_HISTOGRAM_NONE | PIXELPIPE_FLOW_HISTOGRAM_ON_GPU);
+    if(!on_gpu)
+      _histogram_collect(piece, input, roi_in, &piece->histogram, piece->histogram_max);
+    *pixelpipe_flow |= on_gpu ? PIXELPIPE_FLOW_HISTOGRAM_ON_GPU
+                              : PIXELPIPE_FLOW_HISTOGRAM_ON_CPU;
+    *pixelpipe_flow &= ~(PIXELPIPE_FLOW_HISTOGRAM_NONE
+                         | (on_gpu ? PIXELPIPE_FLOW_HISTOGRAM_ON_CPU
+                                   : PIXELPIPE_FLOW_HISTOGRAM_ON_GPU));
 
     if(piece->histogram
        && (module->request_histogram & DT_REQUEST_ON)

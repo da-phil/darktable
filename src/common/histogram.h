@@ -71,6 +71,27 @@ gboolean dt_histogram_helper_vk(int devid,
                                 dt_iop_colorspace_type_t cst_to,
                                 gboolean compensate_middle_grey,
                                 uint32_t *histogram);
+
+/** Collect-level Vulkan sibling of dt_histogram_helper: same
+ *  (re)allocation contract for *histogram, same stats and channel-max
+ *  computation, but the reduction runs on the device image via
+ *  dt_histogram_helper_vk (taking the device lock internally). Returns
+ *  FALSE — with *histogram/stats untouched apart from a possible
+ *  buffer grow — when the case isn't ported (RAW, compensated RGB, a
+ *  module roi whose dimensions differ from the device buffer) so the
+ *  caller falls back to the CPU collection. Used by the pixelpipe's
+ *  §5.3.1 site-2 histogram tap: a few-KB histogram readback instead of
+ *  materializing the whole trunk to host. */
+gboolean dt_histogram_helper_vk_collect(dt_dev_histogram_collection_params_t *histogram_params,
+                                        dt_dev_histogram_stats_t *histogram_stats,
+                                        const dt_iop_colorspace_type_t cst,
+                                        const dt_iop_colorspace_type_t cst_to,
+                                        dt_vk_mem_t *dev_in,
+                                        const int width,
+                                        const int height,
+                                        uint32_t **histogram,
+                                        uint32_t *histogram_max,
+                                        const gboolean compensate_middle_grey);
 #endif
 
 // clang-format off

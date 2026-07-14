@@ -304,6 +304,74 @@ static void test_lch_random(void **state)
   dt_free_align(p);
 }
 
+// collect-level sibling: dt_histogram_helper_vk_collect must reproduce
+// dt_histogram_helper's whole contract — buffer allocation, stats,
+// channel maxima — not just the raw bin counts. Bin-centre inputs so
+// the comparison is exact.
+static void test_collect_level(void **state)
+{
+  (void)state; REQUIRE_DEVICE();
+  s_rng = 0xf6;
+  float *p = dt_alloc_align_float(TN * 4);
+  assert_non_null(p);
+  fill_bin_centres(p, 1); // Lab
+
+  // CPU reference through the real collect path
+  dt_histogram_roi_t roi = { TW, TH, 0, 0, 0, 0 };
+  dt_dev_histogram_collection_params_t params = { &roi, BINS };
+  dt_dev_histogram_stats_t cpu_stats = { 0 };
+  uint32_t *cpu_hist = NULL;
+  uint32_t cpu_max[4] = { 0 };
+  dt_histogram_helper(&params, &cpu_stats, IOP_CS_LAB, IOP_CS_LAB, p,
+                      &cpu_hist, cpu_max, FALSE, NULL);
+  assert_non_null(cpu_hist);
+
+  // GPU collect (locks the device itself)
+  dt_dev_histogram_stats_t gpu_stats = { 0 };
+  uint32_t *gpu_hist = NULL;
+  uint32_t gpu_max[4] = { 0 };
+  const size_t bytes = TN * 4 * sizeof(float);
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  dt_vk_mem_t *din = NULL;
+  if(!rc)
+  {
+    din = dt_vulkan_alloc_buffer(dev, bytes);
+    if(!din) rc = -101;
+  }
+  if(!rc) rc = dt_vulkan_write_to_device(dev, din, p, bytes);
+  if(dev == 0) dt_vulkan_unlock_device(dev); // collect takes the lock itself
+  gboolean ran = FALSE;
+  if(!rc)
+    ran = dt_histogram_helper_vk_collect(&params, &gpu_stats,
+                                         IOP_CS_LAB, IOP_CS_LAB,
+                                         din, TW, TH,
+                                         &gpu_hist, gpu_max, FALSE);
+  if(din)
+  {
+    const int d2 = dt_vulkan_lock_device();
+    if(d2 == 0) { dt_vulkan_free_buffer(d2, din); dt_vulkan_unlock_device(d2); }
+  }
+
+  const gboolean hist_equal =
+    ran && gpu_hist && memcmp(cpu_hist, gpu_hist, 4 * BINS * sizeof(uint32_t)) == 0;
+  const gboolean max_equal = memcmp(cpu_max, gpu_max, sizeof(cpu_max)) == 0;
+  const uint32_t c_bins = cpu_stats.bins_count, g_bins = gpu_stats.bins_count;
+  const uint32_t c_px = cpu_stats.pixels, g_px = gpu_stats.pixels;
+  const uint32_t c_ch = cpu_stats.ch, g_ch = gpu_stats.ch;
+  if(cpu_hist) dt_free_align(cpu_hist);
+  if(gpu_hist) dt_free_align(gpu_hist);
+  dt_free_align(p);
+
+  assert_int_equal(rc, 0);
+  assert_true(ran);
+  assert_true(hist_equal);
+  assert_true(max_equal);
+  assert_int_equal((int)g_bins, (int)c_bins);
+  assert_int_equal((int)g_px, (int)c_px);
+  assert_int_equal((int)g_ch, (int)c_ch);
+}
+
 static void test_subset_gates(void **state)
 {
   (void)state; REQUIRE_DEVICE();
@@ -348,6 +416,7 @@ int main(void)
     cmocka_unit_test(test_rgb_random),
     cmocka_unit_test(test_lab_random),
     cmocka_unit_test(test_lch_random),
+    cmocka_unit_test(test_collect_level),
     cmocka_unit_test(test_subset_gates),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

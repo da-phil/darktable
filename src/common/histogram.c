@@ -374,6 +374,80 @@ gboolean dt_histogram_helper_vk(int devid,
   dt_vulkan_free_buffer(devid, dev_hist);
   return ok;
 }
+
+gboolean dt_histogram_helper_vk_collect(dt_dev_histogram_collection_params_t *histogram_params,
+                                        dt_dev_histogram_stats_t *histogram_stats,
+                                        const dt_iop_colorspace_type_t cst,
+                                        const dt_iop_colorspace_type_t cst_to,
+                                        dt_vk_mem_t *dev_in,
+                                        const int width,
+                                        const int height,
+                                        uint32_t **histogram,
+                                        uint32_t *histogram_max,
+                                        const gboolean compensate_middle_grey)
+{
+  // mirror _histogram_collect's roi defaulting
+  dt_histogram_roi_t full_roi;
+  const dt_histogram_roi_t *roi = histogram_params->roi;
+  if(roi == NULL)
+  {
+    full_roi = (dt_histogram_roi_t){ .width = width, .height = height,
+                                     .crop_x = 0, .crop_y = 0,
+                                     .crop_right = 0, .crop_bottom = 0 };
+    roi = &full_roi;
+  }
+  // the device buffer is width×height; a module-supplied roi with
+  // different dimensions would index a different buffer layout
+  if(roi->width != width || roi->height != height) return FALSE;
+
+  const uint32_t bins = histogram_params->bins_count;
+  const size_t buf_size = (size_t)4 * bins * sizeof(uint32_t);
+
+  // same (re)allocation contract as _hist_worker: keep the caller's
+  // buffer when large enough, else grow it
+  if(!(*histogram) || histogram_stats->buf_size < buf_size)
+  {
+    if(*histogram) dt_free_align(*histogram);
+    *histogram = dt_alloc_aligned(buf_size);
+    if(!*histogram) return FALSE;
+    histogram_stats->buf_size = buf_size;
+  }
+
+  const int devid = dt_vulkan_lock_device();
+  gboolean ok = FALSE;
+  if(devid >= 0)
+  {
+    ok = dt_histogram_helper_vk(devid, dev_in, width, height, roi, bins,
+                                cst, cst_to, compensate_middle_grey, *histogram);
+    dt_vulkan_unlock_device(devid);
+  }
+  if(!ok) return FALSE;
+
+  histogram_stats->bins_count = bins;
+  histogram_stats->pixels = (roi->width - roi->crop_right - roi->crop_x)
+                            * (roi->height - roi->crop_bottom - roi->crop_y);
+  histogram_stats->ch = 3u;
+
+  // channel maxima, same rules as dt_histogram_helper: skip bin 0 for
+  // lightness-like channels, keep it for Lab ab / LCh h
+  if(histogram_max)
+  {
+    const uint32_t *hist = *histogram;
+    DT_ALIGNED_PIXEL uint32_t m[4] = { 0u, 0u, 0u, 0u };
+    if(cst == IOP_CS_LAB)
+    {
+      if(cst_to != IOP_CS_LCH)
+        m[1] = hist[1];
+      m[2] = hist[2];
+    }
+    for(uint32_t k = 4; k < 4 * bins; k += 4)
+      for_each_channel(ch, aligned(m:16))
+        m[ch] = MAX(m[ch], hist[k + ch]);
+    for_each_channel(ch, aligned(m:16))
+      histogram_max[ch] = m[ch];
+  }
+  return TRUE;
+}
 #endif
 
 // clang-format off
