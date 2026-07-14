@@ -63,9 +63,11 @@ void dt_color_picker_helper(const struct dt_iop_buffer_dsc_t *dsc,
  *  `dt_color_picker_helper` for the no-conversion picker path
  *  (image colorspace already equals the picker colorspace). Returns
  *  FALSE — leaving the caller on the CPU reducer — for the unported
- *  cases: denoise (needs the blur), a colorspace-converting picker
- *  (LCH/HSL/JzCzhz), or an out-of-bounds/empty box. `box` is the
- *  half-open [x0,y0,x1,y1] region. Caller holds the device lock. */
+ *  cases: denoise (needs the blur), the JzCzhz picker without a
+ *  valid-matrix `profile`, or an out-of-bounds/empty box. `box` is the
+ *  half-open [x0,y0,x1,y1] region. `profile` is needed only for the
+ *  JzCzhz picker (may be NULL otherwise). Caller holds the device
+ *  lock. */
 gboolean dt_color_picker_helper_vk(int devid,
                                    dt_vk_mem_t *dev_in,
                                    int width,
@@ -74,7 +76,8 @@ gboolean dt_color_picker_helper_vk(int devid,
                                    const gboolean denoise,
                                    lib_colorpicker_stats pick,
                                    const enum dt_iop_colorspace_type_t image_cst,
-                                   const enum dt_iop_colorspace_type_t picker_cst);
+                                   const enum dt_iop_colorspace_type_t picker_cst,
+                                   const dt_iop_order_iccprofile_info_t *const profile);
 #endif
 
 // clang-format off

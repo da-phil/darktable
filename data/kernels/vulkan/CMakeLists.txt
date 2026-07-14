@@ -98,6 +98,7 @@ set(VK_KERNELS
     colorspaces_lab_to_rgb:colorspaces_transform_lab_to_rgb_matrix
     histogram:histogram_rgb
     picker:picker_rgb
+    picker_jzczhz:picker_jzczhz
     lowlight:lowlight
     bilateral_zero:bilateral_zero
     bilateral_splat:bilateral_splat

@@ -1,0 +1,145 @@
+// GLSL fallback for picker_jzczhz.cl :: picker_jzczhz.
+// See the .cl header for design notes. Replicates the RGB->JzCzhz
+// chain and the float-atomic reduction; validated against the CPU
+// rgb_to_JzCzhz by test_vulkan_picker.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer In    { vec4 data[]; } in_buf;
+layout(std430, binding = 1)          buffer Stats { uint data[]; } stats;
+
+layout(std430, binding = 2) readonly buffer Prof {
+    float matrix_in[9];
+    float matrix_out[9];
+    int   lutsize;
+    float unbounded_coeffs_in[9];
+    float unbounded_coeffs_out[9];
+    int   nonlinearlut;
+    float grey;
+} profile_info;
+
+layout(std430, binding = 3) readonly buffer Lut { float data[]; } lut;
+
+layout(push_constant) uniform PC {
+    int width;
+    int box_x0;
+    int box_y0;
+    int box_x1;
+    int box_y1;
+} pc;
+
+const float DT_2PI = 6.2831853071795864769;
+
+void atomic_add_f(uint idx, float v) {
+    uint old = stats.data[idx]; uint expected;
+    do { expected = old;
+         old = atomicCompSwap(stats.data[idx], expected,
+                              floatBitsToUint(uintBitsToFloat(expected) + v));
+    } while(old != expected);
+}
+void atomic_min_f(uint idx, float v) {
+    uint old = stats.data[idx]; uint expected;
+    do { if(uintBitsToFloat(old) <= v) return; expected = old;
+         old = atomicCompSwap(stats.data[idx], expected, floatBitsToUint(v));
+    } while(old != expected);
+}
+void atomic_max_f(uint idx, float v) {
+    uint old = stats.data[idx]; uint expected;
+    do { if(uintBitsToFloat(old) >= v) return; expected = old;
+         old = atomicCompSwap(stats.data[idx], expected, floatBitsToUint(v));
+    } while(old != expected);
+}
+
+float lerp_lookup(float x, float c0, float c1, float c2, int n_lut) {
+    if(c0 >= 0.0) {
+        if(x < 1.0) {
+            int sz = profile_info.lutsize;
+            float ft = clamp(x * float(sz - 1), 0.0, float(sz - 1));
+            int   t  = (ft < float(sz - 2)) ? int(ft) : sz - 2;
+            float f  = ft - float(t);
+            int   base = n_lut * sz;
+            return lut.data[base + t] * (1.0 - f) + lut.data[base + t + 1] * f;
+        }
+        return c1 * pow(x * c0, c2);
+    }
+    return x;
+}
+vec4 apply_trc_in(vec4 rgb) {
+    float R = lerp_lookup(rgb.x, profile_info.unbounded_coeffs_in[0],
+             profile_info.unbounded_coeffs_in[1], profile_info.unbounded_coeffs_in[2], 0);
+    float G = lerp_lookup(rgb.y, profile_info.unbounded_coeffs_in[3],
+             profile_info.unbounded_coeffs_in[4], profile_info.unbounded_coeffs_in[5], 1);
+    float B = lerp_lookup(rgb.z, profile_info.unbounded_coeffs_in[6],
+             profile_info.unbounded_coeffs_in[7], profile_info.unbounded_coeffs_in[8], 2);
+    return vec4(R, G, B, rgb.w);
+}
+
+// XYZ D50 -> XYZ D65 (Bradford), matching vk_XYZ_D50_to_XYZ_D65.
+vec4 XYZ_D50_to_D65(vec4 x) {
+    return vec4(
+        0.9555766 * x.x - 0.0230393 * x.y + 0.0631636 * x.z,
+       -0.0282895 * x.x + 1.0099416 * x.y + 0.0210077 * x.z,
+        0.0122982 * x.x - 0.0204830 * x.y + 1.3299098 * x.z,
+        x.w);
+}
+
+// XYZ D65 -> JzAzBz, matching vk_XYZ_to_JzAzBz / dt_XYZ_2_JzAzBz.
+vec4 XYZ_to_JzAzBz(vec4 XYZ) {
+    vec3 t1;
+    t1.x = 1.15 * XYZ.x - 0.15 * XYZ.z;
+    t1.y = 0.66 * XYZ.y + 0.34 * XYZ.x;
+    t1.z = XYZ.z;
+    vec3 lms;
+    lms.x =  0.41478972 * t1.x + 0.579999 * t1.y + 0.0146480 * t1.z;
+    lms.y = -0.2015100  * t1.x + 1.120649 * t1.y + 0.0531008 * t1.z;
+    lms.z = -0.0166008  * t1.x + 0.264800 * t1.y + 0.6684799 * t1.z;
+    lms = pow(max(lms / 10000.0, vec3(0.0)), vec3(0.159301758));
+    lms = pow((0.8359375 + 18.8515625 * lms) / (1.0 + 18.6875 * lms), vec3(134.034375));
+    float Iz = 0.5 * lms.x + 0.5 * lms.y;
+    float az = 3.524000 * lms.x - 4.066708 * lms.y + 0.542708 * lms.z;
+    float bz = 0.199076 * lms.x + 1.096799 * lms.y - 1.295875 * lms.z;
+    float Jz = max(0.44 * Iz / (1.0 - 0.56 * Iz) - 1.6295499532821566e-11, 0.0);
+    return vec4(Jz, az, bz, XYZ.w);
+}
+
+// JzAzBz -> JzCzhz, matching vk_JzAzBz_to_JzCzhz / dt_JzAzBz_2_JzCzhz.
+vec4 JzAzBz_to_JzCzhz(vec4 j) {
+    float H = atan(j.z, j.y) / DT_2PI;
+    H = (H >= 0.0) ? H : 1.0 + H;
+    return vec4(j.x, length(j.yz), H, j.w);
+}
+
+void main() {
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int bw = pc.box_x1 - pc.box_x0;
+    int bh = pc.box_y1 - pc.box_y0;
+    if(gx >= bw || gy >= bh) return;
+
+    int x = pc.box_x0 + gx;
+    int y = pc.box_y0 + gy;
+    vec4 rgb = in_buf.data[y * pc.width + x];
+
+    if(profile_info.nonlinearlut != 0)
+        rgb = apply_trc_in(rgb);
+
+    vec4 xyz;
+    xyz.x = profile_info.matrix_in[0] * rgb.x + profile_info.matrix_in[1] * rgb.y
+          + profile_info.matrix_in[2] * rgb.z;
+    xyz.y = profile_info.matrix_in[3] * rgb.x + profile_info.matrix_in[4] * rgb.y
+          + profile_info.matrix_in[5] * rgb.z;
+    xyz.z = profile_info.matrix_in[6] * rgb.x + profile_info.matrix_in[7] * rgb.y
+          + profile_info.matrix_in[8] * rgb.z;
+    xyz.w = rgb.w;
+
+    vec4 px = JzAzBz_to_JzCzhz(XYZ_to_JzAzBz(XYZ_D50_to_D65(xyz)));
+    px.w = (px.z < 0.5) ? px.z + 0.5 : px.z - 0.5;
+
+    atomic_add_f(0u, px.x); atomic_add_f(1u, px.y);
+    atomic_add_f(2u, px.z); atomic_add_f(3u, px.w);
+    atomic_min_f(4u, px.x); atomic_min_f(5u, px.y);
+    atomic_min_f(6u, px.z); atomic_min_f(7u, px.w);
+    atomic_max_f(8u, px.x); atomic_max_f(9u, px.y);
+    atomic_max_f(10u, px.z); atomic_max_f(11u, px.w);
+}

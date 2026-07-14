@@ -45,6 +45,8 @@
 #include "common/darktable.h"
 #include "common/vulkan.h"
 #include "common/color_picker.h"
+#include "common/iop_profile.h"
+#include "common/colorspaces.h"
 #include "control/conf.h"
 #include "develop/format.h"
 #include "develop/imageop.h"
@@ -103,10 +105,11 @@ static float frand(float lo, float hi)
 // exactly (no-conversion path) or within a tolerance (converting paths,
 // where the GPU/CPU conversions differ by a few ulp so a different
 // pixel may hold the extremum).
-static void run_box_cst(const float *pixels, const int *box,
-                        const dt_iop_colorspace_type_t image_cst,
-                        const dt_iop_colorspace_type_t picker_cst,
-                        const gboolean exact_extrema, const char *tag)
+static void run_box_prof(const float *pixels, const int *box,
+                         const dt_iop_colorspace_type_t image_cst,
+                         const dt_iop_colorspace_type_t picker_cst,
+                         const dt_iop_order_iccprofile_info_t *profile,
+                         const gboolean exact_extrema, const char *tag)
 {
   const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
   dt_iop_buffer_dsc_t dsc;
@@ -117,7 +120,7 @@ static void run_box_cst(const float *pixels, const int *box,
 
   lib_colorpicker_stats cpu, gpu;
   dt_color_picker_helper(&dsc, pixels, &roi, box, FALSE, cpu,
-                         image_cst, picker_cst, NULL);
+                         image_cst, picker_cst, profile);
 
   const size_t bytes = TN * 4 * sizeof(float);
   const int dev = dt_vulkan_lock_device();
@@ -132,7 +135,7 @@ static void run_box_cst(const float *pixels, const int *box,
   if(!rc) rc = dt_vulkan_write_to_device(dev, din, pixels, bytes);
   if(!rc)
     ran = dt_color_picker_helper_vk(dev, din, TW, TH, box, FALSE, gpu,
-                                    image_cst, picker_cst);
+                                    image_cst, picker_cst, profile);
   if(din) dt_vulkan_free_buffer(dev, din);
   if(dev == 0) dt_vulkan_unlock_device(dev);
 
@@ -157,9 +160,44 @@ static void run_box_cst(const float *pixels, const int *box,
   }
 }
 
+static void run_box_cst(const float *pixels, const int *box,
+                        const dt_iop_colorspace_type_t image_cst,
+                        const dt_iop_colorspace_type_t picker_cst,
+                        const gboolean exact_extrema, const char *tag)
+{
+  run_box_prof(pixels, box, image_cst, picker_cst, NULL, exact_extrema, tag);
+}
+
 static void run_box(const float *pixels, const int *box, const char *tag)
 {
   run_box_cst(pixels, box, IOP_CS_RGB, IOP_CS_RGB, TRUE, tag);
+}
+
+// sRGB D50 matrices matching dt_vulkan_common.h's vk_sRGB_to_XYZ /
+// vk_XYZ_to_sRGB; linear TRC. Both matrix and its transpose filled (the
+// CPU path reads matrix_in_transposed).
+static void make_srgb_profile(dt_iop_order_iccprofile_info_t *p)
+{
+  static const float SRGB_TO_XYZ[9] = {
+    0.4360747f, 0.3850649f, 0.1430804f,
+    0.2225045f, 0.7168786f, 0.0606169f,
+    0.0139322f, 0.0971045f, 0.7141733f };
+  static const float XYZ_TO_SRGB[9] = {
+     3.1338561f, -1.6168667f, -0.4906146f,
+    -0.9787684f,  1.9161415f,  0.0334540f,
+     0.0719453f, -0.2289914f,  1.4052427f };
+  dt_ioppr_init_profile_info(p, 0);
+  p->type = DT_COLORSPACE_SRGB;
+  g_strlcpy(p->filename, "srgb-test", sizeof(p->filename));
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+    {
+      p->matrix_in[i][j]  = SRGB_TO_XYZ[i * 3 + j];
+      p->matrix_out[i][j] = XYZ_TO_SRGB[i * 3 + j];
+      p->matrix_in_transposed[j][i]  = SRGB_TO_XYZ[i * 3 + j];
+      p->matrix_out_transposed[j][i] = XYZ_TO_SRGB[i * 3 + j];
+    }
+  p->nonlinearlut = 0;
 }
 
 static void fill(float *p)
@@ -242,6 +280,26 @@ static void test_lch_picker(void **state)
   dt_free_align(p);
 }
 
+static void test_jzczhz_picker(void **state)
+{
+  (void)state; REQUIRE_DEVICE();
+  s_rng = 0x66;
+  float *p = dt_alloc_align_float(TN * 4);
+  assert_non_null(p);
+  // scene-referred RGB in a sane range for the JzAzBz chain
+  for(size_t i = 0; i < TN; i++)
+  {
+    p[i*4+0] = frand(0.0f, 1.0f); p[i*4+1] = frand(0.0f, 1.0f);
+    p[i*4+2] = frand(0.0f, 1.0f); p[i*4+3] = 1.0f;
+  }
+  dt_iop_order_iccprofile_info_t prof;
+  make_srgb_profile(&prof);
+  const int box[4] = { 3, 4, 3 + 55, 4 + 45 };
+  run_box_prof(p, box, IOP_CS_RGB, IOP_CS_JZCZHZ, &prof, FALSE, "jzczhz picker");
+  dt_ioppr_cleanup_profile_info(&prof);
+  dt_free_align(p);
+}
+
 static void test_subset_gates(void **state)
 {
   (void)state; REQUIRE_DEVICE();
@@ -266,17 +324,17 @@ static void test_subset_gates(void **state)
   {
     // denoise not ported
     denoise_g = dt_color_picker_helper_vk(dev, din, TW, TH, box, TRUE, out,
-                                          IOP_CS_RGB, IOP_CS_RGB);
-    // JzCzhz picker needs the profile -> not ported
+                                          IOP_CS_RGB, IOP_CS_RGB, NULL);
+    // JzCzhz picker WITHOUT a profile -> refuse (needs the matrix)
     jzczhz_g = dt_color_picker_helper_vk(dev, din, TW, TH, box, FALSE, out,
-                                         IOP_CS_RGB, IOP_CS_JZCZHZ);
+                                         IOP_CS_RGB, IOP_CS_JZCZHZ, NULL);
     // empty/inverted box
     badbox_g = dt_color_picker_helper_vk(dev, din, TW, TH, bad_box, FALSE, out,
-                                         IOP_CS_RGB, IOP_CS_RGB);
+                                         IOP_CS_RGB, IOP_CS_RGB, NULL);
     // out-of-bounds box
     const int oob[4] = { 0, 0, TW + 4, TH };
     oob_g = dt_color_picker_helper_vk(dev, din, TW, TH, oob, FALSE, out,
-                                      IOP_CS_RGB, IOP_CS_RGB);
+                                      IOP_CS_RGB, IOP_CS_RGB, NULL);
   }
   if(din) dt_vulkan_free_buffer(dev, din);
   if(dev == 0) dt_vulkan_unlock_device(dev);
@@ -297,6 +355,7 @@ int main(void)
     cmocka_unit_test(test_single_pixel_box),
     cmocka_unit_test(test_hsl_picker),
     cmocka_unit_test(test_lch_picker),
+    cmocka_unit_test(test_jzczhz_picker),
     cmocka_unit_test(test_subset_gates),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

@@ -570,7 +570,12 @@ void dt_color_picker_helper(const dt_iop_buffer_dsc_t *dsc,
 // and colorspaces VK helpers.
 typedef struct { int width, box_x0, box_y0, box_x1, box_y1, mode; } _vk_picker_pc_t;
 
+// JzCzhz uses a separate kernel: it needs the profile buffers, so 4
+// storage bindings and a mode-less push constant (5 ints).
+typedef struct { int width, box_x0, box_y0, box_x1, box_y1; } _vk_picker_jz_pc_t;
+
 static dt_vk_module_kernel_t _vk_picker = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_picker_jz = DT_VK_MODULE_KERNEL_INIT;
 static gboolean              _vk_picker_loaded = FALSE;
 
 static void _vk_picker_ensure_kernel(void)
@@ -579,6 +584,8 @@ static void _vk_picker_ensure_kernel(void)
   if(!dt_vulkan_running()) return;
   dt_vulkan_module_kernel_load(&_vk_picker, "picker", "picker_rgb",
                                2, sizeof(_vk_picker_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_picker_jz, "picker_jzczhz", "picker_jzczhz",
+                               4, sizeof(_vk_picker_jz_pc_t), 16, 16, 1);
   _vk_picker_loaded = TRUE;
 }
 
@@ -590,24 +597,31 @@ gboolean dt_color_picker_helper_vk(int devid,
                                    const gboolean denoise,
                                    lib_colorpicker_stats pick,
                                    const dt_iop_colorspace_type_t image_cst,
-                                   const dt_iop_colorspace_type_t picker_cst)
+                                   const dt_iop_colorspace_type_t picker_cst,
+                                   const dt_iop_order_iccprofile_info_t *const profile)
 {
   if(denoise) return FALSE; // blur not ported yet
   // map the cst pair to a kernel mode, mirroring dt_color_picker_helper's
-  // branches. JzCzhz needs the profile and isn't ported.
+  // branches. mode 3 (JzCzhz) uses the separate profile-bearing kernel.
   const dt_iop_colorspace_type_t eff =
     (image_cst == IOP_CS_RAW) ? IOP_CS_RGB : image_cst;
   int mode;
   if(eff == picker_cst || picker_cst == IOP_CS_NONE)              mode = 0;
   else if(eff == IOP_CS_LAB && picker_cst == IOP_CS_LCH)          mode = 1;
   else if(eff == IOP_CS_RGB && picker_cst == IOP_CS_HSL)          mode = 2;
+  else if(eff == IOP_CS_RGB && picker_cst == IOP_CS_JZCZHZ)       mode = 3;
   else return FALSE;
+  // JzCzhz needs a valid-matrix profile (the lcms path stays on CPU)
+  if(mode == 3
+     && (!profile || !dt_is_valid_colormatrix(profile->matrix_in[0][0])))
+    return FALSE;
   // non-empty, in-bounds box
   if(!box || box[2] <= box[0] || box[3] <= box[1]) return FALSE;
   if(box[0] < 0 || box[1] < 0 || box[2] > width || box[3] > height) return FALSE;
 
   _vk_picker_ensure_kernel();
-  if(_vk_picker.kernel < 0) return FALSE;
+  if((mode < 3 && _vk_picker.kernel < 0) || (mode == 3 && _vk_picker_jz.kernel < 0))
+    return FALSE;
 
   const size_t size = (size_t)(box[3] - box[1]) * (box[2] - box[0]);
   // 12 accumulators: [0..3] sum=0, [4..7] min=+FLT_MAX, [8..11] max=-FLT_MAX
@@ -617,14 +631,34 @@ gboolean dt_color_picker_helper_vk(int devid,
   dt_vk_mem_t *dev_stats = dt_vulkan_alloc_buffer(devid, sizeof(acc));
   if(!dev_stats) return FALSE;
 
+  // JzCzhz profile buffers (built only for mode 3)
+  dt_colorspaces_iccprofile_info_vk_t *info = NULL;
+  float *plut = NULL;
+  dt_vk_mem_t *dev_info = NULL, *dev_plut = NULL;
+
   gboolean ok = FALSE;
-  if(dt_vulkan_write_to_device(devid, dev_stats, acc, sizeof(acc)) == 0)
+  gboolean setup = (dt_vulkan_write_to_device(devid, dev_stats, acc, sizeof(acc)) == 0);
+  if(setup && mode == 3)
+    setup = (dt_ioppr_build_iccprofile_params_vk(profile, devid, &info, &plut,
+                                                 &dev_info, &dev_plut) == 0);
+  if(setup)
   {
-    const _vk_picker_pc_t pc = { width, box[0], box[1], box[2], box[3], mode };
-    dt_vk_mem_t *bufs[2] = { dev_in, dev_stats };
-    if(dt_vulkan_dispatch_n(&_vk_picker, bufs, 2,
-                            box[2] - box[0], box[3] - box[1], &pc, sizeof(pc)) == 0
-       && dt_vulkan_read_from_device(devid, acc, dev_stats, sizeof(acc)) == 0)
+    int rc;
+    if(mode == 3)
+    {
+      const _vk_picker_jz_pc_t pc = { width, box[0], box[1], box[2], box[3] };
+      dt_vk_mem_t *bufs[4] = { dev_in, dev_stats, dev_info, dev_plut };
+      rc = dt_vulkan_dispatch_n(&_vk_picker_jz, bufs, 4,
+                                box[2] - box[0], box[3] - box[1], &pc, sizeof(pc));
+    }
+    else
+    {
+      const _vk_picker_pc_t pc = { width, box[0], box[1], box[2], box[3], mode };
+      dt_vk_mem_t *bufs[2] = { dev_in, dev_stats };
+      rc = dt_vulkan_dispatch_n(&_vk_picker, bufs, 2,
+                                box[2] - box[0], box[3] - box[1], &pc, sizeof(pc));
+    }
+    if(rc == 0 && dt_vulkan_read_from_device(devid, acc, dev_stats, sizeof(acc)) == 0)
     {
       for(int c = 0; c < 4; c++)
       {
@@ -635,6 +669,8 @@ gboolean dt_color_picker_helper_vk(int devid,
       ok = TRUE;
     }
   }
+  if(mode == 3)
+    dt_ioppr_free_iccprofile_params_vk(&info, &plut, &dev_info, &dev_plut, devid);
   dt_vulkan_free_buffer(devid, dev_stats);
   return ok;
 }

@@ -900,6 +900,27 @@ static inline float4 vk_XYZ_to_JzAzBz(const float4 XYZ_D65)
   return temp1;
 }
 
+// XYZ D50 -> XYZ D65 Bradford adaptation, matching the CPU
+// dt_XYZ_D50_2_XYZ_D65 (transposed Bradford matrix from Lindbloom).
+static inline float4 vk_XYZ_D50_to_XYZ_D65(const float4 XYZ_D50)
+{
+  float4 out;
+  out.x =  0.9555766f * XYZ_D50.x - 0.0230393f * XYZ_D50.y + 0.0631636f * XYZ_D50.z;
+  out.y = -0.0282895f * XYZ_D50.x + 1.0099416f * XYZ_D50.y + 0.0210077f * XYZ_D50.z;
+  out.z =  0.0122982f * XYZ_D50.x - 0.0204830f * XYZ_D50.y + 1.3299098f * XYZ_D50.z;
+  out.w = XYZ_D50.w;
+  return out;
+}
+
+// JzAzBz -> JzCzhz (polar), matching the CPU dt_JzAzBz_2_JzCzhz: hue
+// in turns wrapped to [0,1), chroma = hypot(az, bz).
+static inline float4 vk_JzAzBz_to_JzCzhz(const float4 JzAzBz)
+{
+  float H = atan2(JzAzBz.z, JzAzBz.y) / DT_2PI_F;
+  H = (H >= 0.0f) ? H : 1.0f + H;
+  return (float4)(JzAzBz.x, vk_dt_fast_hypot(JzAzBz.y, JzAzBz.z), H, JzAzBz.w);
+}
+
 static inline float4 vk_JzAzBz_2_XYZ(const float4 JzAzBz)
 {
   const float b = 1.15f;
