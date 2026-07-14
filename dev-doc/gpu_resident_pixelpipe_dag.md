@@ -647,6 +647,20 @@ explicit node (or is planned away):
   host-side by `dt_iop_image_fill` — same values as the device mask,
   no readback. The eager VK hook already uses this path today;
   the graph-node form reuses the same kernels unchanged.
+  **M2 status note (blend-space transforms landed).** The
+  "optional blend-space transform nodes … into temporaries" sketched
+  above are implemented (`bf4c024`): a blend colorspace differing
+  from the buffers' colorspace no longer refuses — the buffers are
+  converted into temporaries with the Lab↔RGB transform primitive,
+  blended there, and the result copied into the output buffer, which
+  ends up in the *blend* colorspace exactly as the CPU
+  `_transform_for_blend` leaves `*output`; the hook mirrors the
+  `pipe->dsc.cst` bookkeeping via a `blended_cst` out-parameter.
+  Never in place, so any failure leaves the module output intact for
+  the CPU fallback. Mismatches outside Lab↔RGB or without a matrix
+  work profile still refuse. Validated function-level against
+  darktable's own CPU transform + the independent blend references
+  in both directions (`test_vulkan_blendop`).
 - **Detail (scharr) mask.** `dt_dev_write_scharr_mask_cl` already
   computes on GPU and reads back; as a graph node the mask becomes a
   resident single-channel resource written once after
@@ -1066,12 +1080,16 @@ Each milestone lands green and user-invisible-by-default
   module to GPU span. **Landed:** the sync-point audit (§5.3.1), the
   span machinery (run-scoped capture, deferred interior readbacks,
   sync-at-need sites, root final sync — bit-identical eager-vs-graph),
-  and the **module-input colorspace glue node** (§5.4 status note:
+  the **module-input colorspace glue node** (§5.4 status note:
   Lab↔RGB matrix transforms on-device, so a `colorin → … → colorout`
   span now captures as one submission; float-precision equivalent to
-  eager, kernels validated against the CPU transform). Remaining:
-  blend-space transforms (they gate on CPU blend today, so they wait
-  for blendif/mask nodes) and format conversions; then the RGB↔RGB
+  eager, kernels validated against the CPU transform), and the
+  **blend-space transforms** (§5.4 blending status note: a blend
+  colorspace differing from the buffers no longer forces the CPU
+  blend — the `_transform_for_blend` step runs on-device into
+  temporaries, validated function-level in both directions).
+  Remaining: format conversions (1f↔4f along the RAW segment — needs
+  a raw sample, belongs with the demosaic-path work) and the RGB↔RGB
   output transform wired into the export tail.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
   spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
@@ -1140,6 +1158,48 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-14 — M2 blend-space transforms landed: device blend survives cst mismatches
+
+Commit: `bf4c024` (widened gate + hook bookkeeping + tests).
+
+`dt_develop_blend_process_vk` no longer refuses when the blend
+colorspace differs from the buffers' colorspace: the CPU
+`_transform_for_blend` step runs on the device instead, reusing the
+M2 Lab↔RGB transform primitive. Design points:
+
+- **Temporaries, never in place.** Both buffers convert into fresh
+  buffers, the blend runs there, and one device copy lands the result
+  in `dev_out` — the only write to `dev_out` on this path, so a
+  failure at any earlier step leaves the module output intact and the
+  CPU fallback stays correct (an in-place variant would have
+  corrupted `dev_out` on a mid-sequence failure, poisoning the
+  fallback).
+- **Colorspace bookkeeping mirrors the CPU path.** The blended output
+  is in the *blend* colorspace, like the CPU path's `*output`; a new
+  `blended_cst` out-parameter carries that to the hook, which sets
+  `pipe->dsc.cst` accordingly, so the next module's input transform
+  (site 1 / cst glue) sees the truth. In the matched (M0) case the
+  value equals the module output colorspace and the override is a
+  no-op.
+- **Refusals kept:** mismatches outside Lab↔RGB, and pipes without a
+  matrix work profile (the function-level gate test now documents
+  that it refuses *for lack of a profile*).
+- **Evidence.** Two new function-level tests reference the device
+  path against darktable's own CPU
+  `dt_ioppr_transform_image_colorspace` on host copies plus the
+  independent blend references: RGB buffers blending in Lab, and Lab
+  buffers blending in scene-RGB (jzczhz), both asserting the reported
+  `blended_cst`. Full ctest green (9 blendop tests); the deep-pipe
+  export A/B is unchanged from the pre-change baseline — the
+  benchmark pipe's blends all use matching colorspaces, so the glue
+  path correctly stays idle there and the unit tests carry its
+  coverage.
+
+With this, a module whose user-selected blend space differs from its
+output space stops being a guaranteed span boundary (audit sites
+10–11 fire only for masks outside the uniform subset now, not for
+mere colorspace mismatches).
 
 ### 2026-07-14 — M5 histogram tap wired into the pipe, validated headless
 
