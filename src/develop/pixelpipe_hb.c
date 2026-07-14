@@ -1566,6 +1566,12 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
   const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
   const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
 
+#ifdef HAVE_VULKAN
+  // set by the device blend when it ran (M2 glue may leave the output
+  // in the blend colorspace rather than the module output colorspace)
+  dt_iop_colorspace_type_t vk_blended_cst = IOP_CS_NONE;
+#endif
+
   dt_dev_prepare_piece_cfa(piece, roi_in);
 
   gboolean cst_on_device = FALSE;
@@ -1790,20 +1796,26 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
             const int rc = module->process_vk(module, piece, vin, vout, roi_in, roi_out);
             if(rc == 0)
             {
-              // DAG M0: blend on the device for the uniform-mask
+              // DAG M0+M2: blend on the device for the uniform-mask
               // subset, before the readback — host buffer, pipe
               // cache, and the §5.14 hand-off then all carry the
               // blended result, and the module no longer forces the
-              // chain through the CPU blend round-trip. Conservative
-              // gates: GUI mask display, color pickers, and the
-              // fast-blend cache keep the CPU path (they need host
-              // buffers or the pre-blend output).
+              // chain through the CPU blend round-trip. A blend
+              // colorspace differing from the module output runs the
+              // _transform_for_blend step on-device (M2 glue), and
+              // vout then holds the *blend*-space result —
+              // vk_blended_cst carries that to the pipe->dsc.cst
+              // bookkeeping below, mirroring the CPU path.
+              // Conservative gates: GUI mask display, color pickers,
+              // and the fast-blend cache keep the CPU path (they
+              // need host buffers or the pre-blend output).
               if(_piece_wants_blending(piece)
                  && dt_pipe_no_mask_display(pipe)
                  && !_request_color_pick(pipe, dev, module)
                  && !want_bcache
                  && dt_develop_blend_process_vk(module, piece, vin, vout,
-                                                roi_in, roi_out, cst_to, cst_out))
+                                                roi_in, roi_out, cst_to, cst_out,
+                                                &vk_blended_cst))
               {
                 *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_GPU;
                 *pixelpipe_flow &= ~PIXELPIPE_FLOW_BLENDED_ON_CPU;
@@ -1969,6 +1981,15 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
 
   // and save the output colorspace
   pipe->dsc.cst = module->output_colorspace(module, pipe, piece);
+
+#ifdef HAVE_VULKAN
+  // when the device blend ran its M2 glue transforms, *output (and
+  // the hand-off) carry the blend colorspace — mirror the bookkeeping
+  // the CPU _transform_for_blend block below would have done
+  if((*pixelpipe_flow & PIXELPIPE_FLOW_BLENDED_ON_GPU)
+     && vk_blended_cst != IOP_CS_NONE)
+    pipe->dsc.cst = vk_blended_cst;
+#endif
 
   dt_iop_colorspace_type_t blend_cst = dt_develop_blend_colorspace(piece, pipe->dsc.cst);
   const gboolean blend_picking = _request_color_pick(pipe, dev, module)

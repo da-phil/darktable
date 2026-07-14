@@ -1432,7 +1432,8 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
                                      const dt_iop_roi_t *roi_in,
                                      const dt_iop_roi_t *roi_out,
                                      const dt_iop_colorspace_type_t cst_in,
-                                     const dt_iop_colorspace_type_t cst_out)
+                                     const dt_iop_colorspace_type_t cst_out,
+                                     dt_iop_colorspace_type_t *blended_cst)
 {
   const dt_develop_blend_params_t *const d = piece->blendop_data;
   if(!d || !dev_in || !dev_out) return FALSE;
@@ -1456,12 +1457,26 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
     default:                           return FALSE; // RAW/NONE: CPU path
   }
 
-  // both buffers must already live in the blend colorspace — the
-  // in-place host transforms the CPU path performs around blending
-  // become M2 glue nodes; until then, mismatches fall back
+  // When a buffer isn't already in the blend colorspace, mirror the
+  // CPU path's _transform_for_blend on the device (M2 glue): convert
+  // into temporaries — never in place, so a failure anywhere leaves
+  // dev_out holding the module output and the CPU fallback stays
+  // correct — blend on those, then copy the result into dev_out. The
+  // caller learns the output's final colorspace via *blended_cst,
+  // exactly as the CPU path leaves *output in the blend space.
   const dt_iop_colorspace_type_t blend_ist =
     dt_develop_blend_colorspace(piece, cst_out);
-  if(cst_in != blend_ist || cst_out != blend_ist) return FALSE;
+  const gboolean need_in_cst  = (cst_in != blend_ist);
+  const gboolean need_out_cst = (cst_out != blend_ist);
+  if(need_in_cst || need_out_cst)
+  {
+    // Lab<->RGB matrix hops only — the coverage of
+    // dt_ioppr_transform_image_colorspace_vk
+    if((blend_ist != IOP_CS_LAB && blend_ist != IOP_CS_RGB)
+       || (need_in_cst && cst_in != IOP_CS_LAB && cst_in != IOP_CS_RGB)
+       || (need_out_cst && cst_out != IOP_CS_LAB && cst_out != IOP_CS_RGB))
+      return FALSE;
+  }
 
   // work-area feasibility, mirroring dt_develop_blend_process_cl —
   // on failure the CPU path prints its "skip blending" diagnostic
@@ -1477,14 +1492,52 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
 
   const float opacity = CLIP(d->opacity / 100.0f);
 
-  dt_vk_mem_t *dev_mask =
-    dt_vulkan_alloc_buffer(0, sizeof(float) * owidth * oheight);
-  if(!dev_mask) return FALSE;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
 
-  const _vk_setmask_pc_t mpc = { owidth, oheight, opacity };
-  gboolean ok = dt_vulkan_dispatch_n(&_vk_blend_set_mask,
-                                     (dt_vk_mem_t *[]){ dev_mask }, 1,
-                                     owidth, oheight, &mpc, sizeof(mpc)) == 0;
+  // blend-space glue transforms into temporaries
+  dt_vk_mem_t *t_in = NULL, *t_out = NULL;
+  dt_vk_mem_t *in_b = dev_in, *out_b = dev_out;
+  gboolean ok = TRUE;
+  if(need_in_cst)
+  {
+    dt_iop_colorspace_type_t conv = cst_in;
+    t_in = dt_vulkan_alloc_buffer(0, sizeof(float) * 4
+                                  * (size_t)roi_in->width * roi_in->height);
+    ok = t_in
+         && dt_ioppr_transform_image_colorspace_vk(0, dev_in, t_in,
+                                                   roi_in->width, roi_in->height,
+                                                   cst_in, blend_ist, &conv,
+                                                   work_profile, "blend glue in")
+         && conv == blend_ist;
+    in_b = t_in;
+  }
+  if(ok && need_out_cst)
+  {
+    dt_iop_colorspace_type_t conv = cst_out;
+    t_out = dt_vulkan_alloc_buffer(0, sizeof(float) * 4
+                                   * (size_t)owidth * oheight);
+    ok = t_out
+         && dt_ioppr_transform_image_colorspace_vk(0, dev_out, t_out,
+                                                   owidth, oheight,
+                                                   cst_out, blend_ist, &conv,
+                                                   work_profile, "blend glue out")
+         && conv == blend_ist;
+    out_b = t_out;
+  }
+
+  dt_vk_mem_t *dev_mask = ok
+    ? dt_vulkan_alloc_buffer(0, sizeof(float) * owidth * oheight)
+    : NULL;
+  ok = ok && dev_mask;
+
+  if(ok)
+  {
+    const _vk_setmask_pc_t mpc = { owidth, oheight, opacity };
+    ok = dt_vulkan_dispatch_n(&_vk_blend_set_mask,
+                              (dt_vk_mem_t *[]){ dev_mask }, 1,
+                              owidth, oheight, &mpc, sizeof(mpc)) == 0;
+  }
   if(ok)
   {
     const _vk_blend_pc_t pc = {
@@ -1498,12 +1551,22 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
       // only non-zero if mask_display was set by an _earlier_ module
       .mask_display = (int32_t)piece->pipe->mask_display,
     };
-    dt_vk_mem_t *bufs[3] = { dev_in, dev_out, dev_mask };
+    dt_vk_mem_t *bufs[3] = { in_b, out_b, dev_mask };
     ok = dt_vulkan_dispatch_n(kernel, bufs, 3,
                               owidth, oheight, &pc, sizeof(pc)) == 0;
   }
 
-  dt_vulkan_free_buffer(0, dev_mask);
+  // the blended result lives in out_b; land it in dev_out — the only
+  // write to dev_out on the glue path, so any earlier failure leaves
+  // it intact
+  if(ok && out_b != dev_out)
+    ok = dt_vulkan_copy_device_to_device(0, dev_out, out_b,
+                                         sizeof(float) * 4
+                                         * (size_t)owidth * oheight) == 0;
+
+  if(dev_mask) dt_vulkan_free_buffer(0, dev_mask);
+  if(t_in)     dt_vulkan_free_buffer(0, t_in);
+  if(t_out)    dt_vulkan_free_buffer(0, t_out);
 
   if(!ok)
   {
@@ -1539,10 +1602,13 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
   else
     dt_iop_piece_clear_raster(piece, NULL);
 
+  if(blended_cst) *blended_cst = blend_ist;
+
   dt_print_pipe(DT_DEBUG_PIPE,
                 "blend vk", piece->pipe, self, DT_DEVICE_VK, roi_in, roi_out,
-                "%s, %s", dt_iop_colorspace_to_name(blend_ist),
-                _develop_blend_colorspace_to_str(d->blend_cst));
+                "%s, %s%s", dt_iop_colorspace_to_name(blend_ist),
+                _develop_blend_colorspace_to_str(d->blend_cst),
+                (need_in_cst || need_out_cst) ? ", glue transforms" : "");
   return TRUE;
 }
 #endif // HAVE_VULKAN

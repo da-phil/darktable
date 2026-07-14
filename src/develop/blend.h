@@ -523,21 +523,27 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
 
 #ifdef HAVE_VULKAN
 /** Apply blending on the Vulkan device for the uniform-mask subset
- *  (DAG milestone M0, dev-doc/gpu_resident_pixelpipe_dag.md §9).
+ *  (DAG milestones M0 + M2, dev-doc/gpu_resident_pixelpipe_dag.md §9).
  *
  *  Covers mask_mode == DEVELOP_MASK_ENABLED (plain global opacity —
  *  no drawn/parametric/raster mask) in the Lab, display-RGB, and
  *  scene-RGB blend colorspaces, all blend modes; the math is a
  *  faithful port of the blendop.cl apply kernels. `cst_in`/`cst_out`
- *  are the actual colorspaces of dev_in/dev_out; when they differ
- *  from the blend colorspace the CPU path's transform step would be
- *  needed, so this returns FALSE (transform nodes arrive with M2).
+ *  are the actual colorspaces of dev_in/dev_out. When they differ
+ *  from the blend colorspace, the CPU path's _transform_for_blend
+ *  step runs on the device instead (M2 glue): the buffers are
+ *  converted into temporaries via the Lab<->RGB matrix transform of
+ *  the pipe work profile, blended there, and the result is copied
+ *  into dev_out — which therefore ends up in the *blend* colorspace,
+ *  reported through *blended_cst (may be NULL), exactly as the CPU
+ *  path leaves *output. Mismatches outside Lab<->RGB, or without a
+ *  matrix work profile, still return FALSE.
  *
- *  Blends dev_out in place (reading dev_in at the roi offset). On
- *  TRUE the caller must skip the CPU blend AND the host blend
- *  colorspace transforms; on FALSE nothing was touched and the
- *  eager CPU path applies unchanged. Caller holds the device lock;
- *  works both under graph capture and eagerly. */
+ *  On TRUE the caller must skip the CPU blend AND the host blend
+ *  colorspace transforms, and account pipe->dsc.cst = *blended_cst.
+ *  On FALSE dev_out was not written and the eager CPU path applies
+ *  unchanged. Caller holds the device lock; works both under graph
+ *  capture and eagerly. */
 gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
                                      dt_dev_pixelpipe_iop_t *piece,
                                      dt_vk_mem_t *dev_in,
@@ -545,7 +551,8 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
                                      const dt_iop_roi_t *roi_in,
                                      const dt_iop_roi_t *roi_out,
                                      const dt_iop_colorspace_type_t cst_in,
-                                     const dt_iop_colorspace_type_t cst_out);
+                                     const dt_iop_colorspace_type_t cst_out,
+                                     dt_iop_colorspace_type_t *blended_cst);
 #endif
 
 #define _BLEND_FUNC_PROTO(align, uni) DT_OMP_DECLARE_SIMD(aligned align uniform uni) static void

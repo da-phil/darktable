@@ -49,6 +49,7 @@
 
 #include "common/darktable.h"
 #include "common/vulkan.h"
+#include "common/iop_profile.h"
 #include "control/conf.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
@@ -832,7 +833,7 @@ static void test_process_vk_uniform_blend(void **state)
   if(!rc)
   {
     blended = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
-                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB);
+                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
     if(blended) rc = dt_vulkan_read_from_device(dev, out, db, TN * sizeof(v4));
   }
   if(da) dt_vulkan_free_buffer(dev, da);
@@ -852,6 +853,143 @@ static void test_process_vk_uniform_blend(void **state)
 
   scaffold_cleanup(&sc);
   free(a); free(b); free(out);
+}
+
+// sRGB D50 matrices (linear TRC), matching dt_vulkan_common.h — both
+// the row-major matrices (GPU) and the transposed copies (CPU path)
+static void make_srgb_profile(dt_iop_order_iccprofile_info_t *p)
+{
+  static const float SRGB_TO_XYZ[9] = {
+    0.4360747f, 0.3850649f, 0.1430804f,
+    0.2225045f, 0.7168786f, 0.0606169f,
+    0.0139322f, 0.0971045f, 0.7141733f };
+  static const float XYZ_TO_SRGB[9] = {
+     3.1338561f, -1.6168667f, -0.4906146f,
+    -0.9787684f,  1.9161415f,  0.0334540f,
+     0.0719453f, -0.2289914f,  1.4052427f };
+  dt_ioppr_init_profile_info(p, 0);
+  p->type = DT_COLORSPACE_SRGB;
+  g_strlcpy(p->filename, "srgb-test", sizeof(p->filename));
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+    {
+      p->matrix_in[i][j]  = SRGB_TO_XYZ[i * 3 + j];
+      p->matrix_out[i][j] = XYZ_TO_SRGB[i * 3 + j];
+      p->matrix_in_transposed[j][i]  = SRGB_TO_XYZ[i * 3 + j];
+      p->matrix_out_transposed[j][i] = XYZ_TO_SRGB[i * 3 + j];
+    }
+  p->nonlinearlut = 0;
+}
+
+// M2 glue: the buffers are NOT in the blend colorspace, so the device
+// must run the _transform_for_blend step itself — convert both into
+// temporaries, blend there, land the blend-space result in dev_out and
+// report it via blended_cst. Reference: darktable's own CPU colorspace
+// transform on host copies + the independent blend reference.
+static void run_blend_glue_case(const dt_develop_blend_colorspace_t bcs,
+                                const dt_iop_colorspace_type_t buf_cst,
+                                const dt_iop_colorspace_type_t want_cst,
+                                ref_fn_t ref, const uint32_t mode,
+                                const float eps, const char *tag)
+{
+  blend_scaffold_t sc;
+  scaffold_init(&sc, bcs, mode, 70.0f);
+  dt_iop_order_iccprofile_info_t prof;
+  make_srgb_profile(&prof);
+  sc.pipe.work_profile_info = &prof;
+
+  s_rng = 0x9a9a;
+  const size_t bytes = TN * sizeof(v4);
+  v4 *a = malloc(bytes), *b = malloc(bytes), *out = malloc(bytes);
+  v4 *ra = dt_alloc_aligned(bytes), *rb = dt_alloc_aligned(bytes);
+  assert_non_null(a); assert_non_null(b); assert_non_null(out);
+  assert_non_null(ra); assert_non_null(rb);
+  if(buf_cst == IOP_CS_LAB) { fill_lab(a, TN); fill_lab(b, TN); }
+  else
+    for(size_t i = 0; i < TN; i++)
+    {
+      a[i] = (v4){ frand(0.0f, 1.0f), frand(0.0f, 1.0f), frand(0.0f, 1.0f), frand(0.0f, 1.0f) };
+      b[i] = (v4){ frand(0.0f, 1.0f), frand(0.0f, 1.0f), frand(0.0f, 1.0f), frand(0.0f, 1.0f) };
+    }
+
+  const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  gboolean blended = FALSE;
+  dt_iop_colorspace_type_t bcst = IOP_CS_NONE;
+  dt_vk_mem_t *da = NULL, *db = NULL;
+  if(!rc)
+  {
+    da = dt_vulkan_alloc_buffer(dev, bytes);
+    db = dt_vulkan_alloc_buffer(dev, bytes);
+    if(!da || !db) rc = -101;
+  }
+  if(!rc) rc = dt_vulkan_write_to_device(dev, da, a, bytes);
+  if(!rc) rc = dt_vulkan_write_to_device(dev, db, b, bytes);
+  if(!rc)
+  {
+    blended = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
+                                          &roi, &roi, buf_cst, buf_cst, &bcst);
+    if(blended) rc = dt_vulkan_read_from_device(dev, out, db, bytes);
+  }
+  if(da) dt_vulkan_free_buffer(dev, da);
+  if(db) dt_vulkan_free_buffer(dev, db);
+  if(dev == 0) dt_vulkan_unlock_device(dev);
+
+  // CPU reference: transform host copies with darktable's own function
+  // (exactly what _transform_for_blend does), then blend-reference
+  dt_iop_colorspace_type_t c1 = buf_cst, c2 = buf_cst;
+  dt_ioppr_transform_image_colorspace(&sc.module, (const float *)a, (float *)ra,
+                                      TW, TH, buf_cst, want_cst, &c1, &prof);
+  dt_ioppr_transform_image_colorspace(&sc.module, (const float *)b, (float *)rb,
+                                      TW, TH, buf_cst, want_cst, &c2, &prof);
+
+#define GLUE_ERR(g, r) (fabsf((g) - (r)) / fmaxf(1.0f, fabsf(r)))
+  float maxerr = 0.0f;
+  size_t worst = 0;
+  if(!rc && blended && c1 == want_cst && c2 == want_cst)
+    for(size_t i = 0; i < TN; i++)
+    {
+      const v4 r = ref(ra[i], rb[i], 0.7f, mode, 1.0f, 0);
+      const float e = fmaxf(fmaxf(GLUE_ERR(out[i].x, r.x), GLUE_ERR(out[i].y, r.y)),
+                            GLUE_ERR(out[i].z, r.z));
+      if(e > maxerr) { maxerr = e; worst = i; }
+    }
+#undef GLUE_ERR
+
+  scaffold_cleanup(&sc);
+  dt_ioppr_cleanup_profile_info(&prof);
+  free(a); free(b); free(out);
+  dt_free_align(ra); dt_free_align(rb);
+
+  assert_int_equal(rc, 0);
+  assert_true(blended);
+  assert_int_equal(bcst, want_cst);
+  assert_int_equal(c1, want_cst);
+  assert_int_equal(c2, want_cst);
+  if(maxerr > eps)
+    fail_msg("%s: max scaled error %g exceeds eps %g at px %zu",
+             tag, (double)maxerr, (double)eps, worst);
+}
+
+static void test_process_vk_blend_glue_rgb_to_lab(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+  // RGB buffers, Lab blend space (e.g. an RGB module blending in LAB)
+  run_blend_glue_case(DEVELOP_BLEND_CS_LAB, IOP_CS_RGB, IOP_CS_LAB,
+                      _ref_lab_adapter, 0x18 /*NORMAL2*/, 1e-3f,
+                      "glue rgb->lab");
+}
+
+static void test_process_vk_blend_glue_lab_to_rgb(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+  // Lab buffers, scene-RGB blend space (jzczhz kernel after Lab->RGB)
+  run_blend_glue_case(DEVELOP_BLEND_CS_RGB_SCENE, IOP_CS_LAB, IOP_CS_RGB,
+                      ref_blend_jzczhz, 0x18 /*NORMAL2*/, 1e-3f,
+                      "glue lab->rgb");
 }
 
 static void test_process_vk_subset_gates(void **state)
@@ -878,26 +1016,28 @@ static void test_process_vk_subset_gates(void **state)
     scaffold_init(&sc, DEVELOP_BLEND_CS_RGB_SCENE, 0x18, 60.0f);
     sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
     gate_mask = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
-                                            &roi, &roi, IOP_CS_RGB, IOP_CS_RGB);
+                                            &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
     scaffold_cleanup(&sc);
 
-    // colorspace mismatch: buffers not in the blend space -> M2 glue
+    // colorspace mismatch WITHOUT a work profile: the M2 glue
+    // transforms need the profile matrix, so this must still refuse
+    // (the with-profile case is test_process_vk_blend_glue_*)
     scaffold_init(&sc, DEVELOP_BLEND_CS_LAB, 0x18, 60.0f);
     gate_cs = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
-                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB);
+                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
     scaffold_cleanup(&sc);
 
     // RAW blend colorspace is not ported
     scaffold_init(&sc, DEVELOP_BLEND_CS_RAW, 0x18, 60.0f);
     gate_raw = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
-                                           &roi, &roi, IOP_CS_RAW, IOP_CS_RAW);
+                                           &roi, &roi, IOP_CS_RAW, IOP_CS_RAW, NULL);
     scaffold_cleanup(&sc);
 
     // 1-channel buffers are not ported
     scaffold_init(&sc, DEVELOP_BLEND_CS_RGB_SCENE, 0x18, 60.0f);
     sc.piece.colors = 1;
     gate_ch = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
-                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB);
+                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
     scaffold_cleanup(&sc);
   }
   if(da) dt_vulkan_free_buffer(dev, da);
@@ -920,6 +1060,8 @@ int main(void)
     cmocka_unit_test(test_lab_modes),
     cmocka_unit_test(test_roi_offsets),
     cmocka_unit_test(test_process_vk_uniform_blend),
+    cmocka_unit_test(test_process_vk_blend_glue_rgb_to_lab),
+    cmocka_unit_test(test_process_vk_blend_glue_lab_to_rgb),
     cmocka_unit_test(test_process_vk_subset_gates),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);
