@@ -10,7 +10,11 @@ deferred-readback tap registry are landed and validated, and the
 histogram tap is wired into the pipe (validated headless through
 levels-automatic; picker/scope wiring still wants a darkroom bench).
 M3 started: the liveness peak-memory measurement is landed (the
-aliasing planner wants a real GPU). See §11 for the living
+aliasing planner wants a real GPU). Both the eager per-module VK path
+and the graph span-capture path are now validated on real AMD hardware
+(RADV PHOENIX, §11): zero errors, and graph mode fuses ~90 % of GPU
+dispatch work into large single-submit spans, bounded only by the seven
+still-unported CPU-island modules. See §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -1088,6 +1092,19 @@ Two consequences for milestone priority:
   M3 stays queued but is no longer the obvious next step it looked
   like on paper.
 
+**Hardware confirmation (2026-07-15, AMD RADV, §11).** The same shape
+holds on real silicon and names the islands. A graph-mode darkroom +
+export session fused **90 % of GPU dispatch work (732 / 817 dispatches)
+into 30 large spans**, the biggest 91 nodes / 76 dispatches in one
+submit — but not into a single end-to-end span, because the seven
+unported modules (`highlights`, `demosaic`, `toneequal`,
+`denoiseprofile`, `gamma`, `rawprepare`, `channelmixerrgb`) rolled back
+30× and broke the chain, exactly as the lavapipe run predicted. The
+Path-B port priority is now empirical: order those seven by rollback
+frequency. A caution the hardware added: the count-weighted view is
+misleading — 70 % of *flushes* are trivial 2-node readback servers, so
+span health has to be read dispatch-weighted, not flush-weighted.
+
 ## 9. Migration plan
 
 Each milestone lands green and user-invisible-by-default
@@ -1207,6 +1224,59 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — graph path validated on AMD RADV; the "short spans" read corrected
+
+The re-run the eager entry asked for: same build (`g3056c0b`,
+darktable 5.7.0+193, dirty) and hardware (AMD RADV PHOENIX), now with
+`--conf pixelpipe_vulkan_graph=TRUE -d vkgraph -d perf`. This is the
+first time the DAG span-capture path — not just the per-module eager
+hook — has run on non-lavapipe silicon. Analysed from the attached log;
+no code change (the log revealed no bug).
+
+- **Stability + fault path.** 377 `[vkgraph]` lines, **zero** errors /
+  asserts / `VK_ERROR`s. 100 flushes, 817 dispatches, 1394 nodes across
+  darkroom-full, preview and 16 export jobs. The rollback fault path
+  fired **30×** — each a clean single-node drop of a module the capture
+  HAL declined to record (`highlights` ×3, `toneequal`/`gamma`/
+  `denoiseprofile`/`demosaic` ×2 each, `rawprepare`/`channelmixerrgb`
+  ×1) — and every one recovered to eager execution with correct output.
+  The conservative-rollback design (§5.11) works on real hardware:
+  correctness over fusion, no capture ever corrupted a run.
+- **The DAG fuses the bulk of the work — my mid-analysis "spans are
+  short" note was wrong, and this corrects it.** That read was
+  *count-weighted*: 70 of 100 flushes are trivial 2-node readback
+  servers (19 of them the 244 MB full-res input upload staged to serve
+  a preview/export readback — a pipe boundary, not an intra-pipe
+  stall), so by flush-count the small ones dominate. **Work-weighted**
+  tells the real story: **30 large spans (≥10 nodes) carry 732 of 817
+  dispatches = 90 % of all GPU dispatch work**, and they occur across
+  every pipe type (7 export, 4 darkroom-full, 5 preview at ≥40 nodes).
+  The largest single span is **91 nodes / 76 dispatches → 1 submit +
+  1 fence** — 76 kernel launches fused into one command buffer, exactly
+  the design goal. The 20 cst glue nodes and 20 deferred readbacks
+  confirm the M2 span machinery runs on hardware.
+- **What still breaks the spans is the CPU islands, now named.** The 30
+  rollbacks + the sync-at-need breaks are the seven modules above —
+  the same demosaic/highlights/toneequal/denoiseprofile set the eager
+  run flagged as unported. They interrupt the top of the pipe, so the
+  big fused spans form in the mid/late stack *after* the island, which
+  is why 90 % of the work fuses but not into a single end-to-end span.
+  This is §8.1's "CPU islands bound span length" finding, now confirmed
+  on silicon and with the offending modules enumerated: they are the
+  Path-B port targets, in priority order by rollback frequency.
+- **No `peak-live` data.** Build `g3056c0b` predates the liveness commit
+  (`3c5c4af`); 0 peak-live lines, as expected. M3 measurement wants a
+  build at `c158eb8`+.
+- **Perf: no head-to-head claim from these logs.** The eager and graph
+  logs are two *different* interactive sessions (different images,
+  edits, zoom), so per-module wall sums aren't comparable and I won't
+  quote a speedup. The honest signal is structural: on this pipe the
+  DAG already fuses 90 % of dispatch work into 30 submits instead of
+  817, and the residual 120 sync taps map one-to-one onto the seven
+  unported modules. The measurable win is now gated on porting those,
+  not on more DAG-core work — the same conclusion §8.1 drew on lavapipe,
+  now with the hardware to back it and the module list to act on.
 
 ### 2026-07-15 — first real-hardware run: eager VK path validated on AMD RADV
 
