@@ -1208,6 +1208,37 @@ gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
 
+### 2026-07-15 — first real-hardware run: eager VK path validated on AMD RADV
+
+A user darkroom session (`-d opencl -d perf`, build `g3056c0b`) on a
+real AMD Radeon (RADV PHOENIX, gfx1103, 10 GB) with
+`opencl_force_vulkan_routing=true` — the first time this branch has run
+on non-lavapipe hardware. Analysed from the attached log; no code
+change.
+
+- **Stability.** Zero errors / asserts / `VK_ERROR`s across 892
+  thumbnail + 41 preview + 210 full-pipe module invocations on a
+  ~60 MP raw. The VK kernels and HAL that lavapipe validated run clean
+  on RADV too — meaningful de-risking of every ported kernel. (The two
+  `[opencl_events_flush] invalid profiling data` lines are a benign CL
+  event-timer quirk, not VK.)
+- **M0 blend on real hardware.** `channelmixerrgb` (uniform mask)
+  reported `blended on GPU`; every other blended module used a
+  drawn/parametric mask and correctly refused to the CPU path — the M0
+  gate behaving exactly as designed, now confirmed on hardware.
+- **Coverage.** Only the expected unported paths fell back: demosaic
+  bayer/xtrans, denoiseprofile Y0U0V0, retouch HEAL, toneequal, gamma.
+- **The graph path was NOT exercised** — `pixelpipe_vulkan_graph` was
+  at its default (off), so span capture / glue nodes / histogram tap /
+  `peak-live` never fired. The log is the *eager* per-module VK path,
+  and its perf makes the DAG's case concretely: parametric-masked
+  modules cost full-res readbacks + CPU blends (e.g. `exposure.2`
+  1.9 s wall / **21 s CPU**, `colorequal` 11 s CPU), and every module
+  pays its own upload/process/readback with no fusion (~3.7 s per
+  full reprocess). Validating the DAG itself on this hardware needs a
+  re-run with the pref enabled and `-d vkgraph`. Recorded as the
+  concrete next step for whoever has the hardware.
+
 ### 2026-07-14 — M3 liveness measurement landed; M2 output-tail claim corrected
 
 Commits: `3c5c4af` (liveness peak + test), doc.
