@@ -2,13 +2,15 @@
 
 **Status:** in implementation — M1 (capture HAL + segment executor),
 M0 (VK blend kernels, uniform-mask blending on-device), and M2 (run-
-scoped span capture with deferred readbacks + the module-input
-colorspace glue node) landed; a `colorin → … → colorout` span now
-captures as a single GPU submission. M5 in progress: the GPU histogram
-and color-picker reduction kernels and the deferred-readback tap
-registry are landed and validated, and the histogram tap is wired into
-the pipe — validated headless through levels-automatic (picker/scope
-wiring still pending a darkroom bench). See §11 for the living
+scoped span capture with deferred readbacks + colorspace/blend-space
+glue nodes + verified format conversions) landed; a `colorin → … →
+colorout` span captures as a single GPU submission. M5: the GPU
+histogram and full-colorspace color-picker reduction kernels and the
+deferred-readback tap registry are landed and validated, and the
+histogram tap is wired into the pipe (validated headless through
+levels-automatic; picker/scope wiring still wants a darkroom bench).
+M3 started: the liveness peak-memory measurement is landed (the
+aliasing planner wants a real GPU). See §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -790,6 +792,30 @@ been visible in one number. The win isn't only peak; it's that
 `vkAllocateMemory`/`vkCreateBuffer` churn drops to ~zero per run
 (plan reuse, §5.8).
 
+**M3 status note (liveness measurement landed).** Step 2 above (the
+liveness sweep) and the peak it yields are implemented ahead of the
+aliasing planner as a pure measurement: `dt_vulkan_capture_peak_bytes`
++ per-segment `peak-live` under `-d vkgraph` (`vulkan.c`
+`_capture_peak_live_bytes`) compute the max simultaneous live device
+bytes over each span's `[first, last]` intervals. It is read-only over
+the node list — safe under today's fully-serialised executor — and
+reports exactly what the deferred-free model keeps resident until
+flush, i.e. what the aliasing arena (step 3) must fit. First real
+numbers (benchmark XMP, 702×465 preview ROI): **node count doesn't
+predict memory** — a 565-node span peaks at 34 MB (long chain, few
+buffers live at once) while a 124-node span peaks at **128 MB** (many
+image-sized buffers simultaneously live, e.g. a wavelet module's
+scales). So the aliasing/spill target is the *high-simultaneity* span,
+not the longest — and, scaled to full resolution, the 128 MB peak
+alone would exceed VRAM on many cards, which is the concrete
+justification for the arena + spill work. Unit-tested against
+hand-computed peaks from the buffers' actual sizes
+(`test_vulkan_capture::test_liveness_peak`). The aliasing planner
+(steps 3–5) stays for a real-GPU context where the VRAM win is
+measurable; the safe recycling that could ride today's conservative
+barriers is deferred with it (the rollback interaction and the
+zero-measurable-benefit here don't justify the correctness risk).
+
 ### 5.6 Record & submit
 
 - Per segment: allocate descriptor sets from a per-graph pool (reset
@@ -1100,13 +1126,22 @@ Each milestone lands green and user-invisible-by-default
   Format conversions (1f↔4f along the RAW segment) are verified at
   the HAL level (§5.4 status note: mixed-bpp capture is bit-identical
   to eager) — a full raw-pipe capture still wants a real GPU + raw
-  file, but nothing DAG-specific is missing. **M2 is complete for
-  what this software-Vulkan bench can build and test;** the only
-  strictly-remaining piece is the RGB↔RGB output transform wired into
-  the export tail (a modest follow-on, the `_rgb_vk` primitive
-  already exists).
+  file, but nothing DAG-specific is missing. **M2's glue is complete.**
+  The trunk needs no output-tail RGB↔RGB glue node: `colorout` already
+  performs the working→output-profile transform *inside* its
+  `process_vk` (the `_rgb_vk` primitive is used *within* modules like
+  `overexposed`, not as a pipe glue), and the working profile is
+  constant between `colorin` and `colorout` so interior site-1
+  transforms are same-profile no-ops. A full raw-pipe capture on a
+  real GPU is the only M2-adjacent validation left.
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
   spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
+  *Started:* the **liveness measurement** is landed (§5.5 status note:
+  `dt_vulkan_capture_peak_bytes` + `-d vkgraph` peak-live, unit-tested)
+  — the number the arena/spill work is sized from, and its first real
+  data already reprioritises which span to alias (high-simultaneity,
+  not longest). The arena + aliasing + spill remain a real-GPU job
+  (the VRAM win is unmeasurable on this software-Vulkan bench).
 - **M4 — cache integration.** Async cache-tap readbacks; VRAM
   residency pins; plan reuse via topology hash.
 - **M5 — taps on GPU.** Histogram/picker/scope reduction kernels +
@@ -1172,6 +1207,33 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-14 — M3 liveness measurement landed; M2 output-tail claim corrected
+
+Commits: `3c5c4af` (liveness peak + test), doc.
+
+- **Liveness peak-memory measurement** (M3 step one). `-d vkgraph` now
+  reports per-segment `peak-live` MB, and `dt_vulkan_capture_peak_bytes`
+  exposes the run's peak. The deep-pipe numbers immediately paid off:
+  the 565-node span holds only 34 MB, but a 124-node span holds
+  128 MB — node count doesn't predict memory, simultaneity does, so
+  the aliasing/spill target is the high-simultaneity span. Details in
+  the §5.5 status note. The test caught a real subtlety worth noting:
+  the buffer pool hands back *oversized* buffers, so the peak counts
+  actual `->size`, and the test computes its expectation from the
+  buffers' real sizes rather than assuming equal-size allocations
+  (the first cut asserted `chain == 2 × single` and failed by exactly
+  one pool-oversized buffer, 256 B — the measurement was right, the
+  test's assumption wasn't).
+- **Doc correction.** A prior entry called the RGB↔RGB output-tail
+  transform "the only strictly-remaining M2 piece." That was wrong:
+  `colorout` already performs the working→output-profile transform
+  *inside* its `process_vk`, the `_rgb_vk` primitive is used within
+  modules (`overexposed`) not as a pipe glue, and the working profile
+  is constant colorin→colorout so interior site-1 transforms are
+  same-profile no-ops. M2's glue is complete; §9/§5.4 corrected to
+  match. (Keeping the doc honest is the point — the claim was an
+  overstatement, not a missing feature.)
 
 ### 2026-07-14 — M2 format-conversion mechanism verified; module-port viability noted
 
