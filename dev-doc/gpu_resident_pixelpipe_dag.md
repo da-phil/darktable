@@ -425,6 +425,15 @@ vk_graph_possible = dt_vulkan_running()
 > stops full-res export from exhausting RAM on an integrated GPU (§11,
 > 2026-07-15 export-freeze entry). The other two terms are still the
 > pref plus the debug-mode exclusions in `dt_dev_pixelpipe_process`.
+>
+> The **VK routing heuristic follows this decision**: the
+> `vk_chain_live` / `vk_chain_ahead` look-ahead (~:2758) only routes a
+> CL-capable module to VK when `pipe->vk_graph_run` is set, because the
+> chain trade pays off only if the executor fuses the span. When the gate
+> declines (oversized export), CL-capable modules stay on OpenCL — GPU
+> compute + full GPU blend, as upstream — instead of staging every module
+> through the host and CPU-blending (§11, "VK routing must follow the
+> graph decision").
 
 Before the walk, a cheap linear pre-pass over `pipe->nodes` classifies
 every enabled piece:
@@ -1254,6 +1263,56 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — export still 5× slower after the gate: VK routing must follow the graph decision
+
+With the budget gate in place the freeze was gone, but export was still
+~5× slower than upstream (63 s vs ~13 s) and littered with "blended on
+CPU". The follow-up log shows the gate firing correctly
+(`graph capture declined: trunk ~865 MB > budget 385 MB`) — and then a
+second, independent bug underneath it.
+
+- **What the log shows.** Every GPU module carries a ~2 s floor even for
+  point ops (`crop` 2.5 s, `colorin` 2.3 s, `primaries` 2.3 s,
+  `finalscale` 2.1 s), and three modules with non-trivial masks —
+  `exposure.1` (8.6 s / 37 CPU-s), `exposure.2` (6.9 s), `colorequal`
+  (15.5 s / 25 CPU-s) — report "blended on CPU". Those three alone are
+  ~31 s of the 63 s.
+
+- **Root cause: the VK routing heuristic ignored whether the graph would
+  actually run.** The §5.2 router (`pixelpipe_hb.c` ~:2758) sends a
+  CL-capable module to VK whenever a VK chain is live or ≥2 VK-ready
+  modules lie ahead (`vk_chain_live` / `vk_chain_ahead`). That trade is
+  only sound **if the graph executor fuses the span and skips the
+  per-module readbacks**. The budget gate had just turned graph mode
+  *off* for this export — so eager VK still (a) reads the whole 865 MB
+  trunk back to host after every module (the ~2 s floor, and it breaks
+  the OpenCL `cl_mem` residency chain upstream keeps end-to-end), and
+  (b) can only blend the M0 subset on device, so every parametric/drawn-
+  mask blend falls back to the CPU (the "blended on CPU" lines, and the
+  25–37 CPU-s that dominate the run). Upstream keeps these modules in
+  `cl_mem` on the OpenCL arm with **full GPU blend** — hence 5×.
+
+- **The fix (this commit).** Gate the chain heuristics on
+  `pipe->vk_graph_run`: `chain_worthwhile = vk_graph_run && (vk_chain_live
+  || vk_chain_ahead)`. When the graph won't run, a CL-capable module is
+  no longer routed to VK — it stays on OpenCL (GPU compute + full GPU
+  blend), exactly like upstream. VK is still taken when it is the only
+  GPU option (`vk_is_only_gpu`) or the user forces it
+  (`opencl_force_vulkan_routing`). Small-buffer runs where the graph
+  *does* run are unchanged: chains still form and fuse. So the routing
+  now tracks the executor: chain to VK only when something will fuse the
+  chain; otherwise stay resident on CL.
+
+- **On "blended on CPU".** It means: the module computed on the GPU, but
+  its blend wasn't in the on-device VK blend subset (M0: normal mode,
+  uniform mask; §9/§11 M0), so darktable read the result back and blended
+  on the CPU. After this fix the *export* path routes those modules to
+  OpenCL and blends on the GPU, so the message disappears there. In
+  *darkroom* (graph on, small buffers) a module with a parametric or
+  drawn mask can still show it, because VK's blend is still M0-only —
+  widening that subset (M0+) is tracked separately; until then, OpenCL is
+  the full-featured GPU-blend path.
 
 ### 2026-07-15 — export near-froze the machine: the missing budget gate, now implemented
 

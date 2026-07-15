@@ -2755,7 +2755,20 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
         }
       }
 
-      if(force_vk || vk_chain_live || vk_is_only_gpu || vk_chain_ahead)
+      // The chain heuristics (live / ahead) only pay off when the graph
+      // executor will actually fuse the span and skip the per-module
+      // readbacks. With graph mode off — e.g. the §5.2 budget gate
+      // declined an oversized export — eager VK still reads the whole
+      // trunk back to host after every module (865 MB at export res) and
+      // its blend only covers the M0 subset, so blends fall to the CPU.
+      // Routing a CL-capable module to VK there is a pure loss versus
+      // keeping it resident in cl_mem on the OpenCL arm (GPU compute +
+      // full GPU blend), which is exactly what upstream does. So when the
+      // graph won't run, only take VK when it is the *only* GPU option
+      // (no CL path) or the user forced it for coverage testing.
+      const gboolean chain_worthwhile =
+          pipe->vk_graph_run && (vk_chain_live || vk_chain_ahead);
+      if(force_vk || vk_is_only_gpu || chain_worthwhile)
       {
         dt_print_pipe(DT_DEBUG_OPENCL, "prefer-vulkan",
                       pipe, module, DT_DEVICE_VK, &roi_in, roi_out, "%s",
