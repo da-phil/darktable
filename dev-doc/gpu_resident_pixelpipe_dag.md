@@ -742,6 +742,15 @@ explicit node (or is planned away):
 - **Format conversions** (`bpp` changes along the RAW segment, 1f→4f
   at demosaic) are DISPATCH nodes like any other; the RAW trunk
   segment is just resources with different element sizes.
+  **M2 status note (verified).** The capture HAL keys on byte sizes,
+  not element counts, so a dispatch reading a 1-channel buffer and
+  writing a 4-channel one captures and replays like any other — no
+  special handling. Confirmed by `test_vulkan_capture`'s
+  `test_mixed_bpp_format_conversion` (`capt_expand` 1f→4f then a 4f
+  dispatch, bit-identical eager-vs-capture, one submission). A full
+  raw-pipe capture (`rawprepare`/`demosaic` on device) still wants a
+  real GPU + raw file, but the element-size mechanism it relies on is
+  covered.
 
 ### 5.5 Memory planning
 
@@ -1088,9 +1097,14 @@ Each milestone lands green and user-invisible-by-default
   colorspace differing from the buffers no longer forces the CPU
   blend — the `_transform_for_blend` step runs on-device into
   temporaries, validated function-level in both directions).
-  Remaining: format conversions (1f↔4f along the RAW segment — needs
-  a raw sample, belongs with the demosaic-path work) and the RGB↔RGB
-  output transform wired into the export tail.
+  Format conversions (1f↔4f along the RAW segment) are verified at
+  the HAL level (§5.4 status note: mixed-bpp capture is bit-identical
+  to eager) — a full raw-pipe capture still wants a real GPU + raw
+  file, but nothing DAG-specific is missing. **M2 is complete for
+  what this software-Vulkan bench can build and test;** the only
+  strictly-remaining piece is the RGB↔RGB output transform wired into
+  the export tail (a modest follow-on, the `_rgb_vk` primitive
+  already exists).
 - **M3 — memory planner.** Liveness + arena + aliasing + budget +
   spill-by-segmentation. Retire per-dispatch pool churn in graph mode.
 - **M4 — cache integration.** Async cache-tap readbacks; VRAM
@@ -1158,6 +1172,32 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-14 — M2 format-conversion mechanism verified; module-port viability noted
+
+Commit: `d418988` (mixed-bpp capture test).
+
+Closes the last buildable M2 glue item. `test_mixed_bpp_format_conversion`
+runs a 1-channel→4-channel dispatch (`capt_expand`, the demosaic
+pattern) followed by a 4-channel dispatch and asserts the captured
+mixed-bpp span is bit-identical to eager in one submission —
+confirming the design claim that the RAW segment's element-size
+change needs no special handling (the HAL tracks bytes, not
+elements). A full raw-pipe capture stays for a real GPU + raw file.
+
+**Module-port viability, recorded for the next lane.** With the DAG
+core done, the frontier is CPU-island modules (the §8.1 finding). An
+audit of the benchmark pipe's CPU-only enabled modules found none is
+a clean next port *on this bench*: the ones with an existing CL path
+are already VK-ported; of the rest, `grain` uses double-precision
+3D simplex noise (a float GPU port diverges by the grain amplitude,
+not float-precision, so the CPU-comparison validation every port has
+relied on doesn't apply), `toneequal` is a large guided-filter
+pyramid, `dither` is sequential/output-stage, and `diffuse` is
+explicitly M7 (`create_nodes_vk`). So further un-islanding is real
+work but not *cleanly testable here* — it belongs with the Path B
+lane on a real GPU, where statistical/visual validation of
+noise-class modules is acceptable.
 
 ### 2026-07-14 — M2 blend-space transforms landed: device blend survives cst mismatches
 
