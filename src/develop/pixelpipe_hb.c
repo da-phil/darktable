@@ -444,6 +444,45 @@ size_t dt_get_available_pipe_mem(const dt_dev_pixelpipe_t *pipe)
   return MAX(DT_MEGA, allmem / (dt_pipe_is_thumb(pipe) ? 3 : 1));
 }
 
+#ifdef HAVE_VULKAN
+// DAG budget gate (gpu_resident_pixelpipe_dag.md §5.2 / §5.10 fallback
+// #3): graph capture keeps several full-image trunk buffers resident at
+// once — deferred frees, the §5.14 hand-off, and deferred readbacks
+// together hold a working set the liveness sweep (§5.5) measured at ~2x
+// a single trunk buffer, plus the upload snapshot ring — and, unlike the
+// OpenCL path, it cannot tile. On an integrated GPU that resident set
+// comes out of system RAM, so an unbounded span at full-res export can
+// exhaust memory and thrash the machine. The §5.2 gate always meant to
+// carry a "predicted arena vs budget" term (§5.10 fallback #3); this is
+// its first implementation. Bound graph mode to runs whose trunk buffer
+// still fits darktable's single-buffer budget: the same threshold the
+// OpenCL tiler uses to decide a buffer is too big to hold whole. If a
+// single buffer already needs tiling, a span that holds several of them
+// without tiling cannot be safe. Oversized runs (notably full-res
+// export) keep the eager per-module path, which reads back and frees
+// each module's buffers before the next and so never accumulates a span.
+static gboolean _vk_graph_fits_budget(const dt_iop_roi_t *roi_out)
+{
+  if(!roi_out || roi_out->width <= 0 || roi_out->height <= 0) return FALSE;
+  // 4-channel float is the widest common trunk buffer; use it as the
+  // per-buffer estimate. Intermediate buffers run at the processing
+  // scale, which for export equals this output scale.
+  const uint64_t trunk =
+      (uint64_t)roi_out->width * (uint64_t)roi_out->height * 4 * sizeof(float);
+  const uint64_t budget = dt_get_singlebuffer_mem();
+  if(trunk > budget)
+  {
+    dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VKGRAPH,
+             "[vkgraph] graph capture declined: trunk ~%.0f MB > single-buffer"
+             " budget %.0f MB (a span holds several, no tiling) — using eager"
+             " per-module path",
+             1e-6 * (double)trunk, 1e-6 * (double)budget);
+    return FALSE;
+  }
+  return TRUE;
+}
+#endif
+
 static void get_output_format(dt_iop_module_t *module,
                               dt_dev_pixelpipe_t *pipe,
                               dt_dev_pixelpipe_iop_t *piece,
@@ -3629,7 +3668,8 @@ static gboolean _dev_pixelpipe_process_rec_and_backcopy(dt_dev_pixelpipe_t *pipe
     pipe->vk_graph_run = graph_pref && dt_vulkan_running()
         && !darktable.dump_pfm_pipe
         && !darktable.bench_module
-        && !(darktable.unmuted & DT_DEBUG_NAN);
+        && !(darktable.unmuted & DT_DEBUG_NAN)
+        && _vk_graph_fits_budget(roi_out);
     pipe->vk_span_host_stale = NULL;
     pipe->vk_span_skips = 0;
     _vk_handoff_invalidate(pipe);

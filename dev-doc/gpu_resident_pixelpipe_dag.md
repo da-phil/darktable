@@ -11,12 +11,17 @@ histogram tap is wired into the pipe (validated headless through
 levels-automatic; picker/scope wiring still wants a darkroom bench).
 M3 started: the liveness peak-memory measurement is landed (the
 aliasing planner wants a real GPU). Both the eager per-module VK path
-and the graph span-capture path are now validated on real AMD hardware
+and the graph span-capture path are validated on real AMD hardware
 (RADV PHOENIX, §11): zero errors, and graph mode fuses ~90 % of GPU
 dispatch work into large single-submit spans, bounded by the RAW/CFA
 front-end (chiefly the still-missing real demosaic kernels) and a few
 other CPU-island modules — a source audit (§11) sorts these into three
-structurally distinct buckets. See §11 for the living
+structurally distinct buckets. **Safety:** graph mode now carries the
+§5.2 memory-budget gate it always specified — a full-res export on an
+integrated GPU was accumulating an un-tileable multi-buffer span that
+exhausted system RAM and froze the machine; runs whose trunk buffer
+exceeds the single-buffer budget now decline graph mode and use the
+eager path (§11, 2026-07-15 export-freeze entry). See §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -407,7 +412,19 @@ into the ring; module-owned payloads keep the safe snapshot default.
 vk_graph_possible = dt_vulkan_running()
                  && pipe has no CL-only segments the planner can't bridge
                  && conf: pixelpipe_vulkan_graph=true
+                 && trunk buffer fits the single-buffer budget   // §5.10 #3
 ```
+
+> **Status (implemented).** The budget term is live in
+> `_vk_graph_fits_budget()` (`pixelpipe_hb.c`): a run whose estimated
+> trunk buffer (`w·h·4·float`) exceeds `dt_get_singlebuffer_mem()` — the
+> very threshold the OpenCL tiler uses to decide a buffer is too big to
+> hold whole — declines graph mode and keeps the eager per-module path.
+> Graph capture holds several such buffers live and cannot tile, so a
+> single tiling-sized buffer already makes a span unsafe. This is what
+> stops full-res export from exhausting RAM on an integrated GPU (§11,
+> 2026-07-15 export-freeze entry). The other two terms are still the
+> pref plus the debug-mode exclusions in `dt_dev_pixelpipe_process`.
 
 Before the walk, a cheap linear pre-pass over `pipe->nodes` classifies
 every enabled piece:
@@ -953,7 +970,14 @@ strategies, in escalation order:
    *deferred* until data shows segment spill isn't enough.
 3. **Fallback:** run that pipe eagerly (today's path). Always
    available, decided per run in the §5.2 gate (predicted arena vs
-   budget).
+   budget). ✅ **implemented** (`_vk_graph_fits_budget`): the coarse
+   form of this gate — decline graph mode whenever a single trunk
+   buffer already exceeds the single-buffer budget — is what the M1/M2
+   executor ships today, since it has neither segment spill (#1) nor
+   graph-level tiling (#2). It is what keeps a 24 MP+ export from
+   accumulating a multi-buffer span that thrashes an integrated GPU's
+   shared RAM (§11, 2026-07-15). Spill/tiling would *raise* this
+   ceiling; until they land, the ceiling is the safety net.
 
 Rule of thumb from §5.5's estimate: 24 MP export fits 8 GB cards
 without spilling; 61 MP on a 4 GB card takes 1–2 spills; the darkroom
@@ -1230,6 +1254,80 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — export near-froze the machine: the missing budget gate, now implemented
+
+A user ran a full-res export with `pixelpipe_vulkan_graph=TRUE` and it
+"almost crashed my laptop" — darktable ate all RAM and every CPU core
+and froze the system; an earlier run reported memory corruption; and it
+felt "very sluggish, nothing in comparison to upstream master." The
+attached export log is unambiguous, and it exposes a real design gap:
+**graph mode had no memory budget gate**, so at export resolution the
+span accumulates more resident memory than the machine has.
+
+- **What the log shows.** The hardware is an AMD **PHOENIX APU** —
+  integrated, so device "VRAM" *is* system RAM. Export trunk buffers are
+  **865 MB** each (vs 53 MB for the darkroom preview in the same log);
+  the liveness sweep reports **peak-live 1791 MB**, i.e. ~2 whole trunk
+  buffers live at once, and the upload ring stages another ~865 MB.
+  `exposure.1` alone took **55.4 s wall / 45.6 CPU-s** ("blended on
+  CPU"), and there is a ~40 s stretch (t≈111→151 s) with nothing logged
+  but histogram redraws. That profile — wall ≫ useful work, a single
+  memcpy-scale operation costing 45 CPU-s, a dead 40 s gap — is swap
+  thrashing: the resident set (graph device buffers on shared RAM + the
+  ring + the host CPU-blend copies + the pipe cache) exceeded physical
+  RAM and the box went to swap.
+
+- **Why it's so much worse than upstream.** Upstream's OpenCL path
+  **tiles** large buffers and reads back + frees each module before the
+  next; it never holds a whole-pipe span of 865 MB buffers. Graph mode
+  holds several live (deferred frees + §5.14 hand-off + deferred
+  readbacks) and **cannot tile** (§5.10). On a discrete card with spare
+  VRAM that is merely aggressive; on an APU it is fatal, because every
+  one of those buffers is system RAM competing with the host copies.
+
+- **Root cause = a gate that was designed but never built.** §5.2's
+  graph gate always specified a "predicted arena vs budget" term (§5.10
+  fallback #3), but the M1/M2 executor shipped the gate as *pref +
+  debug-exclusions only* — no size check. So graph mode engaged for
+  **any** buffer size, including full-res export.
+
+- **The fix (this commit).** `_vk_graph_fits_budget()` in
+  `pixelpipe_hb.c` implements the missing term: decline graph mode when
+  the estimated trunk buffer (`w·h·4·float`) exceeds
+  `dt_get_singlebuffer_mem()` — the exact threshold darktable's OpenCL
+  tiler uses to decide a buffer is too big to hold whole. A span holds
+  several such buffers and can't tile, so one tiling-sized buffer
+  already makes the span unsafe. Oversized runs fall back to the eager
+  per-module path (read back + free each module before the next: bounded
+  to ~2 buffers, no ring, no span). The threshold scales with the user's
+  resource level, so it needs no magic constant, and it declines to the
+  log: `[vkgraph] graph capture declined: trunk ~N MB > single-buffer
+  budget M MB`. Darkroom preview (53 MB) is far under any real budget and
+  keeps graph mode; export (865 MB) declines. Compiles clean; the guard
+  is pure arithmetic over existing budgeting, exercised on every pipe
+  run. I could not re-run on the APU (no such hardware here), so this is
+  validated by build + the log's own numbers, not by a fresh capture.
+
+- **On the reported corruption.** I audited the capture lifecycle most
+  likely to corrupt — `capture_mark` / `capture_rollback` /
+  `_capture_truncate` and the deferred-free list — and it holds up on
+  inspection: the mark snapshots `nodes`/`dfree`/`ring`/`taps` lengths,
+  rollback truncates to them and releases only post-mark frees, and
+  vin/vout frees defer correctly past pending nodes. I did not find a
+  clear defect by reading, and without a reproducer on the affected
+  hardware I will not guess-patch memory-safety code. The budget gate
+  removes the memory-pressure regime where a latent overrun is most
+  likely to bite (near-OOM allocation failures that the capture paths do
+  not all check). Tracked as its own task for a hardware repro under a
+  validation layer.
+
+- **What this does *not* fix.** Darkroom interactive is still bounded by
+  the CPU-island round-trips (the demosaic/highlights/etc. rollbacks of
+  the entries below) — that's the Path-B work, unchanged. And large-
+  buffer *support* (segment spill §5.10 #1, graph tiling #2) is still
+  future work; today large runs simply decline graph mode rather than
+  spilling. The gate is the safety net under that unfinished ceiling.
 
 ### 2026-07-15 — root-cause audit of the 30 rollbacks: three buckets, not a frequency list
 
