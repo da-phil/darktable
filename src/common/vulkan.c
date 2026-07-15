@@ -182,6 +182,8 @@ typedef struct dt_vk_capture_ctx_t
   size_t     ring_cap;
   GPtrArray *dfree;      // dt_vk_mem_t* whose free is deferred to flush
   GArray    *taps;       // of _capture_tap_t, drained at capture_end
+  uint64_t   peak_bytes; // M3 liveness: max simultaneous live device bytes
+                         // across this session's flushes (reset at begin)
   uint32_t   flushes;    // segments submitted since begin (diagnostics)
 } dt_vk_capture_ctx_t;
 
@@ -1117,6 +1119,78 @@ static int _record_batched(VkCommandBuffer cmd, void *u)
 
 // ---- capture executor (plan / record / submit one segment) -----------
 
+// M3 liveness (dev-doc/gpu_resident_pixelpipe_dag.md §5.5, first step):
+// the peak simultaneous live device memory this segment holds. Each
+// captured buffer is live across [first node that references it, last
+// node that references it]; the peak over all node positions is what a
+// future interval-aliasing planner would have to fit (and what tells us
+// whether spilling is needed). Read-only over the node list — safe
+// today under the fully-serialised executor, and the number it reports
+// is exactly the memory the deferred-free model keeps resident until
+// flush. Excludes the shared staging buffer (a separate, single
+// allocation, already reported as "staged MB").
+static uint64_t _capture_peak_live_bytes(const dt_vk_capture_ctx_t *cap)
+{
+  const guint nn = cap->nodes->len;
+  if(nn == 0) return 0;
+
+  GHashTable *firsts = g_hash_table_new(g_direct_hash, g_direct_equal);
+  GHashTable *lasts  = g_hash_table_new(g_direct_hash, g_direct_equal);
+  GPtrArray  *bufs   = g_ptr_array_new();
+
+  for(guint i = 0; i < nn; i++)
+  {
+    const _capture_node_t *n = &g_array_index(cap->nodes, _capture_node_t, i);
+    dt_vk_mem_t *refs[DT_VULKAN_MAX_BINDINGS + 2];
+    int nr = 0;
+    if(n->kind == _NODE_DISPATCH)
+      for(uint32_t b = 0; b < n->nbufs; b++) refs[nr++] = n->bufs[b];
+    else
+    {
+      if(n->dst) refs[nr++] = n->dst;
+      if(n->src) refs[nr++] = (dt_vk_mem_t *)n->src;
+    }
+    for(int r = 0; r < nr; r++)
+    {
+      dt_vk_mem_t *b = refs[r];
+      if(!b) continue;
+      if(!g_hash_table_contains(firsts, b))
+      {
+        g_hash_table_insert(firsts, b, GUINT_TO_POINTER(i));
+        g_ptr_array_add(bufs, b);
+      }
+      g_hash_table_insert(lasts, b, GUINT_TO_POINTER(i));
+    }
+  }
+
+  // delta sweep: +size at first ref, -size just past last ref
+  int64_t *delta = calloc((size_t)nn + 1, sizeof(int64_t));
+  uint64_t peak = 0;
+  if(delta)
+  {
+    for(guint k = 0; k < bufs->len; k++)
+    {
+      dt_vk_mem_t *b = g_ptr_array_index(bufs, k);
+      const guint f = GPOINTER_TO_UINT(g_hash_table_lookup(firsts, b));
+      const guint l = GPOINTER_TO_UINT(g_hash_table_lookup(lasts, b));
+      delta[f]     += (int64_t)b->size;
+      delta[l + 1] -= (int64_t)b->size;
+    }
+    int64_t running = 0;
+    for(guint i = 0; i < nn; i++)
+    {
+      running += delta[i];
+      if(running > (int64_t)peak) peak = (uint64_t)running;
+    }
+    free(delta);
+  }
+
+  g_ptr_array_free(bufs, TRUE);
+  g_hash_table_destroy(firsts);
+  g_hash_table_destroy(lasts);
+  return peak;
+}
+
 typedef struct _graph_record_args_t
 {
   dt_vk_capture_ctx_t *cap;
@@ -1247,12 +1321,20 @@ gboolean dt_vulkan_capture_begin(int devid)
   g_capture->devid = devid;
   g_capture->ring_used = 0;
   g_capture->flushes = 0;
+  g_capture->peak_bytes = 0;
   return TRUE;
 }
 
 gboolean dt_vulkan_capture_active(void)
 {
   return _cap() != NULL;
+}
+
+uint64_t dt_vulkan_capture_peak_bytes(void)
+{
+  // Survives capture_end (the context persists, only `active` clears),
+  // so the run-scoped peak can be read after the span closes.
+  return g_capture ? g_capture->peak_bytes : 0;
 }
 
 uint32_t dt_vulkan_capture_pending(void)
@@ -1385,11 +1467,17 @@ int dt_vulkan_capture_flush(int devid)
     if(pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(d->device, pool, NULL);
     free(dsets);
 
+    // M3 liveness: peak resident device memory this segment held. The
+    // running max over the session is what the run actually needed.
+    const uint64_t seg_peak = _capture_peak_live_bytes(cap);
+    if(seg_peak > cap->peak_bytes) cap->peak_bytes = seg_peak;
+
     dt_print(DT_DEBUG_VKGRAPH,
              "[vkgraph] flush #%u: %u nodes (%u dispatch, %u upload / %.1f MB staged, "
-             "%u copy) -> %s",
+             "%u copy / %.1f MB peak-live) -> %s",
              cap->flushes, nn, n_dispatch, n_upload, 1e-6 * (double)staging_total,
-             n_copy, rc == 0 ? "1 submit" : "FAILED, segment dropped");
+             n_copy, 1e-6 * (double)seg_peak,
+             rc == 0 ? "1 submit" : "FAILED, segment dropped");
   }
 
   // ---- segment epilogue: reset capture state, run deferred frees ----

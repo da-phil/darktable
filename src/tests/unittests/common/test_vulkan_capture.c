@@ -723,6 +723,88 @@ static void test_mixed_bpp_format_conversion(void **state)
   free(in); free(out_eager); free(out_capt); free(ref);
 }
 
+// M3 liveness (§5.5): dt_vulkan_capture_peak_bytes reports the peak
+// simultaneous live device memory — the figure a future aliasing
+// planner must fit. It measures *simultaneity*, not total: a linear
+// chain of N buffers peaks at two live at a time, however long. The
+// pool may hand back oversized buffers, so the expected peak is
+// computed from each buffer's *actual* ->size over the known live
+// sets. Runs the sequences, releases the lock, then asserts (a mid-
+// lock assert failure would deadlock the following tests).
+static void test_liveness_peak(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  float *in = malloc(TBYTES);
+  assert_non_null(in);
+  _fill_input(in);
+  const pc_addmul_t pc = { TW, TH, 1.0f };
+
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  uint64_t peakA = 0, peakB = 0, peakC = 0;
+  uint64_t szA = 0, szB = 0, szC = 0, szE = 0;
+  dt_vk_mem_t *a = NULL, *b = NULL, *c = NULL, *e = NULL;
+  if(!rc)
+  {
+    a = dt_vulkan_alloc_buffer(dev, TBYTES);
+    b = dt_vulkan_alloc_buffer(dev, TBYTES);
+    c = dt_vulkan_alloc_buffer(dev, TBYTES);
+    e = dt_vulkan_alloc_buffer(dev, TBYTES);
+    if(!a || !b || !c || !e) rc = -101;
+    else { szA = a->size; szB = b->size; szC = c->size; szE = e->size; }
+  }
+  // A) a single live buffer -> peak == that buffer's bytes
+  if(!rc && dt_vulkan_capture_begin(dev))
+  {
+    rc = dt_vulkan_write_to_device(dev, a, in, TBYTES);
+    if(!rc) rc = dt_vulkan_capture_end(dev);
+    peakA = dt_vulkan_capture_peak_bytes();
+  }
+  // B) linear chain a->b->c: two buffers live at the peak
+  if(!rc && dt_vulkan_capture_begin(dev))
+  {
+    rc = dt_vulkan_write_to_device(dev, a, in, TBYTES);
+    if(!rc) rc = dt_vulkan_dispatch_inout(&k_add, a, b, TW, TH, &pc, sizeof(pc));
+    if(!rc) rc = dt_vulkan_dispatch_inout(&k_mul, b, c, TW, TH, &pc, sizeof(pc));
+    if(!rc) rc = dt_vulkan_capture_end(dev);
+    peakB = dt_vulkan_capture_peak_bytes();
+  }
+  // C) fresh buffer every step (a->b->c->e): four buffers touched, still
+  // only two live at any node — peak reflects simultaneity, not total
+  if(!rc && dt_vulkan_capture_begin(dev))
+  {
+    rc = dt_vulkan_write_to_device(dev, a, in, TBYTES);
+    if(!rc) rc = dt_vulkan_dispatch_inout(&k_add, a, b, TW, TH, &pc, sizeof(pc));
+    if(!rc) rc = dt_vulkan_dispatch_inout(&k_mul, b, c, TW, TH, &pc, sizeof(pc));
+    if(!rc) rc = dt_vulkan_dispatch_inout(&k_add, c, e, TW, TH, &pc, sizeof(pc));
+    if(!rc) rc = dt_vulkan_capture_end(dev);
+    peakC = dt_vulkan_capture_peak_bytes();
+  }
+  if(a) dt_vulkan_free_buffer(dev, a);
+  if(b) dt_vulkan_free_buffer(dev, b);
+  if(c) dt_vulkan_free_buffer(dev, c);
+  if(e) dt_vulkan_free_buffer(dev, e);
+  if(dev == 0) dt_vulkan_unlock_device(dev);
+  free(in);
+
+  // expected peaks from the actual (possibly pool-oversized) sizes:
+  //   A: {a}                     -> szA
+  //   B: {a},{a,b},{b,c}         -> max(szA+szB, szB+szC)
+  //   C: + {c,e}                 -> max(B, szC+szE)
+  const uint64_t expB = MAX(szA + szB, szB + szC);
+  const uint64_t expC = MAX(expB, szC + szE);
+
+  assert_int_equal(rc, 0);
+  assert_int_equal((int)peakA, (int)szA);
+  assert_true(szA >= TBYTES);
+  assert_int_equal((int)peakB, (int)expB);
+  assert_int_equal((int)peakC, (int)expC);
+  // two-live-at-a-time never exceeds two single buffers' worth
+  assert_true(peakB <= szA + szB + szC); // sanity: not summing all three
+}
+
 // A second begin on the same thread must refuse (and report inactive
 // again once the first capture ends).
 static void test_nested_begin_refused(void **state)
@@ -755,6 +837,7 @@ int main(void)
     cmocka_unit_test(test_gpu_tap_survives_sync_flush),
     cmocka_unit_test(test_gpu_tap_abort_and_rollback),
     cmocka_unit_test(test_mixed_bpp_format_conversion),
+    cmocka_unit_test(test_liveness_peak),
     cmocka_unit_test(test_nested_begin_refused),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

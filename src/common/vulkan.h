@@ -426,6 +426,17 @@ gboolean dt_vulkan_capture_active(void);
 /** Number of nodes captured but not yet flushed (0 outside capture). */
 uint32_t dt_vulkan_capture_pending(void);
 
+/** M3 liveness (gpu_resident_pixelpipe_dag.md §5.5): peak simultaneous
+ *  live device memory, in bytes, across the flushes of the current (or
+ *  most recently ended) capture session on this thread. Each captured
+ *  buffer is live across [first, last] node that references it; this is
+ *  the max over node positions and over the session's segments — the
+ *  memory the deferred-free model keeps resident, i.e. the figure a
+ *  future interval-aliasing planner (and spill decision) works from.
+ *  0 outside capture / before any flush. Diagnostic and test-facing;
+ *  also emitted per segment under `-d vkgraph`. */
+uint64_t dt_vulkan_capture_peak_bytes(void);
+
 /** Submit the pending segment (one command buffer, one fence wait),
  *  then execute deferred frees. Capture stays active — subsequent HAL
  *  calls start a new segment. No-op segment (0 nodes) skips the
@@ -560,6 +571,7 @@ typedef struct dt_vk_capture_mark_t { int _unused; } dt_vk_capture_mark_t;
 static inline gboolean dt_vulkan_capture_begin(int devid) { (void)devid; return FALSE; }
 static inline gboolean dt_vulkan_capture_active(void) { return FALSE; }
 static inline uint32_t dt_vulkan_capture_pending(void) { return 0; }
+static inline uint64_t dt_vulkan_capture_peak_bytes(void) { return 0; }
 static inline int dt_vulkan_capture_flush(int devid) { (void)devid; return 0; }
 static inline int dt_vulkan_capture_end(int devid) { (void)devid; return 0; }
 static inline void dt_vulkan_capture_abort(int devid) { (void)devid; }
