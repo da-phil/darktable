@@ -992,6 +992,40 @@ Rule of thumb from §5.5's estimate: 24 MP export fits 8 GB cards
 without spilling; 61 MP on a 4 GB card takes 1–2 spills; the darkroom
 screen pipes essentially never spill.
 
+#### 5.10.1 Whole-pipe output tiling (the `ME` export mechanism)
+
+The form of graph-level tiling (#2 above) chosen for the export
+milestone, because it reuses machinery that already exists rather than
+building a new intra-executor tiler:
+
+- **darktable already processes an arbitrary output region.**
+  `dt_dev_pixelpipe_process(pipe, dev, x, y, w, h, scale, devid)`
+  (`pixelpipe_hb.c`) runs the pipe for region `(x,y,w,h)`; darkroom uses
+  it for the viewport, export calls it once with the full image
+  (`imageio.c`). Call it once **per output tile** instead and each
+  tile-run is an independent small pipe.
+- **Halos come for free.** Each module's `modify_roi_in` adds its
+  overlap as the ROI propagates backward, so a tile's haloed input
+  region is pulled automatically — no manual halo bookkeeping in the
+  driver.
+- **Memory becomes image-size-independent.** A tile-run's graph capture
+  operates at *tile*-sized buffers, so it passes the §5.2 budget gate
+  and fuses; peak-live is bounded by the tile, not the image. This is
+  what makes full-res export *possible* on the graph.
+- **Tiling wraps at the pipe-run level, not inside the executor** — the
+  capture executor (`dt_vulkan_capture_flush`) is unchanged; it just
+  gets handed tile-sized work. Same layering as the OpenCL tiler, which
+  wraps `process_cl` per tile.
+
+Grid/overlap/alignment and tile assembly reuse the algorithm in
+`_default_process_tiling_cl_roi` (`tiling.c`): the whole-pipe overlap is
+`Σ` each enabled piece's `tiling_callback` overlap (clamped), `align` the
+lcm of per-module aligns, `factor` the graph peak-live (§5.5). Cost: the
+whole pipe (incl. demosaic) recomputes per tile over the halo — the same
+tiled cost OpenCL pays, coarser-grained; large tiles keep the overlap
+fraction small. Pathological Σoverlap (deep neighbourhood stacks) falls
+back to OpenCL via the gate's third branch (§5.2 / #3).
+
 ### 5.11 Error handling & the fallback ladder
 
 Mirrors the existing OpenCL discipline (`pipe->opencl_error` → restart
@@ -1226,6 +1260,54 @@ Independent lanes that keep paying either way: Path B module ports
 (each un-islands a stack), Path D CPU-module ports (toneequal), §8.5
 images/samplers (unlocks the last OpenCL-only kernels).
 
+### Priority milestone — `ME`: GPU-resident export
+
+**Reprioritised 2026-07-15 at user request:** *export*, not interactive
+darkroom (which is fine on OpenCL), is the target. This pulls the
+graph-level tiling out of M7 (opportunistic) onto the critical path and
+folds in Path-B demosaic and M0+ blend as coverage. Two decisions taken
+with the user: **success = parity at any resolution** (correct vs the
+OpenCL/CPU reference, memory-safe, competitive perf — *not* beating
+OpenCL, which is already resident+tiled; the win is backend unification
++ future fusion/aliasing headroom), and **port demosaic to VK now** (no
+permanent OpenCL island mid-pipe).
+
+Mechanism (see §5.10.1): **whole-pipe output tiling** — split the export
+output into budget-sized tiles and run the pipe per tile via the
+existing region path (`dt_dev_pixelpipe_process(x,y,w,h)`); each tile's
+graph capture then operates at tile-sized buffers → fits the §5.2 budget
+→ fuses. darktable's ROI back-propagation pulls each tile's haloed input
+for free. Tiling wraps at the pipe-run level, like the OpenCL tiler —
+the capture executor is unchanged.
+
+- **ME.0 — export parity harness + baseline.** Headless: export one edit
+  via OpenCL and via the graph path, diff the output (fp tolerance);
+  record the OpenCL wall-time as the perf bar. Small-image half runs on
+  lavapipe. The gate for every later stage.
+- **ME.1 — whole-pipe output tiling** *(critical path)*. Tile driver +
+  grid/overlap/align math (reuse `_default_process_tiling_cl_roi`,
+  `tiling.c`), whole-pipe overlap/factor accumulated from each piece's
+  `tiling_callback`, tile assembly.
+- **ME.2 — flip the budget gate to tile.** `_vk_graph_fits_budget` →
+  `_vk_graph_tile_plan`: fits → 1 tile; oversized → N tiles ≤ budget;
+  un-tileable overlap → decline to OpenCL (the existing safe branch).
+- **ME.3 — demosaic VK kernels** (task #22): RCD + Markesteijn first,
+  then PPG/VNG; widen the mosaic front-end gates (`rawprepare`,
+  `highlights`; task #21). Un-islands sensor → RGBA.
+- **ME.4 — M0+ on-device blend** (task #25): parametric/drawn masks +
+  common modes, so blend-heavy export modules stay in-span.
+- **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
+  boundaries first, promote later.
+- **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈
+  OpenCL + clean under the validation layers (task #23) → enable
+  export-via-graph by default; until then behind `pixelpipe_vulkan_graph`.
+
+Critical path: ME.0 → **ME.1 + ME.2** (this is what makes full-res
+export *possible and memory-safe* on the graph — a demosaic'd full-res
+span still won't fit RAM without tiling) → ME.3 + ME.4 (coverage, in
+parallel) → ME.5/ME.6. Memory aliasing (M3) is a deferred perf lever,
+not on the parity path.
+
 ## 10. Risks and open questions
 
 - **Capture assumes modules don't inspect device buffer contents
@@ -1263,6 +1345,33 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — plan set: GPU-resident export (`ME`) is the priority
+
+The user reprioritised: make *export* run on the graph Vulkan pipeline;
+interactive darkroom is fine on OpenCL and is not the target. Plan
+recorded in §9 (`ME` milestone) and §5.10.1 (mechanism). Two decisions
+taken with them:
+
+- **Success = parity at any resolution**, not beating OpenCL. Upstream's
+  OpenCL export is already GPU-resident and tiled, so the graph's
+  near-term value is backend unification + future fusion/aliasing
+  headroom. Done = correct (bit-parity vs OpenCL/CPU), memory-safe at any
+  resolution, competitive perf, enable-able by default. Aliasing arena
+  (M3) is a deferred perf lever, off the parity path.
+- **Port demosaic to VK now** — the whole pipe from the sensor should
+  form spans; no permanent OpenCL island mid-export.
+
+Architecture: **whole-pipe output tiling** (§5.10.1) — tile the export
+output, run the pipe per tile via the existing region path, let ROI
+back-prop pull each tile's halo, capture each tile at tile-sized buffers
+so it fits the §5.2 budget and fuses. Reuses `dt_dev_pixelpipe_process`
+region processing + `_default_process_tiling_cl_roi`'s grid math; the
+capture executor is untouched. Critical path: ME.0 harness → ME.1/ME.2
+tiling + gate-flip (the memory enabler) → ME.3 demosaic + ME.4 blend
+(coverage) → ME.6 parity gate. No code this entry — plan + task
+restructure only; implementation lands stage by stage with a runnable
+check each, per the standing directive.
 
 ### 2026-07-15 — export still 5× slower after the gate: VK routing must follow the graph decision
 
