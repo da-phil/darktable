@@ -1320,8 +1320,18 @@ the capture executor is unchanged.
 - **ME.3 — demosaic VK kernels** (task #22): RCD + Markesteijn first,
   then PPG/VNG; widen the mosaic front-end gates (`rawprepare`,
   `highlights`; task #21). Un-islands sensor → RGBA.
-- **ME.4 — M0+ on-device blend** (task #25): parametric/drawn masks +
-  common modes, so blend-heavy export modules stay in-span.
+- **ME.4 — M0+ on-device blend** (task #25): the gap is the mask
+  *build*, not the modes or the apply. The device blend already
+  implements every blend mode and its apply kernel already consumes a
+  **per-pixel mask buffer** (`blend.c:1554`); `_vk_blend_set_mask` just
+  fills that buffer with a constant, and the gate (`:1447`) refuses any
+  non-uniform `mask_mode`. So: (a) **drawn/raster masks** — build on the
+  CPU from geometry (no pixel readback), upload into `dev_mask`, apply on
+  device: tractable, and keeps the module in-span; (b) **parametric
+  masks** — the condition evaluation needs pixel values, so building on
+  CPU would force a readback; the real win is to evaluate the blendif
+  conditions on the device (GLSL port of `dt_develop_blendif`). Ship (a)
+  first, then (b).
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈
@@ -1371,6 +1381,39 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — ME.1 addressing landed; pivot to coverage kernels; ME.3/ME.4 scoped
+
+The ME.1 tiling *driver* has one part left — the hot-path loop that runs
+the pipe per tile and assembles into the pipe output. That output is a
+**cache-owned cacheline** (`pipe->backbuf`, only `g_free`d for screen
+pipes, `pixelpipe_hb.c:685`), so assembling into it means allocating a
+full-image cacheline through the pipe cache and keying it right; a
+mistake is a leak or the use-after-free class already reported. There is
+no sample raw here to validate an end-to-end export, so — with the user
+— the loop is deferred behind the ME.0 harness (or their hardware), and
+this lands the driver's deterministic *addressing* instead (region +
+blit, unit-tested; previous entry). Task #24's loop is now blocked on
+ME.0 (#26). Pivoted to the coverage kernels, which *are* validatable
+in-repo (kernel vs CPU reference). Scoping both, from the source:
+
+- **ME.4 blend is smaller than it looked.** The device blend already
+  implements every blend mode and its apply kernel already reads a
+  per-pixel mask buffer (`blend.c:1554`); only the mask *build* is
+  missing. Drawn/raster masks build on the CPU from geometry (no pixel
+  readback) → upload → apply: the tractable first slice. Parametric
+  masks need pixel values, so their real win is a device GLSL port of
+  the blendif evaluation. The "blended on CPU" the user saw is masks,
+  **not** modes.
+- **ME.3 demosaic is a whole-algorithm unit.** Only the passthrough
+  kernels are simple (and already ported); the real methods are
+  multi-kernel (PPG 10, RCD 11, Markesteijn 18) and only validate as a
+  *complete* chain against the CPU reference — no partial-kernel test is
+  meaningful. So each algorithm is one atomic, multi-step increment.
+
+No code this entry — findings + task/scope sync. Next: the ME.4
+drawn-mask slice (upload the CPU mask, apply on device), which directly
+removes a "blended on CPU" case and is unit-testable.
 
 ### 2026-07-15 — ME.2 landed: the whole-pipe tile planner (pure geometry, unit-tested)
 
