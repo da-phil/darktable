@@ -521,17 +521,21 @@ static v4 _ref_lab_adapter(v4 a, v4 b, float op, uint32_t m, float p, int md)
 // g_vk_lock is held would deadlock every following test. So each test
 // runs the whole device sequence first (collecting an rc), releases the
 // lock, and only then asserts.
+// `mask_arr` NULL => uniform `opacity` everywhere (the common case). A
+// non-NULL per-pixel mask exercises the apply kernel's spatial mask
+// indexing — the property drawn/parametric masks (ME.4) rely on — with
+// the reference blended at each pixel's own mask value.
 static void run_mode_check(const dt_vk_module_kernel_t *kernel,
                            const v4 *in_a, const v4 *in_b,
                            float opacity, uint32_t mode, float param,
                            int mask_display, ref_fn_t ref, float eps,
-                           const char *tag)
+                           const char *tag, const float *mask_arr)
 {
   const size_t bytes = TN * sizeof(v4);
   float *mask = malloc(TN * sizeof(float));
   v4 *out = malloc(bytes);
   assert_non_null(mask); assert_non_null(out);
-  for(size_t i = 0; i < TN; i++) mask[i] = opacity;
+  for(size_t i = 0; i < TN; i++) mask[i] = mask_arr ? mask_arr[i] : opacity;
 
   const int dev = dt_vulkan_lock_device();
   int rc = (dev == 0) ? 0 : -100;
@@ -569,7 +573,8 @@ static void run_mode_check(const dt_vk_module_kernel_t *kernel,
   if(!rc)
     for(size_t i = 0; i < TN; i++)
     {
-      const v4 r = ref(in_a[i], in_b[i], opacity, mode, param, mask_display);
+      const float px_op = mask_arr ? mask_arr[i] : opacity;
+      const v4 r = ref(in_a[i], in_b[i], px_op, mode, param, mask_display);
       const float e = fmaxf(fmaxf(BLEND_ERR(out[i].x, r.x), BLEND_ERR(out[i].y, r.y)),
                             fmaxf(BLEND_ERR(out[i].z, r.z), BLEND_ERR(out[i].w, r.w)));
       if(e > maxerr)
@@ -649,10 +654,10 @@ static void test_jzczhz_modes(void **state)
   for(size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
     for(size_t p = 0; p < 3; p++)
       run_mode_check(&k_jzczhz, a, b, ops[p], modes[m], 1.3f, 0,
-                     ref_blend_jzczhz, 1e-5f, "jzczhz");
+                     ref_blend_jzczhz, 1e-5f, "jzczhz", NULL);
 
   // mask_display transfers a.w
-  run_mode_check(&k_jzczhz, a, b, 0.5f, 0x18, 1.0f, 1, ref_blend_jzczhz, 1e-5f, "jzczhz/md");
+  run_mode_check(&k_jzczhz, a, b, 0.5f, 0x18, 1.0f, 1, ref_blend_jzczhz, 1e-5f, "jzczhz/md", NULL);
 
   free(a); free(b);
 }
@@ -673,7 +678,7 @@ static void test_rgb_hsl_modes(void **state)
   for(size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
     for(size_t p = 0; p < 3; p++)
       run_mode_check(&k_hsl, a, b, ops[p], modes[m], 1.0f, 0,
-                     _ref_hsl_adapter, 1e-4f, "rgb_hsl");
+                     _ref_hsl_adapter, 1e-4f, "rgb_hsl", NULL);
 
   free(a); free(b);
 }
@@ -698,9 +703,36 @@ static void test_lab_modes(void **state)
   for(size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
     for(size_t p = 0; p < 3; p++)
       run_mode_check(&k_lab, a, b, ops[p], modes[m], 1.0f, 0,
-                     _ref_lab_adapter, 5e-4f, "lab");
+                     _ref_lab_adapter, 5e-4f, "lab", NULL);
 
   free(a); free(b);
+}
+
+// ME.4 foundation: the apply kernel must read the mask per pixel, not
+// treat it as one global opacity. Feed a spatially-varying mask (the
+// shape a drawn/parametric mask produces) and require the device blend
+// to match the reference blended at each pixel's own mask value. This is
+// what lets a future non-uniform mask be uploaded and applied on device
+// instead of forcing the CPU blend.
+static void test_per_pixel_mask(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+  s_rng = 0x5a5a;
+  v4 *a = malloc(TN * sizeof(v4)), *b = malloc(TN * sizeof(v4));
+  float *mask = malloc(TN * sizeof(float));
+  assert_non_null(a); assert_non_null(b); assert_non_null(mask);
+  fill_lab(a, TN); fill_lab(b, TN);
+  // clearly non-uniform, deterministic, spans [0,1]
+  for(size_t i = 0; i < TN; i++) mask[i] = (float)((i * 37u) % 101u) / 100.0f;
+
+  // opacity arg is ignored when a per-pixel mask is given (passed 0)
+  run_mode_check(&k_lab, a, b, 0.0f, 0x18 /*NORMAL2*/, 1.0f, 0,
+                 _ref_lab_adapter, 5e-4f, "lab/ppmask", mask);
+  run_mode_check(&k_lab, a, b, 0.0f, 0x04 /*MULTIPLY*/, 1.0f, 0,
+                 _ref_lab_adapter, 5e-4f, "lab/ppmask-mul", mask);
+
+  free(a); free(b); free(mask);
 }
 
 // non-equal rois: in_a is larger and read at an (offx, offy) offset
@@ -1058,6 +1090,7 @@ int main(void)
     cmocka_unit_test(test_jzczhz_modes),
     cmocka_unit_test(test_rgb_hsl_modes),
     cmocka_unit_test(test_lab_modes),
+    cmocka_unit_test(test_per_pixel_mask),
     cmocka_unit_test(test_roi_offsets),
     cmocka_unit_test(test_process_vk_uniform_blend),
     cmocka_unit_test(test_process_vk_blend_glue_rgb_to_lab),

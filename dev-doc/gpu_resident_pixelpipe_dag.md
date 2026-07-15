@@ -1331,7 +1331,11 @@ the capture executor is unchanged.
   masks** — the condition evaluation needs pixel values, so building on
   CPU would force a readback; the real win is to evaluate the blendif
   conditions on the device (GLSL port of `dt_develop_blendif`). Ship (a)
-  first, then (b).
+  first, then (b). ✅ **foundation validated:** the device apply kernel
+  already applies a *spatially-varying* per-pixel mask bit-identically to
+  the CPU reference (`test_vulkan_blendop.c::test_per_pixel_mask`, on
+  lavapipe) — so all that (a) adds is the gate relax + uploading the
+  CPU-built mask instead of the constant fill.
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈
