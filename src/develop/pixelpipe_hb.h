@@ -497,6 +497,22 @@ dt_dev_vk_tile_plan_t dt_dev_pixelpipe_plan_vk_tiles(int width, int height,
                                                      float maxbuf, int overlap,
                                                      unsigned int align,
                                                      size_t budget);
+
+// ME.1: the non-overlapping output *core* region for tile (tx,ty) of a
+// plan over an image_w x image_h output. The cores tile the image exactly
+// — no gaps, no overlap — and are clamped at the right/bottom edges; the
+// halo that sizes the tiles is pulled by the pipe's ROI back-propagation
+// per tile-run, not added here. Unit-tested in test_vulkan_tile_plan.c.
+void dt_dev_pixelpipe_vk_tile_region(const dt_dev_vk_tile_plan_t *plan,
+                                     int tx, int ty, int image_w, int image_h,
+                                     int *ox, int *oy, int *ow, int *oh);
+
+// ME.1: assemble a processed tile into the full output. Copies the
+// ow x oh tile (row-packed, `bpp` bytes/px) into `out` (row stride
+// out_w px) at offset (ox,oy). Format-agnostic — `out` may be float or
+// 8-bit export pixels. Unit-tested in test_vulkan_tile_plan.c.
+void dt_dev_pixelpipe_vk_tile_blit(void *out, int out_w, const void *tile,
+                                   int ox, int oy, int ow, int oh, size_t bpp);
 #endif
 
 // helper function to pass a raster mask through a (so far) processed pipe

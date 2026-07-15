@@ -131,6 +131,49 @@ static void test_degenerate_not_tileable(void **state)
                                               0).tileable);
 }
 
+// The driver's addressing + assembly: the tile cores must tile the image
+// exactly (every pixel written once — no gaps, no overlap), and the blit
+// must place each tile at the right offset. Simulate the driver with an
+// identity "process" (extract the core from a reference) and assert a
+// bit-exact reconstruction.
+static void test_tiles_reconstruct_image(void **state)
+{
+  (void)state;
+  const int W = 1000, H = 700, ch = 4;
+  const size_t bpp = (size_t)ch * sizeof(float);
+  // small budget => several tiles
+  const dt_dev_vk_tile_plan_t p =
+      dt_dev_pixelpipe_plan_vk_tiles(W, H, bpp, 1.0f, 1.0f, 0, 1, (size_t)4u << 20);
+  assert_true(p.tileable);
+  assert_true(p.tiles_x * p.tiles_y >= 2);
+
+  float *ref = malloc((size_t)W * H * ch * sizeof(float));
+  float *out = calloc((size_t)W * H * ch, sizeof(float));
+  float *tile = malloc((size_t)p.tile_w * p.tile_h * ch * sizeof(float));
+  assert_non_null(ref); assert_non_null(out); assert_non_null(tile);
+  for(size_t i = 0; i < (size_t)W * H * ch; i++) ref[i] = (float)i * 0.5f - 3.0f;
+
+  long covered = 0;
+  for(int ty = 0; ty < p.tiles_y; ty++)
+    for(int tx = 0; tx < p.tiles_x; tx++)
+    {
+      int ox, oy, ow, oh;
+      dt_dev_pixelpipe_vk_tile_region(&p, tx, ty, W, H, &ox, &oy, &ow, &oh);
+      if(ow <= 0 || oh <= 0) continue;
+      // the pipe would produce the output for region (ox,oy,ow,oh); here
+      // identity-extract it from the reference into a packed tile buffer
+      for(int r = 0; r < oh; r++)
+        for(int c = 0; c < ow * ch; c++)
+          tile[(size_t)r * ow * ch + c] = ref[((size_t)(oy + r) * W + ox) * ch + c];
+      dt_dev_pixelpipe_vk_tile_blit(out, W, tile, ox, oy, ow, oh, bpp);
+      covered += (long)ow * oh;
+    }
+
+  assert_int_equal((int)covered, W * H);  // exact cover: no gaps, no overlap
+  assert_memory_equal(out, ref, (size_t)W * H * ch * sizeof(float));
+  free(ref); free(out); free(tile);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -140,6 +183,7 @@ int main(void)
     cmocka_unit_test(test_alignment_respected),
     cmocka_unit_test(test_overlap_covers_and_fits),
     cmocka_unit_test(test_degenerate_not_tileable),
+    cmocka_unit_test(test_tiles_reconstruct_image),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

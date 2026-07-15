@@ -526,6 +526,31 @@ dt_dev_vk_tile_plan_t dt_dev_pixelpipe_plan_vk_tiles(const int owidth,
   return plan;
 }
 
+void dt_dev_pixelpipe_vk_tile_region(const dt_dev_vk_tile_plan_t *plan,
+                                     const int tx, const int ty,
+                                     const int image_w, const int image_h,
+                                     int *ox, int *oy, int *ow, int *oh)
+{
+  const int x = tx * plan->tile_w;
+  const int y = ty * plan->tile_h;
+  *ox = x;
+  *oy = y;
+  *ow = MAX(0, MIN(plan->tile_w, image_w - x));
+  *oh = MAX(0, MIN(plan->tile_h, image_h - y));
+}
+
+void dt_dev_pixelpipe_vk_tile_blit(void *out, const int out_w, const void *tile,
+                                   const int ox, const int oy, const int ow,
+                                   const int oh, const size_t bpp)
+{
+  char *const o = (char *)out;
+  const char *const t = (const char *)tile;
+  for(int r = 0; r < oh; r++)
+    memcpy(o + ((size_t)(oy + r) * (size_t)out_w + ox) * bpp,
+           t + (size_t)r * (size_t)ow * bpp,
+           (size_t)ow * bpp);
+}
+
 // DAG budget gate (§5.2 / §5.10.1): graph capture keeps several full-image
 // trunk buffers resident at once — deferred frees, the §5.14 hand-off,
 // and deferred readbacks hold a working set the liveness sweep (§5.5)

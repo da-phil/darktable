@@ -1041,6 +1041,16 @@ back to OpenCL via the gate's third branch (§5.2 / #3).
 > (`factor 1`, no halo). Landing the driver flips the oversized branch
 > from *decline* to *tile*, and feeds the real per-pipe `factor`/`overlap`
 > accumulated from the pieces' `tiling_callback`.
+>
+> The driver's deterministic addressing is also landed and tested:
+> `dt_dev_pixelpipe_vk_tile_region()` (the non-overlapping output core for
+> a tile) and `dt_dev_pixelpipe_vk_tile_blit()` (place a processed tile
+> into the full output, format-agnostic). A round-trip test proves the
+> cores tile the image exactly — every pixel written once, no gaps or
+> overlap — and the blit places each tile correctly. What remains is the
+> hot-path *loop* that runs the pipe per tile and the `tiling_callback`
+> accumulation; that needs an end-to-end export to validate (ME.0 harness
+> or real hardware), so it lands next rather than untested here.
 
 ### 5.11 Error handling & the fallback ladder
 
