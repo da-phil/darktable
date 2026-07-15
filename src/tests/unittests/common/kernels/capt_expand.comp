@@ -1,0 +1,24 @@
+// GLSL twin used by test_vulkan_capture.c: a 1-channel -> 4-channel
+// format-conversion dispatch, the pattern the RAW segment hits at
+// demosaic (1f -> 4f). The input buffer is width*height floats, the
+// output width*height*4 — the capture HAL tracks byte sizes, not
+// element counts, so this must capture and replay like any other
+// dispatch. out.rgb = in + k scaled per channel, out.a = 1.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, set = 0, binding = 0) buffer InBuf  { float v[]; } inb;  // 1ch
+layout(std430, set = 0, binding = 1) buffer OutBuf { float v[]; } outb; // 4ch
+layout(push_constant) uniform PC { int width; int height; float k; } pc;
+
+void main()
+{
+  const uint x = gl_GlobalInvocationID.x;
+  const uint y = gl_GlobalInvocationID.y;
+  if(x >= uint(pc.width) || y >= uint(pc.height)) return;
+  const uint i = y * uint(pc.width) + x;
+  const float v = inb.v[i] + pc.k;
+  outb.v[4 * i + 0] = v;
+  outb.v[4 * i + 1] = v * 2.0;
+  outb.v[4 * i + 2] = v * 3.0;
+  outb.v[4 * i + 3] = 1.0;
+}

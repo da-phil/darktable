@@ -71,6 +71,7 @@ static gboolean s_have_device = FALSE;
 static dt_vk_module_kernel_t k_add = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t k_mul = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t k_lut = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t k_expand = DT_VK_MODULE_KERNEL_INIT; // 1ch -> 4ch
 
 static void _fill_input(float *buf)
 {
@@ -106,10 +107,12 @@ static int group_setup(void **state)
   const int p_add = dt_vulkan_load_program("capt_add", TEST_VK_KERNEL_DIR "/capt_add.spv");
   const int p_mul = dt_vulkan_load_program("capt_mul", TEST_VK_KERNEL_DIR "/capt_mul.spv");
   const int p_lut = dt_vulkan_load_program("capt_lut", TEST_VK_KERNEL_DIR "/capt_lut.spv");
+  const int p_exp = dt_vulkan_load_program("capt_expand", TEST_VK_KERNEL_DIR "/capt_expand.spv");
   dt_vulkan_module_kernel_create_from(&k_add, p_add, "main", 2, sizeof(pc_addmul_t), 8, 8, 1);
   dt_vulkan_module_kernel_create_from(&k_mul, p_mul, "main", 2, sizeof(pc_addmul_t), 8, 8, 1);
   dt_vulkan_module_kernel_create_from(&k_lut, p_lut, "main", 3, sizeof(pc_lut_t), 8, 8, 1);
-  if(k_add.kernel < 0 || k_mul.kernel < 0 || k_lut.kernel < 0)
+  dt_vulkan_module_kernel_create_from(&k_expand, p_exp, "main", 2, sizeof(pc_addmul_t), 8, 8, 1);
+  if(k_add.kernel < 0 || k_mul.kernel < 0 || k_lut.kernel < 0 || k_expand.kernel < 0)
   {
     fprintf(stderr, "test kernels failed to load — capture tests will be skipped\n");
     return 0;
@@ -648,6 +651,78 @@ static void test_gpu_tap_abort_and_rollback(void **state)
   free(in); free(tap_dst);
 }
 
+// Format conversion (§5.4): the RAW segment changes element size at
+// demosaic (1f -> 4f). A dispatch that reads a 1-channel buffer and
+// writes a 4-channel one, followed by a 4-channel dispatch, must
+// capture and replay bit-identically to eager — the capture HAL keys
+// on byte sizes, not element counts, so mixed-bpp chains need no
+// special handling.
+static void test_mixed_bpp_format_conversion(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  const size_t n1 = TN;               // 1-channel element count
+  const size_t b1 = n1 * sizeof(float);
+  const size_t b4 = 4 * b1;           // 4-channel buffer bytes
+
+  float *in = malloc(b1);
+  float *out_eager = malloc(b4), *out_capt = malloc(b4), *ref = malloc(b4);
+  assert_non_null(in); assert_non_null(out_eager);
+  assert_non_null(out_capt); assert_non_null(ref);
+  for(size_t i = 0; i < n1; i++) in[i] = 0.01f * (float)(i % 97) - 0.3f;
+
+  // reference: expand(+0.5) then add(+0.25) over the flat 4N floats
+  for(size_t i = 0; i < n1; i++)
+  {
+    const float v = in[i] + 0.5f;
+    ref[4*i+0] = v        + 0.25f;
+    ref[4*i+1] = v * 2.0f + 0.25f;
+    ref[4*i+2] = v * 3.0f + 0.25f;
+    ref[4*i+3] = 1.0f     + 0.25f;
+  }
+
+  const pc_addmul_t pc_exp = { TW, TH, 0.5f };
+  // add over the whole 4N-float buffer as a (4*TW)xTH grid
+  const pc_addmul_t pc_add = { 4 * TW, TH, 0.25f };
+
+  const int dev = dt_vulkan_lock_device();
+  assert_int_equal(dev, 0);
+  dt_vk_mem_t *s1 = dt_vulkan_alloc_buffer(dev, b1);   // 1ch source
+  dt_vk_mem_t *m4 = dt_vulkan_alloc_buffer(dev, b4);   // 4ch intermediate
+  dt_vk_mem_t *o4 = dt_vulkan_alloc_buffer(dev, b4);   // 4ch output
+  assert_non_null(s1); assert_non_null(m4); assert_non_null(o4);
+
+  // eager reference run
+  assert_int_equal(dt_vulkan_write_to_device(dev, s1, in, b1), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_expand, s1, m4, TW, TH, &pc_exp, sizeof(pc_exp)), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, m4, o4, 4 * TW, TH, &pc_add, sizeof(pc_add)), 0);
+  assert_int_equal(dt_vulkan_read_from_device(dev, out_eager, o4, b4), 0);
+
+  // captured run: same calls, one segment
+  const uint64_t s0 = dt_vulkan_submission_count(dev);
+  assert_true(dt_vulkan_capture_begin(dev));
+  assert_int_equal(dt_vulkan_write_to_device(dev, s1, in, b1), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_expand, s1, m4, TW, TH, &pc_exp, sizeof(pc_exp)), 0);
+  assert_int_equal(dt_vulkan_dispatch_inout(&k_add, m4, o4, 4 * TW, TH, &pc_add, sizeof(pc_add)), 0);
+  assert_int_equal(dt_vulkan_capture_pending(), 3);
+  assert_int_equal((int)(dt_vulkan_submission_count(dev) - s0), 0);
+  assert_int_equal(dt_vulkan_capture_end(dev), 0);
+  // the whole mixed-bpp span: exactly one submission
+  assert_int_equal((int)(dt_vulkan_submission_count(dev) - s0), 1);
+  assert_int_equal(dt_vulkan_read_from_device(dev, out_capt, o4, b4), 0);
+
+  assert_memory_equal(out_eager, out_capt, b4);
+  for(size_t i = 0; i < 4 * n1; i++)
+    assert_float_equal(out_capt[i], ref[i], 1e-5);
+
+  dt_vulkan_free_buffer(dev, s1);
+  dt_vulkan_free_buffer(dev, m4);
+  dt_vulkan_free_buffer(dev, o4);
+  dt_vulkan_unlock_device(dev);
+  free(in); free(out_eager); free(out_capt); free(ref);
+}
+
 // A second begin on the same thread must refuse (and report inactive
 // again once the first capture ends).
 static void test_nested_begin_refused(void **state)
@@ -679,6 +754,7 @@ int main(void)
     cmocka_unit_test(test_gpu_tap_deferred_readback),
     cmocka_unit_test(test_gpu_tap_survives_sync_flush),
     cmocka_unit_test(test_gpu_tap_abort_and_rollback),
+    cmocka_unit_test(test_mixed_bpp_format_conversion),
     cmocka_unit_test(test_nested_begin_refused),
   };
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

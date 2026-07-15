@@ -17,7 +17,7 @@ if(NOT GLSLANG_BIN)
 endif()
 
 set(_capt_spv)
-foreach(_k capt_add capt_mul capt_lut)
+foreach(_k capt_add capt_mul capt_lut capt_expand)
   add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${_k}.spv"
     COMMAND "${GLSLANG_BIN}" -V "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${_k}.comp"
