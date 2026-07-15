@@ -13,8 +13,10 @@ M3 started: the liveness peak-memory measurement is landed (the
 aliasing planner wants a real GPU). Both the eager per-module VK path
 and the graph span-capture path are now validated on real AMD hardware
 (RADV PHOENIX, §11): zero errors, and graph mode fuses ~90 % of GPU
-dispatch work into large single-submit spans, bounded only by the seven
-still-unported CPU-island modules. See §11 for the living
+dispatch work into large single-submit spans, bounded by the RAW/CFA
+front-end (chiefly the still-missing real demosaic kernels) and a few
+other CPU-island modules — a source audit (§11) sorts these into three
+structurally distinct buckets. See §11 for the living
 implementation log and §9 for per-milestone state. §1–§10 are the
 design and stay authoritative; deviations carry inline status notes.
 **Scope:** when Vulkan is available, run the whole pixelpipe on the GPU as
@@ -1099,9 +1101,13 @@ into 30 large spans**, the biggest 91 nodes / 76 dispatches in one
 submit — but not into a single end-to-end span, because the seven
 unported modules (`highlights`, `demosaic`, `toneequal`,
 `denoiseprofile`, `gamma`, `rawprepare`, `channelmixerrgb`) rolled back
-30× and broke the chain, exactly as the lavapipe run predicted. The
-Path-B port priority is now empirical: order those seven by rollback
-frequency. A caution the hardware added: the count-weighted view is
+30× and broke the chain, exactly as the lavapipe run predicted. A
+source audit of *why* each rolls back (§11, 2026-07-15) then showed the
+seven are three structurally different problems — the RAW/CFA front-end
+(led by the missing real demosaic kernels), two 4-channel gate-widenings,
+and two net-new ports — not the flat frequency-ordered list the count
+first suggested; the HAL substrate is not the blocker. A caution the
+hardware added: the count-weighted view is
 misleading — 70 % of *flushes* are trivial 2-node readback servers, so
 span health has to be read dispatch-weighted, not flush-weighted.
 
@@ -1225,6 +1231,68 @@ gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
 
+### 2026-07-15 — root-cause audit of the 30 rollbacks: three buckets, not a frequency list
+
+Follow-up to the graph-path entry below, which named the seven rollback
+modules and proposed porting them "in rollback-frequency order." A source
+audit of *why* each rolls back shows that ordering is a **count artifact**
+and the seven are structurally three different problems. No code change —
+this corrects the priority framing (and Task #21) to match the code.
+
+- **Rollback frequency measures how often a module runs, not how hard it is
+  to port or what blocks it.** The RAW front-end modules run once per pipe
+  (their mask/preview variants add counts), so they top the count; that says
+  nothing about the port. Read structurally instead.
+
+- **Bucket A — the RAW/CFA front-end (1-channel mosaic domain):
+  `rawprepare`, `highlights`, `demosaic`.** These run before demosaic emits
+  RGBA, on single-channel CFA data. Crucially this is **not** a HAL/substrate
+  limit:
+  - the capture HAL already records 1-channel and 1ch→4ch nodes — the
+    `capt_expand` test (Task #20) is literally a "demosaic (1f → 4f)" node
+    (`src/tests/unittests/common/kernels/capt_expand.comp`); and
+  - `temperature`/whitebalance already runs mosaic on VK in production
+    (`vk_1f` / `vk_1f_xtrans`, single-channel float buffers,
+    `src/iop/temperature.c:696`), sitting *inside* the front-end but
+    islanded because its neighbours roll back.
+
+  The island therefore comes from module-level choices, not the graph core:
+  `rawprepare` (`src/iop/rawprepare.c:805`) and `highlights`
+  (`src/iop/highlights.c:1088`) gate their `process_vk` OFF for
+  `dsc.filters` (mosaic) — feasible to widen, temperature is the template —
+  and `demosaic` (`src/iop/demosaic.c:1284`, `:1293`) ships only
+  passthrough/mono kernels at full scale, bailing `"bayer/xtrans method not
+  ported"` / `"zoom path not ported"` for every colour RAW and every
+  reduced-scale (darkroom-preview / thumbnail) pass. The **real demosaic
+  algorithm kernels are the single largest missing piece** and the
+  highest-payoff lever: they un-island the whole `rawprepare → temperature →
+  highlights → demosaic → …` front-end into one span.
+
+- **Bucket B — 4-channel modules with narrow gates: `channelmixerrgb`,
+  `denoiseprofile`.** Post-demosaic RGBA, close to portable.
+  `channelmixerrgb` (`src/iop/channelmixerrgb.c:3330`, `:3346`) only rolls
+  back when the needed adaptation `.spv` didn't load (glslang-only builds
+  keep just linear-Bradford) or `colors != 4` — a **build-config** artifact
+  a full clspv build removes with *zero code change*. `denoiseprofile`
+  (`src/iop/denoiseprofile.c:2892`–`:2905`) supports wavelets + RGB +
+  new-VST and bails NLM / Y0U0V0 / legacy-VST — a genuine mode-gate to widen.
+
+- **Bucket C — no GPU path at all: `gamma`, `toneequal`.** Both have no
+  `process_cl` (hence no `process_vk`); never GPU-ported by any effort.
+  `gamma` is the trivial final 8-bit display encode; `toneequal` is a
+  guided-filter module. These are net-new GPU ports unrelated to the DAG
+  substrate, and the lowest DAG priority.
+
+- **Corrected lever order (by span-merge payoff, not count):** (1) demosaic
+  real-algorithm kernels — biggest single merge, largest effort, needs real
+  GPU; (2) `rawprepare` + `highlights` mosaic gate-widening — cheap given
+  temperature's template, but only pays once demosaic-VK exists (else the
+  span still breaks at demosaic), so sequenced after (1); (3)
+  `denoiseprofile` mode-gate widening — independent 4-channel win; (4)
+  `channelmixerrgb` — free on a clspv build, no code; (5) `gamma` /
+  `toneequal` — separate net-new GPU ports, lowest priority. Task #21
+  rewritten to this; Task #22 added for the demosaic kernels.
+
 ### 2026-07-15 — graph path validated on AMD RADV; the "short spans" read corrected
 
 The re-run the eager entry asked for: same build (`g3056c0b`,
@@ -1264,7 +1332,9 @@ no code change (the log revealed no bug).
   is why 90 % of the work fuses but not into a single end-to-end span.
   This is §8.1's "CPU islands bound span length" finding, now confirmed
   on silicon and with the offending modules enumerated: they are the
-  Path-B port targets, in priority order by rollback frequency.
+  Path-B port targets. (Priority correction: the audit entry above shows
+  rollback frequency is a count artifact, not the port order — the real
+  order is payoff-ranked across three buckets.)
 - **No `peak-live` data.** Build `g3056c0b` predates the liveness commit
   (`3c5c4af`); 0 peak-live lines, as expected. M3 measurement wants a
   build at `c158eb8`+.
