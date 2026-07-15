@@ -7,6 +7,16 @@
 # on hosts without clspv. At runtime the tests skip cleanly when no
 # Vulkan device (e.g. lavapipe) is available.
 
+# ME.1/ME.2 (§5.10.1): the whole-pipe output-tiling planner is pure
+# geometry — no kernels, no Vulkan device — so it builds and runs without
+# the glslang toolchain gated below.
+add_cmocka_test(test_vulkan_tile_plan
+                SOURCES test_vulkan_tile_plan.c
+                LINK_LIBRARIES lib_darktable cmocka)
+if(WIN32)
+    _copy_required_library(test_vulkan_tile_plan lib_darktable)
+endif(WIN32)
+
 find_program(GLSLANG_BIN glslangValidator)
 
 if(NOT GLSLANG_BIN)

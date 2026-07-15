@@ -445,41 +445,128 @@ size_t dt_get_available_pipe_mem(const dt_dev_pixelpipe_t *pipe)
 }
 
 #ifdef HAVE_VULKAN
-// DAG budget gate (gpu_resident_pixelpipe_dag.md §5.2 / §5.10 fallback
-// #3): graph capture keeps several full-image trunk buffers resident at
-// once — deferred frees, the §5.14 hand-off, and deferred readbacks
-// together hold a working set the liveness sweep (§5.5) measured at ~2x
-// a single trunk buffer, plus the upload snapshot ring — and, unlike the
-// OpenCL path, it cannot tile. On an integrated GPU that resident set
-// comes out of system RAM, so an unbounded span at full-res export can
-// exhaust memory and thrash the machine. The §5.2 gate always meant to
-// carry a "predicted arena vs budget" term (§5.10 fallback #3); this is
-// its first implementation. Bound graph mode to runs whose trunk buffer
-// still fits darktable's single-buffer budget: the same threshold the
-// OpenCL tiler uses to decide a buffer is too big to hold whole. If a
-// single buffer already needs tiling, a span that holds several of them
-// without tiling cannot be safe. Oversized runs (notably full-res
-// export) keep the eager per-module path, which reads back and frees
-// each module's buffers before the next and so never accumulates a span.
+// ME.1/ME.2 (gpu_resident_pixelpipe_dag.md §5.10.1): plan whole-pipe
+// output tiling for a graph export. Pure geometry mirroring the OpenCL
+// tiler (`_default_process_tiling_cl_roi`, tiling.c) for the whole-pipe
+// case: shrink the tile until the span's live set fits `budget`, square
+// it if the halo would dominate a thin tile, apply the module alignment,
+// then derive the tile grid. Declared in pixelpipe_hb.h for unit testing
+// (test_vulkan_tile_plan.c); no side effects, no logging.
+dt_dev_vk_tile_plan_t dt_dev_pixelpipe_plan_vk_tiles(const int owidth,
+                                                     const int oheight,
+                                                     const size_t bpp,
+                                                     const float factor_in,
+                                                     const float maxbuf_in,
+                                                     const int overlap_in,
+                                                     unsigned int align,
+                                                     const size_t budget)
+{
+  dt_dev_vk_tile_plan_t plan = { 1, 1, owidth, oheight, 0, TRUE };
+  if(owidth <= 0 || oheight <= 0 || bpp == 0 || budget == 0)
+  {
+    plan.tileable = FALSE;
+    return plan;
+  }
+  if(align == 0) align = 1;
+
+  const float factor = fmaxf(factor_in, 1.0f);
+  const float maxbuf = fmaxf(maxbuf_in, 1.0f);
+  const float ceil_bytes = (float)budget;  // per-tile memory ceiling
+
+  int width = owidth, height = oheight;
+
+  // Shrink the tile until factor*maxbuf*bpp*w*h fits the budget, keeping
+  // aspect where a single-axis cut suffices (same policy as the CL tiler).
+  if((float)width * height * (float)bpp * factor * maxbuf > ceil_bytes)
+  {
+    const float scale =
+        ceil_bytes / ((float)width * height * (float)bpp * factor * maxbuf);
+    if(width < height && scale >= 0.333f)       height = (int)floorf(height * scale);
+    else if(height <= width && scale >= 0.333f) width  = (int)floorf(width * scale);
+    else
+    {
+      width  = (int)floorf(width  * sqrtf(scale));
+      height = (int)floorf(height * sqrtf(scale));
+    }
+  }
+
+  // If the halo would dominate a thin tile, fall back to square tiles.
+  if(3 * overlap_in > width || 3 * overlap_in > height)
+    width = height = (int)floorf(sqrtf((float)width * (float)height));
+
+  // Alignment: only constrain an axis we actually tile.
+  if(width  < owidth)  width  = MAX((int)align, (width  / (int)align) * (int)align);
+  if(height < oheight) height = MAX((int)align, (height / (int)align) * (int)align);
+
+  // Overlap rounded up to the alignment.
+  const int overlap = (overlap_in % (int)align != 0)
+                          ? (overlap_in / (int)align + 1) * (int)align
+                          : overlap_in;
+
+  const int tile_wd = width  - 2 * overlap > 0 ? width  - 2 * overlap : 1;
+  const int tile_ht = height - 2 * overlap > 0 ? height - 2 * overlap : 1;
+
+  const int tiles_x = width  < owidth  ? (int)ceilf(owidth  / (float)tile_wd) : 1;
+  const int tiles_y = height < oheight ? (int)ceilf(oheight / (float)tile_ht) : 1;
+
+  // Runaway tile count (overlap ate the tile) => not tileable; the caller
+  // declines to OpenCL. 10000 matches the CL tiler's sane cap.
+  if((long long)tiles_x * tiles_y > 10000)
+  {
+    plan.tileable = FALSE;
+    return plan;
+  }
+
+  plan.tiles_x  = tiles_x;
+  plan.tiles_y  = tiles_y;
+  plan.tile_w   = tile_wd;
+  plan.tile_h   = tile_ht;
+  plan.overlap  = overlap;
+  plan.tileable = TRUE;
+  return plan;
+}
+
+// DAG budget gate (§5.2 / §5.10.1): graph capture keeps several full-image
+// trunk buffers resident at once — deferred frees, the §5.14 hand-off,
+// and deferred readbacks hold a working set the liveness sweep (§5.5)
+// measured at ~2x a single trunk buffer, plus the upload ring — and,
+// unlike the OpenCL path, it cannot tile. On an integrated GPU that
+// resident set is system RAM, so an unbounded span at full-res export can
+// exhaust memory and thrash the machine. The gate plans the run as graph
+// tiles: a run that fits the single-buffer budget as one span keeps graph
+// mode; an oversized run is (for now) declined to the eager/OpenCL path.
 static gboolean _vk_graph_fits_budget(const dt_iop_roi_t *roi_out)
 {
   if(!roi_out || roi_out->width <= 0 || roi_out->height <= 0) return FALSE;
-  // 4-channel float is the widest common trunk buffer; use it as the
-  // per-buffer estimate. Intermediate buffers run at the processing
-  // scale, which for export equals this output scale.
+  const size_t budget = dt_get_singlebuffer_mem();
+  // factor/maxbuf/overlap/align are the single-span first cut (factor 1,
+  // no halo) until the ME.1 whole-pipe tiling *driver* accumulates the
+  // real requirements from each piece's tiling_callback. This keeps
+  // today's gate behaviour exactly — fits -> one span; oversized ->
+  // decline — while the tile-plan machinery lands and is unit-tested.
+  // When the driver lands, the tiles>1 branch runs the plan (with the real
+  // factor/overlap) instead of declining.
+  const dt_dev_vk_tile_plan_t plan = dt_dev_pixelpipe_plan_vk_tiles(
+      roi_out->width, roi_out->height, 4 * sizeof(float), 1.0f, 1.0f, 0, 1, budget);
+
+  if(plan.tileable && plan.tiles_x == 1 && plan.tiles_y == 1)
+    return TRUE;  // fits as a single span — today's fast path
+
   const uint64_t trunk =
       (uint64_t)roi_out->width * (uint64_t)roi_out->height * 4 * sizeof(float);
-  const uint64_t budget = dt_get_singlebuffer_mem();
-  if(trunk > budget)
-  {
+  if(plan.tileable)
     dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VKGRAPH,
-             "[vkgraph] graph capture declined: trunk ~%.0f MB > single-buffer"
-             " budget %.0f MB (a span holds several, no tiling) — using eager"
-             " per-module path",
+             "[vkgraph] graph declined: trunk ~%.0f MB > single-buffer budget"
+             " %.0f MB; would tile %dx%d (core %dx%d) — ME.1 driver pending,"
+             " using eager/OpenCL",
+             1e-6 * (double)trunk, 1e-6 * (double)budget,
+             plan.tiles_x, plan.tiles_y, plan.tile_w, plan.tile_h);
+  else
+    dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VKGRAPH,
+             "[vkgraph] graph declined: trunk ~%.0f MB > budget %.0f MB and not"
+             " tileable — using eager/OpenCL",
              1e-6 * (double)trunk, 1e-6 * (double)budget);
-    return FALSE;
-  }
-  return TRUE;
+  return FALSE;
 }
 #endif
 

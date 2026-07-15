@@ -1026,6 +1026,22 @@ tiled cost OpenCL pays, coarser-grained; large tiles keep the overlap
 fraction small. Pathological Σoverlap (deep neighbourhood stacks) falls
 back to OpenCL via the gate's third branch (§5.2 / #3).
 
+> **Status (ME.2 planner landed).** The grid geometry is implemented as
+> the pure function `dt_dev_pixelpipe_plan_vk_tiles()`
+> (`pixelpipe_hb.c`, declared in `pixelpipe_hb.h`) — a faithful port of
+> the CL tiler's shrink/square/align/grid math to the whole-pipe case,
+> returning a `dt_dev_vk_tile_plan_t` (grid, per-tile core, aligned halo,
+> or `tileable = FALSE` → decline). Unit-tested in
+> `test_vulkan_tile_plan.c` (6 cases incl. the field 865 MB→385 MB export:
+> tiles cover the image and each fits budget). The §5.2 gate
+> (`_vk_graph_fits_budget`) now routes through it; behaviour is unchanged
+> for now (single-span → graph; oversized → decline) because the **ME.1
+> driver** that actually runs the pipe per tile and assembles the output
+> is not landed yet, and the gate still passes the single-span first cut
+> (`factor 1`, no halo). Landing the driver flips the oversized branch
+> from *decline* to *tile*, and feeds the real per-pipe `factor`/`overlap`
+> accumulated from the pieces' `tiling_callback`.
+
 ### 5.11 Error handling & the fallback ladder
 
 Mirrors the existing OpenCL discipline (`pipe->opencl_error` → restart
@@ -1345,6 +1361,24 @@ Living section, newest first. Every landing that touches the design
 gets an entry here; where the implementation deviates from the
 proposal, the affected section carries an inline **status note** and
 the rationale lives here. Keep this in lockstep with the code.
+
+### 2026-07-15 — ME.2 landed: the whole-pipe tile planner (pure geometry, unit-tested)
+
+First implementation increment of the `ME` export plan. Added
+`dt_dev_pixelpipe_plan_vk_tiles()` — a pure port of the OpenCL tiler's
+grid math (`_default_process_tiling_cl_roi`) to the whole-pipe case:
+shrink the tile until the span's live set fits the budget, square it if
+the halo would dominate, apply alignment, derive the tile grid; returns
+`dt_dev_vk_tile_plan_t` or `tileable = FALSE`. The §5.2 budget gate now
+routes through it. **Behaviour-preserving on purpose:** the gate still
+returns single-span → graph, oversized → decline, because the ME.1
+*driver* (run pipe per tile + assemble) is not landed; this increment is
+the geometry + its test, so the driver builds on a verified planner.
+Unit test `test_vulkan_tile_plan.c` (6 cases, no device needed — pure
+math): single-span fit, the field 865 MB→385 MB export split (tiles
+cover the image and each fits budget), factor-forces-tiles, alignment,
+haloed coverage, degenerate inputs. `pixelpipe.c.o` + `libdarktable.so`
+compile/link clean; all 6 tests pass. Next: ME.1 driver.
 
 ### 2026-07-15 — plan set: GPU-resident export (`ME`) is the priority
 

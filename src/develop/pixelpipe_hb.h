@@ -472,6 +472,31 @@ static inline void dt_pipe_vk_fallback(dt_dev_pixelpipe_iop_t *piece,
 {
   if(piece && piece->pipe) piece->pipe->vk_fallback_reason = reason;
 }
+
+// ME.1/ME.2 (gpu_resident_pixelpipe_dag.md §5.10.1): whole-pipe output
+// tiling plan for graph-mode export. A run that will not fit the §5.2
+// budget as one span can be split into tile-sized spans instead of
+// declining to OpenCL. This struct is the geometry of that split.
+typedef struct dt_dev_vk_tile_plan_t
+{
+  int      tiles_x, tiles_y;  // grid; 1x1 == single span, no tiling
+  int      tile_w, tile_h;    // per-tile *core* size (halo excluded)
+  int      overlap;           // aligned halo per side
+  gboolean tileable;          // FALSE => no usable tile; decline to OpenCL
+} dt_dev_vk_tile_plan_t;
+
+// Plan the tile grid for an output of width x height at `bpp` bytes/px.
+// `factor` is the span's peak live-set as a multiple of one trunk buffer
+// (§5.5 liveness), `maxbuf`/`overlap`/`align` the accumulated whole-pipe
+// requirements, `budget` the per-tile memory ceiling (e.g.
+// dt_get_singlebuffer_mem()). Pure geometry — mirrors the OpenCL tiler's
+// grid math (_default_process_tiling_cl_roi); no side effects, no
+// logging. Unit-tested in test_vulkan_tile_plan.c.
+dt_dev_vk_tile_plan_t dt_dev_pixelpipe_plan_vk_tiles(int width, int height,
+                                                     size_t bpp, float factor,
+                                                     float maxbuf, int overlap,
+                                                     unsigned int align,
+                                                     size_t budget);
 #endif
 
 // helper function to pass a raster mask through a (so far) processed pipe
