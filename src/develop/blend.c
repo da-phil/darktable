@@ -1440,11 +1440,24 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
   if(!dt_vulkan_running()) return FALSE;
 
   // ---- subset gate ----------------------------------------------------
-  // uniform mask only: plain global opacity, no drawn/parametric/raster
-  // mask and none of their post ops (feather/blur/tone curve act on
-  // non-uniform masks only, matching the `uniform` shortcut the CPU
-  // and CL paths take)
-  if(d->mask_mode != DEVELOP_MASK_ENABLED) return FALSE;
+  // Two mask cases run on device (ME.4): (1) uniform mask — plain global
+  // opacity; (2) the simplest drawn mask — a drawn shape with no
+  // parametric condition, no raster, no post ops (feather/blur/tone
+  // curve) and no detail refine. Those are exactly the masks whose build
+  // reads no pixel data (blendif_*_make_mask's non-conditional branch is
+  // pixel-free, e.g. blendif_lab.c:223), so the mask can be built on the
+  // host from geometry and uploaded. Everything else — parametric,
+  // feathered, raster, or a drawn mask feeding a raster consumer — stays
+  // on the CPU path.
+  _develop_mask_post_processing _post_ops[3];
+  const gboolean _uniform_mask = (d->mask_mode == DEVELOP_MASK_ENABLED);
+  const gboolean _drawn_mask =
+      d->mask_mode == (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK)
+      && d->details == 0
+      && _get_post_operations(d, piece, _post_ops) == 0
+      && !(self->flags() & IOP_FLAGS_NO_MASKS)
+      && !dt_iop_piece_is_raster_mask_used(piece, BLEND_RASTER_ID);
+  if(!_uniform_mask && !_drawn_mask) return FALSE;
   // 4-channel float buffers only (RAW 1ch blending stays CPU/CL)
   if(piece->colors != 4) return FALSE;
 
@@ -1531,12 +1544,51 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
     : NULL;
   ok = ok && dev_mask;
 
-  if(ok)
+  if(ok && _uniform_mask)
   {
     const _vk_setmask_pc_t mpc = { owidth, oheight, opacity };
     ok = dt_vulkan_dispatch_n(&_vk_blend_set_mask,
                               (dt_vk_mem_t *[]){ dev_mask }, 1,
                               owidth, oheight, &mpc, sizeof(mpc)) == 0;
+  }
+  else if(ok)  // _drawn_mask
+  {
+    // Build the drawn mask on the host from geometry (no pixel data),
+    // mirroring the CPU path exactly — the drawn branch (render form or
+    // fill) then the non-conditional opacity/inverse-combine of
+    // blendif_*_make_mask (blendif_lab.c:223-234) — and upload it in
+    // place of the constant fill. This keeps a drawn-masked module in the
+    // graph span instead of forcing the CPU blend and its readback.
+    const size_t n = (size_t)owidth * oheight;
+    float *host_mask = dt_alloc_align_float(n);
+    ok = host_mask != NULL;
+    if(ok)
+    {
+      const gboolean inverted = (d->mask_combine & DEVELOP_COMBINE_MASKS_POS);
+      dt_masks_form_t *form = dt_masks_get_from_id_ext(piece->pipe->forms, d->mask_id);
+      gboolean built = TRUE;
+      if(form)
+      {
+        built = dt_masks_group_render_roi(self, piece, form, roi_out, host_mask);
+        if(built && inverted) dt_iop_image_invert(host_mask, 1.0f, owidth, oheight, 1);
+      }
+      else
+      {
+        // drawn mask enabled but no form defined: constant, as the CPU path
+        dt_iop_image_fill(host_mask, inverted ? 0.0f : 1.0f, owidth, oheight, 1);
+      }
+      if(built)
+      {
+        // global opacity + inverse combine (DEVELOP_COMBINE_INV), pixel-free
+        if(d->mask_combine & DEVELOP_COMBINE_INV)
+          for(size_t i = 0; i < n; i++) host_mask[i] = opacity * (1.0f - host_mask[i]);
+        else
+          for(size_t i = 0; i < n; i++) host_mask[i] *= opacity;
+      }
+      ok = built
+           && dt_vulkan_write_to_device(0, dev_mask, host_mask, sizeof(float) * n) == 0;
+      dt_free_align(host_mask);
+    }
   }
   if(ok)
   {

@@ -1349,8 +1349,21 @@ the capture executor is unchanged.
   `DEVELOP_MASK_CONDITIONAL` nor feathering is present, build the mask on
   host with NULL pixel pointers, and upload it in place of the constant
   fill. Parametric masks and feathered masks stay on the CPU path until
-  (b). The refactor touches the critical CPU blend path and has no
-  unit-test net here, so it wants a focused pass, not a rushed one.
+  (b). ✅ **(a) landed (drawn masks):** `dt_develop_blend_process_vk`
+  (`blend.c`) now accepts `DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK` when
+  there is no parametric condition, no detail refine, no post-op
+  (feather/blur/tone-curve, via `_get_post_operations`), and the mask
+  isn't consumed as a raster elsewhere. It builds the mask on the host
+  (render the form via `dt_masks_group_render_roi`, or fill when no form,
+  then the pixel-free opacity + inverse-combine that mirrors
+  `blendif_lab.c:223-234` exactly) and uploads it in place of the constant
+  fill. To avoid touching the critical CPU path with no test net, this is
+  a *conservative inline* build in the VK function — not the CPU-path
+  refactor — so the two stay independent and the VK-vs-CPU comparison
+  actually validates the build. Tested: `test_process_vk_drawn_mask`
+  (accepted + correct) and `test_process_vk_subset_gates` (parametric and
+  drawn-with-post-op still refuse). Raster masks and a varying-form
+  render test are the next small follow-ups; parametric stays for (b).
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈

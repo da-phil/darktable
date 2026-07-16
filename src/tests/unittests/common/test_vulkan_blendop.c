@@ -799,6 +799,10 @@ static void test_roi_offsets(void **state)
 
 static void _free_align_notify(gpointer p) { dt_free_align(p); }
 
+// the scaffolded module reports blending support (and crucially not
+// IOP_FLAGS_NO_MASKS), which the ME.4 drawn-mask gate queries
+static int _blendtest_flags(void) { return IOP_FLAGS_SUPPORTS_BLENDING; }
+
 typedef struct blend_scaffold_t
 {
   dt_dev_pixelpipe_t pipe;
@@ -815,6 +819,7 @@ static void scaffold_init(blend_scaffold_t *s,
   s->pipe.mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;
   s->pipe.store_all_raster_masks = FALSE;
   g_strlcpy(s->module.op, "blendtest", sizeof(s->module.op));
+  s->module.flags = _blendtest_flags;
   s->module.raster_mask.source.users = g_hash_table_new(g_direct_hash, g_direct_equal);
   s->piece.pipe = &s->pipe;
   s->piece.module = &s->module;
@@ -874,6 +879,66 @@ static void test_process_vk_uniform_blend(void **state)
 
   assert_int_equal(rc, 0);
   assert_true(blended);
+  for(size_t i = 0; i < TN; i++)
+  {
+    const v4 r = ref_blend_jzczhz(a[i], b[i], 0.6f, 0x18, 1.0f, 0);
+    assert_float_equal(out[i].x, r.x, 1e-6);
+    assert_float_equal(out[i].y, r.y, 1e-6);
+    assert_float_equal(out[i].z, r.z, 1e-6);
+    assert_float_equal(out[i].w, r.w, 1e-6);
+  }
+
+  scaffold_cleanup(&sc);
+  free(a); free(b); free(out);
+}
+
+// ME.4: a drawn mask (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK) now runs
+// on device instead of forcing the CPU blend. With no form defined the
+// build fills 1.0 and applies the global opacity, so the result must
+// equal a uniform blend at that opacity — this exercises the new gate,
+// the host mask build, the upload and the apply end to end. (A varying
+// drawn form reaches the same code path; its per-pixel correctness is
+// covered by test_per_pixel_mask + the reused dt_masks build.)
+static void test_process_vk_drawn_mask(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  blend_scaffold_t sc;
+  scaffold_init(&sc, DEVELOP_BLEND_CS_RGB_SCENE, 0x18 /*NORMAL2*/, 60.0f);
+  sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK; // drawn
+
+  s_rng = 0x1234;
+  v4 *a = malloc(TN * sizeof(v4)), *b = malloc(TN * sizeof(v4)), *out = malloc(TN * sizeof(v4));
+  assert_non_null(a); assert_non_null(b); assert_non_null(out);
+  fill_rgb(a, TN); fill_rgb(b, TN);
+
+  const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
+
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  gboolean blended = FALSE;
+  dt_vk_mem_t *da = NULL, *db = NULL;
+  if(!rc)
+  {
+    da = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    db = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    if(!da || !db) rc = -101;
+  }
+  if(!rc) rc = dt_vulkan_write_to_device(dev, da, a, TN * sizeof(v4));
+  if(!rc) rc = dt_vulkan_write_to_device(dev, db, b, TN * sizeof(v4));
+  if(!rc)
+  {
+    blended = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
+                                          &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
+    if(blended) rc = dt_vulkan_read_from_device(dev, out, db, TN * sizeof(v4));
+  }
+  if(da) dt_vulkan_free_buffer(dev, da);
+  if(db) dt_vulkan_free_buffer(dev, db);
+  if(dev == 0) dt_vulkan_unlock_device(dev);
+
+  assert_int_equal(rc, 0);
+  assert_true(blended);  // the drawn mask was accepted and ran on device
   for(size_t i = 0; i < TN; i++)
   {
     const v4 r = ref_blend_jzczhz(a[i], b[i], 0.6f, 0x18, 1.0f, 0);
@@ -1033,6 +1098,7 @@ static void test_process_vk_subset_gates(void **state)
   const int dev = dt_vulkan_lock_device();
   int rc = (dev == 0) ? 0 : -100;
   gboolean gate_mask = TRUE, gate_cs = TRUE, gate_raw = TRUE, gate_ch = TRUE;
+  gboolean gate_drawn_postop = TRUE;
   dt_vk_mem_t *da = NULL, *db = NULL;
   if(!rc)
   {
@@ -1044,11 +1110,22 @@ static void test_process_vk_subset_gates(void **state)
   {
     blend_scaffold_t sc;
 
-    // drawn/parametric masks are out of the M0 subset
+    // parametric masks still refuse: their build reads pixel data (the
+    // device blendif port is future work). Drawn masks are now accepted
+    // on device — see test_process_vk_drawn_mask.
     scaffold_init(&sc, DEVELOP_BLEND_CS_RGB_SCENE, 0x18, 60.0f);
-    sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
     gate_mask = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
                                             &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
+    scaffold_cleanup(&sc);
+
+    // a drawn mask with a post-op (blur) still refuses — the on-device
+    // build only covers the pixel-free, post-op-free case
+    scaffold_init(&sc, DEVELOP_BLEND_CS_RGB_SCENE, 0x18, 60.0f);
+    sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    sc.params.blur_radius = 5.0f;
+    gate_drawn_postop = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
+                                                    &roi, &roi, IOP_CS_RGB, IOP_CS_RGB, NULL);
     scaffold_cleanup(&sc);
 
     // colorspace mismatch WITHOUT a work profile: the M2 glue
@@ -1077,7 +1154,8 @@ static void test_process_vk_subset_gates(void **state)
   if(dev == 0) dt_vulkan_unlock_device(dev);
 
   assert_int_equal(rc, 0);
-  assert_false(gate_mask);
+  assert_false(gate_mask);          // parametric refused
+  assert_false(gate_drawn_postop);  // drawn + post-op refused
   assert_false(gate_cs);
   assert_false(gate_raw);
   assert_false(gate_ch);
@@ -1093,6 +1171,7 @@ int main(void)
     cmocka_unit_test(test_per_pixel_mask),
     cmocka_unit_test(test_roi_offsets),
     cmocka_unit_test(test_process_vk_uniform_blend),
+    cmocka_unit_test(test_process_vk_drawn_mask),
     cmocka_unit_test(test_process_vk_blend_glue_rgb_to_lab),
     cmocka_unit_test(test_process_vk_blend_glue_lab_to_rgb),
     cmocka_unit_test(test_process_vk_subset_gates),
