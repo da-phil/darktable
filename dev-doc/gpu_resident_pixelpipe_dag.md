@@ -1336,6 +1336,21 @@ the capture executor is unchanged.
   the CPU reference (`test_vulkan_blendop.c::test_per_pixel_mask`, on
   lavapipe) — so all that (a) adds is the gate relax + uploading the
   CPU-built mask instead of the constant fill.
+  **Mechanics of (a), from the source:** the CPU mask build applies the
+  global opacity as a plain `mask *= opacity` and — crucially — reads no
+  pixel data when no parametric condition is set (`blendif_lab.c:223`,
+  `:234`). So the whole build (`dt_masks_group_render_roi` → opacity →
+  blur/tone-curve post-ops) is pixel-free for a drawn/raster mask
+  *without* parametric conditions *and without feathering* (feather is
+  the only post-op that needs the guide image). The safe first slice is
+  therefore: factor the CPU build (`blend.c` ~585–720) into a reusable
+  `_develop_build_blend_mask()`, relax the `:1447` gate to also accept
+  `DEVELOP_MASK_MASK`/`DEVELOP_MASK_RASTER` when neither
+  `DEVELOP_MASK_CONDITIONAL` nor feathering is present, build the mask on
+  host with NULL pixel pointers, and upload it in place of the constant
+  fill. Parametric masks and feathered masks stay on the CPU path until
+  (b). The refactor touches the critical CPU blend path and has no
+  unit-test net here, so it wants a focused pass, not a rushed one.
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈
