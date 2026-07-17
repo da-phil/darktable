@@ -1378,10 +1378,20 @@ the capture executor is unchanged.
   keeps make_mask's early decisions — non-conditional → opacity fill;
   canceling-channel or no-active-channel → uniform fill — and only
   dispatches the kernel for the true per-pixel branch (`any_active &&
-  !canceling`). Remaining for (b): wire the kernel into
-  `dt_develop_blend_process_vk` with that host split (feathered masks
-  still stay CPU — they need the guide image on device), and the RGB-HSL
-  / RGB-scene twins (more channels: gray/R/G/B + H,S,L or Jz,Cz,hz).
+  !canceling`). ✅ **(b) wired for Lab:** `dt_develop_blend_process_vk`
+  now accepts a parametric-only Lab mask (`DEVELOP_MASK_ENABLED |
+  DEVELOP_MASK_CONDITIONAL`, `blend_cst == LAB`, no post-op/detail/raster),
+  applies make_mask's early split on the host (non-active/canceling →
+  uniform fill via `blendop_set_mask`; else dispatch
+  `blendop_parametric_lab` against the blend-space `in_b`/`out_b` with a
+  `INCL ? 0 : 1` base and the processed params), then the existing apply
+  blends. `test_process_vk_param_blend` runs a parametric-masked module
+  through the whole function and matches the CPU (make_mask + per-pixel
+  blend) end to end; `test_process_vk_subset_gates` confirms RGB-space
+  parametric still refuses. Remaining for (b): the RGB-HSL / RGB-scene
+  kernel twins (more channels: gray/R/G/B + H,S,L or Jz,Cz,hz), and
+  drawn+parametric combos; feathered masks stay CPU (they need the guide
+  image on device).
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈

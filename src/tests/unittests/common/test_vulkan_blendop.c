@@ -1289,6 +1289,77 @@ static void test_param_lab_mask(void **state)
                                   stops, 0.5f, DEVELOP_COMBINE_INV, 80.0f);
 }
 
+// ME.4b end-to-end: a parametric-masked module blends on device.
+// dt_develop_blend_process_vk must accept the parametric Lab mask,
+// evaluate it on device, and produce the same blended output as the CPU
+// (make_mask then per-pixel blend).
+static void test_process_vk_param_blend(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+
+  blend_scaffold_t sc;
+  scaffold_init(&sc, DEVELOP_BLEND_CS_LAB, 0x18 /*NORMAL2*/, 70.0f);
+  sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  sc.params.blendif = (1u << DEVELOP_BLENDIF_L_in) | (1u << DEVELOP_BLENDIF_B_out);
+  const float stops[4] = { 0.15f, 0.35f, 0.6f, 0.85f };
+  for(int ch = 0; ch < DEVELOP_BLENDIF_SIZE; ch++)
+    if(sc.params.blendif & (1u << ch))
+      for(int k = 0; k < 4; k++) sc.params.blendif_parameters[ch * 4 + k] = stops[k];
+
+  s_rng = 0x77;
+  v4 *a = malloc(TN * sizeof(v4)), *b = malloc(TN * sizeof(v4)), *out = malloc(TN * sizeof(v4));
+  assert_non_null(a); assert_non_null(b); assert_non_null(out);
+  fill_lab(a, TN); fill_lab(b, TN);
+
+  const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
+
+  // CPU reference mask (conditional-only, non-inclusive => base 1.0)
+  float *mask = malloc(TN * sizeof(float));
+  assert_non_null(mask);
+  for(size_t i = 0; i < TN; i++) mask[i] = 1.0f;
+  dt_develop_blendif_lab_make_mask(&sc.piece, (const float *)a, (const float *)b,
+                                   &roi, &roi, mask);
+
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  gboolean blended = FALSE;
+  dt_vk_mem_t *da = NULL, *db = NULL;
+  if(!rc)
+  {
+    da = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    db = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    if(!da || !db) rc = -101;
+  }
+  if(!rc) rc = dt_vulkan_write_to_device(dev, da, a, TN * sizeof(v4));
+  if(!rc) rc = dt_vulkan_write_to_device(dev, db, b, TN * sizeof(v4));
+  if(!rc)
+  {
+    blended = dt_develop_blend_process_vk(&sc.module, &sc.piece, da, db,
+                                          &roi, &roi, IOP_CS_LAB, IOP_CS_LAB, NULL);
+    if(blended) rc = dt_vulkan_read_from_device(dev, out, db, TN * sizeof(v4));
+  }
+  if(da) dt_vulkan_free_buffer(dev, da);
+  if(db) dt_vulkan_free_buffer(dev, db);
+  if(dev == 0) dt_vulkan_unlock_device(dev);
+
+  float maxerr = 0.0f;
+  if(rc == 0 && blended)
+    for(size_t i = 0; i < TN; i++)
+    {
+      const v4 r = ref_blend_lab(a[i], b[i], mask[i], 0x18, 0);
+      maxerr = fmaxf(maxerr, fmaxf(fmaxf(fabsf(out[i].x - r.x), fabsf(out[i].y - r.y)),
+                                  fmaxf(fabsf(out[i].z - r.z), fabsf(out[i].w - r.w))));
+    }
+  scaffold_cleanup(&sc);
+  free(a); free(b); free(out); free(mask);
+
+  assert_int_equal(rc, 0);
+  assert_true(blended);  // the parametric mask was accepted + ran on device
+  if(maxerr > 5e-3f)
+    fail_msg("parametric blend: device vs CPU max error %g", (double)maxerr);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1301,6 +1372,7 @@ int main(void)
     cmocka_unit_test(test_process_vk_uniform_blend),
     cmocka_unit_test(test_process_vk_drawn_mask),
     cmocka_unit_test(test_param_lab_mask),
+    cmocka_unit_test(test_process_vk_param_blend),
     cmocka_unit_test(test_process_vk_blend_glue_rgb_to_lab),
     cmocka_unit_test(test_process_vk_blend_glue_lab_to_rgb),
     cmocka_unit_test(test_process_vk_subset_gates),

@@ -1395,10 +1395,21 @@ typedef struct _vk_setmask_pc_t
   float value;
 } _vk_setmask_pc_t;
 
+// push constants for blendop_parametric_lab (ME.4b) — keep in sync with
+// the kernel's PC block.
+typedef struct _vk_param_pc_t
+{
+  int32_t width, height, iwidth, offx, offy;
+  uint32_t blendif;   // already XOR'd (Lab_MASK << 16) for inclusive
+  float opacity;
+  uint32_t flags;     // bit0 inclusive, bit1 inversed
+} _vk_param_pc_t;
+
 static dt_vk_module_kernel_t _vk_blend_set_mask   = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t _vk_blend_lab        = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t _vk_blend_rgb_hsl    = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t _vk_blend_rgb_jzczhz = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t _vk_blend_param_lab  = DT_VK_MODULE_KERNEL_INIT;
 static gboolean _vk_blend_tried_load = FALSE;
 
 // Lazy one-shot load on first use. Unlike the per-module kernels
@@ -1423,6 +1434,9 @@ static void _vk_blend_load_kernels(void)
   dt_vulkan_module_kernel_load(&_vk_blend_rgb_jzczhz,
                                "blendop_rgb_jzczhz", "blendop_rgb_jzczhz",
                                3, sizeof(_vk_blend_pc_t), 16, 16, 1);
+  dt_vulkan_module_kernel_load(&_vk_blend_param_lab,
+                               "blendop_parametric_lab", "blendop_parametric_lab",
+                               5, sizeof(_vk_param_pc_t), 16, 16, 1);
 }
 
 gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
@@ -1440,24 +1454,28 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
   if(!dt_vulkan_running()) return FALSE;
 
   // ---- subset gate ----------------------------------------------------
-  // Two mask cases run on device (ME.4): (1) uniform mask — plain global
-  // opacity; (2) the simplest drawn mask — a drawn shape with no
-  // parametric condition, no raster, no post ops (feather/blur/tone
-  // curve) and no detail refine. Those are exactly the masks whose build
-  // reads no pixel data (blendif_*_make_mask's non-conditional branch is
-  // pixel-free, e.g. blendif_lab.c:223), so the mask can be built on the
-  // host from geometry and uploaded. Everything else — parametric,
-  // feathered, raster, or a drawn mask feeding a raster consumer — stays
-  // on the CPU path.
+  // Three mask cases run on device (ME.4): (1) uniform — plain global
+  // opacity; (2) a simple drawn mask — a drawn shape, built host-side
+  // from geometry (blendif_*_make_mask's non-conditional branch is
+  // pixel-free, blendif_lab.c:223); (3) a parametric (blendif) mask in
+  // the Lab blend space, evaluated per pixel on device (ME.4b). All three
+  // require no post op (feather/blur/tone-curve), no detail refine, and
+  // that the mask isn't consumed as a raster elsewhere. Feathered,
+  // raster, RGB-space parametric, and drawn+parametric combos stay on the
+  // CPU path for now.
   _develop_mask_post_processing _post_ops[3];
-  const gboolean _uniform_mask = (d->mask_mode == DEVELOP_MASK_ENABLED);
-  const gboolean _drawn_mask =
-      d->mask_mode == (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK)
-      && d->details == 0
+  const gboolean _no_extra =
+      d->details == 0
       && _get_post_operations(d, piece, _post_ops) == 0
       && !(self->flags() & IOP_FLAGS_NO_MASKS)
       && !dt_iop_piece_is_raster_mask_used(piece, BLEND_RASTER_ID);
-  if(!_uniform_mask && !_drawn_mask) return FALSE;
+  const gboolean _uniform_mask = (d->mask_mode == DEVELOP_MASK_ENABLED);
+  const gboolean _drawn_mask =
+      d->mask_mode == (DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK) && _no_extra;
+  const gboolean _param_mask =
+      d->mask_mode == (DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL)
+      && d->blend_cst == DEVELOP_BLEND_CS_LAB && _no_extra;
+  if(!_uniform_mask && !_drawn_mask && !_param_mask) return FALSE;
   // 4-channel float buffers only (RAW 1ch blending stays CPU/CL)
   if(piece->colors != 4) return FALSE;
 
@@ -1551,7 +1569,7 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
                               (dt_vk_mem_t *[]){ dev_mask }, 1,
                               owidth, oheight, &mpc, sizeof(mpc)) == 0;
   }
-  else if(ok)  // _drawn_mask
+  else if(ok && _drawn_mask)
   {
     // Build the drawn mask on the host from geometry (no pixel data),
     // mirroring the CPU path exactly — the drawn branch (render form or
@@ -1588,6 +1606,63 @@ gboolean dt_develop_blend_process_vk(dt_iop_module_t *self,
       ok = built
            && dt_vulkan_write_to_device(0, dev_mask, host_mask, sizeof(float) * n) == 0;
       dt_free_align(host_mask);
+    }
+  }
+  else if(ok)  // _param_mask (parametric blendif, Lab blend space)
+  {
+    // Mirror make_mask's early decisions on the host and dispatch the
+    // per-pixel blendif kernel only for the true conditional branch.
+    const uint32_t any_active = d->blendif & DEVELOP_BLENDIF_Lab_MASK;
+    const uint32_t incl = (d->mask_combine & DEVELOP_COMBINE_INCL) ? 1u : 0u;
+    const uint32_t inv  = (d->mask_combine & DEVELOP_COMBINE_INV) ? 1u : 0u;
+    const uint32_t blendif_x =
+        d->blendif ^ (incl ? ((uint32_t)DEVELOP_BLENDIF_Lab_MASK << 16) : 0u);
+    const uint32_t canceling = (blendif_x >> 16) & ~blendif_x & DEVELOP_BLENDIF_Lab_MASK;
+
+    if(!any_active || canceling)
+    {
+      // the conditional opacity is the same for all pixels: a uniform
+      // fill of ((inv==0) ^ (incl==0)) ? opacity : 0 (blendif_lab.c:242)
+      const float fillv = (((inv == 0u) ^ (incl == 0u)) != 0u) ? opacity : 0.0f;
+      const _vk_setmask_pc_t mpc = { owidth, oheight, fillv };
+      ok = dt_vulkan_dispatch_n(&_vk_blend_set_mask,
+                                (dt_vk_mem_t *[]){ dev_mask }, 1,
+                                owidth, oheight, &mpc, sizeof(mpc)) == 0;
+    }
+    else if(_vk_blend_param_lab.kernel < 0)
+    {
+      ok = FALSE;  // kernel unavailable (e.g. failed load) -> CPU fallback
+    }
+    else
+    {
+      // base mask for a conditional-only mask is INCL ? 0 : 1
+      // (blendif_lab.c:618); the kernel folds the global opacity + combine
+      // and the per-channel trapezoids evaluated against the blend-space
+      // input (in_b) and pre-blend output (out_b).
+      const size_t n = (size_t)owidth * oheight;
+      float params_h[DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE];
+      dt_develop_blendif_process_parameters(params_h, d);
+      float *base_h    = dt_alloc_align_float(n);
+      dt_vk_mem_t *base = dt_vulkan_alloc_buffer(0, sizeof(float) * n);
+      dt_vk_mem_t *prm  = dt_vulkan_alloc_buffer(0, sizeof(params_h));
+      ok = base_h && base && prm;
+      if(ok)
+      {
+        dt_iop_image_fill(base_h, incl ? 0.0f : 1.0f, owidth, oheight, 1);
+        ok = dt_vulkan_write_to_device(0, base, base_h, sizeof(float) * n) == 0
+             && dt_vulkan_write_to_device(0, prm, params_h, sizeof(params_h)) == 0;
+      }
+      if(ok)
+      {
+        const _vk_param_pc_t ppc = { owidth, oheight, roi_in->width, dx, dy,
+                                     blendif_x, opacity, incl | (inv << 1) };
+        dt_vk_mem_t *pbufs[5] = { in_b, out_b, base, dev_mask, prm };
+        ok = dt_vulkan_dispatch_n(&_vk_blend_param_lab, pbufs, 5,
+                                  owidth, oheight, &ppc, sizeof(ppc)) == 0;
+      }
+      if(base_h) dt_free_align(base_h);
+      if(base)   dt_vulkan_free_buffer(0, base);
+      if(prm)    dt_vulkan_free_buffer(0, prm);
     }
   }
   if(ok)
