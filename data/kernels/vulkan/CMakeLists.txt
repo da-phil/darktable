@@ -247,7 +247,8 @@ set(VK_KERNELS
     blendop_set_mask:blendop_set_mask
     blendop_lab:blendop_lab
     blendop_rgb_hsl:blendop_rgb_hsl
-    blendop_rgb_jzczhz:blendop_rgb_jzczhz)
+    blendop_rgb_jzczhz:blendop_rgb_jzczhz
+    blendop_parametric_lab:blendop_parametric_lab)
 
 # Kernels that must use the glslang .comp twin even when clspv is
 # available. These use the portable float-atomic-add idiom (a
@@ -260,7 +261,9 @@ set(VK_KERNELS
 # See dt_vulkan_common.h::vk_atomic_add_f for the detailed note.
 set(VK_FORCE_GLSLANG
     bilateral_splat
-    colorreconstruction_splat)
+    colorreconstruction_splat
+    # new kernel, no .cl twin yet — glslang-only for now (ME.4b)
+    blendop_parametric_lab)
 
 set(VK_SPV_FILES "")
 foreach(SPEC IN LISTS VK_KERNELS)

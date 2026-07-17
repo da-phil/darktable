@@ -1363,7 +1363,25 @@ the capture executor is unchanged.
   actually validates the build. Tested: `test_process_vk_drawn_mask`
   (accepted + correct) and `test_process_vk_subset_gates` (parametric and
   drawn-with-post-op still refuse). Raster masks and a varying-form
-  render test are the next small follow-ups; parametric stays for (b).
+  render test are the next small follow-ups.
+  🚧 **(b) started (parametric — the export "blended on CPU" cause):** the
+  device blendif kernel for the **Lab** blend colorspace is landed and
+  validated. `data/kernels/vulkan/blendop_parametric_lab.comp` evaluates
+  the conditional branch of `dt_develop_blendif_lab_make_mask` per pixel —
+  the per-channel trapezoids (L/a/b + LCH C/h, input *and* output
+  channels), the pre-processed 6-float-per-channel params (marshaled by
+  calling `dt_develop_blendif_process_parameters` directly, so boost /
+  offset / open-ends match), and the inclusive/inversed opacity fold.
+  `test_param_lab_mask` compares it bit-for-bit (≤1e-5) against the CPU
+  make_mask across input/output/LCH channels and exclusive/inclusive/
+  inversed combines. **Split of labour, from the source:** the *host*
+  keeps make_mask's early decisions — non-conditional → opacity fill;
+  canceling-channel or no-active-channel → uniform fill — and only
+  dispatches the kernel for the true per-pixel branch (`any_active &&
+  !canceling`). Remaining for (b): wire the kernel into
+  `dt_develop_blend_process_vk` with that host split (feathered masks
+  still stay CPU — they need the guide image on device), and the RGB-HSL
+  / RGB-scene twins (more channels: gray/R/G/B + H,S,L or Jz,Cz,hz).
 - **ME.5 — straggler islands** (`toneequal`, `gamma`): cheap OpenCL/CPU
   boundaries first, promote later.
 - **ME.6 — parity gate + enable.** Bit-parity across a corpus + perf ≈

@@ -87,6 +87,14 @@ typedef struct pc_setmask_t
   float value;
 } pc_setmask_t;
 
+typedef struct pc_param_t
+{
+  int      width, height, iwidth, offx, offy;
+  uint32_t blendif;   // already XOR'd (Lab_MASK << 16) for inclusive
+  float    opacity;
+  uint32_t flags;     // bit0 inclusive, bit1 inversed
+} pc_param_t;
+
 static dt_vulkan_t s_vk;
 static dt_conf_t s_conf;
 static gboolean s_have_device = FALSE;
@@ -94,6 +102,7 @@ static dt_vk_module_kernel_t k_set_mask = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t k_lab = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t k_hsl = DT_VK_MODULE_KERNEL_INIT;
 static dt_vk_module_kernel_t k_jzczhz = DT_VK_MODULE_KERNEL_INIT;
+static dt_vk_module_kernel_t k_param_lab = DT_VK_MODULE_KERNEL_INIT;
 
 #define REQUIRE_DEVICE() do { if(!s_have_device) skip(); } while(0)
 
@@ -470,7 +479,10 @@ static int group_setup(void **state)
                                3, sizeof(pc_blend_t), 16, 16, 1);
   dt_vulkan_module_kernel_load(&k_jzczhz, "blendop_rgb_jzczhz", "blendop_rgb_jzczhz",
                                3, sizeof(pc_blend_t), 16, 16, 1);
-  if(k_set_mask.kernel < 0 || k_lab.kernel < 0 || k_hsl.kernel < 0 || k_jzczhz.kernel < 0)
+  dt_vulkan_module_kernel_load(&k_param_lab, "blendop_parametric_lab", "blendop_parametric_lab",
+                               5, sizeof(pc_param_t), 16, 16, 1);
+  if(k_set_mask.kernel < 0 || k_lab.kernel < 0 || k_hsl.kernel < 0 || k_jzczhz.kernel < 0
+     || k_param_lab.kernel < 0)
   {
     fprintf(stderr, "blendop kernels failed to load — tests will be skipped\n");
     return 0;
@@ -1161,6 +1173,122 @@ static void test_process_vk_subset_gates(void **state)
   assert_false(gate_ch);
 }
 
+// ME.4b: the on-device parametric (blendif) Lab mask must match the CPU
+// dt_develop_blendif_lab_make_mask within fp tolerance. One trapezoid
+// (stops) is applied to every active channel; the pipeline's base-mask
+// fill for a conditional-only mask (INCL ? 0 : 1) is reproduced on both
+// sides so only the parametric evaluation is under test.
+static void _check_param_lab(const char *tag, uint32_t blendif,
+                             const float stops[4], float boost_val,
+                             uint32_t mask_combine, float opacity_pct)
+{
+  blend_scaffold_t sc;
+  scaffold_init(&sc, DEVELOP_BLEND_CS_LAB, 0x18, opacity_pct);
+  sc.params.mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  sc.params.blendif = blendif;
+  sc.params.mask_combine = mask_combine;
+  for(int ch = 0; ch < DEVELOP_BLENDIF_SIZE; ch++)
+    if(blendif & (1u << ch))
+    {
+      for(int k = 0; k < 4; k++) sc.params.blendif_parameters[ch * 4 + k] = stops[k];
+      sc.params.blendif_boost_factors[ch] = boost_val;
+    }
+
+  s_rng = 0x2468;
+  v4 *a = malloc(TN * sizeof(v4)), *b = malloc(TN * sizeof(v4));
+  assert_non_null(a); assert_non_null(b);
+  fill_lab(a, TN); fill_lab(b, TN);
+
+  const float base_fill = (mask_combine & DEVELOP_COMBINE_INCL) ? 0.0f : 1.0f;
+  const dt_iop_roi_t roi = { 0, 0, TW, TH, 1.0f };
+
+  // CPU reference
+  float *ref = malloc(TN * sizeof(float));
+  assert_non_null(ref);
+  for(size_t i = 0; i < TN; i++) ref[i] = base_fill;
+  dt_develop_blendif_lab_make_mask(&sc.piece, (const float *)a, (const float *)b,
+                                   &roi, &roi, ref);
+
+  // marshal params + push constants exactly as the production wiring will
+  float params[DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE];
+  dt_develop_blendif_process_parameters(params, &sc.params);
+  const uint32_t incl = (mask_combine & DEVELOP_COMBINE_INCL) ? 1u : 0u;
+  const uint32_t inv  = (mask_combine & DEVELOP_COMBINE_INV) ? 1u : 0u;
+  const uint32_t blendif_k = blendif ^ (incl ? ((uint32_t)DEVELOP_BLENDIF_Lab_MASK << 16) : 0u);
+  const float op = fminf(fmaxf(opacity_pct / 100.0f, 0.0f), 1.0f);
+
+  float *base = malloc(TN * sizeof(float)), *dout = malloc(TN * sizeof(float));
+  assert_non_null(base); assert_non_null(dout);
+  for(size_t i = 0; i < TN; i++) base[i] = base_fill;
+
+  const int dev = dt_vulkan_lock_device();
+  int rc = (dev == 0) ? 0 : -100;
+  dt_vk_mem_t *da = NULL, *db = NULL, *dbm = NULL, *dom = NULL, *dp = NULL;
+  if(!rc)
+  {
+    da  = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    db  = dt_vulkan_alloc_buffer(dev, TN * sizeof(v4));
+    dbm = dt_vulkan_alloc_buffer(dev, TN * sizeof(float));
+    dom = dt_vulkan_alloc_buffer(dev, TN * sizeof(float));
+    dp  = dt_vulkan_alloc_buffer(dev, sizeof(params));
+    if(!da || !db || !dbm || !dom || !dp) rc = -101;
+  }
+  if(!rc) rc = dt_vulkan_write_to_device(dev, da,  a,      TN * sizeof(v4));
+  if(!rc) rc = dt_vulkan_write_to_device(dev, db,  b,      TN * sizeof(v4));
+  if(!rc) rc = dt_vulkan_write_to_device(dev, dbm, base,   TN * sizeof(float));
+  if(!rc) rc = dt_vulkan_write_to_device(dev, dp,  params, sizeof(params));
+  if(!rc)
+  {
+    const pc_param_t pc = { TW, TH, TW, 0, 0, blendif_k, op, incl | (inv << 1) };
+    dt_vk_mem_t *bufs[5] = { da, db, dbm, dom, dp };
+    rc = dt_vulkan_dispatch_n(&k_param_lab, bufs, 5, TW, TH, &pc, sizeof(pc));
+  }
+  if(!rc) rc = dt_vulkan_read_from_device(dev, dout, dom, TN * sizeof(float));
+  if(da)  dt_vulkan_free_buffer(dev, da);
+  if(db)  dt_vulkan_free_buffer(dev, db);
+  if(dbm) dt_vulkan_free_buffer(dev, dbm);
+  if(dom) dt_vulkan_free_buffer(dev, dom);
+  if(dp)  dt_vulkan_free_buffer(dev, dp);
+  if(dev == 0) dt_vulkan_unlock_device(dev);
+
+  float maxerr = 0.0f; size_t worst = 0;
+  if(!rc)
+    for(size_t i = 0; i < TN; i++)
+    {
+      const float e = fabsf(dout[i] - ref[i]);
+      if(e > maxerr) { maxerr = e; worst = i; }
+    }
+  scaffold_cleanup(&sc);
+  const float got = dout[worst], want = ref[worst];
+  free(a); free(b); free(ref); free(base); free(dout);
+
+  if(rc) fail_msg("%s: device sequence failed rc=%d", tag, rc);
+  if(maxerr > 1e-5f)
+    fail_msg("%s: parametric Lab mask max error %g at px %zu (got %g want %g)",
+             tag, (double)maxerr, worst, (double)got, (double)want);
+}
+
+static void test_param_lab_mask(void **state)
+{
+  (void)state;
+  REQUIRE_DEVICE();
+  const float stops[4] = { 0.2f, 0.4f, 0.6f, 0.8f };
+  _check_param_lab("L_in", 1u << DEVELOP_BLENDIF_L_in, stops, 0.0f, 0, 60.0f);
+  _check_param_lab("Lab_in", (1u << DEVELOP_BLENDIF_L_in) | (1u << DEVELOP_BLENDIF_A_in)
+                              | (1u << DEVELOP_BLENDIF_B_in), stops, 0.0f, 0, 75.0f);
+  _check_param_lab("LCh_in", (1u << DEVELOP_BLENDIF_L_in) | (1u << DEVELOP_BLENDIF_C_in)
+                              | (1u << DEVELOP_BLENDIF_h_in), stops, 0.0f, 0, 100.0f);
+  _check_param_lab("L_in+L_out", (1u << DEVELOP_BLENDIF_L_in) | (1u << DEVELOP_BLENDIF_L_out),
+                                  stops, 0.0f, 0, 50.0f);
+  // inclusive needs every channel active to stay a full-parametric case
+  // (otherwise a non-active channel "cancels" and the CPU short-circuits
+  // to a uniform fill, which the host handles, not this kernel)
+  _check_param_lab("all incl", (uint32_t)DEVELOP_BLENDIF_Lab_MASK, stops, 0.0f,
+                                 DEVELOP_COMBINE_INCL, 60.0f);
+  _check_param_lab("Lab_in inv", (1u << DEVELOP_BLENDIF_L_in) | (1u << DEVELOP_BLENDIF_A_in),
+                                  stops, 0.5f, DEVELOP_COMBINE_INV, 80.0f);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1172,6 +1300,7 @@ int main(void)
     cmocka_unit_test(test_roi_offsets),
     cmocka_unit_test(test_process_vk_uniform_blend),
     cmocka_unit_test(test_process_vk_drawn_mask),
+    cmocka_unit_test(test_param_lab_mask),
     cmocka_unit_test(test_process_vk_blend_glue_rgb_to_lab),
     cmocka_unit_test(test_process_vk_blend_glue_lab_to_rgb),
     cmocka_unit_test(test_process_vk_subset_gates),

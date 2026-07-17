@@ -1,0 +1,117 @@
+// On-device parametric (blendif) mask for the Lab blend colorspace
+// (DAG ME.4b, dev-doc/gpu_resident_pixelpipe_dag.md §9). Evaluates the
+// conditional branch of dt_develop_blendif_lab_make_mask on the GPU so a
+// parametric-masked module can stay in the graph span instead of forcing
+// the CPU blend and its full-buffer readback.
+//
+// Must stay behaviour-equivalent with
+// src/develop/blends/blendif_lab.c. The 6-float-per-channel `params`
+// buffer is produced host-side by dt_develop_blendif_process_parameters
+// (boost + offset + open-end handling already baked in), and `blendif`
+// is passed already XOR'd with (Lab_MASK << 16) for the inclusive-combine
+// case, exactly as blendif_lab.c does before combining.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InA   { vec4  v[]; } in_a;   // roi_in, blend space
+layout(std430, binding = 1) readonly buffer InB   { vec4  v[]; } in_b;   // roi_out, blend space
+layout(std430, binding = 2) readonly buffer BaseM { float v[]; } basem;  // roi_out (drawn / 1.0)
+layout(std430, binding = 3)          buffer OutM  { float v[]; } outm;   // roi_out (result mask)
+layout(std430, binding = 4) readonly buffer Prm   { float v[]; } prm;    // 6 * 16 processed params
+
+layout(push_constant) uniform PC {
+    int   width;    // roi_out
+    int   height;
+    int   iwidth;   // roi_in
+    int   offx;     // roi_out.x - roi_in.x
+    int   offy;     // roi_out.y - roi_in.y
+    uint  blendif;  // already XOR'd (Lab_MASK << 16) for inclusive
+    float opacity;  // global opacity, 0..1
+    uint  flags;    // bit0 = inclusive, bit1 = inversed
+} pc;
+
+#define DT_2PI_F 6.28318530717958647692
+
+// mirrors dt_vulkan_common.h::vk_Lab_2_LCH (hue normalized to [0,1))
+vec4 Lab_to_LCH(vec4 Lab)
+{
+    float H = atan(Lab.z, Lab.y);
+    H = (H > 0.0) ? H / float(DT_2PI_F) : 1.0 - abs(H) / float(DT_2PI_F);
+    float C = sqrt(Lab.y * Lab.y + Lab.z * Lab.z);
+    return vec4(Lab.x, C, H, Lab.w);
+}
+
+// mirrors _blendif_compute_factor: a trapezoid from prm[base+0..3] with
+// pre-computed increasing/decreasing slopes prm[base+4],[+5]; the whole
+// channel is inverted when `invert`.
+float factor(float value, bool invert, uint base)
+{
+    float p0 = prm.v[base + 0u], p1 = prm.v[base + 1u];
+    float p2 = prm.v[base + 2u], p3 = prm.v[base + 3u];
+    float f;
+    if(value <= p0)      f = 0.0;
+    else if(value < p1)  f = (value - p0) * prm.v[base + 4u];
+    else if(value <= p2) f = 1.0;
+    else if(value < p3)  f = 1.0 - (value - p2) * prm.v[base + 5u];
+    else                 f = 0.0;
+    return invert ? 1.0 - f : f;
+}
+
+// mirrors _blendif_combine_channels for Lab: channel bits within `bch`
+// are L=0, a=1, b=2, C=8, h=9; the per-channel invert bit is 16 above
+// the active bit; the param slot for channel k is pbase + k*6.
+float combine_channels(vec4 px, uint bch, uint pbase)
+{
+    const float c_scale = 1.0 / (128.0 * 1.41421356237309504880);
+    float t = 1.0;
+    if((bch & (1u << 0)) != 0u)
+        t *= factor(px.x / 100.0, (bch & (1u << 16)) != 0u, pbase + 0u * 6u);
+    if((bch & (1u << 1)) != 0u)
+        t *= factor(px.y / 256.0, (bch & (1u << 17)) != 0u, pbase + 1u * 6u);
+    if((bch & (1u << 2)) != 0u)
+        t *= factor(px.z / 256.0, (bch & (1u << 18)) != 0u, pbase + 2u * 6u);
+    if((bch & ((1u << 8) | (1u << 9))) != 0u)
+    {
+        vec4 lch = Lab_to_LCH(px);
+        if((bch & (1u << 8)) != 0u)
+            t *= factor(lch.y * c_scale, (bch & (1u << 24)) != 0u, pbase + 8u * 6u);
+        if((bch & (1u << 9)) != 0u)
+            t *= factor(lch.z, (bch & (1u << 25)) != 0u, pbase + 9u * 6u);
+    }
+    return t;
+}
+
+void main()
+{
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    if(x >= uint(pc.width) || y >= uint(pc.height)) return;
+    const uint o = y * uint(pc.width) + x;
+
+    // input pixel at (x+offx, y+offy) in roi_in; output pixel at o
+    const uint ia = (uint(pc.offy) + y) * uint(pc.iwidth) + (uint(pc.offx) + x);
+    const vec4 pa = in_a.v[ia];
+    const vec4 pb = in_b.v[o];
+
+    // combine the conditional channels: input channels read from in_a,
+    // output channels from in_b (blendif >> L_out, params from L_out*6).
+    float temp = 1.0;
+    temp *= combine_channels(pa, pc.blendif, 0u);
+    temp *= combine_channels(pb, pc.blendif >> 4u, 24u);
+
+    // fold the base (drawn / 1.0) mask, global opacity and the
+    // inclusive/inversed combine — the four cases of blendif_lab.c
+    const float bm = basem.v[o];
+    const bool incl = (pc.flags & 1u) != 0u;
+    const bool inv  = (pc.flags & 2u) != 0u;
+    float m;
+    if(incl)
+        m = inv ? pc.opacity * (1.0 - bm) * temp
+                : pc.opacity * (1.0 - (1.0 - bm) * temp);
+    else
+        m = inv ? pc.opacity * (1.0 - bm * temp)
+                : pc.opacity * bm * temp;
+    outm.v[o] = m;
+}
