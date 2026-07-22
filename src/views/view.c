@@ -1958,24 +1958,38 @@ void dt_view_paint_surface(cairo_t *cr,
   const double img_w = processed_width * backbuf_scale * (1 << closeup) / ppd;
   const double img_h = processed_height * backbuf_scale * (1 << closeup) / ppd;
 
+  // The visible image rectangle: the image (scaled to the live zoom and offset
+  // by the pan) intersected with the viewport. Computed here because the colour
+  // assessment frame below is keyed off this same rectangle.
+  const double clip_x0 = fmax(-0.5 * port->width, (-0.5 - zoom_x) * img_w);
+  const double clip_x1 = fmin(0.5 * port->width, (0.5 - zoom_x) * img_w);
+  const double clip_y0 = fmax(-0.5 * port->height, (-0.5 - zoom_y) * img_h);
+  const double clip_y1 = fmin(0.5 * port->height, (0.5 - zoom_y) * img_h);
+  const double clip_w = fmax(0.0, clip_x1 - clip_x0);
+  const double clip_h = fmax(0.0, clip_y1 - clip_y0);
+
   if(port->color_assessment
-     && window != DT_WINDOW_SLIDESHOW)
+     && window != DT_WINDOW_SLIDESHOW
+     && clip_w > 0.0 && clip_h > 0.0)
   {
-    // draw the white frame around picture
+    // Draw the white frame around the picture. Grow the *visible* image
+    // rectangle (clip_*) by the white border width -- NOT the full image
+    // geometry (img_w/img_h). Beyond the fit zoom the image is larger than the
+    // viewport and is clamped to it, so keying the frame off the unclamped
+    // image size would push the white frame out past the viewport and paint
+    // over the grey assessment background on the zoomed-past sides. Growing the
+    // clamped rectangle instead keeps the white border a constant width on
+    // every side, while still tracking the image edge (and the pan) wherever
+    // that edge is actually on screen.
     const double ratio = dt_conf_get_float("darkroom/ui/color_assessment_border_white_ratio");
-    const double borw = img_w + 2.0 * tb * ratio;
-    const double borh = img_h + 2.0 * tb * ratio;
-    cairo_rectangle(cr, -0.5 * borw - zoom_x * img_w, -0.5 * borh - zoom_y * img_h, borw, borh);
+    const double bw = tb * ratio;
+    cairo_rectangle(cr, clip_x0 - bw, clip_y0 - bw, clip_w + 2.0 * bw, clip_h + 2.0 * bw);
     dt_gui_gtk_set_source_rgb(cr, DT_GUI_COLOR_COLOR_ASSESSMENT_FG);
     cairo_fill(cr);
   }
 
   // clip to the image rectangle intersected with the viewport
-  const double clip_x0 = fmax(-0.5 * port->width, (-0.5 - zoom_x) * img_w);
-  const double clip_x1 = fmin(0.5 * port->width, (0.5 - zoom_x) * img_w);
-  const double clip_y0 = fmax(-0.5 * port->height, (-0.5 - zoom_y) * img_h);
-  const double clip_y1 = fmin(0.5 * port->height, (0.5 - zoom_y) * img_h);
-  cairo_rectangle(cr, clip_x0, clip_y0, fmax(0.0, clip_x1 - clip_x0), fmax(0.0, clip_y1 - clip_y0));
+  cairo_rectangle(cr, clip_x0, clip_y0, clip_w, clip_h);
   cairo_clip(cr);
   const double back_scale = (buf_scale == 0 ? 1.0 : backbuf_scale / buf_scale) * (1<<closeup) / ppd;
   const double trans_x = (offset_x - zoom_x) * processed_width * buf_scale - 0.5 * buf_width;
