@@ -16,6 +16,7 @@
   <dttab name="processing" title="processing">
     <section name="general" title="image processing"/>
     <section name="hdr_alignment" title="HDR alignment"/>
+    <section name="hdr_merge" title="HDR merge"/>
     <section name="cpugpu" title="CPU / memory"/>
     <section name="opencl" title="OpenCL GPU acceleration"/>
     <section name="platform" title="OpenCL drivers"/>
@@ -465,6 +466,45 @@
     <default>false</default>
     <shortdescription>save alignment debug images</shortdescription>
     <longdescription>write per-frame diagnostic images while merging: the feature-detection input, the detected keypoints and all feature matches (green = inlier, red = outlier).\nsaved as Netpbm (.pgm/.ppm) in a darktable_hdr_align_debug folder in the system temp directory (or the folder named by the DT_HDR_DEBUG_IMAGE_DIR environment variable). for diagnosing alignment problems; off by default.</longdescription>
+  </dtconfig>
+  <dtconfig prefs="processing" section="hdr_merge">
+    <name>plugins/lighttable/hdrmerge/weight</name>
+    <type>
+      <enum>
+        <option>exponential</option>
+        <option>triangular</option>
+        <option>legacy</option>
+      </enum>
+    </type>
+    <default>exponential</default>
+    <shortdescription>HDR merge weight function</shortdescription>
+    <longdescription>weight envelope used when merging an exposure bracket: 'exponential' (Jakob/hdrmerge, more decisive frame selection) or 'triangular' (softer). 'legacy' instead runs the original pre-hdrmerge weighted-average merge (photon-count weighted, order-dependent), for comparing the current algorithm against the previous one; it ignores the blend/feather/de-ghosting options.</longdescription>
+  </dtconfig>
+  <dtconfig prefs="processing" section="hdr_merge">
+    <name>plugins/lighttable/hdrmerge/deghost_threshold</name>
+    <type>float</type>
+    <default>0.0</default>
+    <shortdescription>HDR merge de-ghosting threshold</shortdescription>
+    <longdescription>0 disables de-ghosting; a positive value (e.g. 0.5) rejects, per pixel, frames whose luminance deviates from the consensus by more than this fraction, reducing artefacts from content that changed between frames (foliage, ripples). not a substitute for aligning large moving objects.</longdescription>
+  </dtconfig>
+  <dtconfig prefs="processing" section="hdr_merge">
+    <name>plugins/lighttable/hdrmerge/blend</name>
+    <type>
+      <enum>
+        <option>pyramid</option>
+        <option>linear</option>
+      </enum>
+    </type>
+    <default>pyramid</default>
+    <shortdescription>HDR merge blending</shortdescription>
+    <longdescription>how the exposures are combined: 'pyramid' is a multi-scale Laplacian-pyramid blend that cross-fades exposure and motion transitions across scales (smoother, no demosaic fringing on moving content; Bayer sensors only, CPU only) while 'linear' is the faster single per-pixel weighted average (also the GPU path, and the automatic fallback for X-Trans sensors).</longdescription>
+  </dtconfig>
+  <dtconfig prefs="processing" section="hdr_merge">
+    <name>plugins/lighttable/hdrmerge/feather</name>
+    <type min="0.0" max="1.0">float</type>
+    <default>0.5</default>
+    <shortdescription>HDR merge blend feathering</shortdescription>
+    <longdescription>softness of the multi-scale ('pyramid') blend: 0 is crispest, higher values feather the exposure/motion transitions. The clipped-highlight (blown-sun) core border is always feathered independently of this. No effect on the 'linear' blend.</longdescription>
   </dtconfig>
   <dtconfig dialog="collect">
     <name>plugins/lighttable/tagging/case_sensitivity</name>

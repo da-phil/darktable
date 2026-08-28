@@ -24,6 +24,7 @@
 #include "common/film.h"
 #include "common/gpx.h"
 #include "common/hdr_alignment.h"
+#include "common/hdrmerge.h"
 #include "common/history.h"
 #include "common/history_snapshot.h"
 #include "common/image.h"
@@ -47,6 +48,7 @@
 #include "gui/gtk.h"
 #include "gui/hist_dialog.h"
 
+#include <float.h>
 #include <gio/gio.h>
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -409,17 +411,43 @@ typedef struct dt_control_merge_hdr_t
   uint32_t first_filter;
   uint8_t first_xtrans[6][6];
 
-  float *pixels, *weight;
+  // Metadata reference = the shortest-exposure frame (the largest calibration
+  // factor). The merge normalizes radiance to that exposure (out = E / cal_max),
+  // so the output DNG has to carry ITS exif (exposure time / iso / aperture /
+  // exposure bias) for darktable to develop the result at a consistent
+  // brightness. Picking it by exposure rather than by selection order is what
+  // makes the merge deterministic: the same bracket yields the same DNG no
+  // matter what order the frames were selected in.
+  dt_imgid_t meta_imgid;
+  float meta_cal;
+
+  // one fp16 buffer (wd*ht, single channel CFA, output of rawprepare) per
+  // bracketed frame plus its radiometric calibration factor. All frames are
+  // collected first, then merged in one pass by the hdrmerge algorithm.
+  // luma holds a per-frame brightness proxy (fp16, the 2x2 mosaic-block
+  // maximum) that drives the per-frame weights so all CFA channels at a
+  // position stay consistent (no false colour on moving content).
+  dt_hdrmerge_half_t **frames;
+  dt_hdrmerge_half_t **luma;
+  float *cal;
+  // per-frame expected photon count (100*aperture*exposure/iso), only used by
+  // the legacy (pre-hdrmerge) weighted-average merge for A/B comparison.
+  float *photoncnt;
+  int num_frames;    // expected number of frames (the export 'total')
+  int frames_filled; // number actually collected so far
+
+  // merge parameters, read once from config.
+  dt_hdrmerge_weight_t weight;
+  float deghost_threshold;
+
+  float *pixels; // merged output, wd*ht
 
   int wd;
   int ht;
   dt_image_orientation_t orientation;
 
-  float whitelevel;
-  float epsw;
   dt_aligned_pixel_t wb_coeffs;
   float adobe_XYZ_to_CAM[4][3];
-  char camera_makermodel[128];
 
   // auto-alignment of exposure brackets (handheld / shaky tripod). When
   // enabled, the first frame seeds the reference and every later frame is
@@ -436,6 +464,157 @@ typedef struct dt_control_merge_hdr_t
   // 0 - ok; 1 - errors, abort
   gboolean abort;
 } dt_control_merge_hdr_t;
+
+// Per-position brightness proxy: the MAXIMUM of the 2x2 mosaic block (anchored
+// on the CFA grid, clamped at borders). All four pixels of a Bayer quad share
+// the same value, so the merge weights derived from it are identical for the
+// quad's R/G/G/B samples and the channels cannot be sourced from different
+// frames (which would demosaic into false colour where content moves).
+//
+// The MAXIMUM (rather than the average) is used on purpose: it tracks the
+// brightest, first-to-clip channel (green, on most sensors). That makes it both
+// the shared weight signal AND the saturation detector, so the merge can spot a
+// pixel whose green clips while red/blue do not (the cause of magenta highlights
+// around the sun / on specular wave crests) and neutralize it. For X-Trans the
+// 2x2 block is an approximation. Output is stored as fp16.
+static void _hdr_compute_luma(const float *const in,
+                              dt_hdrmerge_half_t *const out,
+                              const int wd,
+                              const int ht)
+{
+  DT_OMP_FOR(collapse(2))
+  for(int y = 0; y < ht; y++)
+    for(int x = 0; x < wd; x++)
+    {
+      const int xx = x & ~1, yy = y & ~1;
+      const int x1 = MIN(xx + 1, wd - 1);
+      const int y1 = MIN(yy + 1, ht - 1);
+      float m = in[xx + (size_t)wd * yy];
+      m = MAX(m, in[x1 + (size_t)wd * yy]);
+      m = MAX(m, in[xx + (size_t)wd * y1]);
+      m = MAX(m, in[x1 + (size_t)wd * y1]);
+      out[x + (size_t)wd * y] = dt_hdrmerge_float_to_half(m);
+    }
+}
+
+// Broad exposure envelope of the original merge: a smooth hat peaking at the mid
+// value, kept non-zero at the extremes. Copied verbatim from the pre-branch
+// algorithm so the 'legacy' merge matches it (modulo fp16 storage of the frames).
+static float _hdr_legacy_envelope(const float xx)
+{
+  const float x = fminf(fmaxf(xx, 0.0f), 1.0f);
+  const float beta = 0.5f;
+  if(x < beta)
+  {
+    const float tmp = fabsf(x / beta - 1.0f);
+    return 1.0f - tmp * tmp;
+  }
+  const float tmp1 = (1.0f - x) / (1.0f - beta);
+  const float tmp2 = tmp1 * tmp1;
+  return 3.0f * tmp2 - 2.0f * tmp2 * tmp1;
+}
+
+// The legacy (pre-hdrmerge) exposure-bracket merge, reproduced over the frames
+// collected in d->frames so it can be selected via the 'legacy' weight option
+// and compared against the hdrmerge algorithm. It is the original streaming
+// weighted average of scene radiance E = raw * cal: each frame is trusted in
+// proportion to its expected photon count times a broad exposure envelope of the
+// (2x2-anchored) 3x3 block maximum; a pixel clipped in a block falls back to the
+// best single frame ("use only if nothing better"), and one clipped in every
+// frame goes to white. The output is normalized to 1.0 = saturation of the
+// shortest exposure - the same convention as the new merge - so the two are
+// directly comparable. Like the original it is order-dependent and CPU-only (the
+// luma proxy and the new machinery are unused here). Writes d->pixels.
+static void _hdr_merge_legacy(dt_control_merge_hdr_t *const d)
+{
+  const int wd = d->wd, ht = d->ht, n = d->frames_filled;
+  const size_t npx = (size_t)wd * ht;
+  const float saturation = 1.0f;
+  const float offset = 3000.0f / (float)UINT16_MAX; // upsampling / 16-bit head room
+  const float epsw = 1e-8f;
+
+  // white level = brightest representable radiance = saturation * max cal.
+  float whitelevel = 0.0f;
+  for(int i = 0; i < n; i++)
+    whitelevel = fmaxf(whitelevel, saturation * d->cal[i]);
+
+  float *const pixels = d->pixels;
+  float *const weight = dt_alloc_align_float(npx);
+  if(!weight)
+  {
+    // abort rather than write an all-black DNG; the caller checks d->abort.
+    dt_control_log(_("unable to allocate memory for HDR merge"));
+    d->abort = TRUE;
+    return;
+  }
+  memset(pixels, 0, npx * sizeof(float));
+  memset(weight, 0, npx * sizeof(float));
+
+  // accumulate the frames in collection (selection) order, exactly as the
+  // original streaming merge saw them.
+  for(int i = 0; i < n; i++)
+  {
+    const float cal = d->cal[i];
+    const float photoncnt = d->photoncnt[i];
+    const dt_hdrmerge_half_t *const fr = d->frames[i];
+    DT_OMP_FOR(collapse(2))
+    for(int y = 0; y < ht; y++)
+      for(int x = 0; x < wd; x++)
+      {
+        const float in = dt_hdrmerge_half_to_float(fr[x + (size_t)wd * y]);
+        float w = photoncnt;
+        // the envelope needs the block maximum (to catch per-channel saturation),
+        // so scan the 2x2-anchored 3x3 block for its max M and min m.
+        const int xx = x & ~1, yy = y & ~1;
+        float M = 0.0f, m = FLT_MAX;
+        if(xx < wd - 2 && yy < ht - 2)
+        {
+          for(int j = 0; j < 3; j++)
+            for(int ii = 0; ii < 3; ii++)
+            {
+              const float v = dt_hdrmerge_half_to_float(fr[xx + ii + (size_t)wd * (yy + j)]);
+              M = MAX(M, v);
+              m = MIN(m, v);
+            }
+          w *= epsw + _hdr_legacy_envelope((M + offset) / saturation);
+        }
+
+        const size_t p = x + (size_t)wd * y;
+        if(M + offset >= saturation)
+        {
+          // block is clipped: only used if nothing unclipped has covered this
+          // pixel yet (weight <= 0), and only if this frame clips less (larger m).
+          if(weight[p] <= 0.0f && (weight[p] == 0.0f || m < -weight[p]))
+          {
+            if(m + offset >= saturation)
+              pixels[p] = 1.0f;                  // clipped in every channel too
+            else
+              pixels[p] = in * cal / whitelevel; // recover from the other channels
+            weight[p] = -m;                      // negative marks a clipped placeholder
+          }
+        }
+        else
+        {
+          if(weight[p] <= 0.0f)
+          {
+            pixels[p] = 0.0f; // drop a blown-highlight placeholder from an earlier frame
+            weight[p] = 0.0f;
+          }
+          pixels[p] += w * in * cal;
+          weight[p] += w;
+        }
+      }
+  }
+
+  // normalize the accumulated (non-clipped) pixels; clipped placeholders are
+  // already normalized and carry weight <= 0, so they are left untouched.
+  DT_OMP_FOR()
+  for(size_t p = 0; p < npx; p++)
+    if(weight[p] > 0.0f)
+      pixels[p] = fmaxf(0.0f, pixels[p] / (whitelevel * weight[p]));
+
+  dt_free_align(weight);
+}
 
 typedef struct dt_control_merge_hdr_format_t
 {
@@ -456,26 +635,6 @@ static int _control_merge_hdr_levels(dt_imageio_module_data_t *data)
 static const char *_control_merge_hdr_mime(dt_imageio_module_data_t *data)
 {
   return "memory";
-}
-
-static float _envelope(const float xx)
-{
-  const float x = CLAMPS(xx, 0.0f, 1.0f);
-  // const float alpha = 2.0f;
-  const float beta = 0.5f;
-  if(x < beta)
-  {
-    // return 1.0f-fabsf(x/beta-1.0f)^2
-    const float tmp = fabsf(x / beta - 1.0f);
-    return 1.0f - tmp * tmp;
-  }
-  else
-  {
-    const float tmp1 = (1.0f - x) / (1.0f - beta);
-    const float tmp2 = tmp1 * tmp1;
-    const float tmp3 = tmp2 * tmp1;
-    return 3.0f * tmp2 - 2.0f * tmp3;
-  }
 }
 
 static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
@@ -500,7 +659,7 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
   dt_image_cache_read_release(img);
 
   // Auto-reference pre-pass: just probe each frame's feature richness and keep
-  // the richest as the reference; do not accumulate anything.
+  // the richest as the reference; do not collect anything.
   if(d->probe_mode)
   {
     if(image.buf_dsc.filters != 0u
@@ -520,7 +679,7 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
     return 0;
   }
 
-  if(!d->pixels)
+  if(!d->frames)
   {
     d->first_imgid = imgid;
     d->first_filter = dt_rawspeed_crop_dcraw_filters(image.buf_dsc.filters, image.crop_x, image.crop_y);
@@ -536,8 +695,12 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
       for(int i = 0; i < 6; i++)
         d->first_xtrans[j][i] = FCxtrans(j, i, &roi, image.buf_dsc.xtrans);
 
-    d->pixels = calloc((size_t)datai->width * datai->height, sizeof(float));
-    d->weight = calloc((size_t)datai->width * datai->height, sizeof(float));
+    d->num_frames = MAX(1, total);
+    d->frames = calloc((size_t)d->num_frames, sizeof(dt_hdrmerge_half_t *));
+    d->luma = calloc((size_t)d->num_frames, sizeof(dt_hdrmerge_half_t *));
+    d->cal = calloc((size_t)d->num_frames, sizeof(float));
+    d->photoncnt = calloc((size_t)d->num_frames, sizeof(float));
+    d->frames_filled = 0;
     d->wd = datai->width;
     d->ht = datai->height;
     d->orientation = image.orientation;
@@ -559,7 +722,7 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
         for(int i = 0; i < 3; ++i)
           d->adobe_XYZ_to_CAM[k][i] = image.adobe_XYZ_to_CAM[k][i];
   }
-  if(!d->pixels || !d->weight)
+  if(!d->frames || !d->luma || !d->cal || !d->photoncnt)
   {
     dt_control_log(_("unable to allocate memory for HDR merge"));
     d->abort = TRUE;
@@ -590,8 +753,10 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
     return 1;
   }
 
-  // if no valid exif data can be found, assume peleng fisheye at
-  // f/16, 8mm, with half of the light lost in the system => f/22
+  // radiometric calibration: scene radiance is proportional to (raw value *
+  // cal). this accounts for shutter, aperture and ISO differences across the
+  // bracket. if no valid exif data can be found, assume peleng fisheye at
+  // f/16, 8mm, with half of the light lost in the system => f/22.
   const float eap = image.exif_aperture > 0.0f ? image.exif_aperture : 22.0f;
   const float efl = image.exif_focal_length > 0.0f ? image.exif_focal_length : 8.0f;
   const float rad = .5f * efl / eap;
@@ -599,16 +764,26 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
   const float iso = image.exif_iso > 0.0f ? image.exif_iso : 100.0f;
   const float exp = image.exif_exposure > 0.0f ? image.exif_exposure : 1.0f;
   const float cal = 100.0f / (aperture * exp * iso);
-  // about proportional to how many photons we can expect from this shot:
+  // expected photon count (proportional to how much light this shot captured):
+  // the per-frame trust weight the legacy merge uses.
   const float photoncnt = 100.0f * aperture * exp / iso;
-  float saturation = 1.0f;
-  d->whitelevel = fmaxf(d->whitelevel, saturation * cal);
 
-  // Auto-align this frame onto the reference before accumulation.  The first
+  // Track the shortest exposure (largest cal) as the metadata reference. The
+  // merge normalizes the output radiance to this exposure, so embedding its exif
+  // makes darktable develop the merged DNG at a consistent brightness; choosing
+  // it by exposure (not by which frame happened to be processed first) is what
+  // makes the result independent of the selection order.
+  if(cal > d->meta_cal)
+  {
+    d->meta_cal = cal;
+    d->meta_imgid = imgid;
+  }
+
+  // Auto-align this frame onto the reference before it is collected. The first
   // frame becomes the reference; every later frame is registered onto it and
-  // accumulated from a warped scratch buffer.  On any failure (or when
-  // alignment is disabled / built without OpenCV) we fall back to the raw
-  // unaligned mosaic, i.e. the legacy behavior.
+  // collected from a warped scratch buffer. On any failure (or when alignment
+  // is disabled / built without OpenCV) we fall back to the raw unaligned
+  // mosaic, i.e. the legacy behavior.
   const float *in_buf = (const float *)ivoid;
   if(d->align_enabled && d->align)
   {
@@ -628,72 +803,36 @@ static int _control_merge_hdr_process(dt_imageio_module_data_t *datai,
     }
   }
 
-  DT_OMP_FOR(collapse(2))
-  for(int y = 0; y < d->ht; y++)
-    for(int x = 0; x < d->wd; x++)
-    {
-      // read unclamped raw value with subtracted black and rescaled
-      // to 1.0 saturation.  this is the output of the rawprepare iop
-      // (optionally registered onto the reference frame, see in_buf above).
-      const float in = in_buf[x + d->wd * y];
-      // weights based on siggraph 12 poster zijian zhu, zhengguo li,
-      // susanto rahardja, pasi fraenti 2d denoising factor for high
-      // dynamic range imaging
-      float w = photoncnt;
+  // stash this frame (output of rawprepare: black subtracted, rescaled to 1.0
+  // saturation, single channel CFA; optionally registered onto the reference)
+  // as fp16 for the merge pass.
+  if(d->frames_filled >= d->num_frames)
+  {
+    // should not happen (the export 'total' bounds the count), but guard the
+    // array so a miscount can never write out of bounds.
+    return 0;
+  }
+  const size_t npx = (size_t)d->wd * d->ht;
+  dt_hdrmerge_half_t *buf = dt_alloc_align_type(dt_hdrmerge_half_t, npx);
+  dt_hdrmerge_half_t *lbuf = dt_alloc_align_type(dt_hdrmerge_half_t, npx);
+  if(!buf || !lbuf)
+  {
+    dt_control_log(_("unable to allocate memory for HDR merge"));
+    dt_free_align(buf);
+    dt_free_align(lbuf);
+    d->abort = TRUE;
+    return 1;
+  }
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npx; k++)
+    buf[k] = dt_hdrmerge_float_to_half(in_buf[k]);
+  _hdr_compute_luma(in_buf, lbuf, d->wd, d->ht);
 
-      // need some safety margin due to upsampling and 16-bit quantization + dithering?
-      float offset = 3000.0f / (float)UINT16_MAX;
-
-      // cannot do an envelope based on single pixel values here, need
-      // to get maximum value of all color channels. to find that, go
-      // through the pattern block (we conservatively do a 3x3 for
-      // bayer or xtrans):
-      int xx = x & ~1, yy = y & ~1;
-      float M = 0.0f, m = FLT_MAX;
-      if(xx < d->wd - 2 && yy < d->ht - 2)
-      {
-        for(int i = 0; i < 3; i++)
-          for(int j = 0; j < 3; j++)
-          {
-            M = MAX(M, in_buf[xx + i + d->wd * (yy + j)]);
-            m = MIN(m, in_buf[xx + i + d->wd * (yy + j)]);
-          }
-        // move envelope a little to allow non-zero weight even for
-        // clipped regions.  this is because even if the 2x2 block is
-        // clipped somewhere, the other channels might still prove
-        // useful. we'll check for individual channel saturation
-        // below.
-        w *= d->epsw + _envelope((M + offset) / saturation);
-      }
-
-      if(M + offset >= saturation)
-      {
-        if(d->weight[x + d->wd * y] <= 0.0f)
-        { // only consider saturated pixels in case we have nothing better:
-          if(d->weight[x + d->wd * y] == 0 || m < -d->weight[x + d->wd * y])
-          {
-            if(m + offset >= saturation)
-              d->pixels[x + d->wd * y] = 1.0f; // let's admit we were completely clipped, too
-            else
-              d->pixels[x + d->wd * y] = in * cal / d->whitelevel;
-            d->weight[x + d->wd * y]
-                = -m; // could use -cal here, but m is per pixel and
-                      // safer for varying illumination conditions
-          }
-        }
-        // else silently ignore, others have filled in a better color here already
-      }
-      else
-      {
-        if(d->weight[x + d->wd * y] <= 0.0)
-        { // cleanup potentially blown highlights from earlier images
-          d->pixels[x + d->wd * y] = 0.0f;
-          d->weight[x + d->wd * y] = 0.0f;
-        }
-        d->pixels[x + d->wd * y] += w * in * cal;
-        d->weight[x + d->wd * y] += w;
-      }
-    }
+  d->frames[d->frames_filled] = buf;
+  d->luma[d->frames_filled] = lbuf;
+  d->cal[d->frames_filled] = cal;
+  d->photoncnt[d->frames_filled] = photoncnt;
+  d->frames_filled++;
 
   return 0;
 }
@@ -767,7 +906,20 @@ static int32_t _control_merge_hdr_job_run(dt_job_t *job)
   dt_control_job_set_progress_message(job, ngettext("merging %d image",
                                                     "merging %d images", total), total);
 
-  dt_control_merge_hdr_t d = (dt_control_merge_hdr_t){.epsw = 1e-8f, .abort = FALSE };
+  dt_control_merge_hdr_t d = (dt_control_merge_hdr_t){ .abort = FALSE,
+                                                       .meta_imgid = NO_IMGID,
+                                                       .meta_cal = -1.0f };
+
+  // merge parameters (runtime configurable via darktablerc; defaults match the
+  // unset-key fallbacks so they work even without registered config entries).
+  const char *weight_str = dt_conf_get_string_const("plugins/lighttable/hdrmerge/weight");
+  // 'legacy' selects the original pre-branch weighted-average merge (for A/B
+  // comparison); otherwise weight_str picks the hdrmerge weight envelope.
+  const gboolean legacy_merge = (weight_str && !g_strcmp0(weight_str, "legacy"));
+  d.weight = (weight_str && !g_strcmp0(weight_str, "triangular"))
+    ? DT_HDRMERGE_WEIGHT_TRIANGULAR : DT_HDRMERGE_WEIGHT_EXPONENTIAL;
+  d.deghost_threshold = CLAMP(dt_conf_get_float("plugins/lighttable/hdrmerge/deghost_threshold"),
+                              0.0f, 2.0f);
 
   // Opt-in auto-alignment of the brackets (only when built with OpenCV).
 #ifdef HAVE_OPENCV
@@ -866,23 +1018,67 @@ static int32_t _control_merge_hdr_job_run(dt_job_t *job)
 
   if(d.abort) goto end;
 
-// normalize by white level to make clipping at 1.0 work as expected
+  if(d.frames_filled < 1)
+    goto end;
 
-  DT_OMP_FOR(shared(d))
-  for(size_t k = 0; k < (size_t)d.wd * d.ht; k++)
+  // merge all collected frames into d.pixels. the result is normalized so
+  // 1.0 = brightest representable radiance, which is the convention the
+  // downstream raw pipeline / dng writer expect.
+  d.pixels = dt_alloc_align_float((size_t)d.wd * d.ht);
+  if(!d.pixels)
   {
-    if(d.weight[k] > 0.0)
-      d.pixels[k] = fmaxf(0.0f, d.pixels[k] / (d.whitelevel * d.weight[k]));
+    dt_control_log(_("unable to allocate memory for HDR merge"));
+    goto end;
+  }
+  if(legacy_merge)
+  {
+    // original pre-branch weighted-average merge, for A/B comparison.
+    _hdr_merge_legacy(&d);
+  }
+  else
+  {
+    // hdrmerge algorithm (OpenCL when available and the data fits, multi-threaded
+    // CPU otherwise). blending: 'pyramid' (default) = multi-scale Laplacian-
+    // pyramid merge for smooth, fringe-free exposure/motion transitions (Bayer
+    // only); 'linear' = the single per-pixel weighted average (also the GPU path).
+    const char *blend_str = dt_conf_get_string_const("plugins/lighttable/hdrmerge/blend");
+    const gboolean use_pyramid = !(blend_str && !g_strcmp0(blend_str, "linear"));
+    // feathering / soft-blending amount for the pyramid path (0 = crisp).
+    const float feather = CLAMP(dt_conf_get_float("plugins/lighttable/hdrmerge/feather"), 0.0f, 1.0f);
+    dt_hdrmerge_t hm = { .width = d.wd,
+                         .height = d.ht,
+                         .num_frames = d.frames_filled,
+                         .frames = (const dt_hdrmerge_half_t *const *)d.frames,
+                         .luma = (const dt_hdrmerge_half_t *const *)d.luma,
+                         .cal = d.cal,
+                         .white_thresh = DT_HDRMERGE_DEFAULT_WHITE_THRESH,
+                         .weight = d.weight,
+                         .deghost_threshold = d.deghost_threshold,
+                         .pyramid = use_pyramid,
+                         .xtrans = (d.first_filter == 9u), // 9u == X-Trans CFA
+                         .feather = feather,
+                         .out = d.pixels };
+    dt_hdrmerge_process(&hm);
   }
 
-  // output hdr as digital negative with exif data.
+  // a merge that could not allocate its scratch aborted above; don't write out
+  // an all-black result (only the legacy path can fail here - the hdrmerge path
+  // always succeeds via its CPU fallback).
+  if(d.abort) goto end;
+
+  // output hdr as digital negative with exif data. The exif (and the output
+  // file name) come from the shortest-exposure frame, not the first selected
+  // one: the merged radiance is normalized to that exposure, so this both keeps
+  // the developed brightness correct and makes the whole result deterministic
+  // regardless of the order the brackets were selected in.
+  const dt_imgid_t meta_imgid = dt_is_valid_imgid(d.meta_imgid) ? d.meta_imgid : d.first_imgid;
   uint8_t *exif = NULL;
   char pathname[PATH_MAX] = { 0 };
   gboolean from_cache = TRUE;
-  dt_image_full_path(d.first_imgid, pathname, sizeof(pathname), &from_cache);
+  dt_image_full_path(meta_imgid, pathname, sizeof(pathname), &from_cache);
 
   // last param is dng mode
-  const int exif_len = dt_exif_read_blob(&exif, pathname, d.first_imgid, FALSE, d.wd, d.ht, TRUE);
+  const int exif_len = dt_exif_read_blob(&exif, pathname, meta_imgid, FALSE, d.wd, d.ht, TRUE);
   char *c = pathname + strlen(pathname);
   while(*c != '.' && c > pathname) c--;
   const size_t free_space = sizeof(pathname) - (c - pathname);
@@ -927,8 +1123,16 @@ static int32_t _control_merge_hdr_job_run(dt_job_t *job)
   dt_control_queue_redraw_center();
 
 end:
-  free(d.pixels);
-  free(d.weight);
+  for(int i = 0; i < d.frames_filled; i++)
+  {
+    if(d.frames) dt_free_align(d.frames[i]);
+    if(d.luma) dt_free_align(d.luma[i]);
+  }
+  free(d.frames);
+  free(d.luma);
+  free(d.cal);
+  free(d.photoncnt);
+  dt_free_align(d.pixels);
   if(d.aligned_buf) dt_free_align(d.aligned_buf);
   if(d.align) dt_hdr_alignment_free(d.align);
 
