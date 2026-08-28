@@ -35,6 +35,11 @@ This guide covers building Image Operation (IOP) modules for darktable's darkroo
 |------|-------------|
 | **[New_Module_Guide.md](New_Module_Guide.md)** | Step-by-step guide to creating a new IOP module |
 
+### Algorithms
+| File | Description |
+|------|-------------|
+| **[HDR_Merge.md](HDR_Merge.md)** | Exposure-bracket HDR merge (hdrmerge algorithm), CPU + OpenCL design and differences vs. the previous merge |
+
 ---
 
 ## Quick Reference

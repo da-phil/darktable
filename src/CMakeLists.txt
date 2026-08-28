@@ -56,6 +56,7 @@ FILE(GLOB SOURCE_FILES
   "common/grouping.c"
   "common/guided_filter.c"
   "common/hdr_alignment.cc"
+  "common/hdrmerge.c"
   "common/heal.c"
   "common/histogram.c"
   "common/history.c"
