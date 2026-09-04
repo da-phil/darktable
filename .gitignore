@@ -28,3 +28,7 @@ workspace/
 cmake-build-debug/
 .idea/
 AppDir/
+
+# Python bytecode from the tools/ scripts
+__pycache__/
+*.pyc
