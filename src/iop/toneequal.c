@@ -1711,7 +1711,6 @@ int process_cl(dt_iop_module_t *self,
       dt_iop_gui_enter_critical_section(self);
       g->luminance_valid = TRUE;
       dt_iop_gui_leave_critical_section(self);
-      dt_dev_pixelpipe_cache_invalidate_later(piece->pipe, self->iop_order, "toneequal: ");
     }
   }
 
