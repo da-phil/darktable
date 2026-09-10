@@ -120,9 +120,9 @@ changes (where available).
 - Don't invalidate the pixelpipe cache on every commit
   when a raster mask is used.
 
-- Add a OpenCL code path to tone equalizer which gives around
-  6-20x faster processing times in comparison to CPU code path,
-  dependening on CPU & GPU.
+- Added an OpenCL code path to the tone equalizer, which processes
+  around 6 to 20 times faster than the CPU code path depending on
+  the CPU and GPU.
 
 - Sped up editing an image that uses a detail mask. Every history change
   used to discard the cached output of every module from demosaic onwards,
