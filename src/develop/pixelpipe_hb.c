@@ -1844,6 +1844,10 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
           // from a previous module can't leak into this dispatch's
           // fallback log line.
           pipe->vk_fallback_reason = NULL;
+          // stage `tmp`, not `input`: it holds the colorspace-converted
+          // pixels and aliases `input` only when no conversion was needed,
+          // so process_vk has to read what process() reads or it silently
+          // works on the wrong colorspace
           const gboolean upload_ok = vin_from_cache
               ? TRUE
               : (vin && dt_vulkan_write_to_device(devid, vin, tmp, in_size) == 0);

@@ -1067,11 +1067,14 @@ int process_vk(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const int width  = roi_out->width;
   const int height = roi_out->height;
 
-  // Only the legacy 8-bit Cairo ARGB32 compositing path has a Vulkan
-  // kernel. The HQ float compositor has no VK twin yet, so refuse it
-  // here and let the pipeline fall back to OpenCL/CPU rather than
-  // silently blending it at legacy quality.
-  if(data->compositing != DT_OVERLAY_COMPOSITE_LEGACY) return -1;
+  // only the legacy 8-bit Cairo ARGB32 compositor has a Vulkan kernel:
+  // blending an HQ float overlay with it would silently downgrade the
+  // result, so hand those back to OpenCL/CPU
+  if(data->compositing != DT_OVERLAY_COMPOSITE_LEGACY)
+  {
+    dt_pipe_vk_fallback(piece, "overlay: HQ float compositing not ported");
+    return -1;
+  }
 
   int stride = 0;
   guint8 *image = _get_overlay_argb(self, piece, roi_in, roi_out, &stride);
