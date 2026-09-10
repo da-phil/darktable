@@ -686,6 +686,30 @@ static void _toneeq_preview_resized(void *const user_data)
   if(g) g->luminance_valid = FALSE;
 }
 
+static float *_full_preview_buffer(dt_iop_module_t *const self,
+                                   const size_t width,
+                                   const size_t height)
+{
+  // the full pipe luminance mask cache, shared by the CPU and OpenCL paths.
+  // only that pipe's thread touches the buffer, so it needs no lock; the
+  // hash keying it is also written by invalidate_luminance_cache() on the
+  // GUI thread, so that one does
+  dt_iop_toneequalizer_gui_data_t *const g = self->gui_data;
+
+  if(g->full_preview_buf_width != width || g->full_preview_buf_height != height)
+  {
+    dt_free_align(g->full_preview_buf);
+    g->full_preview_buf = dt_alloc_align_float(width * height);
+    // a fresh buffer holds no mask: never let a matching hash pass it off as one
+    const gboolean ok = g->full_preview_buf != NULL;
+    g->full_preview_buf_width = ok ? width : 0;
+    g->full_preview_buf_height = ok ? height : 0;
+    const dt_hash_t invalid = DT_INVALID_HASH;
+    hash_set_get(&invalid, &g->ui_preview_hash, &self->gui_lock);
+  }
+  return g->full_preview_buf;
+}
+
 // gaussian-ish kernel - sum is == 1.0f so we don't care much about actual coeffs
 static const dt_colormatrix_t gauss_kernel =
   { { 0.076555024f, 0.124401914f, 0.076555024f },
@@ -1089,18 +1113,7 @@ void toneeq_process(dt_iop_module_t *self,
     {
       // For DT_DEV_PIXELPIPE_FULL, we cache the luminance mask for performance
       // but it's not accessed from GUI
-      // no need for threads lock since no other function is writing/reading that buffer
-
-      // Re-allocate a new buffer if the full preview size has changed
-      if(g->full_preview_buf_width != width || g->full_preview_buf_height != height)
-      {
-        dt_free_align(g->full_preview_buf);
-        g->full_preview_buf = dt_alloc_align_float(num_elem);
-        g->full_preview_buf_width = width;
-        g->full_preview_buf_height = height;
-      }
-
-      luminance = g->full_preview_buf;
+      luminance = _full_preview_buffer(self, width, height);
       cached = TRUE;
     }
     else if(dt_pipe_is_preview(piece->pipe))
@@ -1618,9 +1631,12 @@ int process_cl(dt_iop_module_t *self,
     return DT_OPENCL_PROCESS_CL; // input should be at least as large as output
   if(piece->colors != 4) return DT_OPENCL_PROCESS_CL;  // we need RGB signal
 
-  // Only the preview pipe publishes its luminance mask to the GUI, so only
-  // that one is copied back to host memory; see below.
+  // Both darkroom pipes keep a host copy of the mask, shared with
+  // toneeq_process() so a CPU fallback stays in sync: the preview pipe one
+  // feeds the GUI histogram and the exposure under the cursor, the full pipe
+  // one is the cache a band slider drag reuses instead of rebuilding the mask
   gboolean cached = FALSE;
+  gboolean fresh = FALSE;
   float *luminance = NULL;
 
   if(self->dev->gui_attached && g)
@@ -1639,19 +1655,17 @@ int process_cl(dt_iop_module_t *self,
 
     if(dt_pipe_is_full(piece->pipe))
     {
-      // The mask stays on the device : the correction is applied there and
-      // no GUI code reads g->full_preview_buf.  Both GUI consumers, the
-      // histogram and the exposure under the cursor, are fed by the preview
-      // pipe buffer instead.  Copying the full pipe mask back would be a
-      // blocking multi-megabyte transfer into a buffer nobody reads, and it
-      // would happen on every roi or upstream change.
-      //
-      // toneeq_process() skips compute_luminance_mask() while
-      // g->ui_preview_hash still matches, so invalidate it here: should the
-      // pipe fall back to the CPU, it has to recompute the mask rather than
-      // reuse a host buffer this path never filled.
-      const dt_hash_t invalid = DT_INVALID_HASH;
-      hash_set_get(&invalid, &g->ui_preview_hash, &self->gui_lock);
+      luminance = _full_preview_buffer(self, width, height);
+      cached = TRUE;
+
+      dt_hash_t saved_hash;
+      hash_set_get(&g->ui_preview_hash, &saved_hash, &self->gui_lock);
+
+      dt_iop_gui_enter_critical_section(self);
+      const gboolean luminance_valid = g->luminance_valid;
+      dt_iop_gui_leave_critical_section(self);
+
+      fresh = luminance && hash == saved_hash && luminance_valid;
     }
     else if(dt_pipe_is_preview(piece->pipe))
     {
@@ -1661,6 +1675,14 @@ int process_cl(dt_iop_module_t *self,
       luminance = dt_preview_data_resize(&g->pd, width, height,
                                          _toneeq_preview_resized, self);
       cached = TRUE;
+
+      const dt_hash_t saved_hash = dt_preview_data_get_hash(&g->pd);
+
+      dt_iop_gui_enter_critical_section(self);
+      const gboolean luminance_valid = g->luminance_valid;
+      dt_iop_gui_leave_critical_section(self);
+
+      fresh = luminance && hash == saved_hash && luminance_valid;
     }
 
     if(cached && !luminance)
@@ -1671,44 +1693,60 @@ int process_cl(dt_iop_module_t *self,
   }
 
   cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+  const size_t bsize = num_elem * sizeof(float);
 
-  cl_mem dev_luminance = dt_opencl_alloc_device_buffer(devid, num_elem * sizeof(float));
+  cl_mem dev_luminance = dt_opencl_alloc_device_buffer(devid, bsize);
   if(!dev_luminance) goto error;
 
-  // Compute the luminance mask
-  err = _compute_luminance_mask_cl(devid, gd, dev_in, dev_luminance,
-                                   width, height, d);
-  if(err != CL_SUCCESS) goto error;
-
-  // Keep the host-side cache in sync so that the GUI can compute the histogram
-  // and read the luminance under the cursor
-  if(cached)
+  if(fresh)
   {
-    const dt_hash_t saved_hash = dt_preview_data_get_hash(&g->pd);
+    // the host copy is current: uploading it is far cheaper than rebuilding
+    // the mask, which is what every frame of a band slider drag would pay
+    err = dt_opencl_write_buffer_to_device(devid, luminance, dev_luminance,
+                                           0, bsize, TRUE);
+    if(err != CL_SUCCESS) goto error;
+  }
+  else
+  {
+    err = _compute_luminance_mask_cl(devid, gd, dev_in, dev_luminance,
+                                     width, height, d);
+    if(err != CL_SUCCESS) goto error;
 
-    dt_iop_gui_enter_critical_section(self);
-    const gboolean luminance_valid = g->luminance_valid;
-    dt_iop_gui_leave_critical_section(self);
-
-    if(saved_hash != hash || !luminance_valid)
+    if(cached)
     {
-      /* copy back only if upstream pipe state has changed */
-      // Flag the cache as being recomputed so the GUI threads never
-      // read a partially filled buffer, then commit hash + validity
-      // once the data is ready.
-      dt_iop_gui_enter_critical_section(self);
-      g->histogram_valid = FALSE;
-      g->luminance_valid = FALSE;
-      dt_iop_gui_leave_critical_section(self);
+      // copy the mask back for the GUI and the next run.  The transfer is
+      // blocking: later runs rewrite and reallocate the host copy, and it is
+      // only issued when the mask changed, i.e. when the device just did the
+      // expensive part anyway.  Invalidate first and commit the key once the
+      // data is complete, so a failed transfer never passes a half filled
+      // buffer off as the mask
+      const gboolean preview = dt_pipe_is_preview(piece->pipe);
+      const dt_hash_t invalid = DT_INVALID_HASH;
+
+      if(preview)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        g->histogram_valid = FALSE;
+        g->luminance_valid = FALSE;
+        dt_iop_gui_leave_critical_section(self);
+      }
+      else
+        hash_set_get(&invalid, &g->ui_preview_hash, &self->gui_lock);
 
       err = dt_opencl_read_buffer_from_device(devid, luminance, dev_luminance,
-                                              0, num_elem * sizeof(float), TRUE);
+                                              0, bsize, TRUE);
       if(err != CL_SUCCESS) goto error;
-      dt_preview_data_set_hash_value(&g->pd, hash);
 
-      dt_iop_gui_enter_critical_section(self);
-      g->luminance_valid = TRUE;
-      dt_iop_gui_leave_critical_section(self);
+      if(preview)
+      {
+        dt_preview_data_set_hash_value(&g->pd, hash);
+
+        dt_iop_gui_enter_critical_section(self);
+        g->luminance_valid = TRUE;
+        dt_iop_gui_leave_critical_section(self);
+      }
+      else
+        hash_set_get(&hash, &g->ui_preview_hash, &self->gui_lock);
     }
   }
 
