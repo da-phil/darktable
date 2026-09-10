@@ -153,9 +153,9 @@ changes (where available).
 - Separated the demosaicer's crop-and-scale step into a new hidden
   module to improve cache efficiency and UI responsiveness.
 
-- Add a OpenCL code path to tone equalizer which gives around
-  6-20x faster processing times in comparison to CPU code path,
-  dependening on CPU & GPU.
+- Added an OpenCL code path to the tone equalizer, which processes
+  around 6 to 20 times faster than the CPU code path depending on
+  the CPU and GPU.
 
 ## Other Changes
 
