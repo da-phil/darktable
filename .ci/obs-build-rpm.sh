@@ -62,3 +62,11 @@ else
   dnf -y install "$TOP_DIR"/RPMS/*/darktable-"$VERSION"-*.rpm
 fi
 darktable-cli --version
+
+# the build leaves out AVIF and OpenCV support without an error when it does
+# not find the libraries, so check that the installed library links them
+LIBDARKTABLE=$(find /usr/lib* -name libdarktable.so | head -n 1)
+test -n "$LIBDARKTABLE"
+for dep in libavif libopencv_core; do
+  ldd "$LIBDARKTABLE" | grep -q "$dep" || { echo "$LIBDARKTABLE does not link $dep"; exit 1; }
+done

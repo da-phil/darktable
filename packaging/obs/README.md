@@ -37,10 +37,11 @@ A new installed file needs a matching entry in `%files` in the spec and in
 ## Testing
 
 `.ci/obs-build-deb.sh` and `.ci/obs-build-rpm.sh` build the packages from
-this directory the way OBS does, then install them and run
-`darktable-cli --version`. They install the build dependencies themselves,
-so run them as root in a throwaway container, on a checkout that includes
-the submodules:
+this directory the way OBS does, then install them, run
+`darktable-cli --version` and check that darktable links libavif and
+OpenCV, which its build leaves out without an error when they are missing.
+They install the build dependencies themselves, so run them as root in a
+throwaway container, on a checkout that includes the submodules:
 
     docker run --rm -v "$PWD":/src:ro -e SRC_DIR=/src debian:12 /src/.ci/obs-build-deb.sh
     docker run --rm -v "$PWD":/src:ro -e SRC_DIR=/src registry.fedoraproject.org/fedora:43 /src/.ci/obs-build-rpm.sh
