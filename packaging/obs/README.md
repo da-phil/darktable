@@ -30,11 +30,27 @@ copy subdirectories, so the directory has to stay flat.
 A new installed file needs a matching entry in `%files` in the spec and in
 `debian.darktable.install`.
 
+## Testing
+
+`.ci/obs-build-deb.sh` and `.ci/obs-build-rpm.sh` build the packages from
+this directory the way OBS does, then install them and run
+`darktable-cli --version`. They install the build dependencies themselves,
+so run them as root in a throwaway container, on a checkout that includes
+the submodules:
+
+    docker run --rm -v "$PWD":/src:ro -e SRC_DIR=/src debian:12 /src/.ci/obs-build-deb.sh
+    docker run --rm -v "$PWD":/src:ro -e SRC_DIR=/src registry.fedoraproject.org/fedora:43 /src/.ci/obs-build-rpm.sh
+
+The OBS packaging workflow runs both on Debian 12, Fedora 43 and openSUSE
+Tumbleweed for pull requests that change a CMake file or this directory,
+and once a week. `.ci/obs-lint.py` checks that the two Debian dependency
+lists agree and that every source file of the spec is here.
+
 ## The OBS side
 
-The OBS package keeps only `_service`, `_constraints` and the generated
-`darktable.changes`. Its `_service` exports this directory with one more
-parameter to the existing `obs_scm` service:
+The OBS package keeps only `_service`, `_servicedata`, `_constraints` and
+the generated `darktable.changes`. Its `_service` exports this directory
+with one more parameter to the existing `obs_scm` service:
 
     <param name="extract">packaging/obs/*</param>
 

@@ -1,0 +1,85 @@
+name: OBS packaging
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "packaging/obs/**"
+      - "**/CMakeLists.txt"
+      - "**/*.cmake"
+      - ".ci/obs-*"
+      - ".github/workflows/obs-packaging.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "packaging/obs/**"
+      - "**/CMakeLists.txt"
+      - "**/*.cmake"
+      - ".ci/obs-*"
+      - ".github/workflows/obs-packaging.yml"
+  schedule:
+    # distributions change too, so build once a week even without changes here
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    name: Check packaging/obs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Check that the Debian and RPM package sources are complete
+        run: python3 .ci/obs-lint.py
+
+  build:
+    needs: lint
+    name: ${{ matrix.distro.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.distro.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest Debian and Fedora releases OBS builds for, and
+        # Tumbleweed
+        distro:
+          - name: Debian 12
+            image: "debian:12"
+            prepare: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+            script: .ci/obs-build-deb.sh
+          - name: Fedora 43
+            image: "registry.fedoraproject.org/fedora:43"
+            prepare: dnf -y install git-core
+            script: .ci/obs-build-rpm.sh
+          - name: openSUSE Tumbleweed
+            image: "registry.opensuse.org/opensuse/tumbleweed:latest"
+            prepare: zypper --non-interactive install git-core
+            script: .ci/obs-build-rpm.sh
+    steps:
+      - name: Install git
+        run: ${{ matrix.distro.prepare }}
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Get only those submodules that are needed for build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule init
+          git config submodule.src/tests/integration.update none
+          git submodule update
+      - name: Build, install and run the packages
+        run: ${{ matrix.distro.script }}
