@@ -176,6 +176,10 @@ BuildRequires:  gcc%{?force_gcc_version}-c++ >= 12
 %endif
 BuildRequires:  intltool
 BuildRequires:  libxslt
+# modules of tools/introspection/parser.pl, which runs during the build
+BuildRequires:  perl(Exporter)
+BuildRequires:  perl(FindBin)
+BuildRequires:  perl(lib)
 %if %{with translated_manpages}
 BuildRequires:  po4a
 %endif
