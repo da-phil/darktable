@@ -27,6 +27,10 @@ copy subdirectories, so the directory has to stay flat.
   are the same on openSUSE and Fedora.
 - `Build-Depends` in `debian.control` and in `darktable.dsc`, identically.
 
+On Debian and Ubuntu, OpenCV is listed as the five module packages darktable
+uses rather than `libopencv-dev`, which would pull in all of OpenCV;
+darktable finds the modules without it.
+
 A new installed file needs a matching entry in `%files` in the spec and in
 `debian.darktable.install`.
 

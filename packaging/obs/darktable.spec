@@ -54,6 +54,8 @@
 %bcond_with    avif
 %endif
 
+%bcond_without opencv
+
 %if 0%{?suse_version} >= 1550 || 0%{?fedora} >= 37
 %bcond_without jxl
 %else
@@ -112,6 +114,12 @@
 %global _use_avif "ON"
 %else
 %global _use_avif "OFF"
+%endif
+
+%if %{with opencv}
+%global _use_opencv "ON"
+%else
+%global _use_opencv "OFF"
 %endif
 
 %if 0%{?suse_version} && 0%{?suse_version} < 1550
@@ -255,7 +263,16 @@ BuildRequires:  gmic-devel
 # /gmic
 %endif
 %if %{with avif}
-BuildRequires:  libavif-devel >= 0.9.0
+BuildRequires:  libavif-devel >= 0.9.3
+%endif
+%if %{with opencv}
+%if 0%{?suse_version}
+# pkgconfig(opencv4) has one provider per GUI flavor on openSUSE, and
+# darktable needs no GUI from OpenCV
+BuildRequires:  opencv-nogui-devel
+%else
+BuildRequires:  pkgconfig(opencv4)
+%endif
 %endif
 BuildRequires:  portmidi-devel
 BuildRequires:  potrace-devel
@@ -342,6 +359,7 @@ rm -rf src/external/lua/
    -DUSE_OPENMP="%{_use_openmp}" \\\
    -DUSE_GMIC="%{_use_gmic}" \\\
    -DUSE_AVIF="%{_use_avif}" \\\
+   -DUSE_OPENCV="%{_use_opencv}" \\\
    -DDONT_USE_INTERNAL_LIBRAW="%{_use_system_libraw}" \\\
    -DBUILD_NOISE_TOOLS=ON \\\
    -DBUILD_CURVE_TOOLS=ON
