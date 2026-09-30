@@ -1,0 +1,54 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+SOURCEPKG=$(shell dpkg-parsechangelog | sed  -n 's/^Source: \(.*\)/\1/p')
+UPSTREAM=$(shell dpkg-parsechangelog |  sed -n 's/^Version: \(.*\)/\1/p')
+SHA1=$(lastword $(subst ~g, ,$(UPSTREAM)))
+ORIG=${SOURCEPKG}_${UPSTREAM}.orig.tar.gz
+
+export CONFIG_SHELL=/bin/bash
+
+ifneq (,$(filter noopt,$(DEB_BUILD_OPTIONS)))
+	export DEB_CFLAGS_MAINT_APPEND=-O0
+	export DEB_CXXFLAGS_MAINT_APPEND=-O0
+else
+	export DEB_CFLAGS_MAINT_APPEND=-O3
+	export DEB_CXXFLAGS_MAINT_APPEND=-O3
+endif
+
+DISTRIBUTION := $(shell lsb_release -si)
+CODENAME     := $(shell lsb_release -sc)
+
+ifneq (,$(filter Ubuntu,$(DISTRIBUTION)))
+	ifneq (,$(filter jammy,$(CODENAME)))
+		export CC=gcc-12
+		export CXX=g++-12
+	endif
+endif
+
+%:
+	dh $@ --parallel
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+override_dh_link:
+	dh_link
+	rm -rf debian/darktable-tools-basecurve/usr/share/doc/darktable-tools-basecurve
+	rm -rf debian/darktable-tools-noise/usr/share/doc/darktable-tools-noise
+	ln -s /usr/share/doc/darktable debian/darktable-tools-basecurve/usr/share/doc/darktable-tools-basecurve
+	ln -s /usr/share/doc/darktable debian/darktable-tools-noise/usr/share/doc/darktable-tools-noise
+
+override_dh_auto_configure: src/version_gen.c
+	dh_auto_configure -- -DCMAKE_INSTALL_DATAROOTDIR="share" -DCMAKE_INSTALL_LIBEXECDIR="lib" -DCMAKE_INSTALL_DOCDIR="share/doc/darktable" -DCMAKE_SKIP_RPATH=OFF -DCMAKE_BUILD_TYPE=Release -DBINARY_PACKAGE_BUILD=1 -DRAWSPEED_ENABLE_LTO=OFF -DUSE_OPENCL=ON -DBUILD_NOISE_TOOLS=ON -DBUILD_CURVE_TOOLS=ON -DDONT_USE_INTERNAL_LUA=Off -DTESTBUILD_OPENCL_PROGRAMS=OFF
+
+describe-current-version:
+	git describe --tags upstream | sed 's,^release-,,;s,-,+,;s,-,~,;'
+
+get-orig-source:
+	git archive --format=tar $(SHA1) | gzip -9 > ../$(ORIG)
+
+src/version_gen.c:
+	./tools/create_version_c.sh src/version_gen.c "${UPSTREAM}"
+
+.PHONY: describe-current-version git-orig-source
