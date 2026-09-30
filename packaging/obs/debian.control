@@ -1,0 +1,104 @@
+Source: darktable
+Section: graphics
+Priority: optional
+Maintainer: Debian PhotoTools Maintainers <pkg-phototools-devel@lists.alioth.debian.org>
+Uploaders: David Bremner <bremner@debian.org>
+#               libavif-dev (>= 0.9.1),
+#               libflickcurl-dev,
+Build-Depends: clang (>= 13),
+               cmake (>= 3.18),
+               debhelper (>= 10),
+               gcc (>= 12),
+               gcc-13 | gcc-12,
+               g++-13 | g++-12,
+               intltool,
+               iso-codes,
+               libcairo2-dev,
+               libclang-dev (>= 13),
+               libcolord-dev,
+               libcolord-gtk-dev,
+               libcups2-dev,
+               libcurl4-gnutls-dev | libcurl-dev,
+               libexiv2-dev,
+               libglib2.0-dev,
+               libgmic-dev,
+               libgphoto2-dev,
+               libgraphicsmagick1-dev,
+               libgtk-3-dev (>= 3.24.5),
+               libheif-dev,
+               libjpeg-dev,
+               libjson-glib-dev,
+               libjxl-dev,
+               liblcms2-dev,
+               liblensfun-dev,
+               liblua5.4-dev | liblua5.3-dev,
+               libncurses-dev,
+               libopenexr-dev,
+               libopenjp2-7-dev,
+               libosmgpsmap-1.0-dev,
+               libpng-dev,
+               libportmidi-dev,
+               libpotrace-dev,
+               libpugixml-dev,
+               librsvg2-dev,
+               libsdl2-dev,
+               libsecret-1-dev,
+               libsoup2.4-dev | libsoup-3.0-dev,
+               libsqlite3-dev,
+               libtiff-dev,
+               libwebp-dev,
+               llvm-dev (>= 13),
+               lsb-release,
+               xsltproc
+Standards-Version: 4.1.2
+Homepage: http://www.darktable.org/
+Vcs-Git: https://salsa.debian.org/debian-phototools-team/darktable.git
+Vcs-Browser: https://salsa.debian.org/debian-phototools-team/darktable
+
+Package: darktable
+Architecture: any-amd64 any-arm64 any-ppc64el
+Depends: ${shlibs:Depends}, ${misc:Depends}, libjs-prototype, libjs-scriptaculous, fonts-roboto, iso-codes
+Replaces: darktable-plugins-legacy (<< 0.9), darktable-plugins-experimental (<< 1.0~)
+Breaks: darktable-plugins-legacy (<< 0.9), darktable-plugins-experimental (<< 1.0~)
+Description: virtual lighttable and darkroom for photographers
+ Darktable manages your digital negatives in a database and lets you view
+ them  through a zoomable lighttable. it also enables you to develop raw
+ images and enhance them.
+ .
+ It tries to fill the gap between the many excellent existing free
+ raw converters and image management tools (such as ufraw or f-spot).
+ The user interface is built around efficient caching of image metadata and
+ mipmaps, all stored in a database. the user will always be able to interact,
+ even if the full resolution image is not yet loaded.
+ .
+ All editing is fully non-destructive and only operates on cached image
+ buffers for display. the full image is only converted during export. The
+ frontend is written in gtk+/cairo, the database uses sqlite3, raw image
+ loading is done using rawspeed, high-dynamic range, and standard image formats
+ such as jpeg are also supported. The core operates completely on floating
+ point values, so darktable can not only be used for photography but also for
+ scientifically acquired images or output of renderers (high dynamic range).
+
+Package: darktable-tools-basecurve
+Architecture: any-amd64 any-arm64 any-ppc64el
+Priority: optional
+Depends: darktable, ${shlibs:Depends}, ${misc:Depends}, dcraw, exiftool, graphicsmagick-imagemagick-compat
+Description: The basecurve tool from tools/basecurve/
+ darktable is a virtual lighttable and darkroom for photographers: it manages
+ digital negatives in a database and can show them through a zoomable
+ lighttable. It also enables developing raw images and enhance them.
+ .
+ This package provides the basecurve tool from tools/basecurve/.
+ Another option to solve the same problem might be the darktable-chart module
+ from the darktable package.
+
+Package: darktable-tools-noise
+Architecture: any-amd64 any-arm64 any-ppc64el
+Priority: optional
+Depends: darktable, ${shlibs:Depends}, ${misc:Depends}, dcraw, exiftool, graphicsmagick-imagemagick-compat
+Description: Noise profiling tools to support new camerasNoise profiling tools to support new cameras
+ darktable is a virtual lighttable and darkroom for photographers: it manages
+ digital negatives in a database and can show them through a zoomable
+ lighttable. It also enables developing raw images and enhance them.
+ .
+ This package provides the noise profiling tools to add support for new cameras.

@@ -1,0 +1,33 @@
+darktable (2.2.0~rc1+dfsg1-1) experimental; urgency=medium
+
+  * This version of darktable has again an incompatible database format
+    with earlier versions. If you think you might go back to an older
+    version of darktable, make a backup of .config/darktable/library.db
+
+ -- David Bremner <bremner@debian.org>  Wed, 23 Nov 2016 21:48:08 -0400
+
+darktable (2.0~rc3-1) experimental; urgency=medium
+
+  * This version of darktable has again an incompatible database format
+    with earlier versions. If you think you might go back to an older
+    version of darktable, make a backup of .config/darktable/library.db
+
+ -- David Bremner <bremner@debian.org>  Sat, 05 Dec 2015 12:04:37 -0400
+
+darktable (1.6.0-1) experimental; urgency=medium
+
+  * This version of darktable has an incompatible database format with
+    earlier versions. If you think you might go back to an older version
+    of darktable, make a backup of .config/darktable/library.db
+
+ -- David Bremner <bremner@debian.org>  Sun, 07 Dec 2014 21:22:55 +0100
+
+darktable (1.0-1) experimental; urgency=low
+
+  * Darktable has changed the storage method for preferences from gconf to
+    a flat file $HOME/.config/darktable/darktablerc. There is no automatic
+    migration method for preferences, but you may find the command
+    "gconftool-2 -R /apps/darktable" useful if you need to view previous
+    settings.
+
+ -- David Bremner <bremner@debian.org>  Thu, 15 Mar 2012 21:24:36 -0300
