@@ -44,7 +44,10 @@ the submodules:
 The OBS packaging workflow runs both on Debian 12, Fedora 43 and openSUSE
 Tumbleweed for pull requests that change a CMake file or this directory,
 and once a week. `.ci/obs-lint.py` checks that the two Debian dependency
-lists agree and that every source file of the spec is here.
+lists agree and that every source file of the spec is here. The OBS status
+workflow reads the build results on OBS every day and fails when a build
+there is broken, which also catches problems only the OBS project
+configuration can fix.
 
 ## The OBS side
 
