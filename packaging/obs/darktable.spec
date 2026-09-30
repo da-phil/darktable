@@ -139,7 +139,6 @@ Source2:        %{pkg_name}-rpmlintrc
 #
 Source95:       series
 Source97:       darktable.dsc
-Source98:       debian.tar.xz
 Source99:       README.openSUSE
 #
 Patch0:         darktable-rawspeed-build-type-override.patch
@@ -218,6 +217,7 @@ BuildRequires:  pkgconfig(iso-codes)
 BuildRequires:  pkgconfig(json-glib-1.0)
 BuildRequires:  pkgconfig(lcms2)
 BuildRequires:  pkgconfig(lensfun) >= 0.3.2
+BuildRequires:  pkgconfig(libarchive)
 BuildRequires:  pkgconfig(libcurl)
 BuildRequires:  pkgconfig(libgphoto2)
 %if %{with libheif}

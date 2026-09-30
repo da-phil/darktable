@@ -42,8 +42,6 @@
 /usr/share/darktable/darktable.bash              /usr/share/bash-completion/completions/darktable.bash
 /usr/share/darktable/luarc
 /usr/share/darktable/gdb_commands
-/usr/share/darktable/noiseprofiles.json
-/usr/share/darktable/mcp-tools.json
+/usr/share/darktable/*.json
 /usr/share/darktable/shortcutsrc*
-/usr/share/darktable/wb_presets.json
 /usr/share/darktable/darktablerc
