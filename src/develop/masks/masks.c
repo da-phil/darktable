@@ -183,6 +183,23 @@ void dt_masks_init_form_gui(dt_masks_form_gui_t *gui)
   gui->source_pos_type = DT_MASKS_SOURCE_POS_RELATIVE_TEMP;
 }
 
+// what the outlines in gui->points are computed from: the shapes, the
+// preview pipe's size and the distorting modules they are transformed
+// through, whose order relative to a clone module places its source
+static dt_hash_t _gui_geometry_hash(dt_develop_t *dev,
+                                    const dt_iop_module_t *module)
+{
+  const dt_dev_pixelpipe_t *pipe = dev->preview_pipe;
+  dt_hash_t hash = dt_dev_hash_distort_plus(dev, dev->preview_pipe,
+                                            0.0, DT_DEV_TRANSFORM_DIR_ALL);
+  const int size[4] = { pipe->iwidth, pipe->iheight,
+                        pipe->processed_width, pipe->processed_height };
+  hash = dt_hash(hash, size, sizeof(size));
+  const double iop_order = module ? module->iop_order : 0.0;
+  hash = dt_hash(hash, &iop_order, sizeof(iop_order));
+  return dt_masks_group_hash(hash, dev->form_visible);
+}
+
 void dt_masks_gui_form_create(dt_masks_form_t *form,
                               dt_masks_form_gui_t *gui,
                               const int index,
@@ -207,6 +224,7 @@ void dt_masks_gui_form_create(dt_masks_form_t *form,
       dt_masks_get_points_border(darktable.develop, form,
                                  &gpt->source, &gpt->source_count, NULL, NULL, 1, module);
     gui->pipe_hash = darktable.develop->preview_pipe->backbuf_hash;
+    gui->geometry_hash = _gui_geometry_hash(darktable.develop, module);
     gui->formid = form->formid;
   }
 }
@@ -259,10 +277,15 @@ void dt_masks_gui_form_test_create(dt_masks_form_t *form,
                                    dt_masks_form_gui_t *gui,
                                    const dt_iop_module_t *module)
 {
-  // we test if the image has changed
-  if(gui->pipe_hash != DT_INVALID_HASH)
+  // a new preview is when the outlines may have moved: processing is what
+  // updates the distorting modules' buffer sizes their transforms use. but
+  // most new previews, including the one each mask edit's history item
+  // causes, leave the geometry alone, and rebuilding every shape of the
+  // group for those made editing long brushes and paths lag
+  if(gui->pipe_hash != DT_INVALID_HASH
+     && gui->pipe_hash != darktable.develop->preview_pipe->backbuf_hash)
   {
-    if(gui->pipe_hash != darktable.develop->preview_pipe->backbuf_hash)
+    if(gui->geometry_hash != _gui_geometry_hash(darktable.develop, module))
     {
       dt_print(DT_DEBUG_EXPOSE, "[dt_masks_gui_form_test_create] refreshes mask visualizer");
       gui->pipe_hash = DT_INVALID_HASH;
@@ -270,6 +293,8 @@ void dt_masks_gui_form_test_create(dt_masks_form_t *form,
       g_list_free_full(gui->points, dt_masks_form_gui_points_free);
       gui->points = NULL;
     }
+    else
+      gui->pipe_hash = darktable.develop->preview_pipe->backbuf_hash;
   }
 
   // we create the spots if needed

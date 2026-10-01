@@ -465,6 +465,7 @@ typedef struct dt_masks_form_gui_t
   // ids
   dt_mask_id_t formid;
   dt_hash_t pipe_hash;
+  dt_hash_t geometry_hash;
 
   // opaque per-type data (e.g. segmentation context for object masks)
   void *scratchpad;
