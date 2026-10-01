@@ -200,6 +200,41 @@ static dt_hash_t _gui_geometry_hash(dt_develop_t *dev,
   return dt_masks_group_hash(hash, dev->form_visible);
 }
 
+static void _gui_points_bbox_extend(float *bbox,
+                                    const float *pts,
+                                    const int from,
+                                    const int count)
+{
+  for(int i = from; i < count; i++)
+  {
+    const float x = pts[i * 2];
+    const float y = pts[i * 2 + 1];
+    // a path's self-intersection cuts are markers, not samples
+    if(x == DT_INVALID_COORDINATE) continue;
+    bbox[0] = fminf(bbox[0], x);
+    bbox[1] = fmaxf(bbox[1], x);
+    bbox[2] = fminf(bbox[2], y);
+    bbox[3] = fmaxf(bbox[3], y);
+  }
+}
+
+static void _gui_points_update_bbox(dt_masks_form_gui_points_t *gpt,
+                                    const dt_masks_form_t *form)
+{
+  // brush and path outlines start with three entries per node, which the
+  // hit tests skip and which are not all coordinates: a brush border's
+  // are zeros, a path border's partly sample indices
+  const int from = (form->type & (DT_MASKS_BRUSH | DT_MASKS_PATH))
+    ? 3 * g_list_length(form->points)
+    : 0;
+
+  gpt->bbox[0] = gpt->bbox[2] = FLT_MAX;
+  gpt->bbox[1] = gpt->bbox[3] = -FLT_MAX;
+  _gui_points_bbox_extend(gpt->bbox, gpt->points, from, gpt->points_count);
+  _gui_points_bbox_extend(gpt->bbox, gpt->border, from, gpt->border_count);
+  _gui_points_bbox_extend(gpt->bbox, gpt->source, from, gpt->source_count);
+}
+
 void dt_masks_gui_form_create(dt_masks_form_t *form,
                               dt_masks_form_gui_t *gui,
                               const int index,
@@ -227,6 +262,8 @@ void dt_masks_gui_form_create(dt_masks_form_t *form,
     gui->geometry_hash = _gui_geometry_hash(darktable.develop, module);
     gui->formid = form->formid;
   }
+
+  _gui_points_update_bbox(gpt, form);
 }
 
 void dt_masks_form_gui_points_free(const gpointer data)

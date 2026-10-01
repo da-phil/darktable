@@ -1927,6 +1927,10 @@ static void _path_get_distance(const float x,
   dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
   if(!gpt) return;
 
+  // nothing to walk when the cursor cannot reach any sample, which is the
+  // case for most shapes of a group on every pointer motion
+  if(!dt_masks_gui_points_reach(gpt, x, y, as)) return;
+
   // we first check if we are inside the source form
   if(dt_masks_point_in_form_exact(x, y, gpt->source, corner_count * 6, gpt->source_count))
   {

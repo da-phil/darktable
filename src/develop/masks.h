@@ -380,7 +380,20 @@ typedef struct dt_masks_form_gui_points_t
   float *source;
   int source_count;
   gboolean clockwise;
+  // box around the samples above: xmin, xmax, ymin, ymax
+  float bbox[4];
 } dt_masks_form_gui_points_t;
+
+// whether a cursor at x, y reaching that far around it can touch any of
+// the samples of gpt: hit tests ask this before walking them
+static inline gboolean dt_masks_gui_points_reach(const dt_masks_form_gui_points_t *gpt,
+                                                 const float x,
+                                                 const float y,
+                                                 const float reach)
+{
+  return x >= gpt->bbox[0] - reach && x <= gpt->bbox[1] + reach
+    && y >= gpt->bbox[2] - reach && y <= gpt->bbox[3] + reach;
+}
 
 /** structure for dynamic buffers */
 typedef struct dt_masks_dynbuf_t
