@@ -3150,6 +3150,12 @@ void dt_masks_line_stroke(cairo_t *cr,
 
   const gboolean restricted = _masks_is_restricted_mode();
 
+  // these lines are a pixel or two wide, where cairo's fast antialiasing
+  // looks the same and takes half the time on the long outlines of brushes
+  // and paths. the caller's setting is restored for what it draws next
+  const cairo_antialias_t antialias = cairo_get_antialias(cr);
+  cairo_set_antialias(cr, CAIRO_ANTIALIAS_FAST);
+
   // first the background draw, darker
   if(restricted && !border)
     dt_draw_set_color_overlay(cr, FALSE, 0.1);
@@ -3182,6 +3188,7 @@ void dt_masks_line_stroke(cairo_t *cr,
   }
 
   cairo_stroke(cr);
+  cairo_set_antialias(cr, antialias);
 }
 
 // stroke the outline points from..to, and back to from if close_path.
