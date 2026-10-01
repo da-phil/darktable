@@ -2347,8 +2347,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
 
     _brush_init_ctrl_points(form);
 
-    dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
-
     // we recreate the form points
     dt_masks_gui_form_create(form, gui, index, module);
 
