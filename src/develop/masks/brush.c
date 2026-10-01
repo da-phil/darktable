@@ -3011,7 +3011,7 @@ static void _brush_bounding_box_raw(const float *const points,
                                     float *y_max)
 {
   // now we want to find the area, so we search min/max points
-  float xmin = FLT_MAX, xmax = FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN;
+  float xmin = FLT_MAX, xmax = -FLT_MAX, ymin = FLT_MAX, ymax = -FLT_MAX;
   DT_OMP_FOR(reduction(min : xmin, ymin) reduction(max : xmax, ymax) if(num_points > 1000))
   for(int i = _nb_ctrl_point(nb_corner); i < num_points; i++)
   {
@@ -3049,7 +3049,7 @@ static void _brush_bounding_box(const float *const points,
                                 int *posx,
                                 int *posy)
 {
-  float xmin = FLT_MAX, xmax = FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN;
+  float xmin = FLT_MAX, xmax = -FLT_MAX, ymin = FLT_MAX, ymax = -FLT_MAX;
   _brush_bounding_box_raw(points, border, nb_corner, num_points,
                           &xmin, &xmax, &ymin, &ymax);
   *height = ymax - ymin + 4;

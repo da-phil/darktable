@@ -919,7 +919,7 @@ static void _bounding_box(const float *const points,
                           int *posy)
 {
   // search for min/max X and Y coordinates
-  float xmin = FLT_MAX, xmax = FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN;
+  float xmin = FLT_MAX, xmax = -FLT_MAX, ymin = FLT_MAX, ymax = -FLT_MAX;
   for(int i = 1; i < num_points; i++) // skip point[0], which is circle's center
   {
     xmin = fminf(points[i * 2], xmin);
@@ -1236,7 +1236,7 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
            form->name, dt_get_lap_time(&start2));
 
   // we get the min/max values ...
-  float xmin = FLT_MAX, ymin = FLT_MAX, xmax = FLT_MIN, ymax = FLT_MIN;
+  float xmin = FLT_MAX, ymin = FLT_MAX, xmax = -FLT_MAX, ymax = -FLT_MAX;
   for(int n = 0; n < circpts; n++)
   {
     // just in case that transform throws surprising values

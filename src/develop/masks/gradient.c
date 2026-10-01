@@ -1044,7 +1044,7 @@ static int _gradient_get_area(const dt_iop_module_t *const module,
   // now we search min and max
   float xmin = 0.0f, xmax = 0.0f, ymin = 0.0f, ymax = 0.0f;
   xmin = ymin = FLT_MAX;
-  xmax = ymax = FLT_MIN;
+  xmax = ymax = -FLT_MAX;
   for(int i = 0; i < _nb_ctrl_point(); i++)
   {
     xmin = fminf(points[i * 2], xmin);

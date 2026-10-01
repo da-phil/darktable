@@ -1956,7 +1956,7 @@ static void _path_get_distance(const float x,
     *inside = TRUE;
 
     float x_min = FLT_MAX, y_min = FLT_MAX;
-    float x_max = FLT_MIN, y_max = FLT_MIN;
+    float x_max = -FLT_MAX, y_max = -FLT_MAX;
 
     for(int i = _nb_wctrl_points(corner_count); i < gpt->source_count; i++)
     {
@@ -2004,7 +2004,7 @@ static void _path_get_distance(const float x,
     int current_seg = 1;
 
     float x_min = FLT_MAX, y_min = FLT_MAX;
-    float x_max = FLT_MIN, y_max = FLT_MIN;
+    float x_max = -FLT_MAX, y_max = -FLT_MAX;
 
     for(int i = _nb_wctrl_points(corner_count); i < gpt->points_count; i++)
     {
@@ -4406,7 +4406,7 @@ static void _path_bounding_box_raw(const float *const points,
 {
   float xmin, xmax, ymin, ymax;
   xmin = ymin = FLT_MAX;
-  xmax = ymax = FLT_MIN;
+  xmax = ymax = -FLT_MAX;
 
   for(int i = _nb_wctrl_points(nb_corner); i < num_borders; i++)
   {
