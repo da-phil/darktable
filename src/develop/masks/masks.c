@@ -1528,6 +1528,18 @@ void dt_masks_events_post_expose(const dt_iop_module_t *module,
 
   cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
 
+  // the outlines are sampled about one device pixel apart: a power of two
+  // of preview pipe pixels, the space they are computed in, so that zooming
+  // only rebuilds them when that doubles or halves, and at least one
+  const float px = zoom_scale * darktable.gui->ppd;
+  float step = 1.0f;
+  while(step < 64.0f && 2.0f * step * px <= 1.0f) step *= 2.0f;
+  if(gui->outline_step != step)
+  {
+    gui->outline_step = step;
+    gui->pipe_hash = DT_INVALID_HASH;
+  }
+
   // we update the form if needed
   // add preview when creating a circle, ellipse and gradient
   if(!(((form->type & DT_MASKS_CIRCLE)

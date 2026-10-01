@@ -445,7 +445,8 @@ static void _brush_points_recurs_border_gaps(float *cmax,
                                              float *bmax,
                                              dt_masks_dynbuf_t *dpoints,
                                              dt_masks_dynbuf_t *dborder,
-                                             const gboolean clockwise)
+                                             const gboolean clockwise,
+                                             const float step)
 {
   // we want to find the start and end angles
   float a1 = atan2f(bmin[1] - cmax[1], bmin[0] - cmax[0]);
@@ -473,6 +474,7 @@ static void _brush_points_recurs_border_gaps(float *cmax,
     l = (a2 - a1) * fmaxf(r1, r2);
   else
     l = (a1 - a2) * fmaxf(r1, r2);
+  if(step > 1.0f) l = l / step;
   if(l < 2) return;
 
   // and now we add the points
@@ -509,7 +511,8 @@ static void _brush_points_recurs_border_small_gaps(float *cmax,
                                                    float *bmin2,
                                                    float *bmax,
                                                    dt_masks_dynbuf_t *dpoints,
-                                                   dt_masks_dynbuf_t *dborder)
+                                                   dt_masks_dynbuf_t *dborder,
+                                                   const float step)
 {
   // we want to find the start and end angles
   const float a1 = fmodf(atan2f(bmin[1] - cmax[1], bmin[0] - cmax[0])
@@ -528,7 +531,8 @@ static void _brush_points_recurs_border_small_gaps(float *cmax,
   if(fabsf(delta) > M_PI_F) delta = delta - copysignf(DT_2PI_F, delta);
 
   // get the max length of the circle arc
-  const int l = fabsf(delta) * fmaxf(r1, r2);
+  int l = fabsf(delta) * fmaxf(r1, r2);
+  if(step > 1.0f) l = l / step;
   if(l < 2) return;
 
   // and now we add the points
@@ -563,7 +567,8 @@ static void _brush_points_stamp(float *cmax,
                                 float *bmin,
                                 dt_masks_dynbuf_t *dpoints,
                                 dt_masks_dynbuf_t *dborder,
-                                const gboolean clockwise)
+                                const gboolean clockwise,
+                                const float step)
 {
   // we want to find the start angle
   const float a1 = atan2f(bmin[1] - cmax[1], bmin[0] - cmax[0]);
@@ -572,7 +577,8 @@ static void _brush_points_stamp(float *cmax,
   const float rad = dt_fast_hypotf(bmin[1] - cmax[1], bmin[0] - cmax[0]);
 
   // determine the max length of the circle arc
-  const int l = 2.0f * M_PI * rad;
+  int l = 2.0f * M_PI * rad;
+  if(step > 1.0f) l = l / step;
   if(l < 2) return;
 
   // and now we add the points
@@ -613,7 +619,8 @@ static void _brush_points_recurs(float *p1,
                                  float *rpayload,
                                  dt_masks_dynbuf_t *dpoints,
                                  dt_masks_dynbuf_t *dborder,
-                                 dt_masks_dynbuf_t *dpayload)
+                                 dt_masks_dynbuf_t *dpayload,
+                                 const float step)
 {
   const gboolean withborder = (dborder != NULL);
   const gboolean withpayload = (dpayload != NULL);
@@ -635,17 +642,28 @@ static void _brush_points_recurs(float *p1,
                          points_max,
                          points_max + 1, border_max, border_max + 1);
   }
-  // are the points near ?
-  if((tmax - tmin < 0.0001f)
-     || ((int)points_min[0] - (int)points_max[0] < 1
-         && (int)points_min[0] - (int)points_max[0] > -1
-         && (int)points_min[1] - (int)points_max[1] < 1
-         && (int)points_min[1] - (int)points_max[1] > -1
-         && (!withborder
-             || ((int)border_min[0] - (int)border_max[0] < 1
-                 && (int)border_min[0] - (int)border_max[0] > -1
-                 && (int)border_min[1] - (int)border_max[1] < 1
-                 && (int)border_min[1] - (int)border_max[1] > -1))))
+  // are the points near ? the pipe wants a sample in every pixel the
+  // stroke crosses, which takes several around each pixel boundary; the
+  // gui only needs one every step pixels
+  gboolean near;
+  if(step > 0.0f)
+    near = fabsf(points_min[0] - points_max[0]) < step
+      && fabsf(points_min[1] - points_max[1]) < step
+      && (!withborder
+          || (fabsf(border_min[0] - border_max[0]) < step
+              && fabsf(border_min[1] - border_max[1]) < step));
+  else
+    near = (int)points_min[0] - (int)points_max[0] < 1
+      && (int)points_min[0] - (int)points_max[0] > -1
+      && (int)points_min[1] - (int)points_max[1] < 1
+      && (int)points_min[1] - (int)points_max[1] > -1
+      && (!withborder
+          || ((int)border_min[0] - (int)border_max[0] < 1
+              && (int)border_min[0] - (int)border_max[0] > -1
+              && (int)border_min[1] - (int)border_max[1] < 1
+              && (int)border_min[1] - (int)border_max[1] > -1));
+
+  if((tmax - tmin < 0.0001f) || near)
   {
     rpoints[0] = points_max[0];
     rpoints[1] = points_max[1];
@@ -665,11 +683,14 @@ static void _brush_points_recurs(float *p1,
       }
 
       // we check gaps in the border (sharp edges)
-      if(abs((int)border_max[0] - (int)border_min[0]) > 2
-         || abs((int)border_max[1] - (int)border_min[1]) > 2)
+      if(step > 0.0f
+         ? (fabsf(border_max[0] - border_min[0]) > 2.0f * step
+            || fabsf(border_max[1] - border_min[1]) > 2.0f * step)
+         : (abs((int)border_max[0] - (int)border_min[0]) > 2
+            || abs((int)border_max[1] - (int)border_min[1]) > 2))
       {
         _brush_points_recurs_border_small_gaps
-          (points_max, border_min, NULL, border_max, dpoints, dborder);
+          (points_max, border_min, NULL, border_max, dpoints, dborder, step);
       }
 
       rborder[0] = border_max[0];
@@ -696,10 +717,10 @@ static void _brush_points_recurs(float *p1,
   float b[2] = { DT_INVALID_COORDINATE, DT_INVALID_COORDINATE };
   float rc[2], rb[2], rp[2];
   _brush_points_recurs(p1, p2, tmin, tx, points_min, c,
-                       border_min, b, rc, rb, rp, dpoints, dborder, dpayload);
+                       border_min, b, rc, rb, rp, dpoints, dborder, dpayload, step);
   _brush_points_recurs(p1, p2, tx, tmax, rc, points_max, rb,
                        border_max, rpoints, rborder, rpayload, dpoints,
-                       dborder, dpayload);
+                       dborder, dpayload, step);
 }
 
 
@@ -716,6 +737,8 @@ static inline int _brush_cyclic_cursor(const int n, const int nb)
 
 /** get all points of the brush and the border */
 /** this takes care of gaps and iop distortions */
+/** step 0 samples every pixel the stroke crosses, as the pipe needs;
+    a step of 1 or more samples one point every step pixels, for the gui */
 static int _brush_get_pts_border(dt_develop_t *dev,
                                  dt_masks_form_t *form,
                                  const double iop_order,
@@ -727,7 +750,8 @@ static int _brush_get_pts_border(dt_develop_t *dev,
                                  int *border_count,
                                  float **payload,
                                  int *payload_count,
-                                 const int source)
+                                 const int source,
+                                 const float step)
 {
   double start2 = dt_get_debug_wtime();
 
@@ -915,7 +939,7 @@ static int _brush_get_pts_border(dt_develop_t *dev,
                             dt_masks_dynbuf_get(dborder, -1) };
           float cmax[2] = { dt_masks_dynbuf_get(dpoints, -2),
                             dt_masks_dynbuf_get(dpoints, -1) };
-          _brush_points_stamp(cmax, bmin, dpoints, dborder, TRUE);
+          _brush_points_stamp(cmax, bmin, dpoints, dborder, TRUE, step);
         }
 
         if(dpayload)
@@ -938,7 +962,8 @@ static int _brush_get_pts_border(dt_develop_t *dev,
         float cmax[2] = { dt_masks_dynbuf_get(dpoints, -2),
                           dt_masks_dynbuf_get(dpoints, -1) };
         float bmax[2] = { 2 * cmax[0] - bmin[0], 2 * cmax[1] - bmin[1] };
-        _brush_points_recurs_border_gaps(cmax, bmin, NULL, bmax, dpoints, dborder, TRUE);
+        _brush_points_recurs_border_gaps(cmax, bmin, NULL, bmax, dpoints, dborder, TRUE,
+                                         step);
       }
 
       if(dpayload)
@@ -960,7 +985,8 @@ static int _brush_get_pts_border(dt_develop_t *dev,
         float cmax[2] = { dt_masks_dynbuf_get(dpoints, -2),
                           dt_masks_dynbuf_get(dpoints, -1) };
         float bmax[2] = { 2 * cmax[0] - bmin[0], 2 * cmax[1] - bmin[1] };
-        _brush_points_recurs_border_gaps(cmax, bmin, NULL, bmax, dpoints, dborder, TRUE);
+        _brush_points_recurs_border_gaps(cmax, bmin, NULL, bmax, dpoints, dborder, TRUE,
+                                         step);
       }
 
       if(dpayload)
@@ -984,7 +1010,7 @@ static int _brush_get_pts_border(dt_develop_t *dev,
     float cmax[2] = { DT_INVALID_COORDINATE, DT_INVALID_COORDINATE };
 
     _brush_points_recurs(p1, p2, 0.0, 1.0, cmin, cmax,
-                         bmin, bmax, rc, rb, rp, dpoints, dborder, dpayload);
+                         bmin, bmax, rc, rb, rp, dpoints, dborder, dpayload, step);
 
     dt_masks_dynbuf_add_2(dpoints, rc[0], rc[1]);
 
@@ -1021,13 +1047,14 @@ static int _brush_get_pts_border(dt_develop_t *dev,
                              p4[2], p4[3], p4[0], p4[1], 0.0001, p3[4], cmin,
                              cmin + 1, bmax, bmax + 1);
       }
-      if(bmax[0] - rb[0] > 1
-         || bmax[0] - rb[0] < -1
-         || bmax[1] - rb[1] > 1
-         || bmax[1] - rb[1] < -1)
+      const float gap = fmaxf(step, 1.0f);
+      if(bmax[0] - rb[0] > gap
+         || bmax[0] - rb[0] < -gap
+         || bmax[1] - rb[1] > gap
+         || bmax[1] - rb[1] < -gap)
       {
         // float bmin2[2] = {(*border)[posb-22],(*border)[posb-21]};
-        _brush_points_recurs_border_gaps(rc, rb, NULL, bmax, dpoints, dborder, cw);
+        _brush_points_recurs_border_gaps(rc, rb, NULL, bmax, dpoints, dborder, cw, step);
       }
     }
 
@@ -1316,7 +1343,9 @@ static int _brush_get_points_border(dt_develop_t *dev,
   const double ioporder = (module) ? module->iop_order : 0.0f;
   return _brush_get_pts_border(dev, form, ioporder,
                                DT_DEV_TRANSFORM_DIR_ALL, dev->preview_pipe, points,
-                               points_count, border, border_count, NULL, NULL, source);
+                               points_count, border, border_count, NULL, NULL, source,
+                               dev->form_gui ? fmaxf(dev->form_gui->outline_step, 1.0f)
+                                             : 1.0f);
 }
 
 /** find relative position within a brush segment that is closest to
@@ -3043,7 +3072,7 @@ static int _get_area(const dt_iop_module_t *const module,
   if(!_brush_get_pts_border(module->dev, form, module->iop_order,
                             DT_DEV_TRANSFORM_DIR_BACK_INCL,
                             piece->pipe, &points, &points_count,
-                            &border, &border_count, NULL, NULL, get_source))
+                            &border, &border_count, NULL, NULL, get_source, 0.0f))
   {
     dt_free_align(points);
     dt_free_align(border);
@@ -3141,7 +3170,7 @@ static int _brush_get_mask(const dt_iop_module_t *const module,
   if(!_brush_get_pts_border(module->dev, form, module->iop_order,
                             DT_DEV_TRANSFORM_DIR_BACK_INCL,
                             piece->pipe,&points, &points_count,
-                            &border, &border_count, &payload, &payload_count, 0))
+                            &border, &border_count, &payload, &payload_count, 0, 0.0f))
   {
     dt_free_align(points);
     dt_free_align(border);
@@ -3274,7 +3303,7 @@ static int _brush_get_mask_roi(const dt_iop_module_t *const module,
   if(!_brush_get_pts_border(module->dev, form, module->iop_order,
                             DT_DEV_TRANSFORM_DIR_BACK_INCL,
                             piece->pipe,&points, &points_count,
-                            &border, &border_count, &payload, &payload_count, 0))
+                            &border, &border_count, &payload, &payload_count, 0, 0.0f))
   {
     dt_free_align(points);
     dt_free_align(border);
