@@ -2683,6 +2683,27 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
   return 1;
 }
 
+// a brush outline array holds the centerline twice, forward and then back
+// (see _brush_get_pts_border()). this is the index where the forward pass
+// reaches the last node, or the last index if it can't be found
+static int _brush_centerline_end(const float *const pts,
+                                 const int count,
+                                 const int nb)
+{
+  if(nb < 2) return count - 1;
+
+  int seg = 1;
+  for(int i = _nb_ctrl_point(nb); i < count; i++)
+  {
+    if(pts[i * 2] == pts[seg * 6 + 2] && pts[i * 2 + 1] == pts[seg * 6 + 3])
+    {
+      if(seg == nb - 1) return i;
+      seg++;
+    }
+  }
+  return count - 1;
+}
+
 static void _brush_events_post_expose(cairo_t *cr,
                                       const float zoom_scale,
                                       dt_masks_form_gui_t *gui,
@@ -2992,10 +3013,10 @@ static void _brush_events_post_expose(cairo_t *cr,
 
     dt_masks_stroke_arrow(cr, gui, index, zoom_scale);
 
-    // we draw the source
-
+    // we draw the source, along the centerline once
     dt_masks_stroke_polyline
-      (cr, gpt->source, _nb_ctrl_point(nb), gpt->source_count - 1, TRUE, FALSE, TRUE,
+      (cr, gpt->source, _nb_ctrl_point(nb),
+       _brush_centerline_end(gpt->source, gpt->source_count, nb), FALSE, FALSE, TRUE,
        (gui->group_selected == index) && (gui->form_selected || gui->form_dragging),
        zoom_scale);
   }
