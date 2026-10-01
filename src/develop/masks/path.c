@@ -874,7 +874,8 @@ static void _path_points_recurs(float *p1,
                                 float *rborder,
                                 dt_masks_dynbuf_t *dpoints,
                                 dt_masks_dynbuf_t *dborder,
-                                const int withborder)
+                                const int withborder,
+                                const gboolean gui)
 {
   // we calculate points if needed
   // Caveat: When the border distance changes by a lot, the resulting border
@@ -893,17 +894,33 @@ static void _path_points_recurs(float *p1,
                         path_max, path_max + 1,
                         border_max, border_max + 1);
   }
-  // are the points near ?
-  if((tmax - tmin < 0.0001)
-     || ((int)path_min[0] - (int)path_max[0] < 1
-         && (int)path_min[0] - (int)path_max[0] > -1
-         && (int)path_min[1] - (int)path_max[1] < 1
-         && (int)path_min[1] - (int)path_max[1] > -1
-         && (!withborder
-             || ((int)border_min[0] - (int)border_max[0] < 1
-                 && (int)border_min[0] - (int)border_max[0] > -1
-                 && (int)border_min[1] - (int)border_max[1] < 1
-                 && (int)border_min[1] - (int)border_max[1] > -1))))
+  // are the points near ? the pipe wants a sample in every pixel the path
+  // crosses, which takes several around each pixel boundary. the gui only
+  // needs them under a pixel apart, with consecutive border samples in the
+  // same pixel or in two sharing a side: _path_find_self_intersection()
+  // follows the border from pixel to pixel and misses a fold whose strands
+  // cross between two diagonal steps
+  gboolean near;
+  if(gui)
+    near = fabsf(path_min[0] - path_max[0]) < 1.0f
+      && fabsf(path_min[1] - path_max[1]) < 1.0f
+      && (!withborder
+          || (fabsf(border_min[0] - border_max[0]) < 1.0f
+              && fabsf(border_min[1] - border_max[1]) < 1.0f
+              && ((int)border_min[0] == (int)border_max[0]
+                  || (int)border_min[1] == (int)border_max[1])));
+  else
+    near = (int)path_min[0] - (int)path_max[0] < 1
+      && (int)path_min[0] - (int)path_max[0] > -1
+      && (int)path_min[1] - (int)path_max[1] < 1
+      && (int)path_min[1] - (int)path_max[1] > -1
+      && (!withborder
+          || ((int)border_min[0] - (int)border_max[0] < 1
+              && (int)border_min[0] - (int)border_max[0] > -1
+              && (int)border_min[1] - (int)border_max[1] < 1
+              && (int)border_min[1] - (int)border_max[1] > -1));
+
+  if((tmax - tmin < 0.0001) || near)
   {
     dt_masks_dynbuf_add_2(dpoints, path_max[0], path_max[1]);
     rpath[0] = path_max[0];
@@ -924,9 +941,9 @@ static void _path_points_recurs(float *p1,
   float b[2] = { DT_INVALID_COORDINATE, DT_INVALID_COORDINATE };
   float rc[2] = { 0 }, rb[2] = { 0 };
   _path_points_recurs(p1, p2, tmin, tx, path_min, c, border_min, b, rc, rb,
-                      dpoints, dborder, withborder);
+                      dpoints, dborder, withborder, gui);
   _path_points_recurs(p1, p2, tx, tmax, rc, path_max, rb,
-                      border_max, rpath, rborder, dpoints, dborder, withborder);
+                      border_max, rpath, rborder, dpoints, dborder, withborder, gui);
 }
 
 
@@ -1462,7 +1479,8 @@ static int _path_get_pts_border(dt_develop_t *dev,
                                 int *points_count,
                                 float **border,
                                 int *border_count,
-                                const gboolean source)
+                                const gboolean source,
+                                const gboolean gui)
 {
   double start2 = dt_get_debug_wtime();
 
@@ -1663,7 +1681,7 @@ static int _path_get_pts_border(dt_develop_t *dev,
     float cmax[2] = { DT_INVALID_COORDINATE, DT_INVALID_COORDINATE };
 
     _path_points_recurs(p1, p2, 0.0, 1.0, cmin, cmax, bmin, bmax,
-                        rc, rb, dpoints, dborder, border && (nb >= 3));
+                        rc, rb, dpoints, dborder, border && (nb >= 3), gui);
 
     // we check gaps in the border (sharp edges)
     if(dborder && (fabs(dt_masks_dynbuf_get(dborder, -2) - rb[0]) > 1.0f
@@ -2046,7 +2064,7 @@ static int _path_get_points_border(dt_develop_t *dev,
   const double ioporder = (module) ? module->iop_order : 0.0f;
   return _path_get_pts_border(dev, form, ioporder,
                               DT_DEV_TRANSFORM_DIR_ALL, dev->preview_pipe, points,
-                              points_count, border, border_count, source);
+                              points_count, border, border_count, source, TRUE);
 }
 
 static GList *_copy_points(const GList *points)
@@ -4463,7 +4481,7 @@ static int _get_area(const dt_iop_module_t *const module,
   if(!_path_get_pts_border(module->dev, form, module->iop_order,
                            DT_DEV_TRANSFORM_DIR_BACK_INCL, piece->pipe,
                            &points, &points_count,
-                           &border, &border_count, get_source))
+                           &border, &border_count, get_source, FALSE))
   {
     dt_free_align(points);
     dt_free_align(border);
@@ -4551,7 +4569,7 @@ static int _path_get_mask(const dt_iop_module_t *const module,
   if(!_path_get_pts_border(module->dev, form, module->iop_order,
                            DT_DEV_TRANSFORM_DIR_BACK_INCL, piece->pipe,
                            &points, &points_count,
-                           &border, &border_count, FALSE))
+                           &border, &border_count, FALSE, FALSE))
   {
     dt_free_align(points);
     dt_free_align(border);
@@ -4995,7 +5013,7 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
   if(!_path_get_pts_border(module->dev, form, module->iop_order,
                            DT_DEV_TRANSFORM_DIR_BACK_INCL, piece->pipe,
                            &points, &points_count,
-                           &border, &border_count, FALSE) || (points_count <= 2))
+                           &border, &border_count, FALSE, FALSE) || (points_count <= 2))
   {
     dt_free_align(points);
     dt_free_align(border);
