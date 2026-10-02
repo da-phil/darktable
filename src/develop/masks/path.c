@@ -3284,6 +3284,9 @@ static int _path_events_button_pressed(dt_iop_module_t *module,
       // we recreate the form points
       dt_masks_gui_form_create(form, gui, index, module);
 
+      // properties that had nothing to act on before this node may apply now
+      dt_dev_masks_list_change(darktable.develop);
+
       dt_control_queue_redraw_center();
       return 1;
     }

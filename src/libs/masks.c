@@ -292,7 +292,9 @@ static void _property_changed(GtkWidget *widget, dt_masks_property_t prop)
   {
     form->functions->modify_property(form, prop, d->last_value[prop],
                                      value, &sum, &count, &min, &max);
-    if(!gui->creation && value != d->last_value[prop])
+    // a shape being drawn has an outline to redraw once it has points, as a
+    // path does after its first node
+    if((!gui->creation || form->points) && value != d->last_value[prop])
       dt_masks_gui_form_create(form, gui, pos, dev->gui_module);
   }
   else
@@ -592,8 +594,14 @@ static void _resize_update(dt_lib_masks_t *d)
     dt_bauhaus_slider_set(d->resize_amount, roundf(amount));
     d->resize_updating = FALSE;
   }
-  // a path needs three nodes to be shrunk or grown, see _path_resize_amount()
-  gtk_widget_set_visible(d->resize_box, path && !g_list_shorter_than(path->points, 3));
+  // shrink/grow re-vectorizes the whole path, the node following the
+  // pointer included, so it applies to finished paths only. It also
+  // needs three nodes, see _path_resize_amount()
+  const dt_masks_form_gui_t *gui = darktable.develop->form_gui;
+  gtk_widget_set_visible(d->resize_box,
+                         path
+                         && !(gui && gui->creation)
+                         && !g_list_shorter_than(path->points, 3));
 }
 
 static void _update_all_properties(dt_lib_masks_t *self)
