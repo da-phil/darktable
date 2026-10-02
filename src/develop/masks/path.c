@@ -5462,6 +5462,9 @@ static void _path_modify_property(dt_masks_form_t *const form,
         bx += (point1[0] + point2[0]) * (point1[0] * point2[1] - point2[0] * point1[1]);
         by += (point1[1] + point2[1]) * (point1[0] * point2[1] - point2[0] * point1[1]);
       }
+      // nothing to scale without an area, as before the first nodes are
+      // placed, and the centroid below would divide by zero
+      if(!surf) break;
       bx /= 3.0f * surf;
       by /= 3.0f * surf;
 
@@ -5505,6 +5508,23 @@ static void _path_modify_property(dt_masks_form_t *const form,
         _resize_state_invalidate(form->formid);
       break;
     case DT_MASKS_PROPERTY_FEATHER:;
+      // the feather that new nodes get, scaled along as shift+scroll does
+      float masks_border =
+        CLAMP(dt_conf_get_float(DT_MASKS_CONF(form->type, path, border)), 0.0005f, 0.5f);
+      if(geom_changed)
+      {
+        masks_border = CLAMP(masks_border * ratio, 0.0005f, 0.5f);
+        dt_conf_set_float(DT_MASKS_CONF(form->type, path, border), masks_border);
+      }
+      if(!form->points)
+      {
+        // no node placed yet: the slider sets the feather of the first ones
+        *sum += masks_border;
+        *max = fminf(*max, 0.5f / masks_border);
+        *min = fmaxf(*min, 0.0005f / masks_border);
+        ++*count;
+        break;
+      }
       for(const GList *l = form->points; l; l = g_list_next(l))
       {
         dt_masks_point_path_t *point = l->data;
@@ -5519,6 +5539,8 @@ static void _path_modify_property(dt_masks_form_t *const form,
         _resize_state_invalidate(form->formid);
       break;
     case DT_MASKS_PROPERTY_ROTATION:;
+      // nothing to rotate before the first nodes are placed
+      if(!form->points) break;
       // Paths have no stored rotation angle. This reuses the exact
       // machinery of the canvas CTRL+drag rotation (dt_masks_rotate_ctrl_points +
       // _path_centroid over the display buffer).

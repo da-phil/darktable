@@ -592,7 +592,8 @@ static void _resize_update(dt_lib_masks_t *d)
     dt_bauhaus_slider_set(d->resize_amount, roundf(amount));
     d->resize_updating = FALSE;
   }
-  gtk_widget_set_visible(d->resize_box, path != NULL);
+  // a path needs three nodes to be shrunk or grown, see _path_resize_amount()
+  gtk_widget_set_visible(d->resize_box, path && !g_list_shorter_than(path->points, 3));
 }
 
 static void _update_all_properties(dt_lib_masks_t *self)
