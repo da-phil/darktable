@@ -373,7 +373,13 @@ static void _property_changed(GtkWidget *widget, dt_masks_property_t prop)
 
       if(dt_isnan(min)) min = _masks_properties[prop].min;
       if(dt_isnan(max)) max = _masks_properties[prop].max;
-      dt_bauhaus_slider_set_soft_range(widget, min, max);
+
+      // a shape that cannot change the property yet leaves it no range, as
+      // a path being drawn does with size and rotation: grey the slider out
+      const gboolean usable = max > min;
+      if(usable)
+        dt_bauhaus_slider_set_soft_range(widget, min, max);
+      gtk_widget_set_sensitive(widget, usable);
 
       dt_bauhaus_slider_set(widget, sum / count);
       d->last_value[prop] = dt_bauhaus_slider_get(widget);
@@ -511,7 +517,8 @@ static void _resize_commit(dt_lib_masks_t *d)
   dt_masks_form_gui_t *gui = dev->form_gui;
   int idx = 0;
   dt_masks_form_t *form = _selected_single_path(&idx);
-  if(!form || !gui || !form->functions || !form->functions->resize)
+  // a shortcut can still move the greyed out slider, see _resize_update()
+  if(!form || !gui || gui->creation || !form->functions || !form->functions->resize)
     return;
 
   const int amount = (int)roundf(dt_bauhaus_slider_get(d->resize_amount));
@@ -596,12 +603,14 @@ static void _resize_update(dt_lib_masks_t *d)
   }
   // shrink/grow re-vectorizes the whole path, the node following the
   // pointer included, so it applies to finished paths only. It also
-  // needs three nodes, see _path_resize_amount()
+  // needs three nodes, see _path_resize_amount(). Until then it is
+  // shown greyed out
   const dt_masks_form_gui_t *gui = darktable.develop->form_gui;
-  gtk_widget_set_visible(d->resize_box,
-                         path
-                         && !(gui && gui->creation)
-                         && !g_list_shorter_than(path->points, 3));
+  gtk_widget_set_visible(d->resize_box, path != NULL);
+  gtk_widget_set_sensitive(d->resize_box,
+                           path
+                           && !(gui && gui->creation)
+                           && !g_list_shorter_than(path->points, 3));
 }
 
 static void _update_all_properties(dt_lib_masks_t *self)

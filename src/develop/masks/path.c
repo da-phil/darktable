@@ -5467,7 +5467,18 @@ static void _path_modify_property(dt_masks_form_t *const form,
       }
       // nothing to scale without an area, as before the first nodes are
       // placed, and the centroid below would divide by zero
-      if(!surf) break;
+      if(!surf)
+      {
+        // a path being drawn leaves no room to change the size until its
+        // nodes enclose an area, which greys it out in _property_changed()
+        if(darktable.develop->form_gui && darktable.develop->form_gui->creation)
+        {
+          *min = fmaxf(*min, 1.0f);
+          *max = fminf(*max, 1.0f);
+          ++*count;
+        }
+        break;
+      }
       bx /= 3.0f * surf;
       by /= 3.0f * surf;
 
@@ -5542,8 +5553,20 @@ static void _path_modify_property(dt_masks_form_t *const form,
         _resize_state_invalidate(form->formid);
       break;
     case DT_MASKS_PROPERTY_ROTATION:;
-      // nothing to rotate before the first nodes are placed
-      if(!form->points) break;
+      // the pivot needs two placed nodes, and the last node of a path being
+      // drawn follows the pointer. Until then no room to turn the dial is
+      // left, which greys it out in _property_changed()
+      const gboolean drawing =
+        darktable.develop->form_gui && darktable.develop->form_gui->creation;
+      const int placed = (int)g_list_length(form->points) - (drawing && form->points ? 1 : 0);
+      if(placed < 2)
+      {
+        *sum += new_val;
+        *min = fmaxf(*min, 0.0f);
+        *max = fminf(*max, 0.0f);
+        ++*count;
+        break;
+      }
       // Paths have no stored rotation angle. This reuses the exact
       // machinery of the canvas CTRL+drag rotation (dt_masks_rotate_ctrl_points +
       // _path_centroid over the display buffer).
