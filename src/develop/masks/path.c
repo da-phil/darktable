@@ -5553,13 +5553,9 @@ static void _path_modify_property(dt_masks_form_t *const form,
         _resize_state_invalidate(form->formid);
       break;
     case DT_MASKS_PROPERTY_ROTATION:;
-      // the pivot needs two placed nodes, and the last node of a path being
-      // drawn follows the pointer. Until then no room to turn the dial is
-      // left, which greys it out in _property_changed()
-      const gboolean drawing =
-        darktable.develop->form_gui && darktable.develop->form_gui->creation;
-      const int placed = (int)g_list_length(form->points) - (drawing && form->points ? 1 : 0);
-      if(placed < 2)
+      // a path being drawn is not rotated: no room to turn the dial is left
+      // until it is finished, which greys it out in _property_changed()
+      if(darktable.develop->form_gui && darktable.develop->form_gui->creation)
       {
         *sum += new_val;
         *min = fmaxf(*min, 0.0f);
