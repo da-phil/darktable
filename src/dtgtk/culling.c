@@ -2265,9 +2265,7 @@ void dt_culling_full_redraw(dt_culling_t *table,
     // deactivate selection_change event
     table->select_desactivate = TRUE;
     // deselect all
-    DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
-                          "DELETE FROM main.selected_images",
-                          NULL, NULL, NULL);
+    dt_selection_clear_silent();
     // select all active images
     GList *ls = NULL;
     for(GList *l = table->list; l; l = g_list_next(l))

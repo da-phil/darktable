@@ -323,6 +323,10 @@ static void test_folder_selection(void **state)
   dt_selection_set_folder_images(missing);
   assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 0);
   g_free(missing);
+
+  dt_selection_set_folder_images(DT_TEST_IMAGES);
+  dt_selection_clear_silent();
+  assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 0);
 }
 
 int main(int argc, char *argv[])

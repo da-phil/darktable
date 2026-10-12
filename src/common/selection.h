@@ -30,6 +30,9 @@ void dt_selection_free(struct dt_selection_t *selection);
 void dt_selection_invert(struct dt_selection_t *selection);
 /** clears the selection */
 void dt_selection_clear(struct dt_selection_t *selection);
+/** empty the selection without raising the selection signal or updating
+    the hint message, for a caller that reselects right after */
+void dt_selection_clear_silent(void);
 /** adds imgid to the current selection */
 void dt_selection_select(struct dt_selection_t *selection, dt_imgid_t imgid);
 /** get the imgid of the last image selected with a single selection (click,

@@ -188,6 +188,12 @@ void dt_selection_invert(dt_selection_t *selection)
   dt_collection_hint_message(darktable.collection);
 }
 
+void dt_selection_clear_silent(void)
+{
+  DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
+                        "DELETE FROM main.selected_images", NULL, NULL, NULL);
+}
+
 void dt_selection_clear(const dt_selection_t *selection)
 {
   DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
