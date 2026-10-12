@@ -60,6 +60,15 @@ GList *dt_selection_get_list(struct dt_selection_t *selection,
 gchar *dt_selection_get_list_query(struct dt_selection_t *selection,
                                    const gboolean only_visible,
                                    const gboolean ordering);
+/** replace the selection with the images of the film rolls whose folder
+    starts with folder (SQL LIKE), writing the table directly: no selection
+    signal is raised */
+void dt_selection_set_folder_images(const char *folder);
+
+/** remove from the selection the images outside the current collection,
+    writing the table directly: no selection signal is raised */
+void dt_selection_drop_outside_collection(void);
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

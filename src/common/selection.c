@@ -573,6 +573,43 @@ GList *dt_selection_get_list(struct dt_selection_t *selection,
   return l;
 }
 
+void dt_selection_set_folder_images(const char *folder)
+{
+  char *escaped = sqlite3_mprintf("%q", folder);
+  DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
+                        "DELETE FROM main.selected_images", NULL, NULL, NULL);
+  // clang-format off
+  gchar *query = g_strdup_printf
+    ("INSERT INTO main.selected_images (imgid)"
+     " SELECT id"
+     " FROM main.images"
+     " WHERE film_id IN (SELECT id FROM main.film_rolls WHERE folder LIKE '%s%%')",
+     escaped);
+  // clang-format on
+  DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db), query, NULL, NULL, NULL);
+  g_free(query);
+  sqlite3_free(escaped);
+}
+
+void dt_selection_drop_outside_collection(void)
+{
+  const gchar *cquery = dt_collection_get_query(darktable.collection);
+  if(!cquery || cquery[0] == '\0') return;
+
+  sqlite3_stmt *stmt = NULL;
+  gchar *complete_query = g_strdup_printf(
+                        "DELETE FROM main.selected_images WHERE imgid NOT IN (%s)",
+                        cquery);
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              complete_query, -1, &stmt, NULL);
+  // the collection query's LIMIT and OFFSET: all of it
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, 0);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, -1);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  g_free(complete_query);
+}
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

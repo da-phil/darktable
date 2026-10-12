@@ -29,6 +29,7 @@
 #include "common/grouping.h"
 #include "common/image.h"
 #include "common/image_cache.h"
+#include "common/selection.h"
 
 static int _count(const char *query)
 {
@@ -312,6 +313,18 @@ static void test_group_members(void **state)
   assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 2);
 }
 
+static void test_folder_selection(void **state)
+{
+  // every image of the film rolls under the folder, the previous selection gone
+  dt_selection_set_folder_images(DT_TEST_IMAGES);
+  assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 3);
+
+  gchar *missing = g_build_filename(DT_TEST_IMAGES, "no-such-dir", NULL);
+  dt_selection_set_folder_images(missing);
+  assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 0);
+  g_free(missing);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -322,6 +335,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_image_range),
     cmocka_unit_test(test_sidecar_rows),
     cmocka_unit_test(test_image_flags_and_stamps),
+    cmocka_unit_test(test_folder_selection),
     cmocka_unit_test(test_thumb_state),
     cmocka_unit_test(test_film_by_access),
     cmocka_unit_test(test_jobs_queries),

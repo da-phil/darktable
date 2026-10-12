@@ -27,6 +27,7 @@
 #include "common/film.h"
 #include "common/map_locations.h"
 #include "common/metadata.h"
+#include "common/selection.h"
 #include "common/utility.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -577,27 +578,11 @@ static void _view_popup_menu_onRemove(GSimpleAction *action,
   if(gtk_tree_selection_get_selected(selection, &model, &iter))
   {
     gchar *filmroll_path = NULL;
-    gchar *fullq = NULL;
 
     gtk_tree_model_get(model, &iter, DT_LIB_COLLECT_COL_PATH, &filmroll_path, -1);
-    char *escaped_filmroll_path = sqlite3_mprintf("%q", filmroll_path);
-
-    /* Clean selected images, and add to the table those which are going to be deleted */
-    DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db),
-                          "DELETE FROM main.selected_images", NULL, NULL, NULL);
-
-    // clang-format off
-    fullq = g_strdup_printf
-      ("INSERT INTO main.selected_images (imgid)"
-       " SELECT id"
-       " FROM main.images"
-       " WHERE film_id IN (SELECT id FROM main.film_rolls WHERE folder LIKE '%s%%')",
-       escaped_filmroll_path);
-    // clang-format on
-
-    DT_DEBUG_SQLITE3_EXEC(dt_database_get(darktable.db), fullq, NULL, NULL, NULL);
+    /* select the images which are going to be deleted */
+    dt_selection_set_folder_images(filmroll_path);
     g_free(filmroll_path);
-    sqlite3_free(escaped_filmroll_path);
 
     if(dt_control_remove_images())
     {
@@ -617,8 +602,6 @@ static void _view_popup_menu_onRemove(GSimpleAction *action,
            &model_iter);
       }
     }
-
-    g_free(fullq);
   }
 }
 
@@ -1264,23 +1247,7 @@ static void _lib_folders_update_collection(const gchar *filmroll)
 {
 
   // remove from selected images where not in this query.
-  sqlite3_stmt *stmt = NULL;
-  const gchar *cquery = dt_collection_get_query(darktable.collection);
-  if(cquery && cquery[0] != '\0')
-  {
-    gchar *complete_query = g_strdup_printf(
-                          "DELETE FROM main.selected_images WHERE imgid NOT IN (%s)",
-                          cquery);
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                complete_query, -1, &stmt, NULL);
-    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, 0);
-    DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, -1);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    /* free allocated strings */
-    g_free(complete_query);
-  }
+  dt_selection_drop_outside_collection();
 
   /* raise signal of collection change, only if this is an original */
   if(!darktable.collection->clone)
