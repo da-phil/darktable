@@ -72,6 +72,13 @@ void dt_selection_set_folder_images(const char *folder);
     writing the table directly: no selection signal is raised */
 void dt_selection_drop_outside_collection(void);
 
+/** TRUE when the image is in main.selected_images, collected or not */
+gboolean dt_selection_contains(const dt_imgid_t imgid);
+
+/** add the image to main.selected_images, or remove it, without raising
+    the selection changed signal */
+void dt_selection_set_member(const dt_imgid_t imgid, const gboolean selected);
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

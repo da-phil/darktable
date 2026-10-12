@@ -59,21 +59,6 @@ static void dt_view_unload_module(dt_view_t *view);
 
 void dt_view_manager_init(dt_view_manager_t *vm)
 {
-  /* prepare statements */
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT imgid FROM main.selected_images "
-                              "WHERE imgid = ?1", -1, &vm->statements.is_selected, NULL);
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "DELETE FROM main.selected_images WHERE imgid = ?1",
-                              -1, &vm->statements.delete_from_selected, NULL);
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "INSERT OR IGNORE INTO main.selected_images (imgid)"
-                              " VALUES (?1)", -1,
-                              &vm->statements.make_selected, NULL);
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT num FROM main.history WHERE imgid = ?1", -1,
-                              &vm->statements.have_history, NULL);
-
   vm->module_toolbox = dt_gui_hbox();
   vm->view_toolbox = dt_gui_hbox();
 
@@ -1113,43 +1098,13 @@ char* dt_view_extend_modes_str(const char * name,
 void dt_view_set_selection(const dt_imgid_t imgid,
                            const int value)
 {
-  /* clear and reset statement */
-  DT_DEBUG_SQLITE3_CLEAR_BINDINGS(darktable.view_manager->statements.is_selected);
-  DT_DEBUG_SQLITE3_RESET(darktable.view_manager->statements.is_selected);
-
-  /* setup statement and iterate over rows */
-  DT_DEBUG_SQLITE3_BIND_INT(darktable.view_manager->statements.is_selected, 1, imgid);
-
-  if(sqlite3_step(darktable.view_manager->statements.is_selected) == SQLITE_ROW)
+  if(dt_selection_contains(imgid))
   {
     if(!value)
-    {
-      /* Value is set and should be unset; get rid of it */
-
-      /* clear and reset statement */
-      DT_DEBUG_SQLITE3_CLEAR_BINDINGS
-        (darktable.view_manager->statements.delete_from_selected);
-      DT_DEBUG_SQLITE3_RESET
-        (darktable.view_manager->statements.delete_from_selected);
-
-      /* setup statement and execute */
-      DT_DEBUG_SQLITE3_BIND_INT
-        (darktable.view_manager->statements.delete_from_selected, 1, imgid);
-      sqlite3_step(darktable.view_manager->statements.delete_from_selected);
-    }
+      dt_selection_set_member(imgid, FALSE);
   }
   else if(value)
-  {
-    /* Select bit is unset and should be set; add it */
-
-    /* clear and reset statement */
-    DT_DEBUG_SQLITE3_CLEAR_BINDINGS(darktable.view_manager->statements.make_selected);
-    DT_DEBUG_SQLITE3_RESET(darktable.view_manager->statements.make_selected);
-
-    /* setup statement and execute */
-    DT_DEBUG_SQLITE3_BIND_INT(darktable.view_manager->statements.make_selected, 1, imgid);
-    sqlite3_step(darktable.view_manager->statements.make_selected);
-  }
+    dt_selection_set_member(imgid, TRUE);
 }
 
 /**
@@ -1158,34 +1113,7 @@ void dt_view_set_selection(const dt_imgid_t imgid,
  */
 void dt_view_toggle_selection(const dt_imgid_t imgid)
 {
-  /* clear and reset statement */
-  DT_DEBUG_SQLITE3_CLEAR_BINDINGS(darktable.view_manager->statements.is_selected);
-  DT_DEBUG_SQLITE3_RESET(darktable.view_manager->statements.is_selected);
-
-  /* setup statement and iterate over rows */
-  DT_DEBUG_SQLITE3_BIND_INT(darktable.view_manager->statements.is_selected, 1, imgid);
-  if(sqlite3_step(darktable.view_manager->statements.is_selected) == SQLITE_ROW)
-  {
-    /* clear and reset statement */
-    DT_DEBUG_SQLITE3_CLEAR_BINDINGS
-      (darktable.view_manager->statements.delete_from_selected);
-    DT_DEBUG_SQLITE3_RESET(darktable.view_manager->statements.delete_from_selected);
-
-    /* setup statement and execute */
-    DT_DEBUG_SQLITE3_BIND_INT(darktable.view_manager->statements.delete_from_selected,
-                              1, imgid);
-    sqlite3_step(darktable.view_manager->statements.delete_from_selected);
-  }
-  else
-  {
-    /* clear and reset statement */
-    DT_DEBUG_SQLITE3_CLEAR_BINDINGS(darktable.view_manager->statements.make_selected);
-    DT_DEBUG_SQLITE3_RESET(darktable.view_manager->statements.make_selected);
-
-    /* setup statement and execute */
-    DT_DEBUG_SQLITE3_BIND_INT(darktable.view_manager->statements.make_selected, 1, imgid);
-    sqlite3_step(darktable.view_manager->statements.make_selected);
-  }
+  dt_selection_set_member(imgid, !dt_selection_contains(imgid));
 }
 
 dt_view_type_flags_t dt_view_get_current(void)

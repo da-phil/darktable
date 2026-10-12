@@ -329,6 +329,27 @@ static void test_folder_selection(void **state)
   assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 0);
 }
 
+static void test_selection_member(void **state)
+{
+  const dt_imgid_t cr2 = dt_test_catalog_image("mire1.cr2");
+  gchar *query = g_strdup_printf("SELECT COUNT(*) FROM main.selected_images"
+                                 " WHERE imgid = %d", cr2);
+  assert_false(dt_selection_contains(cr2));
+
+  // adding twice keeps one row, removing twice is harmless
+  dt_selection_set_member(cr2, TRUE);
+  dt_selection_set_member(cr2, TRUE);
+  assert_true(dt_selection_contains(cr2));
+  assert_int_equal(_count(query), 1);
+  assert_int_equal(_count("SELECT COUNT(*) FROM main.selected_images"), 1);
+
+  dt_selection_set_member(cr2, FALSE);
+  dt_selection_set_member(cr2, FALSE);
+  assert_false(dt_selection_contains(cr2));
+  assert_int_equal(_count(query), 0);
+  g_free(query);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -340,6 +361,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_sidecar_rows),
     cmocka_unit_test(test_image_flags_and_stamps),
     cmocka_unit_test(test_folder_selection),
+    cmocka_unit_test(test_selection_member),
     cmocka_unit_test(test_thumb_state),
     cmocka_unit_test(test_film_by_access),
     cmocka_unit_test(test_jobs_queries),

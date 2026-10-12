@@ -232,22 +232,6 @@ typedef struct dt_view_manager_t
   dt_act_on_cache_t act_on_cache_all;
   dt_act_on_cache_t act_on_cache_visible;
 
-  /* reusable db statements
-   * TODO: reconsider creating a common/database helper API
-   *       instead of having this spread around in sources..
-   */
-  struct
-  {
-    /* select num from history where imgid = ?1*/
-    sqlite3_stmt *have_history;
-    /* select * from selected_images where imgid = ?1 */
-    sqlite3_stmt *is_selected;
-    /* delete from selected_images where imgid = ?1 */
-    sqlite3_stmt *delete_from_selected;
-    /* insert into selected_images values (?1) */
-    sqlite3_stmt *make_selected;
-  } statements;
-
   struct
   {
     GPid audio_player_pid;   // the pid of the child process

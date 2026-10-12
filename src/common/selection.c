@@ -121,6 +121,50 @@ static void _selection_update_collection(gpointer instance,
   dt_collection_update(selection->collection);
 }
 
+// cached: dt_thumbnail_update_selection() asks once per visible thumbnail
+static sqlite3_stmt *_is_selected_stmt = NULL;
+static sqlite3_stmt *_deselect_stmt = NULL;
+static sqlite3_stmt *_select_stmt = NULL;
+
+static sqlite3_stmt *_cached_stmt(sqlite3_stmt **stmt,
+                                  const char *query,
+                                  const dt_imgid_t imgid)
+{
+  if(*stmt)
+  {
+    DT_DEBUG_SQLITE3_CLEAR_BINDINGS(*stmt);
+    DT_DEBUG_SQLITE3_RESET(*stmt);
+  }
+  else
+    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(*stmt, 1, imgid);
+  return *stmt;
+}
+
+gboolean dt_selection_contains(const dt_imgid_t imgid)
+{
+  sqlite3_stmt *stmt = _cached_stmt(&_is_selected_stmt,
+                                    "SELECT imgid FROM main.selected_images "
+                                    "WHERE imgid = ?1",
+                                    imgid);
+  return sqlite3_step(stmt) == SQLITE_ROW;
+}
+
+void dt_selection_set_member(const dt_imgid_t imgid,
+                             const gboolean selected)
+{
+  sqlite3_stmt *stmt =
+    selected
+    ? _cached_stmt(&_select_stmt,
+                   "INSERT OR IGNORE INTO main.selected_images (imgid)"
+                   " VALUES (?1)",
+                   imgid)
+    : _cached_stmt(&_deselect_stmt,
+                   "DELETE FROM main.selected_images WHERE imgid = ?1",
+                   imgid);
+  sqlite3_step(stmt);
+}
+
 const dt_selection_t *dt_selection_new()
 {
   dt_selection_t *s = g_malloc0(sizeof(dt_selection_t));
