@@ -26,6 +26,7 @@
 #include "common/grouping.h"
 #include "common/undo.h"
 #include "common/metadata.h"
+#include "common/selection.h"
 #include "common/tags.h"
 #include "control/control.h"
 #include "control/jobs.h"
@@ -93,21 +94,14 @@ static void _group_helper_function(void)
   ? darktable.gui->expanded_group_id 
   : NO_IMGID;
 
-  GList *imgs = NULL;
-  sqlite3_stmt *stmt;
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT imgid FROM main.selected_images", -1,
-                              &stmt, NULL);
-  while(sqlite3_step(stmt) == SQLITE_ROW)
+  GList *imgs = dt_selection_get_list(darktable.selection, FALSE, FALSE);
+  for(const GList *l = imgs; l; l = g_list_next(l))
   {
-    dt_imgid_t id = sqlite3_column_int(stmt, 0);
+    const dt_imgid_t id = GPOINTER_TO_INT(l->data);
     if(!dt_is_valid_imgid(new_group_id))
       new_group_id = id;
     dt_grouping_add_to_group(new_group_id, id);
-    imgs = g_list_prepend(imgs, GINT_TO_POINTER(id));
   }
-  imgs = g_list_reverse(imgs); // list was built in reverse order, so un-reverse it
-  sqlite3_finalize(stmt);
   if(darktable.gui->grouping)
     darktable.gui->expanded_group_id = new_group_id;
   else
@@ -123,13 +117,10 @@ static void _group_helper_function(void)
 static void _ungroup_helper_function(void)
 {
   GList *imgs = NULL;
-  sqlite3_stmt *stmt;
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT imgid FROM main.selected_images", -1,
-                              &stmt, NULL);
-  while(sqlite3_step(stmt) == SQLITE_ROW)
+  GList *selected = dt_selection_get_list(darktable.selection, FALSE, FALSE);
+  for(const GList *l = selected; l; l = g_list_next(l))
   {
-    const int id = sqlite3_column_int(stmt, 0);
+    const int id = GPOINTER_TO_INT(l->data);
     const int new_group_id = dt_grouping_remove_from_group(id);
     if(dt_is_valid_imgid(new_group_id))
     {
@@ -138,7 +129,7 @@ static void _ungroup_helper_function(void)
       imgs = g_list_prepend(imgs, GINT_TO_POINTER(id));
     }
   }
-  sqlite3_finalize(stmt);
+  g_list_free(selected);
   if(imgs != NULL)
   {
     darktable.gui->expanded_group_id = NO_IMGID;

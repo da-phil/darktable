@@ -925,13 +925,10 @@ static void _setup_selected_images_list(dt_lib_module_t *self)
   d->imgs = NULL;
   d->nb_imgs = 0;
 
-  sqlite3_stmt *stmt;
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT imgid FROM main.selected_images",
-                              -1, &stmt, NULL);
-  while(sqlite3_step(stmt) == SQLITE_ROW)
+  GList *selected = dt_selection_get_list(darktable.selection, FALSE, FALSE);
+  for(const GList *l = selected; l; l = g_list_next(l))
   {
-    const dt_imgid_t imgid = sqlite3_column_int(stmt, 0);
+    const dt_imgid_t imgid = GPOINTER_TO_INT(l->data);
     const dt_image_t *cimg = dt_image_cache_get(imgid, 'r');
     char dt[DT_DATETIME_LENGTH];
     if(!cimg) continue;
@@ -945,7 +942,7 @@ static void _setup_selected_images_list(dt_lib_module_t *self)
     d->imgs = g_list_prepend(d->imgs, img);
     d->nb_imgs++;
   }
-  sqlite3_finalize(stmt);
+  g_list_free(selected);
 }
 
 static void _choose_gpx_callback(GtkWidget *widget, dt_lib_module_t *self)

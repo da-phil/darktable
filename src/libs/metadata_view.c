@@ -23,6 +23,7 @@
 #include "common/debug.h"
 #include "common/image_cache.h"
 #include "common/metadata.h"
+#include "common/selection.h"
 #include "common/tags.h"
 #include "common/datetime.h"
 #include "control/conf.h"
@@ -1108,16 +1109,9 @@ static void _jump_to()
   dt_imgid_t imgid = dt_control_get_mouse_over_id();
   if(!dt_is_valid_imgid(imgid))
   {
-    sqlite3_stmt *stmt;
-
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                                "SELECT imgid FROM main.selected_images", -1, &stmt,
-                                NULL);
-
-    if(sqlite3_step(stmt) == SQLITE_ROW)
-      imgid = sqlite3_column_int(stmt, 0);
-
-    sqlite3_finalize(stmt);
+    GList *selected = dt_selection_get_list(darktable.selection, FALSE, FALSE);
+    if(selected) imgid = GPOINTER_TO_INT(selected->data);
+    g_list_free(selected);
   }
   if(dt_is_valid_imgid(imgid))
   {

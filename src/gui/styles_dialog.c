@@ -19,6 +19,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/history.h"
+#include "common/selection.h"
 #include "common/styles.h"
 #include "common/utility.h"
 #include "control/control.h"
@@ -66,22 +67,10 @@ typedef enum _style_items_columns_t
 
 static int _single_selected_imgid()
 {
-  dt_imgid_t imgid = NO_IMGID;
-  sqlite3_stmt *stmt;
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT imgid FROM main.selected_images",
-                              -1, &stmt, NULL);
-  while(sqlite3_step(stmt) == SQLITE_ROW)
-  {
-    if(!dt_is_valid_imgid(imgid))
-      imgid = sqlite3_column_int(stmt, 0);
-    else
-    {
-      imgid = NO_IMGID;
-      break;
-    }
-  }
-  sqlite3_finalize(stmt);
+  GList *selected = dt_selection_get_list(darktable.selection, FALSE, FALSE);
+  const dt_imgid_t imgid =
+    selected && !selected->next ? GPOINTER_TO_INT(selected->data) : NO_IMGID;
+  g_list_free(selected);
   return imgid;
 }
 
