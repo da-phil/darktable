@@ -1,0 +1,7 @@
+# AMD GPUs through ROCm; needs the amdgpu kernel driver on the host
+services:
+  ollama:
+    image: ${OLLAMA_ROCM_IMAGE:-ollama/ollama:rocm}
+    devices:
+      - /dev/kfd
+      - /dev/dri

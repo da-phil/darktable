@@ -1,0 +1,47 @@
+# run open source LLMs locally with ollama; use ./llm.sh rather than calling
+# this directly, it picks the GPU override and passes the model name
+
+name: local-llm
+
+services:
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    ports:
+      # ollama has no authentication, so only listen on localhost by default
+      - "${LLM_BIND:-127.0.0.1}:${LLM_PORT:-11434}:11434"
+    volumes:
+      # a bare name is a docker volume, a path (./models, /data/llm) a bind mount
+      - ${LLM_MODELS_DIR:-ollama-models}:/root/.ollama
+    environment:
+      # passed through only when set on the host, otherwise ollama's defaults apply
+      - OLLAMA_CONTEXT_LENGTH
+      - OLLAMA_KEEP_ALIVE
+      - OLLAMA_NUM_PARALLEL
+      - OLLAMA_MAX_LOADED_MODELS
+      - OLLAMA_FLASH_ATTENTION
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  webui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    profiles: ["webui"]
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${LLM_BIND:-127.0.0.1}:${WEBUI_PORT:-3000}:8080"
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      # single-user local setup: no login screen
+      WEBUI_AUTH: "False"
+    volumes:
+      - open-webui:/app/backend/data
+
+volumes:
+  ollama-models:
+  open-webui:
