@@ -993,6 +993,9 @@ changes (where available).
 - Fixed scale pixels output shifted by a fraction of a pixel in each
   tile when the image was processed in tiles.
 
+- Fixed an occasional crash at startup when darktable was given images
+  or a folder to import on the command line.
+
 ## Lua
 
 ### API Version
