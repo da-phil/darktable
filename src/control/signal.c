@@ -375,7 +375,13 @@ void dt_control_signal_raise(const dt_control_signal_t *ctlsig, dt_signal_t sign
 
   if(!signal_description->synchronous)
   {
-    g_main_context_invoke_full(NULL, G_PRIORITY_HIGH_IDLE, _signal_raise, params, NULL);
+    // a job thread must queue: g_main_context_invoke_full() runs the handlers
+    // right here whenever this thread can take the default main context,
+    // which it can while the GUI thread is not iterating, e.g. during startup
+    if(pthread_equal(darktable.control->gui_thread, pthread_self()))
+      g_main_context_invoke_full(NULL, G_PRIORITY_HIGH_IDLE, _signal_raise, params, NULL);
+    else
+      g_idle_add_full(G_PRIORITY_HIGH_IDLE, _signal_raise, params, NULL);
   }
   else
   {
